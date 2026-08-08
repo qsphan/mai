@@ -91,12 +91,7 @@ $$
 
 For one input dimension:
 
-$$
-g_{x,i}
-=
-\sum_{j=1}^{d_{\text{out}}}
-W_{ji} g_{y,j}
-$$
+$$ (g_x)_i = \sum_{j=1}^{d_{out}} W_{ji}(g_y)_j $$
 
 Now notice that there are `d_out` terms being summed.
 
