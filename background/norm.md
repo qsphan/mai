@@ -150,7 +150,7 @@ Attention and MLP calculations contain matrix multiplications and nonlinear func
 Normalization acts as an adapter at the sublayer boundary. It converts the current residual vector $\mathbf{x}^{(l)}$ into a controlled input $\mathbf{z}^{(l)}$:
 
 $$
-\mathbf{z}^{(l)} = \operatorname{Norm}(\mathbf{x}^{(l)})
+\mathbf{z}^{(l)} = \mathrm{Norm}(\mathbf{x}^{(l)})
 $$
 
 The sublayer then computes its update from that normalized input:
@@ -164,7 +164,7 @@ In a pre-norm block, the update is finally added to the original, unnormalized r
 $$
 \mathbf{x}^{(l+1)}
 = \mathbf{x}^{(l)}
-+ F_l\!\left(\operatorname{Norm}(\mathbf{x}^{(l)})\right)
++ F_l\!\left(\mathrm{Norm}(\mathbf{x}^{(l)})\right)
 $$
 
 Normalization therefore does not necessarily clamp the residual stream itself. Instead, it gives each attention or MLP sublayer a predictable view of that stream before computing the next update.
@@ -304,7 +304,7 @@ RMSNorm is a simpler relative of LayerNorm. It controls the vector's magnitude b
 First compute the vector's root mean square, or RMS:
 
 $$
-\operatorname{RMS}(\mathbf{x})
+\mathrm{RMS}(\mathbf{x})
 = \sqrt{\frac{1}{d}\sum_{i=1}^{d}x_i^2 + \epsilon}
 $$
 
@@ -312,7 +312,7 @@ Then divide each element by that value and apply a learned scale:
 
 $$
 y_i = \gamma_i
-\frac{x_i}{\operatorname{RMS}(\mathbf{x})}
+\frac{x_i}{\mathrm{RMS}(\mathbf{x})}
 $$
 
 Unlike the usual LayerNorm definition, RMSNorm normally has no learned bias $\beta_i$. Some implementations may offer one, so the exact library API is worth checking.
@@ -330,7 +330,7 @@ $$
 Its root mean square is:
 
 $$
-\operatorname{RMS}(\mathbf{x})
+\mathrm{RMS}(\mathbf{x})
 = \sqrt{\frac{1^2+2^2+3^2}{3}}
 = \sqrt{\frac{14}{3}}
 \approx 2.1602
@@ -393,14 +393,14 @@ $$
 Since
 
 $$
-\operatorname{RMS}(\mathbf{x})
+\mathrm{RMS}(\mathbf{x})
 = \frac{\lVert\mathbf{x}\rVert_2}{\sqrt{d}}
 $$
 
 RMSNorm without its learned scale can be written as:
 
 $$
-\frac{\mathbf{x}}{\operatorname{RMS}(\mathbf{x})}
+\frac{\mathbf{x}}{\mathrm{RMS}(\mathbf{x})}
 = \sqrt{d}\frac{\mathbf{x}}{\lVert\mathbf{x}\rVert_2}
 $$
 
@@ -409,7 +409,7 @@ Geometrically, RMSNorm keeps the vector's direction and places it on a sphere wi
 The two statistics are connected by a useful identity:
 
 $$
-\operatorname{RMS}(\mathbf{x})^2 = \sigma^2 + \mu^2
+\mathrm{RMS}(\mathbf{x})^2 = \sigma^2 + \mu^2
 $$
 
 RMSNorm uses the total squared magnitude on the left. LayerNorm removes the mean first and uses the remaining spread, $\sigma^2$. When the mean is already close to zero, the two denominators are close; when the mean is large, they can differ substantially.
@@ -421,27 +421,27 @@ Suppose every element is multiplied by the same positive constant $a$.
 Ignoring $\epsilon$ and learned parameters, both normalizers are approximately unchanged:
 
 $$
-\operatorname{LayerNorm}(a\mathbf{x})
-= \operatorname{LayerNorm}(\mathbf{x})
+\mathrm{LayerNorm}(a\mathbf{x})
+= \mathrm{LayerNorm}(\mathbf{x})
 $$
 
 $$
-\operatorname{RMSNorm}(a\mathbf{x})
-= \operatorname{RMSNorm}(\mathbf{x})
+\mathrm{RMSNorm}(a\mathbf{x})
+= \mathrm{RMSNorm}(\mathbf{x})
 $$
 
 Now suppose the same constant $b$ is added to every element. Let $\mathbf{1}$ be the all-ones vector. LayerNorm removes this uniform shift:
 
 $$
-\operatorname{LayerNorm}(\mathbf{x}+b\mathbf{1})
-= \operatorname{LayerNorm}(\mathbf{x})
+\mathrm{LayerNorm}(\mathbf{x}+b\mathbf{1})
+= \mathrm{LayerNorm}(\mathbf{x})
 $$
 
 RMSNorm does not:
 
 $$
-\operatorname{RMSNorm}(\mathbf{x}+b\mathbf{1})
-\ne \operatorname{RMSNorm}(\mathbf{x})
+\mathrm{RMSNorm}(\mathbf{x}+b\mathbf{1})
+\ne \mathrm{RMSNorm}(\mathbf{x})
 $$
 
 This is the essential tradeoff. RMSNorm assumes that explicitly removing the mean is unnecessary for the model architecture in question. In many modern language models, that simpler operation works well.
@@ -477,26 +477,26 @@ In many modern **pre-norm** Transformers, normalization is applied before the su
 
 $$
 \mathbf{x}_{\text{next}}
-= \mathbf{x} + F(\operatorname{Norm}(\mathbf{x}))
+= \mathbf{x} + F(\mathrm{Norm}(\mathbf{x}))
 $$
 
-Here, $\operatorname{Norm}$ may be LayerNorm or RMSNorm. The residual path still carries $\mathbf{x}$ directly, while the subcomponent receives a controlled input scale.
+Here, $\mathrm{Norm}$ may be LayerNorm or RMSNorm. The residual path still carries $\mathbf{x}$ directly, while the subcomponent receives a controlled input scale.
 
 A complete block usually has two residual updates. In simplified form:
 
 $$
 \mathbf{u}^{(l)}
 = \mathbf{x}^{(l)}
-+ \operatorname{Attention}_l\!\left(
-\operatorname{Norm}_l^{(1)}(\mathbf{x}^{(l)})
++ \mathrm{Attention}_l\!\left(
+\mathrm{Norm}_l^{(1)}(\mathbf{x}^{(l)})
 \right)
 $$
 
 $$
 \mathbf{x}^{(l+1)}
 = \mathbf{u}^{(l)}
-+ \operatorname{MLP}_l\!\left(
-\operatorname{Norm}_l^{(2)}(\mathbf{u}^{(l)})
++ \mathrm{MLP}_l\!\left(
+\mathrm{Norm}_l^{(2)}(\mathbf{u}^{(l)})
 \right)
 $$
 
@@ -523,7 +523,7 @@ An older **post-norm** arrangement applies normalization after the residual addi
 
 $$
 \mathbf{x}_{\text{next}}
-= \operatorname{Norm}(\mathbf{x}+F(\mathbf{x}))
+= \mathrm{Norm}(\mathbf{x}+F(\mathbf{x}))
 $$
 
 Placement affects training dynamics; it is not merely a code-style choice. When reading a model implementation, check both which normalization it uses and where it is placed.
@@ -539,7 +539,7 @@ Second, the residual path itself remains a direct identity path. In the simplifi
 $$
 \mathbf{x}^{(l+1)}
 = \mathbf{x}^{(l)}
-+ F_l\!\left(\operatorname{Norm}(\mathbf{x}^{(l)})\right)
++ F_l\!\left(\mathrm{Norm}(\mathbf{x}^{(l)})\right)
 $$
 
 the earlier state $\mathbf{x}^{(l)}$ is copied directly into the addition. During backpropagation, this supplies a simple route through many blocks, helping gradient signals reach earlier layers.
@@ -662,7 +662,7 @@ In formula form:
 
 $$
 \boxed{
-\operatorname{LayerNorm}(\mathbf{x})
+\mathrm{LayerNorm}(\mathbf{x})
 = \boldsymbol{\gamma}\odot
 \frac{\mathbf{x}-\mu}{\sqrt{\sigma^2+\epsilon}}
 + \boldsymbol{\beta}
@@ -671,7 +671,7 @@ $$
 
 $$
 \boxed{
-\operatorname{RMSNorm}(\mathbf{x})
+\mathrm{RMSNorm}(\mathbf{x})
 = \boldsymbol{\gamma}\odot
 \frac{\mathbf{x}}
 {\sqrt{\frac{1}{d}\sum_{i=1}^{d}x_i^2+\epsilon}}
