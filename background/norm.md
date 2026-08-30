@@ -167,7 +167,7 @@ $$
 + F_l\!\left(\operatorname{Norm}(\mathbf{x}^{(l)})\right)
 $$
 
-Normalization therefore does not necessarily clamp the residual stream itself. Instead, it gives each attention or MLP sublayer a predictable view of that stream before computing the next update.
+Normalization therefore does not necessarily clamp the residual stream itself. Instead, it gives each attention or MLP sublayer a predictable view of that stream before computing the next update. Pre-norm models normally add one final normalization after the last block; section 11 returns to it.
 
 ```mermaid
 graph LR
@@ -305,15 +305,17 @@ First compute the vector's root mean square, or RMS:
 
 $$
 \operatorname{RMS}(\mathbf{x})
-= \sqrt{\frac{1}{d}\sum_{i=1}^{d}x_i^2 + \epsilon}
+= \sqrt{\frac{1}{d}\sum_{i=1}^{d}x_i^2}
 $$
 
 Then divide each element by that value and apply a learned scale:
 
 $$
 y_i = \gamma_i
-\frac{x_i}{\operatorname{RMS}(\mathbf{x})}
+\frac{x_i}{\sqrt{\operatorname{RMS}(\mathbf{x})^2 + \epsilon}}
 $$
+
+As in LayerNorm, the small positive constant $\epsilon$ sits inside the square root, where it keeps the denominator away from zero. Leaving it out of $\operatorname{RMS}$ itself mirrors how LayerNorm keeps $\epsilon$ out of $\sigma^2$, and it lets the identities in section 8 be stated exactly.
 
 Unlike the usual LayerNorm definition, RMSNorm normally has no learned bias $\beta_i$. Some implementations may offer one, so the exact library API is worth checking.
 
@@ -418,7 +420,7 @@ RMSNorm uses the total squared magnitude on the left. LayerNorm removes the mean
 
 Suppose every element is multiplied by the same positive constant $a$.
 
-Ignoring $\epsilon$ and learned parameters, both normalizers are approximately unchanged:
+Ignoring $\epsilon$ and learned parameters, both normalizers are unchanged:
 
 $$
 \operatorname{LayerNorm}(a\mathbf{x})
@@ -518,6 +520,18 @@ graph LR
     M --> ADD2
     ADD2 --> X2[Residual stream for next block]
 ```
+
+### The final normalization
+
+Because a pre-norm block adds its update to the unnormalized residual stream, nothing inside the stack controls the magnitude of the stream itself. Pre-norm models therefore apply one more normalization after the last block, before the output projection that maps the residual stream to vocabulary scores:
+
+$$
+\text{logits}
+= W_{\text{unembedding}}
+\operatorname{Norm}\!\left(\mathbf{x}^{(L)}\right)
+$$
+
+This final norm is easy to omit when implementing a model as a loop over identical blocks, because it belongs to the model rather than to any single block. A post-norm stack needs it less, since its last operation is already a normalization.
 
 An older **post-norm** arrangement applies normalization after the residual addition:
 
