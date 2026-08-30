@@ -139,8 +139,7 @@ After $L$ blocks, repeated substitution gives:
 
 $$
 \mathbf{x}^{(L)}
-= \mathbf{x}^{(0)}
-+ \sum_{l=0}^{L-1}\Delta\mathbf{x}^{(l)}
+= \mathbf{x}^{(0)} + \sum_{l=0}^{L-1}\Delta\mathbf{x}^{(l)}
 $$
 
 The representation becomes richer because it incorporates the results of many computations. Its shape remains $[B,S,D]$, but its numerical scale need not remain constant. Depending on how the updates are distributed and aligned, repeated additions can increase, decrease, or otherwise change the residual stream's magnitude. Growth is common enough that every later sublayer cannot simply assume it will always receive values in the same range.
@@ -163,8 +162,7 @@ In a pre-norm block, the update is finally added to the original, unnormalized r
 
 $$
 \mathbf{x}^{(l+1)}
-= \mathbf{x}^{(l)}
-+ F_l\!\left(\mathrm{Norm}(\mathbf{x}^{(l)})\right)
+= \mathbf{x}^{(l)} + F_l\left(\mathrm{Norm}(\mathbf{x}^{(l)})\right)
 $$
 
 Normalization therefore does not necessarily clamp the residual stream itself. Instead, it gives each attention or MLP sublayer a predictable view of that stream before computing the next update. Pre-norm models normally add one final normalization after the last block; section 11 returns to it.
@@ -251,8 +249,7 @@ The complete LayerNorm operation is therefore:
 
 $$
 y_i = \gamma_i
-\frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}
-+ \beta_i
+\frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta_i
 $$
 
 Why normalize and then immediately allow the network to change the scale and bias? The normalization provides a stable reference point, while $\boldsymbol{\gamma}$ and $\boldsymbol{\beta}$ preserve flexibility. If the network benefits from a particular coordinate being larger, smaller, or shifted, it can learn that behavior.
@@ -488,16 +485,14 @@ A complete block usually has two residual updates. In simplified form:
 
 $$
 \mathbf{u}^{(l)}
-= \mathbf{x}^{(l)}
-+ \mathrm{Attention}_l\!\left(
+= \mathbf{x}^{(l)} + \mathrm{Attention}_l\left(
 \mathrm{Norm}_l^{(1)}(\mathbf{x}^{(l)})
 \right)
 $$
 
 $$
 \mathbf{x}^{(l+1)}
-= \mathbf{u}^{(l)}
-+ \mathrm{MLP}_l\!\left(
+= \mathbf{u}^{(l)} + \mathrm{MLP}_l\left(
 \mathrm{Norm}_l^{(2)}(\mathbf{u}^{(l)})
 \right)
 $$
@@ -528,7 +523,7 @@ Because a pre-norm block adds its update to the unnormalized residual stream, no
 $$
 \text{logits}
 = W_{\text{unembedding}}
-\mathrm{Norm}\!\left(\mathbf{x}^{(L)}\right)
+\mathrm{Norm}\left(\mathbf{x}^{(L)}\right)
 $$
 
 This final norm is easy to omit when implementing a model as a loop over identical blocks, because it belongs to the model rather than to any single block. A post-norm stack needs it less, since its last operation is already a normalization.
@@ -552,8 +547,7 @@ Second, the residual path itself remains a direct identity path. In the simplifi
 
 $$
 \mathbf{x}^{(l+1)}
-= \mathbf{x}^{(l)}
-+ F_l\!\left(\mathrm{Norm}(\mathbf{x}^{(l)})\right)
+= \mathbf{x}^{(l)} + F_l\left(\mathrm{Norm}(\mathbf{x}^{(l)})\right)
 $$
 
 the earlier state $\mathbf{x}^{(l)}$ is copied directly into the addition. During backpropagation, this supplies a simple route through many blocks, helping gradient signals reach earlier layers.
@@ -678,8 +672,7 @@ $$
 \boxed{
 \mathrm{LayerNorm}(\mathbf{x})
 = \boldsymbol{\gamma}\odot
-\frac{\mathbf{x}-\mu}{\sqrt{\sigma^2+\epsilon}}
-+ \boldsymbol{\beta}
+\frac{\mathbf{x}-\mu}{\sqrt{\sigma^2+\epsilon}} + \boldsymbol{\beta}
 }
 $$
 
