@@ -403,7 +403,7 @@ $$
 = \sqrt{d}\frac{\mathbf{x}}{\lVert\mathbf{x}\rVert_2}
 $$
 
-Geometrically, RMSNorm keeps the vector's direction and places it on a sphere with radius $\sqrt{d}$. LayerNorm first removes the component corresponding to a uniform shift of all coordinates, then controls the remaining vector's magnitude.
+Ignoring $\epsilon$ and the learned scale, RMSNorm keeps the direction of any nonzero vector and places it on a sphere with radius $\sqrt{d}$. LayerNorm first removes the component corresponding to a uniform shift of all coordinates, then controls the remaining vector's magnitude.
 
 The two statistics are connected by a useful identity:
 
@@ -441,6 +441,7 @@ RMSNorm does not:
 $$
 \mathrm{RMSNorm}(\mathbf{x}+b\mathbf{1})
 \ne \mathrm{RMSNorm}(\mathbf{x})
+\quad\text{in general}
 $$
 
 This is the essential tradeoff. RMSNorm assumes that explicitly removing the mean is unnecessary for the model architecture in question. In many modern language models, that simpler operation works well.
@@ -518,7 +519,7 @@ graph LR
 
 ### The final normalization
 
-Because a pre-norm block adds its update to the unnormalized residual stream, nothing inside the stack controls the magnitude of the stream itself. Pre-norm models therefore apply one more normalization after the last block, before the output projection that maps the residual stream to vocabulary scores:
+Because a pre-norm block adds its update to the unnormalized residual stream, the stream is not directly normalized after each residual addition. Pre-norm models therefore typically apply one more normalization after the last block, before the output projection that maps the residual stream to vocabulary scores:
 
 $$
 \text{logits}
