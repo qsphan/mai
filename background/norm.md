@@ -227,6 +227,8 @@ $$
 
 The small positive constant $\epsilon$ prevents division by zero and improves numerical stability.
 
+It can also soften a specific failure mode: if the variance becomes extremely small, the denominator $\sqrt{\sigma^2 + \epsilon}$ would otherwise be tiny, and the normalization step can become overly sensitive to small input changes. In that narrow sense, $\epsilon$ can reduce large local gradients created by the normalization operation itself. It is not, however, a general cure for exploding gradients elsewhere in the network.
+
 Ignoring $\epsilon$ for a moment, the resulting vector has mean zero and variance one:
 
 $$
@@ -253,6 +255,8 @@ y_i = \gamma_i
 $$
 
 Why normalize and then immediately allow the network to change the scale and bias? The normalization provides a stable reference point, while $\boldsymbol{\gamma}$ and $\boldsymbol{\beta}$ preserve flexibility. If the network benefits from a particular coordinate being larger, smaller, or shifted, it can learn that behavior.
+
+In standard implementations, the learned scale is initialized to $\gamma_i = 1$ for every coordinate, and the learned bias is initialized to $\beta_i = 0$. That makes the post-normalization affine step start as a neutral transform: the layer first normalizes, then initially leaves the normalized coordinates at their existing scale and offset until training learns otherwise.
 
 ## 5. A concrete LayerNorm example
 
@@ -314,7 +318,11 @@ $$
 
 As in LayerNorm, the small positive constant $\epsilon$ sits inside the square root, where it keeps the denominator away from zero. Leaving it out of $\mathrm{RMS}$ itself mirrors how LayerNorm keeps $\epsilon$ out of $\sigma^2$, and it lets the identities in section 8 be stated exactly.
 
+The same caveat applies here: $\epsilon$ can damp instability when the mean square is extremely small, but that only addresses sensitivity in the normalization denominator itself. It does not by itself control the full network's gradient dynamics.
+
 Unlike the usual LayerNorm definition, RMSNorm normally has no learned bias $\beta_i$. Some implementations may offer one, so the exact library API is worth checking.
+
+Its learned scale $\gamma_i$ is usually initialized to $1$ for every coordinate, for the same reason as in LayerNorm: the normalization starts with a neutral per-coordinate rescaling rather than an arbitrary distortion.
 
 The name comes directly from the denominator: **root mean square normalization**.
 
@@ -460,6 +468,16 @@ Deep networks are numerically coupled systems. A scale change in an early layer 
 Normalization introduces a predictable scale at known points in the network. This generally allows optimization to proceed more reliably and often permits larger learning rates.
 
 Normalization does **not** guarantee that every later value is bounded, nor does it replace other stability techniques. Learned scales, matrix multiplications, residual additions, nonlinear functions, initialization, and optimizer settings still matter.
+
+### Can $\epsilon$ mitigate exploding gradients?
+
+Sometimes, but only in a limited sense.
+
+If a LayerNorm variance or RMSNorm mean square becomes extremely small, the denominator in the normalization step also becomes very small. That can make the normalization layer's backward pass produce unusually large factors. Adding $\epsilon$ puts a floor under that denominator and therefore reduces this specific source of instability.
+
+That is different from the broader exploding-gradient problem in deep networks. Gradients can still blow up because of repeated Jacobian products across many layers, overly large weights, residual amplification, aggressive learning rates, optimizer behavior, or poor initialization. Changing $\epsilon$ does not fix those causes.
+
+There is also a tradeoff: making $\epsilon$ too large weakens the normalization by biasing the denominator upward, so it should be treated primarily as a numerical-stability constant rather than as the main control knob for training stability.
 
 ## 11. How this fits into a Transformer
 
@@ -629,6 +647,8 @@ $$
 $$
 
 Use the definition expected by the model whose weights you are loading.
+
+In most architectures, $\epsilon$ is a fixed hyperparameter from the model configuration rather than a learned parameter. Common values are small constants such as $10^{-5}$, $10^{-6}$, or $10^{-8}$.
 
 ### Assuming all libraries use the same defaults
 
