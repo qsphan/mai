@@ -1,6 +1,9 @@
-# Understanding `einops.einsum`
+## Understanding `einops.einsum`
 
-## Explaining `einops.einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")`
+### Explaining Matrix Multiplication
+```python
+einops.einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
+```
 
 Consider this line:
 
@@ -14,7 +17,7 @@ return einops.einsum(
 
 This is a linear transformation written in `einsum` notation. It is easiest to understand by reading the shapes and then reading the pattern.
 
-### Start with the shapes
+#### Start with the shapes
 
 Suppose:
 
@@ -38,7 +41,7 @@ If `x` also has a sequence dimension, it might instead be:
 
 In that case, the leading dimensions `(32, 10)` are what the `...` represents.
 
-### Read the `einsum` pattern
+#### Read the `einsum` pattern
 
 The pattern is:
 
@@ -64,7 +67,7 @@ Third, `d_out` appears in the weight and in the output:
 
 So the result has one output feature dimension, `d_out`.
 
-### The actual computation
+#### The actual computation
 
 For one input vector $\mathbf{x} = [x_1, x_2, \ldots, x_{d_{\text{in}}}]$, the output coordinate $y_j$ is:
 
@@ -113,7 +116,7 @@ $$
 (\ldots, d_{\text{out}})
 $$
 
-### Why is the weight shaped `(d_out, d_in)`?
+#### Why is the weight shaped `(d_out, d_in)`?
 
 This is the part that often looks backward at first.
 
@@ -141,7 +144,7 @@ So this expression is conceptually equivalent to:
 x @ self.weight.T
 ```
 
-### A useful mental model
+#### A useful mental model
 
 Read
 
