@@ -595,7 +595,229 @@ def rms_norm(x, gamma, eps):
 
 Production implementations are more complex. They often fuse several operations into one GPU kernel, accumulate statistics in higher precision, and use architecture-specific strategies to reduce memory traffic.
 
-## 13. Why RMSNorm can be faster
+## 13. Implementation notes
+
+This section connects the formulas above to the kind of code used in real PyTorch implementations.
+
+### Choosing $\epsilon$ in practice
+
+Values such as $10^{-6}$ and $10^{-5}$ are implementation choices for numerical stability, not part of the core mathematical idea of RMSNorm.
+
+Recall the denominator:
+
+$$
+\sqrt{\frac{1}{d}\sum_{i=1}^{d}x_i^2 + \epsilon}
+$$
+
+The purpose of $\epsilon$ is to prevent division by zero or division by an extremely small number.
+
+For example, if
+
+$$
+\mathbf{x} = [0,0,0,0]
+$$
+
+then without $\epsilon$,
+
+$$
+\sqrt{\frac{1}{4}\sum_{i=1}^{4}x_i^2} = \sqrt{0} = 0
+$$
+
+and the normalized expression would try to divide by zero.
+
+If instead $\epsilon = 10^{-6}$, the denominator becomes
+
+$$
+\sqrt{0 + 10^{-6}} = 10^{-3}
+$$
+
+so the computation remains well-defined.
+
+There is no universal rule that RMSNorm must use $10^{-6}$. Common fixed choices include:
+
+- $\epsilon = 10^{-5}$
+- $\epsilon = 10^{-6}$
+- $\epsilon = 10^{-8}$
+
+The tradeoff is straightforward:
+
+| $\epsilon$ | Numerical protection | Effect on normal activations |
+|---|---|---|
+| $10^{-3}$ | Strong | Can noticeably change the normalization |
+| $10^{-5}$ | Strong | Usually negligible |
+| $10^{-6}$ | Strong enough | Even smaller effect |
+| $10^{-8}$ | Weaker | Very close to the exact formula |
+
+The goal is to choose $\epsilon$ large enough to avoid numerical problems but small enough that it does not materially change ordinary activations.
+
+For example, if the mean square is about $1$,
+
+$$
+\sqrt{1 + 10^{-6}} \approx 1.0000005
+$$
+
+while
+
+$$
+\sqrt{1 + 10^{-5}} \approx 1.000005
+$$
+
+Both are effectively the same for most purposes.
+
+The more important issue is often numerical precision. In practice, a suitable $\epsilon$ can depend on:
+
+- FP16, BF16, or FP32 computation;
+- the model architecture;
+- compatibility with pretrained checkpoints;
+- historical implementation choices;
+- stability experiments performed by the model authors.
+
+If you are learning or building a small implementation, either $10^{-6}$ or $10^{-5}$ is usually reasonable. If you are reproducing a specific model, use the $\epsilon$ value from that model's code or configuration.
+
+### What $d_{\text{model}}$ means
+
+The symbol $d_{\text{model}}$ is the size of the vector that represents each token inside the Transformer. It is the model's main hidden dimension.
+
+If
+
+$$
+d_{\text{model}} = 512
+$$
+
+then each token is represented by a vector with $512$ coordinates. A batch of activations may therefore have shape
+
+$$
+[B,S,d_{\text{model}}]
+$$
+
+For example:
+
+$$
+[32,128,512]
+$$
+
+means batch size $32$, sequence length $128$, and hidden size $512$.
+
+Different codebases often use different names for the same idea:
+
+- `d_model`
+- `hidden_size`
+- `hidden_dim`
+- `model_dim`
+- `embed_dim`
+
+In normalization code, this dimension determines the shape of the learned scale. For example,
+
+```python
+self.weight = nn.Parameter(torch.ones(d_model))
+```
+
+creates one learned scale value per hidden coordinate:
+
+$$
+\boldsymbol{\gamma} = [\gamma_1, \gamma_2, \ldots, \gamma_{d_{\text{model}}}]
+$$
+
+That is why the RMSNorm output can be written as
+
+$$
+y_i = \gamma_i \frac{x_i}{\mathrm{RMS}(\mathbf{x})}
+$$
+
+with one $\gamma_i$ for each component of the token representation.
+
+### Reading the PyTorch RMSNorm line step by step
+
+A common implementation looks like this:
+
+```python
+rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+```
+
+The most important part is `mean(dim=-1, keepdim=True)`.
+
+Suppose one token vector is
+
+$$
+\mathbf{x} = [1,2,3,4]
+$$
+
+and suppose this token lives in a model with hidden dimension $4$.
+
+First, `x.pow(2)` squares each coordinate:
+
+$$
+[1,2,3,4] \rightarrow [1,4,9,16]
+$$
+
+Next, `.mean(dim=-1, keepdim=True)` averages over the last dimension.
+
+For an ordinary vector, that is just:
+
+$$
+\frac{1 + 4 + 9 + 16}{4} = 7.5
+$$
+
+so after the mean, the result is a single per-token value.
+
+In a Transformer, `x` usually has shape
+
+$$
+[B,S,D]
+$$
+
+where $D$ is the hidden size. In that setting:
+
+- `dim=0` means batch;
+- `dim=1` means sequence position;
+- `dim=2` means hidden dimension;
+- `dim=-1` means the last dimension, which is again the hidden dimension.
+
+So `mean(dim=-1)` means:
+
+> For each token, average across its hidden coordinates only.
+
+It does not average across different tokens or different batch elements.
+
+For example, if `x.shape = [2,3,4]`, then `x.mean(dim=-1)` reduces the last dimension and produces shape `[2,3]`.
+
+Using `keepdim=True` preserves that reduced axis as a size-$1$ dimension, so the result has shape `[2,3,1]` instead of `[2,3]`. That matters because the normalization code later divides the original tensor by this per-token RMS value, and the size-$1$ dimension can be broadcast back across the hidden dimension.
+
+Putting the steps together for $\mathbf{x} = [1,2,3,4]$:
+
+1. Square the vector:
+
+$$
+[1,2,3,4] \rightarrow [1,4,9,16]
+$$
+
+2. Average the squared values:
+
+$$
+\frac{1 + 4 + 9 + 16}{4} = 7.5
+$$
+
+3. Add $\epsilon$:
+
+$$
+7.5 + \epsilon
+$$
+
+4. Take the square root:
+
+$$
+\sqrt{7.5 + \epsilon}
+$$
+
+This is exactly the root-mean-square quantity used by RMSNorm.
+
+The short mental model is:
+
+> `mean(dim=-1)` means "take the average across the hidden dimension for each token."
+
+That is the reduction RMSNorm needs.
+
+## 14. Why RMSNorm can be faster
 
 LayerNorm needs enough information to calculate both a mean and a variance, then it must subtract the mean. RMSNorm needs only the mean of the squared values and does not perform centering.
 
@@ -610,7 +832,7 @@ An optimized LayerNorm kernel may compute its statistics together in one pass, s
 
 The real end-to-end speedup depends on hardware, tensor sizes, kernel fusion, memory bandwidth, and the rest of the model. The normalization layer is only one part of a Transformer block, so “RMSNorm uses fewer operations” does not imply that the entire model becomes proportionally faster.
 
-## 14. LayerNorm is not BatchNorm
+## 15. LayerNorm is not BatchNorm
 
 The names are easy to confuse.
 
@@ -620,7 +842,7 @@ The names are easy to confuse.
 
 For variable-length sequence models and request-by-request language-model inference, this independence is a major reason LayerNorm-style techniques are a natural fit.
 
-## 15. Common implementation pitfalls
+## 16. Common implementation pitfalls
 
 ### Normalizing over the wrong axes
 
@@ -666,7 +888,7 @@ These details matter when reproducing a model or transferring weights.
 
 Statements such as scale invariance are mathematical descriptions that ignore $\epsilon$, rounding, overflow, and underflow. Real implementations are only approximately invariant.
 
-## 16. How to choose between them
+## 17. How to choose between them
 
 If you are implementing an existing architecture, use the normalization specified by that architecture. LayerNorm and RMSNorm are not interchangeable when loading trained weights.
 
@@ -677,7 +899,7 @@ If you are designing and training a new model:
 
 The choice is empirical. A small theoretical reduction in work is not valuable if it harms model quality or stability, and a theoretically stronger normalization is not automatically preferable if the extra centering is unnecessary.
 
-## 17. A compact mental model
+## 18. A compact mental model
 
 Keep these five ideas:
 
