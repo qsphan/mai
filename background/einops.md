@@ -24,6 +24,13 @@ Suppose:
 - `x.shape = (..., d_in)`
 - `self.weight.shape = (d_out, d_in)`
 
+Here:
+
+- `d_in` means the input feature dimension, which is the number of values in each input vector;
+- `d_out` means the output feature dimension, which is the number of values produced by the layer for each input vector.
+
+So this operation maps a vector of length `d_in` to a vector of length `d_out`.
+
 For example, if:
 
 - batch size is `32`
@@ -58,14 +65,14 @@ Second, `d_in` appears in both inputs:
 - `x: ... d_in`
 - `weight: d_out d_in`
 
-Because `d_in` does not appear in the output, `einsum` multiplies over that dimension and sums it away.
+This is the shared input dimension. Because `d_in` does not appear in the output, `einsum` multiplies over that dimension and sums it away.
 
 Third, `d_out` appears in the weight and in the output:
 
 - `weight: d_out d_in`
 - `output: ... d_out`
 
-So the result has one output feature dimension, `d_out`.
+This is the output dimension, so the result keeps one coordinate for each of the `d_out` output features.
 
 #### The actual computation
 
