@@ -352,7 +352,6 @@ The most useful summary is:
 5. The key formula is:
 
 $$
-\boxed{
 \mathrm{SwiGLU}(\mathbf{x})
 =
 W_2 \left[
@@ -360,7 +359,6 @@ W_2 \left[
 \odot
 (W_v \mathbf{x})
 \right]
-}
 $$
 
 If you remember one mental model, use this one:
