@@ -101,7 +101,7 @@ $$
 \mathrm{SwiGLU}(\mathbf{x})
 =
 W_2 \left[
-\operatorname{SiLU}(W_g \mathbf{x})
+\mathrm{SiLU}(W_g \mathbf{x})
 \odot
 (W_v \mathbf{x})
 \right]
@@ -118,13 +118,13 @@ $$
 Then the gate branch is passed through SiLU:
 
 $$
-\operatorname{SiLU}(z) = z \, \sigma(z)
+\mathrm{SiLU}(z) = z \, \sigma(z)
 $$
 
 and multiplied element-wise with the value branch:
 
 $$
-\operatorname{SiLU}(W_g \mathbf{x}) \odot (W_v \mathbf{x})
+\mathrm{SiLU}(W_g \mathbf{x}) \odot (W_v \mathbf{x})
 $$
 
 The result is then projected back to the model dimension by $W_2$.
@@ -161,13 +161,13 @@ Another way to phrase it is:
 The gate uses the **SiLU** activation:
 
 $$
-\operatorname{SiLU}(x) = x \sigma(x)
+\mathrm{SiLU}(x) = x \sigma(x)
 $$
 
 This is different from a hard-threshold activation such as ReLU:
 
 $$
-\operatorname{ReLU}(x) = \max(0,x)
+\mathrm{ReLU}(x) = \max(0,x)
 $$
 
 SiLU is smooth, which makes the gate smoother as well. Instead of creating a hard cutoff, it allows a softer transition between suppressing and passing information.
@@ -264,7 +264,7 @@ $$
 Then the element-wise product still has the same hidden size:
 
 $$
-\operatorname{SiLU}(W_g \mathbf{x}) \odot (W_v \mathbf{x})
+\mathrm{SiLU}(W_g \mathbf{x}) \odot (W_v \mathbf{x})
 \in
 \mathbb{R}^{d_{\text{ff}}}
 $$
@@ -274,7 +274,7 @@ Finally,
 $$
 W_2
 \left[
-\operatorname{SiLU}(W_g \mathbf{x}) \odot (W_v \mathbf{x})
+\mathrm{SiLU}(W_g \mathbf{x}) \odot (W_v \mathbf{x})
 \right]
 \in
 \mathbb{R}^{d_{\text{model}}}
@@ -356,7 +356,7 @@ $$
 \mathrm{SwiGLU}(\mathbf{x})
 =
 W_2 \left[
-\operatorname{SiLU}(W_g \mathbf{x})
+\mathrm{SiLU}(W_g \mathbf{x})
 \odot
 (W_v \mathbf{x})
 \right]
