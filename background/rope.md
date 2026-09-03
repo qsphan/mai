@@ -89,19 +89,25 @@ $$
 RoPE rotates that pair by an angle $\theta$:
 
 $$
-\begin{bmatrix}
+\left[
+\begin{array}{c}
 x_1' \\
 x_2'
-\end{bmatrix}
+\end{array}
+\right]
 =
-\begin{bmatrix}
+\left[
+\begin{array}{cc}
 \cos\theta & -\sin\theta \\
 \sin\theta & \cos\theta
-\end{bmatrix}
-\begin{bmatrix}
+\end{array}
+\right]
+\left[
+\begin{array}{c}
 x_1 \\
 x_2
-\end{bmatrix}
+\end{array}
+\right]
 $$
 
 So:
@@ -245,37 +251,49 @@ $$
 Let the head dimension be $d$, and let $k$ index the 2D coordinate pairs. For a query vector, RoPE transforms pair $(2k, 2k+1)$ at position $m$ as:
 
 $$
-\begin{bmatrix}
+\left[
+\begin{array}{c}
 q'_{2k} \\
 q'_{2k+1}
-\end{bmatrix}
+\end{array}
+\right]
 =
-\begin{bmatrix}
+\left[
+\begin{array}{cc}
 \cos(m\theta_k) & -\sin(m\theta_k) \\
 \sin(m\theta_k) & \cos(m\theta_k)
-\end{bmatrix}
-\begin{bmatrix}
+\end{array}
+\right]
+\left[
+\begin{array}{c}
 q_{2k} \\
 q_{2k+1}
-\end{bmatrix}
+\end{array}
+\right]
 $$
 
 and the same transformation is applied to the corresponding key coordinates:
 
 $$
-\begin{bmatrix}
+\left[
+\begin{array}{c}
 k'_{2k} \\
 k'_{2k+1}
-\end{bmatrix}
+\end{array}
+\right]
 =
-\begin{bmatrix}
+\left[
+\begin{array}{cc}
 \cos(m\theta_k) & -\sin(m\theta_k) \\
 \sin(m\theta_k) & \cos(m\theta_k)
-\end{bmatrix}
-\begin{bmatrix}
+\end{array}
+\right]
+\left[
+\begin{array}{c}
 k_{2k} \\
 k_{2k+1}
-\end{bmatrix}
+\end{array}
+\right]
 $$
 
 This preserves vector norm within each pair while changing its orientation as a function of position.
