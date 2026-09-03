@@ -97,15 +97,7 @@ $$
 
 SwiGLU is commonly written as:
 
-$$
-\mathrm{SwiGLU}(\mathbf{x})
-=
-W_2 \left[
-\mathrm{SiLU}(W_g \mathbf{x})
-\odot
-(W_v \mathbf{x})
-\right]
-$$
+$$ \mathrm{SwiGLU}(\mathbf{x}) = W_2 \left[ \mathrm{SiLU}(W_g \mathbf{x}) \odot (W_v \mathbf{x}) \right] $$
 
 There are two first-layer projections:
 
@@ -225,7 +217,7 @@ If you remember only one sentence, remember this:
 
 SwiGLU has three learned matrices:
 
-$$
+$$ 
 W_g,\qquad W_v,\qquad W_2
 $$
 
@@ -351,15 +343,7 @@ The most useful summary is:
 4. Modern models often choose SwiGLU because it tends to improve quality for roughly similar compute.
 5. The key formula is:
 
-$$
-\mathrm{SwiGLU}(\mathbf{x})
-=
-W_2 \left[
-\mathrm{SiLU}(W_g \mathbf{x})
-\odot
-(W_v \mathbf{x})
-\right]
-$$
+$$ \mathrm{SwiGLU}(\mathbf{x}) = W_2 \left[ \mathrm{SiLU}(W_g \mathbf{x}) \odot (W_v \mathbf{x}) \right] $$
 
 If you remember one mental model, use this one:
 
