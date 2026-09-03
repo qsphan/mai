@@ -46,11 +46,7 @@ $$
 
 and the attention output is:
 
-$$
-\mathrm{Attention}(Q,K,V)
-=
-\mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d}}\right)V
-$$
+$$ \mathrm{Attention}(Q,K,V) = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d}}\right)V $$
 
 RoPE changes this by rotating $Q$ and $K$ before the dot product:
 
@@ -60,11 +56,7 @@ $$
 
 so attention becomes:
 
-$$
-\mathrm{Attention}
-=
-\mathrm{softmax}\left(\frac{Q'K'^\top}{\sqrt{d}}\right)V
-$$
+$$ \mathrm{Attention} = \mathrm{softmax}\left(\frac{Q'K'^\top}{\sqrt{d}}\right)V $$
 
 The important detail is:
 
@@ -88,27 +80,7 @@ $$
 
 RoPE rotates that pair by an angle $\theta$:
 
-$$
-\left[
-\begin{array}{c}
-x_1' \\
-x_2'
-\end{array}
-\right]
-=
-\left[
-\begin{array}{cc}
-\cos\theta & -\sin\theta \\
-\sin\theta & \cos\theta
-\end{array}
-\right]
-\left[
-\begin{array}{c}
-x_1 \\
-x_2
-\end{array}
-\right]
-$$
+$$ \left[ \begin{array}{c} x_1' \\ x_2' \end{array} \right] = \left[ \begin{array}{cc} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{array} \right] \left[ \begin{array}{c} x_1 \\ x_2 \end{array} \right] $$
 
 So:
 
@@ -167,11 +139,7 @@ $$
 
 Because rotations compose cleanly, this can be rewritten so that the interaction depends on the angle difference:
 
-$$
-{q_i'}^\top k_j'
-=
-q_i^\top R((j-i)\theta)k_j
-$$
+$$ {q_i'}^\top k_j' = q_i^\top R((j-i)\theta)k_j $$
 
 The crucial term is:
 
@@ -250,51 +218,11 @@ $$
 
 Let the head dimension be $d$, and let $k$ index the 2D coordinate pairs. For a query vector, RoPE transforms pair $(2k, 2k+1)$ at position $m$ as:
 
-$$
-\left[
-\begin{array}{c}
-q'_{2k} \\
-q'_{2k+1}
-\end{array}
-\right]
-=
-\left[
-\begin{array}{cc}
-\cos(m\theta_k) & -\sin(m\theta_k) \\
-\sin(m\theta_k) & \cos(m\theta_k)
-\end{array}
-\right]
-\left[
-\begin{array}{c}
-q_{2k} \\
-q_{2k+1}
-\end{array}
-\right]
-$$
+$$ \left[ \begin{array}{c} q'_{2k} \\ q'_{2k+1} \end{array} \right] = \left[ \begin{array}{cc} \cos(m\theta_k) & -\sin(m\theta_k) \\ \sin(m\theta_k) & \cos(m\theta_k) \end{array} \right] \left[ \begin{array}{c} q_{2k} \\ q_{2k+1} \end{array} \right] $$
 
 and the same transformation is applied to the corresponding key coordinates:
 
-$$
-\left[
-\begin{array}{c}
-k'_{2k} \\
-k'_{2k+1}
-\end{array}
-\right]
-=
-\left[
-\begin{array}{cc}
-\cos(m\theta_k) & -\sin(m\theta_k) \\
-\sin(m\theta_k) & \cos(m\theta_k)
-\end{array}
-\right]
-\left[
-\begin{array}{c}
-k_{2k} \\
-k_{2k+1}
-\end{array}
-\right]
-$$
+$$ \left[ \begin{array}{c} k'_{2k} \\ k'_{2k+1} \end{array} \right] = \left[ \begin{array}{cc} \cos(m\theta_k) & -\sin(m\theta_k) \\ \sin(m\theta_k) & \cos(m\theta_k) \end{array} \right] \left[ \begin{array}{c} k_{2k} \\ k_{2k+1} \end{array} \right] $$
 
 This preserves vector norm within each pair while changing its orientation as a function of position.
 
@@ -366,11 +294,7 @@ cos = torch.cos(angles)
 sin = torch.sin(angles)
 ```
 
-The shape of `angles`, `cos`, and `sin` is:
-
-$$
-[\text{seq\_len},\ \text{head\_dim}/2]
-$$
+The shape of `angles`, `cos`, and `sin` is `[seq_len, head_dim / 2]`.
 
 ### Rotate pairs of coordinates
 
@@ -385,11 +309,7 @@ def apply_rope_pairwise(x, cos, sin):
     return torch.stack((out1, out2), dim=-1).flatten(-2)
 ```
 
-If `x` has shape:
-
-$$
-[\text{batch},\ \text{seq\_len},\ \text{heads},\ \text{head\_dim}]
-$$
+If `x` has shape `[batch, seq_len, heads, head_dim]`,
 
 then `cos` and `sin` must be broadcastable over the sequence and head dimensions.
 
@@ -451,17 +371,7 @@ Again, only $Q$ and $K$ are rotated.
 
 If you want one compact way to remember RoPE, use this:
 
-$$
-\text{position}
-\rightarrow
-\text{rotation angle}
-\rightarrow
-\text{rotate } Q \text{ and } K
-\rightarrow
-Q'K'^\top
-\rightarrow
-\text{attention that is aware of relative position}
-$$
+$$ \text{position} \rightarrow \text{rotation angle} \rightarrow \text{rotate } Q \text{ and } K \rightarrow Q'K'^\top \rightarrow \text{attention that is aware of relative position} $$
 
 Or, in one sentence:
 
