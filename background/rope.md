@@ -78,7 +78,15 @@ $$
 (x_1, x_2)
 $$
 
-RoPE rotates that pair by an angle $\theta$:
+This can be considered as a point at distance $r$ from the origin $(0, 0)$, at angle $\varphi$ from the $x$-axis. Its coordinates are:
+ - $x_1$ = $r$ cos($\varphi$)
+ - $x_2$ = $r$ sin($\varphi$)
+
+RoPE rotates that pair by an angle $\theta$, that means the distance $r$ doesn't change, but the angle is now $\varphi + \theta$
+ - $x_1'$ = $r$ cos($\varphi + \theta$) = $r$ (cos $\varphi$ cos $\theta$ - sin $\varphi$ sin $\theta$ ) = $x_1$ cos $\theta$ - $x_2$ sin $\theta$
+ - $x_2'$ = $r$ sin($\varphi + \theta$) = $r$ (sin $\varphi$ cos $\theta$ + cos $\varphi$ sin $\theta$ ) = $x_2$ cost $\theta$ + $x_1$ sin $\theta$ = $x_1$ sin $\theta$ +  $x_2$ cost $\theta$
+
+Read off the coefficients into a matrix, since each output is a linear combination of $x_1$ and $x_2$:
 
 $$ \left[ \begin{array}{c} x_1' \\ x_2' \end{array} \right] = \left[ \begin{array}{cc} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{array} \right] \left[ \begin{array}{c} x_1 \\ x_2 \end{array} \right] $$
 
