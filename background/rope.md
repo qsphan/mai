@@ -5,7 +5,7 @@ This note explains **Rotary Positional Embedding (RoPE)** in Transformers: why i
 The core idea is:
 
 $$
-\boxed{\text{RoPE encodes position by rotating } Q \text{ and } K \text{ as a function of token position.}}
+\text{RoPE encodes position by rotating } Q \text{ and } K \text{ as a function of token position.}
 $$
 
 Unlike older positional encodings, RoPE does **not** add a position vector directly to the token embedding. Instead, it modifies the **query** and **key** vectors used by attention.
@@ -58,19 +58,19 @@ so attention becomes:
 
 $$ \mathrm{Attention} = \mathrm{softmax}\left(\frac{Q'K'^\top}{\sqrt{d}}\right)V $$
 
-In practice, modern Transformers use **multi-head attention**. If the model hidden size is $d_{\text{model}}$ and the number of heads is $h$, then each head usually gets:
+In practice, modern Transformers use **multi-head attention**. If the model hidden size is `d_model` and the number of heads is `h`, then each head usually gets:
 
 $$
-\text{head\_dim} = d_{\text{model}} / h
+d_{\mathrm{head}} = d_{\mathrm{model}} / h
 $$
 
 So:
 
 $$
-d_{\text{model}} = h \times \text{head\_dim}
+d_{\mathrm{model}} = h \times d_{\mathrm{head}}
 $$
 
-For example, if $d_{\text{model}} = 512$ and $h = 8$, then each head has dimension $64$.
+For example, if `d_model = 512` and $h = 8$, then each head has dimension $64$.
 
 The important structural point is that each head has its own query, key, and value vectors. You can think of this as:
 
@@ -93,7 +93,7 @@ In implementation, this is often done by one large linear projection followed by
 The important detail is:
 
 $$
-\boxed{\text{RoPE is applied to } Q \text{ and } K,\ \text{not to } V}
+\text{RoPE is applied to } Q \text{ and } K,\ \text{not to } V
 $$
 
 This is exactly what Figure 1 is illustrating: the query and key vectors are position-encoded by rotation before their interaction is used to compute attention.
@@ -303,7 +303,7 @@ Figure 5 uses the "many clocks" intuition for this. Some clocks spin quickly, so
 That is a good mental model for RoPE:
 
 $$
-\boxed{\text{fast frequencies capture short-range position, slow frequencies capture long-range position}}
+\text{fast frequencies capture short-range position, slow frequencies capture long-range position}
 $$
 
 ### A concrete sequence example
@@ -371,11 +371,11 @@ $$
 Equivalently:
 
 $$
-\boxed{\text{frequency depends on the dimension pair}}
+\text{frequency depends on the dimension pair}
 $$
 
 $$
-\boxed{\text{angle depends on both pair and token position}}
+\text{angle depends on both pair and token position}
 $$
 
 That is the operational meaning of RoPE on a real sequence: for every token, every query and key vector is split into coordinate pairs, and each pair is rotated by an amount determined by that token's position and that pair's frequency.
@@ -546,7 +546,7 @@ $$ \text{position} \rightarrow \text{rotation angle} \rightarrow \text{rotate } 
 Or, in one sentence:
 
 $$
-\boxed{\text{RoPE encodes position by rotating } Q \text{ and } K,\ \text{so attention naturally depends on relative distance.}}
+\text{RoPE encodes position by rotating } Q \text{ and } K,\ \text{so attention naturally depends on relative distance.}
 $$
 
 That is why RoPE became the standard positional encoding in many modern LLMs, including Llama-style architectures.
