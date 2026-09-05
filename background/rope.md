@@ -114,6 +114,8 @@ $$
 \text{angle} = m\theta
 $$
 
+Here, the **position** of a token just means its index in the sequence. For example, in `I love cats`, the tokens could have positions $0$, $1$, and $2$.
+
 So:
 
 - position $0$ rotates by $0$;
@@ -253,6 +255,16 @@ So different pairs rotate at different speeds:
 
 - high-frequency pairs change rapidly and capture fine local offsets;
 - low-frequency pairs change slowly and preserve information over longer ranges.
+
+For a single 2D pair, the rotation is periodic: after a full turn of $2\pi$, the pair returns to the same orientation. So if RoPE used only one frequency, some positions would eventually look identical again for that pair alone.
+
+RoPE avoids that problem by using many frequencies at once. Even if one pair has wrapped around by $360^\circ$, the other pairs usually have not. So the full rotated query or key vector is determined by many angles at once,
+
+$$
+\left(m\theta_0,\ m\theta_1,\ m\theta_2,\ \dots\right),
+$$
+
+not just one angle. That makes exact duplicates much less likely within the context lengths the model is designed to use.
 
 Figure 5 uses the "many clocks" intuition for this. Some clocks spin quickly, some slowly. Together they create a multi-scale positional code.
 
