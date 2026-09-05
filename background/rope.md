@@ -578,9 +578,7 @@ $$
 this becomes
 
 $$
-e^{i\theta}
-= \left(1 - \frac{\theta^2}{2!} + \frac{\theta^4}{4!} - \cdots\right)
-+ i\left(\theta - \frac{\theta^3}{3!} + \frac{\theta^5}{5!} - \cdots\right)
+e^{i\theta} = \left(1 - \frac{\theta^2}{2!} + \frac{\theta^4}{4!} - \cdots\right) + i\left(\theta - \frac{\theta^3}{3!} + \frac{\theta^5}{5!} - \cdots\right)
 $$
 
 The first bracket is exactly $\cos\theta$, and the second is exactly $\sin\theta$. Therefore:
@@ -607,11 +605,7 @@ $$
 Expanding gives:
 
 $$
-z_1 z_2
-= r_1 r_2 \left[
-(\cos\theta_1\cos\theta_2 - \sin\theta_1\sin\theta_2)
-+ i(\sin\theta_1\cos\theta_2 + \cos\theta_1\sin\theta_2)
-\right]
+z_1 z_2 = r_1 r_2 \left[(\cos\theta_1\cos\theta_2 - \sin\theta_1\sin\theta_2)+ i(\sin\theta_1\cos\theta_2 + \cos\theta_1\sin\theta_2)\right]
 $$
 
 Now use the angle-sum identities:
