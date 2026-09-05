@@ -100,7 +100,7 @@ $$
 x_2' = x_1\sin\theta + x_2\cos\theta
 $$
 
-This is an ordinary 2D rotation. RoPE simply performs this rotation repeatedly across many coordinate pairs in $Q$ and $K$.
+This is an ordinary 2D rotation. RoPE simply splits query Q and key K to coordinate pairs, then performs this rotation repeatedly across the pairs in $Q$ and $K$.
 
 Figure 5 matches this mental model closely: a token vector is split into 2D pairs, and each pair is rotated by a position-dependent angle.
 
