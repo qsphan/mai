@@ -445,104 +445,105 @@ That is why RoPE became the standard positional encoding in many modern LLMs, in
 
 This appendix explains the complex-number view used in Section 6.
 
-### Cartesian form: $x_1 + i x_2$
+### Cartesian form: `x_1 + i x_2`
 
 A complex number
 
-$$
+```text
 z = x_1 + i x_2
-$$
+```
 
 is just another way to represent a point in a 2D plane, called the **complex plane**:
 
-- $x_1$ is the real part, plotted on the horizontal axis;
-- $x_2$ is the imaginary part, plotted on the vertical axis;
-- $i$ is the imaginary unit, defined by $i^2 = -1$.
+- `x_1` is the real part, plotted on the horizontal axis;
+- `x_2` is the imaginary part, plotted on the vertical axis;
+- `i` is the imaginary unit, defined by `i^2 = -1`.
 
-So instead of writing a point as $(x_1, x_2)$, we write it as the single quantity $x_1 + i x_2$. The advantage is that complex numbers can be multiplied and divided in ways that naturally encode rotations and scalings.
+So instead of writing a point as `(x_1, x_2)`, we write it as the single quantity `x_1 + i x_2`. The advantage is that complex numbers can be multiplied and divided in ways that naturally encode rotations and scalings.
 
-### Polar form: $z = r e^{i\theta}$
+### Polar form: `z = r e^(i theta)`
 
 The same point can also be described by its distance from the origin and its angle from the positive real axis.
 
-If a point has radius $r$ and angle $\theta$, then:
+If a point has radius `r` and angle `theta`, then:
 
-$$
-x_1 = r\cos\theta,\qquad x_2 = r\sin\theta
-$$
+```text
+x_1 = r cos(theta)
+x_2 = r sin(theta)
+```
 
 So the same complex number can be written as:
 
-$$
-z = x_1 + i x_2 = r(\cos\theta + i\sin\theta)
-$$
+```text
+z = x_1 + i x_2 = r (cos(theta) + i sin(theta))
+```
 
 Euler's formula says:
 
-$$
-e^{i\theta} = \cos\theta + i\sin\theta
-$$
+```text
+e^(i theta) = cos(theta) + i sin(theta)
+```
 
 which gives the compact polar form:
 
-$$
-z = r e^{i\theta}
-$$
+```text
+z = r e^(i theta)
+```
 
 Here:
 
-$$
-r = |z| = \sqrt{x_1^2 + x_2^2}
-$$
+```text
+r = |z| = sqrt(x_1^2 + x_2^2)
+```
 
 is the distance from the origin, and
 
-$$
-\theta = \arg(z) = \operatorname{atan2}(x_2, x_1)
-$$
+```text
+theta = angle(z) = atan2(x_2, x_1)
+```
 
 is the angle.
 
-### Why multiplication by $e^{i\phi}$ is a rotation
+### Why multiplication by `e^(i phi)` is a rotation
 
 Suppose
 
-$$
-z = r e^{i\theta}
-$$
+```text
+z = r e^(i theta)
+```
 
-represents a point at radius $r$ and angle $\theta$. Multiply it by $e^{i\phi}$:
+represents a point at radius `r` and angle `theta`. Multiply it by `e^(i phi)`:
 
-$$
-z e^{i\phi} = r e^{i\theta} e^{i\phi} = r e^{i(\theta+\phi)}
-$$
+```text
+z e^(i phi) = r e^(i theta) e^(i phi) = r e^(i (theta + phi))
+```
 
-The radius stays $r$, and the angle changes from $\theta$ to $\theta + \phi$. That is exactly a rotation by angle $\phi$.
+The radius stays `r`, and the angle changes from `theta` to `theta + phi`. That is exactly a rotation by angle `phi`.
 
-If we expand $e^{i\phi}$ using Euler's formula,
+If we expand `e^(i phi)` using Euler's formula,
 
-$$
-e^{i\phi} = \cos\phi + i\sin\phi
-$$
+```text
+e^(i phi) = cos(phi) + i sin(phi)
+```
 
 then
 
-$$
-(x_1 + i x_2)(\cos\phi + i\sin\phi)
-$$
+```text
+(x_1 + i x_2) (cos(phi) + i sin(phi))
+```
 
 becomes
 
-$$
-(x_1\cos\phi - x_2\sin\phi) + i(x_1\sin\phi + x_2\cos\phi)
-$$
+```text
+(x_1 cos(phi) - x_2 sin(phi)) + i (x_1 sin(phi) + x_2 cos(phi))
+```
 
 So the rotated coordinates are:
 
-$$
-x_1' = x_1\cos\phi - x_2\sin\phi,\qquad
-x_2' = x_1\sin\phi + x_2\cos\phi
-$$
+```text
+x_1' = x_1 cos(phi) - x_2 sin(phi)
+x_2' = x_1 sin(phi) + x_2 cos(phi)
+```
 
 This is exactly the same 2D rotation rule written earlier as a matrix multiplication.
 
@@ -550,90 +551,83 @@ This is exactly the same 2D rotation rule written earlier as a matrix multiplica
 
 The exponential, cosine, and sine functions have the Taylor series:
 
-$$
-e^x = 1 + x + \frac{x^2}{2!} + \frac{x^3}{3!} + \frac{x^4}{4!} + \cdots
-$$
+```text
+e^x    = 1 + x + x^2/2! + x^3/3! + x^4/4! + ...
+cos(x) = 1 - x^2/2! + x^4/4! - x^6/6! + ...
+sin(x) = x - x^3/3! + x^5/5! - x^7/7! + ...
+```
 
-$$
-\cos x = 1 - \frac{x^2}{2!} + \frac{x^4}{4!} - \frac{x^6}{6!} + \cdots
-$$
+Now substitute `x = i theta` into the exponential series:
 
-$$
-\sin x = x - \frac{x^3}{3!} + \frac{x^5}{5!} - \frac{x^7}{7!} + \cdots
-$$
+```text
+e^(i theta)
+= 1 + i theta + (i theta)^2 / 2! + (i theta)^3 / 3! + (i theta)^4 / 4! + ...
+```
 
-Now substitute $x = i\theta$ into the exponential series:
+Because powers of `i` cycle as
 
-$$
-e^{i\theta}
-= 1 + i\theta + \frac{(i\theta)^2}{2!} + \frac{(i\theta)^3}{3!} + \frac{(i\theta)^4}{4!} + \cdots
-$$
-
-Because powers of $i$ cycle as
-
-$$
-i,\ -1,\ -i,\ 1,\ i,\ -1,\ \ldots
-$$
+```text
+i, -1, -i, 1, i, -1, ...
+```
 
 this becomes
 
-$$
-e^{i\theta}
-= \left(1 - \frac{\theta^2}{2!} + \frac{\theta^4}{4!} - \cdots\right)
-+ i\left(\theta - \frac{\theta^3}{3!} + \frac{\theta^5}{5!} - \cdots\right)
-$$
+```text
+e^(i theta)
+= (1 - theta^2/2! + theta^4/4! - ...)
++ i (theta - theta^3/3! + theta^5/5! - ...)
+```
 
-The first bracket is exactly $\cos\theta$, and the second is exactly $\sin\theta$. Therefore:
+The first bracket is exactly `cos(theta)`, and the second is exactly `sin(theta)`. Therefore:
 
-$$
-e^{i\theta} = \cos\theta + i\sin\theta
-$$
+```text
+e^(i theta) = cos(theta) + i sin(theta)
+```
 
 ### Why angles add under complex multiplication
 
 Take two complex numbers in polar form:
 
-$$
-z_1 = r_1 e^{i\theta_1},\qquad z_2 = r_2 e^{i\theta_2}
-$$
+```text
+z_1 = r_1 e^(i theta_1)
+z_2 = r_2 e^(i theta_2)
+```
 
 Using Euler's formula:
 
-$$
+```text
 z_1 z_2
-= r_1 r_2 (\cos\theta_1 + i\sin\theta_1)(\cos\theta_2 + i\sin\theta_2)
-$$
+= r_1 r_2 (cos(theta_1) + i sin(theta_1)) (cos(theta_2) + i sin(theta_2))
+```
 
 Expanding gives:
 
-$$
+```text
 z_1 z_2
-= r_1 r_2 \left[
-(\cos\theta_1\cos\theta_2 - \sin\theta_1\sin\theta_2)
-+ i(\sin\theta_1\cos\theta_2 + \cos\theta_1\sin\theta_2)
-\right]
-$$
+= r_1 r_2 [
+  cos(theta_1) cos(theta_2) - sin(theta_1) sin(theta_2)
+  + i (sin(theta_1) cos(theta_2) + cos(theta_1) sin(theta_2))
+]
+```
 
 Now use the angle-sum identities:
 
-$$
-\cos(\theta_1 + \theta_2) = \cos\theta_1\cos\theta_2 - \sin\theta_1\sin\theta_2
-$$
-
-$$
-\sin(\theta_1 + \theta_2) = \sin\theta_1\cos\theta_2 + \cos\theta_1\sin\theta_2
-$$
+```text
+cos(theta_1 + theta_2) = cos(theta_1) cos(theta_2) - sin(theta_1) sin(theta_2)
+sin(theta_1 + theta_2) = sin(theta_1) cos(theta_2) + cos(theta_1) sin(theta_2)
+```
 
 So:
 
-$$
-z_1 z_2 = r_1 r_2 \left(\cos(\theta_1+\theta_2) + i\sin(\theta_1+\theta_2)\right)
-= r_1 r_2 e^{i(\theta_1+\theta_2)}
-$$
+```text
+z_1 z_2
+= r_1 r_2 (cos(theta_1 + theta_2) + i sin(theta_1 + theta_2))
+= r_1 r_2 e^(i (theta_1 + theta_2))
+```
 
 So under complex multiplication:
 
 - magnitudes multiply;
 - angles add.
 
-That is the key reason RoPE can be written as a complex phase multiplication. Multiplying by $e^{i\phi}$ adds an angle $\phi$, which is exactly what a rotation does.
+That is the key reason RoPE can be written as a complex phase multiplication. Multiplying by `e^(i phi)` adds an angle `phi`, which is exactly what a rotation does.
