@@ -58,6 +58,38 @@ so attention becomes:
 
 $$ \mathrm{Attention} = \mathrm{softmax}\left(\frac{Q'K'^\top}{\sqrt{d}}\right)V $$
 
+In practice, modern Transformers use **multi-head attention**. If the model hidden size is $d_{\text{model}}$ and the number of heads is $h$, then each head usually gets:
+
+$$
+\text{head\_dim} = d_{\text{model}} / h
+$$
+
+So:
+
+$$
+d_{\text{model}} = h \times \text{head\_dim}
+$$
+
+For example, if $d_{\text{model}} = 512$ and $h = 8$, then each head has dimension $64$.
+
+The important structural point is that each head has its own query, key, and value vectors. You can think of this as:
+
+$$
+Q^{(1)}, Q^{(2)}, \dots, Q^{(h)}
+$$
+
+$$
+K^{(1)}, K^{(2)}, \dots, K^{(h)}
+$$
+
+$$
+V^{(1)}, V^{(2)}, \dots, V^{(h)}
+$$
+
+where head $a$ computes attention using its own $Q^{(a)}$, $K^{(a)}$, and $V^{(a)}$.
+
+In implementation, this is often done by one large linear projection followed by a reshape into `[batch, seq_len, heads, head_dim]`. RoPE is then applied **inside each head**, pairwise along the `head_dim` dimension.
+
 The important detail is:
 
 $$
@@ -274,6 +306,80 @@ $$
 \boxed{\text{fast frequencies capture short-range position, slow frequencies capture long-range position}}
 $$
 
+### A concrete sequence example
+
+Suppose the input string is:
+
+```text
+cat chases dog
+```
+
+Assume there are $3$ tokens and one attention head with head dimension $d = 8$. Then each query or key vector has $8$ coordinates, which RoPE groups into $4$ pairs:
+
+$$
+(0,1),\ (2,3),\ (4,5),\ (6,7)
+$$
+
+After the linear projections, each token has its own query and key vectors:
+
+```text
+             Q                         K
+cat      [q0 q1 q2 q3 q4 q5 q6 q7]   [k0 k1 k2 k3 k4 k5 k6 k7]
+chases   [q0 q1 q2 q3 q4 q5 q6 q7]   [k0 k1 k2 k3 k4 k5 k6 k7]
+dog      [q0 q1 q2 q3 q4 q5 q6 q7]   [k0 k1 k2 k3 k4 k5 k6 k7]
+```
+
+Each row corresponds to a different token position. For example, the query vector for `cat` is split into:
+
+```text
+(q0,q1)  (q2,q3)  (q4,q5)  (q6,q7)
+  pair 0   pair 1   pair 2   pair 3
+```
+
+and the same pairwise structure is used for the key vector.
+
+Each pair index uses its own frequency. For illustration, we might imagine:
+
+```text
+pair       frequency
+0          theta_0
+1          theta_1
+2          theta_2
+3          theta_3
+```
+
+The exact values come from the RoPE frequency schedule, but the important point is that the frequency depends on the coordinate pair, not on the token identity.
+
+Now assign token positions:
+
+- `cat` is at position $0$;
+- `chases` is at position $1$;
+- `dog` is at position $2$.
+
+RoPE uses the same set of frequencies for every token, but multiplies each frequency by the token position. So:
+
+- for `cat`, pair $k$ rotates by angle $0 \cdot \theta_k$;
+- for `chases`, pair $k$ rotates by angle $1 \cdot \theta_k$;
+- for `dog`, pair $k$ rotates by angle $2 \cdot \theta_k$.
+
+So it is not that `cat` uses one frequency and `chases` uses another. Every token uses all the frequencies. What changes from token to token is the position multiplier:
+
+$$
+\text{angle} = \text{position} \times \text{frequency}
+$$
+
+Equivalently:
+
+$$
+\boxed{\text{frequency depends on the dimension pair}}
+$$
+
+$$
+\boxed{\text{angle depends on both pair and token position}}
+$$
+
+That is the operational meaning of RoPE on a real sequence: for every token, every query and key vector is split into coordinate pairs, and each pair is rotated by an amount determined by that token's position and that pair's frequency.
+
 ## 8. The full formula
 
 Let the head dimension be $d$, and let $k$ index the 2D coordinate pairs. For a query vector, RoPE transforms pair $(2k, 2k+1)$ at position $m$ as:
@@ -318,6 +424,10 @@ So the operational story is:
 2. rotate $Q$ and $K$ according to token positions;
 3. compute attention scores from the rotated vectors;
 4. use those scores to mix the values $V$.
+
+This RoPE step happens in exactly the same place during both training and inference. During training, the model rotates $Q$ and $K$ for the training tokens before computing attention. During inference, it rotates $Q$ and $K$ for the current context before computing attention for the next-token prediction. The rotation rule itself is fixed; it is not separately learned for training versus inference.
+
+In a multi-head block, that means each head forms its own $Q$, $K$, and $V$, and RoPE rotates the $Q$ and $K$ vectors separately inside each head before the attention scores are computed for that head.
 
 ## 11. How to implement RoPE
 
