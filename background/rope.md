@@ -46,7 +46,7 @@ $$
 
 and the attention output is:
 
-$$ \mathrm{Attention}(Q,K,V) = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d}}\right)V $$
+$$ \mathrm{Attention}(Q,K,V) = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_{\mathrm{head}}}}\right)V $$
 
 RoPE changes this by rotating $Q$ and $K$ before the dot product:
 
@@ -56,7 +56,7 @@ $$
 
 so attention becomes:
 
-$$ \mathrm{Attention} = \mathrm{softmax}\left(\frac{Q'K'^\top}{\sqrt{d}}\right)V $$
+$$ \mathrm{Attention} = \mathrm{softmax}\left(\frac{Q'K'^\top}{\sqrt{d_{\mathrm{head}}}}\right)V $$
 
 In practice, modern Transformers use **multi-head attention**. If the model hidden size is `d_model` and the number of heads is `h`, then each head usually gets:
 
@@ -167,10 +167,10 @@ This is the main reason RoPE is powerful.
 
 Suppose token $i$ has query $q_i$ and token $j$ has key $k_j$. After RoPE:
 
-For a small example, suppose the model hidden size is $d_{\text{model}} = 8$, and one attention head uses query/key dimension $d = 4$. Then each token starts with a hidden state vector in $\mathbb{R}^8$, but after projection it gets:
+For a small example, suppose the model hidden size is $d_{\mathrm{model}} = 8$, and one attention head uses query/key dimension $d_{\mathrm{head}} = 4$. Then each token starts with a hidden state vector in $\mathbb{R}^8$, but after projection it gets:
 
 $$
-q_t \in \mathbb{R}^4,\qquad k_t \in \mathbb{R}^4
+q_t \in \mathbb{R}^{d_{\mathrm{head}}},\qquad k_t \in \mathbb{R}^{d_{\mathrm{head}}}
 $$
 
 For example, token $2$ might produce:
@@ -269,13 +269,44 @@ If every pair of coordinates rotated with the same frequency, positional pattern
 
 RoPE avoids that by using a different frequency for each pair of dimensions.
 
-For model dimension $d$, define one frequency per pair:
+For head dimension $d_{\mathrm{head}}$, define one frequency per pair:
 
 $$
-\theta_k = 10000^{-2k/d}
+\theta_k = 10000^{-2k/d_{\mathrm{head}}}
 $$
 
-where $k$ indexes the coordinate pair.
+where:
+
+- $d_{\mathrm{head}}$ is the head dimension;
+- $k$ indexes the coordinate pair;
+- pair $k$ means coordinates $(2k, 2k+1)$.
+
+So this formula assigns one base frequency to each 2D pair. Small values of $k$ get larger frequencies, while larger values of $k$ get smaller frequencies.
+
+Since
+
+$$
+10000^{-2k/d_{\mathrm{head}}} = \frac{1}{10000^{2k/d_{\mathrm{head}}}},
+$$
+
+the value decreases as $k$ increases.
+
+For example, if $d_{\mathrm{head}} = 8$, then there are $4$ pairs:
+
+$$
+k = 0,\ 1,\ 2,\ 3
+$$
+
+and the corresponding frequencies are:
+
+$$
+\theta_0 = 10000^0 = 1,\qquad
+\theta_1 = 10000^{-1/4} = 0.1,\qquad
+\theta_2 = 10000^{-1/2} = 0.01,\qquad
+\theta_3 = 10000^{-3/4} = 0.001
+$$
+
+So the early pairs rotate quickly, while the later pairs rotate slowly.
 
 At position $m$, pair $k$ rotates by:
 
@@ -314,7 +345,7 @@ Suppose the input string is:
 cat chases dog
 ```
 
-Assume there are $3$ tokens and one attention head with head dimension $d = 8$. Then each query or key vector has $8$ coordinates, which RoPE groups into $4$ pairs:
+Assume there are $3$ tokens and one attention head with head dimension $d_{\mathrm{head}} = 8$. Then each query or key vector has $8$ coordinates, which RoPE groups into $4$ pairs:
 
 $$
 (0,1),\ (2,3),\ (4,5),\ (6,7)
@@ -333,7 +364,7 @@ Each row corresponds to a different token position. For example, the query vecto
 
 ```text
 (q0,q1)  (q2,q3)  (q4,q5)  (q6,q7)
-  pair 0   pair 1   pair 2   pair 3
+ pair 0   pair 1   pair 2   pair 3
 ```
 
 and the same pairwise structure is used for the key vector.
@@ -382,7 +413,7 @@ That is the operational meaning of RoPE on a real sequence: for every token, eve
 
 ## 8. The full formula
 
-Let the head dimension be $d$, and let $k$ index the 2D coordinate pairs. For a query vector, RoPE transforms pair $(2k, 2k+1)$ at position $m$ as:
+Let the head dimension be $d_{\mathrm{head}}$, and let $k$ index the 2D coordinate pairs. For a query vector, RoPE transforms pair $(2k, 2k+1)$ at position $m$ as:
 
 $$ \left[ \begin{array}{c} q'_{2k} \\ q'_{2k+1} \end{array} \right] = \left[ \begin{array}{cc} \cos(m\theta_k) & -\sin(m\theta_k) \\ \sin(m\theta_k) & \cos(m\theta_k) \end{array} \right] \left[ \begin{array}{c} q_{2k} \\ q_{2k+1} \end{array} \right] $$
 
@@ -412,7 +443,7 @@ A simplified attention path looks like this:
 ```text
 X
 ├─> W_Q ─> Q ─> RoPE ─┐
-├─> W_K ─> K ─> RoPE ─┼─> Q'K'^T / sqrt(d) ─> softmax ─> attention weights
+├─> W_K ─> K ─> RoPE ─┼─> Q'K'^T / sqrt(head_dim) ─> softmax ─> attention weights
 └─> W_V ─> V ─────────┘
                                       │
                                       └──────────────> weighted sum with V
@@ -441,13 +472,19 @@ In practice, RoPE is simple:
 
 ### Precompute frequencies
 
-For head dimension `dim`:
+Suppose the model hidden size is `d_model` and there are `num_heads` attention heads. Then:
+
+```text
+head_dim = d_model / num_heads
+```
+
+In the code below, the variable `dim` is this `head_dim`:
 
 ```python
 inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
 ```
 
-If `dim = 8`, this produces one frequency for each pair:
+If `head_dim = 8`, this produces one frequency for each pair:
 
 $$
 (0,1),\ (2,3),\ (4,5),\ (6,7)
