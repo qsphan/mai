@@ -113,3 +113,53 @@ Linear(20 → 5)
   ▼
 output
 ```
+
+### `nn.ModuleList`
+PyTorch does not properly register Python list, for example:
+
+```python
+class MyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.layers = [
+            nn.Linear(10, 20),
+            nn.Linear(20, 30),
+        ]
+```
+
+`model.parameters()` will not contain the parameters of those Linear layers. Consequently, an optimizer such as:
+
+```python
+optimizer = torch.optin.Adam(model.parameters())
+```
+
+will not update them.
+
+With `nn.ModuleList`:
+
+```python
+class MyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.layers = nn.ModuleList([
+            nn.Linear(10, 20),
+            nn.Linear(20, 30),
+        ])
+```
+
+PyTorch knows:
+
+```
+MyModel
+ └── layers (ModuleList)
+      ├── Linear
+      │    ├── weight
+      │    └── bias
+      └── Linear
+           ├── weight
+           └── bias
+```
+
+so their paramaters appears in `model.parameters()` and get trained.
