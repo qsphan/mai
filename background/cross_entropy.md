@@ -3,7 +3,7 @@
 Cross-entropy turns a model's prediction into a number that training can minimize. LogSumExp lets us compute that number reliably from the model's raw output. Their connection is:
 
 $$
-\boxed{\text{loss} = \operatorname{logsumexp}(\text{logits}) - \text{logit of the correct class}}
+\boxed{\text{loss} = \mathrm{logsumexp}(\text{logits}) - \text{logit of the correct class}}
 $$
 
 This tutorial assumes you know arrays, functions, and floating-point arithmetic. It introduces the ML vocabulary as needed, then derives and implements the formula used in CS336's `run_cross_entropy` adapter.
@@ -125,13 +125,13 @@ This invariance is the key to a stable implementation.
 The function's name describes its operations from the outside inward:
 
 $$
-\operatorname{LSE}(z) = \ln\left(\sum_j \exp(z_j)\right).
+\mathrm{LSE}(z) = \ln\left(\sum_j \exp(z_j)\right).
 $$
 
 For example:
 
 $$
-\operatorname{LSE}([1,2,3])
+\mathrm{LSE}([1,2,3])
 = \ln(e^1 + e^2 + e^3)
 \approx 3.4076.
 $$
@@ -148,7 +148,7 @@ Set $m = \max_j z_j$. Factor out $e^m$:
 
 $$
 \begin{aligned}
-\operatorname{LSE}(z)
+\mathrm{LSE}(z)
 &= \ln\left(e^m\sum_j e^{z_j-m}\right) \\
 &= m + \ln\left(\sum_j e^{z_j-m}\right).
 \end{aligned}
@@ -165,7 +165,7 @@ Every shifted exponent is at most zero, so each exponential is at most one. At l
 For $C$ classes, the mathematical bound is:
 
 $$
-m \leq \operatorname{LSE}(z) \leq m + \ln C.
+m \leq \mathrm{LSE}(z) \leq m + \ln C.
 $$
 
 That explains why LSE is sometimes called a **smooth maximum**: it is close to the largest score when that score dominates, and equals $m + \ln C$ when every score equals $m$.
@@ -180,16 +180,16 @@ L
 &= -\ln(p_y) \\
 &= -\ln\left(\frac{e^{z_y}}{\sum_j e^{z_j}}\right) \\
 &= -z_y + \ln\left(\sum_j e^{z_j}\right) \\
-&= \operatorname{LSE}(z) - z_y.
+&= \mathrm{LSE}(z) - z_y.
 \end{aligned}
 $$
 
 Related identities are:
 
 $$
-\ln(p_i) = z_i - \operatorname{LSE}(z),
+\ln(p_i) = z_i - \mathrm{LSE}(z),
 \qquad
-p_i = \exp\left(z_i - \operatorname{LSE}(z)\right).
+p_i = \exp\left(z_i - \mathrm{LSE}(z)\right).
 $$
 
 These are mathematical identities. In floating-point code, keep the computation shifted for as long as possible. Combining the stable LSE formula with cross-entropy gives:
