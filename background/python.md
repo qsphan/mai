@@ -163,3 +163,79 @@ MyModel
 ```
 
 so their paramaters appears in `model.parameters()` and get trained.
+
+### `amax()`
+Here is an implementation of softmax:
+```python
+def softmax(x: Float[Tensor, " ..."], dim: int = -1) -> Float[Tensor, " ..."]:
+    exp = torch.exp(x - x.amax(dim=dim, keepdim=True))
+    return exp / exp.sum(dim=dim, keepdim=True)
+```
+
+`amax` finds the biggest number in each row (or column), but don't remove the row/column structure.
+
+For example
+```python
+x = torch.tensor([
+    [1, 5, 3],
+    [7, 2, 4]
+])
+```
+
+The shape is:
+```
+        dim=1 →
+        columns
+        0  1  2
+       ┌─────────
+dim=0  │ 1  5  3
+  ↓    │ 7  2  4
+```
+Note: in PyTorch in general and in `amax(dim=dim, keepdim=True)` in particular, `dim` is the dimension to collapse, not the dimension to look at. So `dim=1` means to collapse dimension 1, i.e. the columns, leaving the maximum at each row.
+
+```
+[1, 5, 3] → 5
+[7, 2, 4] → 7
+
+result = [5, 7]
+```
+
+With `keepdim=True`, `result = [[5], [7]]` instead of `[5, 7]`.
+
+`x - x.amax(dim=dim, keepdim=True)` can be rewritten as:
+```python
+m = x.amax(dim = dim, keepdim=True)
+x = x - m
+```
+
+So PyTorch sees `m` has shape (2, 1), while `x` has shape (2, 3):
+```
+x:          [[1, 5, 3],
+             [7, 2, 4]]
+
+m:          [[5],
+             [7]]
+```
+PyTorch broadcasts the single value in each row across the 3 columns:
+```
+x:          [[1, 5, 3],
+             [7, 2, 4]]
+
+m:          [[5, 5, 5],
+             [7, 7, 7]]
+             ↑
+             broadcasting
+```
+
+Then substraction:
+```
+[[1, 5, 3],       [[5, 5, 5],
+ [7, 2, 4]]   -    [7, 7, 7]]
+
+= [[-4, 0, -2],
+   [ 0,-5, -3]]
+```
+
+This works because rule of Pytorch's broadcasting is: *starting from the rightmost dimension, two dimensions are compatible if they are equal or one of them is 1*. So (2,1) and (2,3) match.
+
+Without `keepdim=True`, `m = [5, 7]`, i.e. the shape is `(2,)`. PyTorch aligns dimensions from the right, so `(2,)` is interpreted as `(1, 2)`. So `(1,2)` and `(2,3)` do not match in PyTorch's broadcasting rule.
