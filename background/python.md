@@ -172,7 +172,7 @@ def softmax(x: Float[Tensor, " ..."], dim: int = -1) -> Float[Tensor, " ..."]:
     return exp / exp.sum(dim=dim, keepdim=True)
 ```
 
-`amax` finds the biggest number in each row (or column), but don't remove the row/column structure.
+`amax` finds the biggest number along `dim`, and with `keepdim=True` it keeps that dimension with size 1 instead of removing it.
 
 For example
 ```python
