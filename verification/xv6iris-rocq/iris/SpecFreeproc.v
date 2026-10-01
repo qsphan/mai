@@ -1,0 +1,506 @@
+(* SpecFreeproc.v -- the public interface of freeproc() (kernel/proc.c),
+   stated independently of its proof.
+
+     static void freeproc(struct proc *p) {
+       if (p->trapframe) kfree(p->trapframe);
+       p->trapframe = 0;
+       if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
+       p->pagetable = 0;
+       p->sz = 0;
+       acquire(&pid_lock);      // upstream ded23f2
+       p->pid = 0;
+       release(&pid_lock);
+       p->name[0] = 0;
+       p->chan = 0;
+       p->killed = 0;
+       p->xstate = 0;
+       p->state = UNUSED;
+     }
+
+   @ KernelSyms.freeproc, thirty-three instructions: a 32-byte ra/s0/s1
+   frame (slot 0 unused), the two guarded frees, nine zeroing stores, and
+   -- since upstream ded23f2 -- an acquire/release of <pid_lock> around the
+   one that clears p->pid.  Both callers already hold p->lock; the pid lock
+   is the only lock it takes itself (see PidLock.v for why the cell needs
+   it), so the contract's order floor is "nextpid" and it carries the
+   lock's handle.  Returns nothing.
+
+   THIS IS THE INVERSE OF allocproc: it turns a slot that owns an address
+   space back into a [ProcInv.proc_dormant] at UNUSED, which is exactly the
+   shape the lock invariant parks.  Both of its transitions are real moves,
+   not recasts: the trapframe page goes to kfree and the user table goes to
+   proc_freepagetable, so the postcondition owes the caller nothing but the
+   emptied block.
+
+   THE PRECONDITION IS NOT [proc_dormant _ ZOMBIE], AND CANNOT BE.  The two
+   address-space cells have to be INDEPENDENTLY optional, because allocproc's
+   two failure tails -- the reason this contract is being written now -- reach
+   freeproc in states [proc_dormant] cannot name:
+
+     tail at +0x86  kalloc failed: p->trapframe = 0, p->pagetable = 0
+     tail at +0x96  proc_pagetable failed: p->trapframe is a LIVE page,
+                    p->pagetable = 0
+
+   [proc_dormant]'s address-space disjunct is keyed on [st] and moves BOTH
+   cells together (ZOMBIE owns a table and a page; UNUSED owns neither), so
+   the second of those is not a [proc_dormant] at any state.  Hence [fp_pt] /
+   [fp_tf] below: one option apiece, and the runtime branch this function
+   actually takes is the same branch the contract splits on.  The four
+   combinations are all stated even though (live table, no trapframe) never
+   occurs -- refusing it would cost a premise and buy nothing.
+
+   WHAT THE CALLER MUST STILL PROVE.  [fp_pt]'s [Some] arm carries
+   [um_below sz um] and [uint sz <= uvm_maxsz] -- proc_freepagetable's two
+   size premises, pulled up one level, and both of them facts a ZOMBIE's
+   [ProcInv.proc_dormant] now records.  It carries NO [page_valid]: the
+   trapframe page's comes out of [proc_pt_wf] and the root's out of the
+   tree's own node claim ([ProcPtOwn.proc_pt_root_valid]), which is what the
+   [c.beqz] at +0x1a is refuted from.  [fp_of_dormant_zombie] below is the
+   bridge kwait() reclaims a child through; it has no side condition. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import LockRank.
+Require Import ProcGeom CpuOwn.
+Require Import PageGeom.
+Require Import UserPtTree.
+Require Import ProcPtOwn.
+Require Import SlotGen.   (* [act_lend]: the permit sweep, L1a *)
+Require Import SwtchCtx.
+Require Import FdSlots.
+Require Import FileInvDefs.
+Require Import ChildTok.  (* [exit_tok]: the escrow a ZOMBIE block parks *)
+Require Import ProcInv.
+Require Import SchedCtx.
+Require Import WpLock.
+Require Import PidLock.   (* the pid lock freeproc takes around [p->pid = 0] *)
+Require Import PidEv.     (* [PFree]: the ledger event the led twin's receipt names *)
+Require Import KvmSpec.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Local Open Scope Z_scope.
+
+Notation FRP := KernelSyms.freeproc.
+
+Section SpecFreeproc.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  (* p->pagetable, and what comes with it.  The [Some] arm's two pure facts
+     are proc_freepagetable's size premises; see the header. *)
+  Definition fp_pt (pa : mword 64) (szv : mword 64) (opt : option uptd) : iProp Σ :=
+    match opt with
+    | None   => p_pagetable pa ↦₈ (zero_reg : mword 64)
+    | Some P => (p_pagetable pa ↦₈ page_base P.(ud_root) ∗
+                 (∃ M : gmap Z (bv 8), proc_pt P M) ∗
+                 ⌜um_below szv P.(ud_um) /\ (uint szv <= uvm_maxsz)%Z⌝)
+    end%I.
+
+  (* p->trapframe, and what comes with it.  [page_valid] is what kfree
+     demands of the pointer it is handed. *)
+  Definition fp_tf (pa : mword 64)
+      (otf : option (mword 44 * list (mword 64))) : iProp Σ :=
+    match otf with
+    | None    => p_trapframe pa ↦₈ (zero_reg : mword 64)
+    | Some tw => (p_trapframe pa ↦₈ page_base tw.1 ∗
+                  tf_page tw.1 tw.2 ∗
+                  ⌜page_valid (page_base tw.1)⌝)
+    end%I.
+
+  (* [ProcInv.proc_dormant] MINUS its address-space disjunct and its two
+     existentials: the part freeproc only zeroes cells in, never moves.
+     Split out so the two optional slots above can be attached
+     independently -- that is the whole reason this predicate exists. *)
+  Definition fp_rest (pa : mword 64) (V : pprivate) (pid : mword 32) : iProp Σ :=
+    (⌜pv_ofile V = replicate NOFILE (zero_reg : mword 64) /\
+      pv_cwd V = (zero_reg : mword 64) /\
+      uint (pv_sz V) <= uvm_maxsz⌝ ∗
+     p_pid pa ↦₄{DfracOwn (1/2)} pid ∗
+     proc_fields pa (DfracOwn 1) V ∗
+     ofile_cells pa (pv_ofile V) ∗
+     ([∗ list] _ ∈ pv_ofile V, fd_slot) ∗
+     fd_slots FDSPARE ∗
+     (* the cwd's own unit and the iref allowance, exactly as in
+        [ProcInv.proc_dormant] -- this predicate IS that block minus its
+        address-space disjunct, so it parks what the block parks.  The bio
+        allowance rides here for the same reason, which is what makes
+        freeproc's ZOMBIE -> UNUSED step a pass-through for it: both arms of
+        [proc_dormant] carry three units, so the step moves none. *)
+     iref_slots (1 + IREFSPARE) ∗
+     bslots 3 ∗
+     (* the slot's KERNEL STACK, likewise: freeproc zeroes cells, it does not
+        move the stack, so the block's ZOMBIE -> UNUSED step carries it
+        through untouched -- which is what makes a reclaimed slot usable by
+        the next allocproc. *)
+     kstack_free pa ∗
+     (* ...AND THE SLOT'S EVENT COUNTER ([SlotGen.act_cnt], design
+        ni-strong-instance.md §7) at the block's [pv_ev], likewise carried
+        through untouched. *)
+     act_cnt pa (pv_ev V) ∗
+     own_ctx (p_context pa))%I.
+
+  (* ------------------------------------------------------------------ *)
+  (* The two bridges [proc_dormant _ UNUSED] <-> the split form.  This is *)
+  (* the state allocproc's FIRST tail is in and the state freeproc leaves *)
+  (* every caller in, so both directions are wanted.  (The ZOMBIE bridge  *)
+  (* kwait will need is NOT here -- see the header.)                      *)
+  (* ------------------------------------------------------------------ *)
+  (* UNUSED is not ZOMBIE, so [proc_dormant]'s [st]-keyed disjunct takes its
+     [else] branch -- the two zeroed cells.  Hoisted, because both bridges
+     need it before any [iFrame] can see through the [if]. *)
+  Lemma fp_unused_not_zombie : bool_decide (UNUSED = ZOMBIE) = false.
+  Proof using . apply bool_decide_eq_false_2. vm_compute. discriminate. Qed.
+
+  (* THE CHILDREN ROW COMES OUT BESIDE THE BLOCK and goes back with it.  It
+     is not inside [fp_rest], because [fp_rest] is the STATE-INDEPENDENT
+     part and the row is not: an UNUSED slot's is at [∅] and a ZOMBIE's is
+     at whatever set its exit left ([ProcDefs.proc_dormant]'s own guard). *)
+  (* ...AND THE SLOT'S HALF OF [p->xstate] comes out beside the row, and for
+     its reason: at a ZOMBIE the escrow is keyed at what it reads, so the
+     value has to be spellable at the bridge, and freeproc's [p->xstate = 0]
+     needs the half in hand to join <p->lock>'s. *)
+  (* ...AND THE SLOT'S GENERATION COMES OUT WHOLE, with the pure fact that
+     the pid cell is 0 ([SlotGen.gen_halves_dorm]'s UNUSED arm): an UNUSED
+     slot's incarnation is over, so nobody holds a piece and nothing is
+     registered at its pid. *)
+  Lemma fp_of_dormant_unused (pa : mword 64) :
+    proc_dormant pa UNUSED ⊢
+      ∃ (V : pprivate) (pid : mword 32) (xsv : mword 32),
+        fp_rest pa V pid ∗ ch_frag (pv_chg V) pa ∅ ∗
+        ⌜bv_unsigned pid = 0⌝ ∗ slot_gen pa (DfracOwn 1) (pv_gen V) ∗
+        p_xstate pa ↦₄{DfracOwn (1/2)} xsv ∗
+        fp_pt pa (pv_sz V) None ∗ fp_tf pa None.
+  Proof using .
+    rewrite /proc_dormant fp_unused_not_zombie.
+    iIntros "(%V & %pid & %Hpure & Hpid & Hf & Hof & Hu & Hsp & Hir & Hbs & Hkst & Hch & Hev & Hgh & Hxs & Hctx & Hpg & Htf)".
+    iDestruct "Hxs" as (xsv) "[Hxc _]".
+    rewrite /gen_halves_dorm fp_unused_not_zombie.
+    iDestruct "Hgh" as "[%Hpid0 Hsg]".
+    iExists V, pid, xsv. rewrite /fp_rest /fp_pt /fp_tf.
+    iFrame "Hpid Hf Hof Hu Hsp Hir Hbs Hkst Hev Hch Hsg Hxc Hctx Hpg Htf".
+    iSplitR;
+      [iPureIntro; exact (conj (proj1 Hpure)
+                            (conj (proj1 (proj2 Hpure))
+                               (proj1 (proj2 (proj2 Hpure))))) |].
+    iPureIntro; exact Hpid0.
+  Qed.
+
+  (* THE PARKED BLOCK IS AT [ProcDefs.pv_lazy = true] (lane LAZY-FLAG, K2),
+     and that is freeproc's to write: a dormant block's claim is vacuous,
+     raising the bit is free (the field is not a cell), and the one caller
+     builds the literal.  It is NOT a row of [fp_rest]: the block freeproc
+     is HANDED belongs to a live process and may be at either bit. *)
+  Lemma fp_to_dormant_unused (pa : mword 64) (V : pprivate) (pid : mword 32)
+      (szv : mword 64) (xsv : mword 32) :
+    bv_unsigned pid = 0 ->
+    pv_lazy V = true ->
+    fp_rest pa V pid -∗ ch_frag (pv_chg V) pa ∅ -∗
+    slot_gen pa (DfracOwn 1) (pv_gen V) -∗
+    p_xstate pa ↦₄{DfracOwn (1/2)} xsv -∗
+    fp_pt pa szv None -∗ fp_tf pa None -∗
+    proc_dormant pa UNUSED.
+  Proof using .
+    intros Hpid0 Hlz.
+    iIntros "(%Hpure & Hpid & Hf & Hof & Hu & Hsp & Hir & Hbs & Hkst & Hev & Hctx) Hch Hsg Hxc Hpg Htf".
+    rewrite /fp_pt /fp_tf /proc_dormant fp_unused_not_zombie.
+    iAssert (gen_halves_dorm pa pid (pv_gen V) UNUSED) with "[Hsg]" as "Hgh".
+    { rewrite /gen_halves_dorm fp_unused_not_zombie.
+      iSplitR; [iPureIntro; exact Hpid0 | iExact "Hsg"]. }
+    iExists V, pid. iFrame "Hpid Hf Hof Hu Hsp Hir Hbs Hkst Hch Hev Hgh Hctx Hpg Htf".
+    iSplitR;
+      [iPureIntro; exact (conj (proj1 Hpure)
+                            (conj (proj1 (proj2 Hpure))
+                               (conj (proj2 (proj2 Hpure)) Hlz))) |].
+    iExists xsv. iFrame "Hxc".
+  Qed.
+
+  (* ------------------------------------------------------------------ *)
+  (* THE ZOMBIE BRIDGE -- what kwait() reclaims.                          *)
+  (* ------------------------------------------------------------------ *)
+  (* This is the direction the header used to record as a GAP.  It closed
+     from three sides, and none of them was "add a premise":
+       - [proc_dormant]'s ZOMBIE arm gained [um_below] (ProcInv.v), the one
+         fact that is genuinely about the process and cannot be recovered
+         from the resources;
+       - the size bound relaxed to [uint sz <= uvm_maxsz] all the way down
+         through proc_freepagetable to uvmfree, because the [+ 4096] form
+         was undischargeable by any holder of a live [p->sz] (SpecUvmfree.v);
+       - the root page's [page_valid] is READ OFF the table
+         ([ProcPtOwn.proc_pt_root_valid]) instead of being demanded.
+     What a ZOMBIE has and freeproc wants therefore match exactly, and the
+     bridge is a repackaging with no side condition. *)
+  Lemma fp_zombie_is_zombie : bool_decide (ZOMBIE = ZOMBIE) = true.
+  Proof using . by apply bool_decide_eq_true_2. Qed.
+
+  (* THE ROW COMES OUT AT [∅], exactly as it does from the UNUSED bridge: a
+     zombie's children went to <init> before it parked ([SpecKexit] moves
+     them under the <wait_lock> it holds at the store), so the reaper has
+     nothing to reset.
+     AND SO DOES THE ESCROW ([ChildTok.exit_tok]), which is the one thing a
+     ZOMBIE block holds that an UNUSED one does not: the kernel's quarter
+     of the dying incarnation together with the payload its exit paid, at
+     the status its [p->xstate] cell holds.  It is what the reaping parent
+     redeems ([ChildTok.gen_pay]); freeproc itself has no use for it, so it
+     comes out here rather than being consumed. *)
+  (* ...AND THE ZOMBIE BLOCK'S TWO HALVES COME OUT BESIDE THE ESCROW
+     ([SlotGen.gen_halves_at]): they are what the reaper agrees against
+     the entry its own parent cell names ([WaitInv.gen_halves]), and
+     reuniting them is what makes the WHOLES this function's premises
+     ask for. *)
+  Lemma fp_of_dormant_zombie (pa : mword 64) :
+    proc_dormant pa ZOMBIE ⊢
+      ∃ (V : pprivate) (pid : mword 32) (xsv : mword 32),
+        fp_rest pa V pid ∗ ch_frag (pv_chg V) pa ∅ ∗
+        gen_halves_at pa pid (pv_gen V) ∗
+        p_xstate pa ↦₄{DfracOwn (1/2)} xsv ∗
+        exit_tok (pv_gen V) pid (xstate_val xsv) ∗
+        fp_pt pa (pv_sz V) (Some (pv_upt V)) ∗
+        fp_tf pa (Some (ud_tfp (pv_upt V), pv_tf V)).
+  Proof using .
+    rewrite /proc_dormant fp_zombie_is_zombie.
+    iIntros "(%V & %pid & %Hpure & Hpid & Hf & Hof & Hu & Hsp & Hir & Hbs & Hkst & Hch & Hev & Hgh & Hxs & Hctx & %Hbel & Hpt & Htfp)".
+    iDestruct "Hxs" as (xsv) "[Hxc Hesc]".
+    rewrite /gen_halves_dorm fp_zombie_is_zombie.
+    iExists V, pid, xsv.
+    (* both [page_valid]s come out of the table: the trapframe's from
+       [proc_pt_wf], the root's from the tree's node claim. *)
+    rewrite /proc_pt_at.
+    iDestruct "Hpt" as (Mz) "(Hpg & Htf & Hpt)".
+    iDestruct (proc_pt_wf_get with "Hpt") as %Hwf.
+    iDestruct (proc_pt_root_valid with "Hpt") as %Hroot.
+    rewrite /fp_rest /fp_pt /fp_tf.
+    iSplitL "Hpid Hf Hof Hu Hsp Hir Hbs Hkst Hev Hctx".
+    { iFrame "Hpid Hf Hof Hu Hsp Hir Hbs Hkst Hev Hctx". iPureIntro.
+      exact (conj (proj1 Hpure)
+               (conj (proj1 (proj2 Hpure)) (proj1 (proj2 (proj2 Hpure))))). }
+    iSplitL "Hch"; [iExact "Hch" |].
+    iSplitL "Hgh"; [iExact "Hgh" |].
+    iSplitL "Hxc"; [iExact "Hxc" |].
+    iSplitL "Hesc"; [iExact "Hesc" |].
+    iSplitL "Hpg Hpt".
+    { iFrame "Hpg". iSplitL "Hpt".
+      { iExists Mz. iExact "Hpt". }
+      iPureIntro. split; [exact Hbel | exact (proj1 (proj2 (proj2 Hpure)))]. }
+    cbn [fst snd]. iFrame "Htf Htfp". iPureIntro.
+    exact (proj2 (proj2 (proj2 (proj2 Hwf)))).
+  Qed.
+
+  (* ------------------------------------------------------------------ *)
+  (* The contract.                                                       *)
+  (* ------------------------------------------------------------------ *)
+  (* [proc_held] rides straight through: freeproc takes no lock, and the
+     four cells it writes that live in there ([p_state], [p_chan], and
+     [proc_pub]'s [p_killed]/[p_xstate]/the OTHER half of [p_pid]) come
+     back at their new values.  [locked] and the park receipt are untouched.
+
+     [kalloc_env] at [None]: kfree needs it and proc_freepagetable is stated
+     only there.  freeproc is therefore a steady-state-only function, which
+     is exactly where its callers (kwait, and allocproc's failure tails --
+     which have already resealed by the time they get here) live.
+
+     PINNED AT [b = false], and it has to be.  The post hands [proc_held]
+     back, and [proc_held] names the hart the lock is HELD ON -- but
+     [wp_next]'s hart equality holds only under [b = false \/ p = zero_reg],
+     so at a generic [b] the returned block would be about a possibly
+     DIFFERENT cpu.  That is not a technicality dodged: a caller of freeproc
+     holds p->lock, and holding a spinlock in xv6 means interrupts are off on
+     this hart.  So [false] is what the callers actually have. *)
+  Definition wp_freeproc_sconf_body
+      (γp γa : gname) (mm : regfile)
+      (j : nat) (γl : gname) (V : pprivate) (g : gname) (pid st : mword 32) (ch : mword 64)
+      (opt : option uptd) (otf : option (mword 44 * list (mword 64)))
+      (K : nat) (eb : bool) (pme : mword 64)
+      (ilvl : nat) (lks : gset string) (k : nat) :=
+    let pcE : mword 64 := mword_of_int KernelSyms.freeproc in
+    let pa := proc_addr j in
+    let ret_tgt := ret_pc (mm !!! Regidx (mword_of_int 1 : mword 5)) in
+    (* 4-slot frame + proc_freepagetable's 40 (kfree needs only 14) *)
+    (44 <= K)%nat ->
+    (* a real slot: the pid store takes <pid_lock>'s quarter of proc[j].pid
+       out of the lock's payload, which is indexed over [seq 0 NPROC] *)
+    (j < NPROC)%nat ->
+    (* the kfree / proc_freepagetable chain keeps the transient noff
+       increment in int range *)
+    (Z.of_nat ilvl + 1 < 2 ^ 31)%Z ->
+    mm !!! Regidx (mword_of_int 10 : mword 5) = pa ->
+    (* freeproc's own kfree(trapframe) is direct, at "kmem"(13); the
+       proc_freepagetable arm's own callees carry no order premise of their
+       own yet, so this is the whole cone this contract needs to state. *)
+    (* freeproc now ACQUIRES <pid_lock> ("nextpid", 10) around its
+       [p->pid = 0] (upstream ded23f2), so that is the floor of what the
+       caller may already hold; kfree's "kmem" (11) follows by
+       [locks_below_mono]. *)
+    locks_below lks "nextpid" ->
+    sie_cap_gpr KT1 mm K false pme -∗
+    cpu_own ilvl eb pme false lks -∗
+    kernel_text -∗
+    pc_is pcE -∗
+    is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+    proc_held cpu_id j γl st ch -∗
+    fp_rest pa V pid -∗
+    (* THE SLOT'S CHILDREN ROW, AT THE EMPTY SET.  freeproc neither reads
+       nor moves it -- it goes straight back into the UNUSED block below --
+       but the block it rebuilds is the one the next allocproc hands out,
+       so the row has to be there and it has to be empty.  Both callers can
+       pay: allocproc's failure tails have the row allocproc just took, and
+       the reaper empties the zombie's under the <wait_lock> it holds. *)
+    ch_frag (pv_chg V) pa ∅ -∗
+    (* ...AND THE INCARNATION'S TWO EXCLUSIVE GHOSTS, BOTH WHOLE, AT THE
+       CALLER'S NAME [g].  A free parameter and not [pv_gen V], because
+       allocproc's failure tails hold the generation the pid section MINTED
+       while the block they carry is still the dormant one they took, whose
+       [pv_gen] is the junk it was sealed at; the UNUSED block this function
+       rebuilds records [g] and the two agree from there on.  This is where
+       a generation DIES: the slot's [SlotGen.slot_gen] goes back into the
+       UNUSED block, and the pid
+       REGISTRATION is deleted from <pid_lock>'s authority at the
+       [p->pid = 0] this function makes -- which is why the whole fragment
+       and not a half is the premise.  Both callers can pay: the reaper
+       reunited the ZOMBIE block's halves with the deposit its own row's
+       entry carried ([WaitInv.gen_halves]), and allocproc's failure tails
+       never split what allocproc gave them. *)
+    slot_gen pa (DfracOwn 1) g -∗
+    pid_reg_rest pid g -∗
+    (* ...AND THE SLOT'S HALF OF [p->xstate].  freeproc's [p->xstate = 0]
+       is a write, so it needs the whole cell: <p->lock>'s half arrives
+       inside [proc_held] ([SchedCtx.proc_pub]) and this is the block's.
+       The zero it leaves is re-split and the block's half goes back into
+       the UNUSED slot. *)
+    (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) -∗
+    fp_pt pa (pv_sz V) opt -∗
+    fp_tf pa otf -∗
+    kalloc_env γa None -∗
+    act_lend pme k -∗
+    wp_next false pme (fun (CID : CpuId) =>
+      ∀ (mr : regfile),
+      sie_cap_gpr KT1 mr K false pme -∗
+      cpu_own ilvl eb pme false lks -∗
+      (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend pme k') -∗
+      pc_is ret_tgt -∗
+      ⌜callee_saved mm mr⌝ -∗
+      proc_held cpu_id j γl UNUSED (zero_reg : mword 64) -∗
+      proc_dormant pa UNUSED -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+
+  (* THE LED TWIN (NI-LEDGER-REST W2, design ni-pid-ledger.md D4/R4): the
+     landed body verbatim, except that the continuation also receives the
+     pid ledger's RECEIPT of the release this call made -- [PFree pme pid]
+     appended right after some history [h] ([SlotGen.pid_receipt]), the
+     actor being the hart's proc word [pme].  The landed contract is its
+     corollary ([ProofFreeproc]), so no caller has to change. *)
+  Definition wp_freeproc_led_sconf_body
+      (γp γa : gname) (mm : regfile)
+      (j : nat) (γl : gname) (V : pprivate) (g : gname) (pid st : mword 32) (ch : mword 64)
+      (opt : option uptd) (otf : option (mword 44 * list (mword 64)))
+      (K : nat) (eb : bool) (pme : mword 64)
+      (ilvl : nat) (lks : gset string) (k : nat) :=
+    let pcE : mword 64 := mword_of_int KernelSyms.freeproc in
+    let pa := proc_addr j in
+    let ret_tgt := ret_pc (mm !!! Regidx (mword_of_int 1 : mword 5)) in
+    (* 4-slot frame + proc_freepagetable's 40 (kfree needs only 14) *)
+    (44 <= K)%nat ->
+    (* a real slot: the pid store takes <pid_lock>'s quarter of proc[j].pid
+       out of the lock's payload, which is indexed over [seq 0 NPROC] *)
+    (j < NPROC)%nat ->
+    (* the kfree / proc_freepagetable chain keeps the transient noff
+       increment in int range *)
+    (Z.of_nat ilvl + 1 < 2 ^ 31)%Z ->
+    mm !!! Regidx (mword_of_int 10 : mword 5) = pa ->
+    (* freeproc's own kfree(trapframe) is direct, at "kmem"(13); the
+       proc_freepagetable arm's own callees carry no order premise of their
+       own yet, so this is the whole cone this contract needs to state. *)
+    (* freeproc now ACQUIRES <pid_lock> ("nextpid", 10) around its
+       [p->pid = 0] (upstream ded23f2), so that is the floor of what the
+       caller may already hold; kfree's "kmem" (11) follows by
+       [locks_below_mono]. *)
+    locks_below lks "nextpid" ->
+    sie_cap_gpr KT1 mm K false pme -∗
+    cpu_own ilvl eb pme false lks -∗
+    kernel_text -∗
+    pc_is pcE -∗
+    is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+    proc_held cpu_id j γl st ch -∗
+    fp_rest pa V pid -∗
+    (* THE SLOT'S CHILDREN ROW, AT THE EMPTY SET.  freeproc neither reads
+       nor moves it -- it goes straight back into the UNUSED block below --
+       but the block it rebuilds is the one the next allocproc hands out,
+       so the row has to be there and it has to be empty.  Both callers can
+       pay: allocproc's failure tails have the row allocproc just took, and
+       the reaper empties the zombie's under the <wait_lock> it holds. *)
+    ch_frag (pv_chg V) pa ∅ -∗
+    (* ...AND THE INCARNATION'S TWO EXCLUSIVE GHOSTS, BOTH WHOLE, AT THE
+       CALLER'S NAME [g].  A free parameter and not [pv_gen V], because
+       allocproc's failure tails hold the generation the pid section MINTED
+       while the block they carry is still the dormant one they took, whose
+       [pv_gen] is the junk it was sealed at; the UNUSED block this function
+       rebuilds records [g] and the two agree from there on.  This is where
+       a generation DIES: the slot's [SlotGen.slot_gen] goes back into the
+       UNUSED block, and the pid
+       REGISTRATION is deleted from <pid_lock>'s authority at the
+       [p->pid = 0] this function makes -- which is why the whole fragment
+       and not a half is the premise.  Both callers can pay: the reaper
+       reunited the ZOMBIE block's halves with the deposit its own row's
+       entry carried ([WaitInv.gen_halves]), and allocproc's failure tails
+       never split what allocproc gave them. *)
+    slot_gen pa (DfracOwn 1) g -∗
+    pid_reg_rest pid g -∗
+    (* ...AND THE SLOT'S HALF OF [p->xstate].  freeproc's [p->xstate = 0]
+       is a write, so it needs the whole cell: <p->lock>'s half arrives
+       inside [proc_held] ([SchedCtx.proc_pub]) and this is the block's.
+       The zero it leaves is re-split and the block's half goes back into
+       the UNUSED slot. *)
+    (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) -∗
+    fp_pt pa (pv_sz V) opt -∗
+    fp_tf pa otf -∗
+    kalloc_env γa None -∗
+    act_lend pme k -∗
+    wp_next false pme (fun (CID : CpuId) =>
+      ∀ (mr : regfile),
+      sie_cap_gpr KT1 mr K false pme -∗
+      cpu_own ilvl eb pme false lks -∗
+      (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend pme k') -∗
+      pc_is ret_tgt -∗
+      ⌜callee_saved mm mr⌝ -∗
+      (∃ h, pid_receipt h (PFree pme pid)) -∗
+      proc_held cpu_id j γl UNUSED (zero_reg : mword 64) -∗
+      proc_dormant pa UNUSED -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+
+End SpecFreeproc.
+
+Module Type FREEPROC.
+  Parameter wp_freeproc_sconf :
+    (* NO [!fileG Σ]: the contract reaches [ProcInv.proc_dormant], which uses
+       only the fd-SLOT ghost, so Rocq prunes [fileG] from the body and the
+       Parameter must not re-introduce it. *)
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γp γa : gname) (mm : regfile)
+      (j : nat) (γl : gname) (V : pprivate) (g : gname) (pid st : mword 32) (ch : mword 64)
+      (opt : option uptd) (otf : option (mword 44 * list (mword 64)))
+      (K : nat) (eb : bool) (pme : mword 64)
+      (ilvl : nat) (lks : gset string) (k : nat),
+      wp_freeproc_sconf_body γp γa mm j γl V g pid st ch opt otf K eb pme ilvl lks k.
+  Parameter wp_freeproc_led_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γp γa : gname) (mm : regfile)
+      (j : nat) (γl : gname) (V : pprivate) (g : gname) (pid st : mword 32) (ch : mword 64)
+      (opt : option uptd) (otf : option (mword 44 * list (mword 64)))
+      (K : nat) (eb : bool) (pme : mword 64)
+      (ilvl : nat) (lks : gset string) (k : nat),
+      wp_freeproc_led_sconf_body γp γa mm j γl V g pid st ch opt otf K eb pme ilvl lks k.
+End FREEPROC.

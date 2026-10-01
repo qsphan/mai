@@ -1,0 +1,328 @@
+(* SpecCopyin.v -- the public interface of Copyin, stated independently of
+   its proof.  Requires only the definitional layer -- never a whole-function
+   proof file -- so every function proof can be checked in parallel.
+
+     int copyin(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva,
+                uint64 len) {
+       while (len > 0) {
+         va0 = PGROUNDDOWN(srcva);
+         pa0 = walkaddr(pagetable, va0);
+         if (pa0 == 0 && (pa0 = vmfault(pagetable, psz, va0, 1)) == 0) return -1;
+         n = PGSIZE - (srcva - va0);  if (n > len) n = len;
+         memmove(dst, (void * )(pa0 + (srcva - va0)), n);
+         len -= n; dst += n; srcva = va0 + PGSIZE;
+       }
+       return 0;
+     }
+
+   STATED AT THE [proc_pt] ALTITUDE, like vmfault: copyin PRESERVES the
+   valid-user-page-table predicate of the table it reads through, and -- as
+   it may fault pages in on the way -- hands back a descriptor EXTENDING the
+   one it was given ([uptd_ext_sz szv]: same root, same trapframe, a user map
+   that only gained entries, and every entry it gained BELOW [szv]).  The
+   size bound is not extra work: vmfault backs a page only after ruling out
+   [va >= psz], so the fact is already in the loop; stating it is what lets
+   a [proc_priv] caller rebuild its block (ProcInv.proc_priv_copy), which a
+   bare [uptd_ext] cannot.  Both exits, 0 and -1, deliver that; a run that
+   gives up part-way has still copied a prefix and still faulted in whatever
+   it faulted in, so there is nothing to roll back and no reason to split
+   the resource story across the two arms.
+
+   WHAT THE DESTINATION BUFFER GETS is named by the MEMORY-INDEXED form
+   below, [wp_copyin_sconf_mem]: it runs at [proc_ptm P (uint szv) M], the
+   contents-indexed refinement of [proc_pt] (ProcPtOwn.v §5c), and its
+   success arm promises [copyin_got M srcva len dst_new] -- byte [j] of the
+   destination IS what the process's memory view holds at user va
+   [srcva + j].  [M] comes back UNCHANGED: copyin only reads, and the
+   lazily-backed pages a fault may add are already in the view
+   (SpecVmfault.v), so the promise can be stated against the INPUT [M].
+
+   There WAS an existential-[M] corollary beside it, in which [dst_new] is
+   simply universally quantified -- the caller learns only that it still
+   owns [len] bytes at [dst].  That is what every current caller speaks, and
+   for most of them it is the right altitude: the bytes copyin copies come
+   from USER memory, which the kernel may make no assumption about, so a
+   caller that wants to constrain what it read must validate the bytes
+   itself either way.  What the indexed form buys is the ability to say
+   WHICH user bytes those were.
+
+   The [-1] arm promises nothing about the destination.  A run that gives up
+   part-way has copied a prefix, and which prefix is not observable from the
+   return value.
+
+   The kalloc tier and [cpu_own] are threaded through only because vmfault
+   needs them; copyin allocates nothing of its own.
+
+   *** THE SIZE IS AN ARGUMENT NOW, AND THE TWO PROC CELLS ARE GONE. ***
+   xv6 `4f2fc8b` gave copyin a [psz] parameter (a1, shifting dst/srcva/len
+   down to a2/a3/a4) and made the vmfault beneath it honest: it bounds
+   against the [psz] handed in rather than `myproc()->sz`, and maps into the
+   [pagetable] handed in rather than `myproc()->pagetable` (SpecVmfault.v).
+   copyin therefore touches NEITHER proc cell, so [p_sz p ↦₈{dqs} szv] and
+   [p_pagetable p ↦₈{dqp} …] are gone, and with them the [dqs]/[dqp]
+   parameters.  [szv] is simply the a1 register value.
+
+   That is not bookkeeping: [p_pagetable p ↦ page_base P.(ud_root)] was the
+   unstated claim "the table you are reading through IS the running
+   process's".  It was true of every caller, and it is why the contract could
+   not be used on a table built but not yet installed.  It is no longer
+   claimed, because it is no longer true of the code. *)
+From Stdlib Require Import Eqdep_dec ZArith Lia List.
+From stdpp Require Import gmap list list_monad bitvector.definitions bitvector.tactics.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import excl.
+From iris.base_logic.lib Require Import gen_heap invariants ghost_var ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.Base SailStdpp.Operators_mwords SailStdpp.Values.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import RiscvModelBytes RiscvPtsto RiscvLang.
+Require Import RiscvExtras.
+Require Import InstrBytes KernelText.
+Require Import LockRank.
+Require Import RegFile WpNext.
+Require Import CalleeSaved.
+Require Import IntrDefs.
+Require Import CpuOwn.
+Require Import KvmSpec.
+Require Import UserPtTree.
+Require Import ProcPtOwn.
+From Kernel Require KernelSyms.
+Require Import SlotGen.   (* [act_lend]: the permit sweep, L1b *)
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Import Defs.
+Require Import TsoCtx.
+
+
+(* THE BUFFER CARRIES ITS OWN TIER [ktb], below the hart's regime [KT1].
+   It is FORCED and it is the same two-tier shape [WpSconfMem]'s merged
+   leaves have: this function's kernel buffer is a FRAME local at [KT1] for
+   one caller and a KT0 page/bio window for the next, and one shared tier
+   cannot state both.  See SpecMemmove.v's note. *)
+(* ===================================================================== *)
+(* THE MEMORY-INDEXED CONTRACT: WHAT THE DESTINATION BUFFER GETS.        *)
+(*                                                                       *)
+(* The contract above leaves [dst_new] universally quantified, which was *)
+(* the honest reading while [proc_pt] owned the user pages with          *)
+(* EXISTENTIAL contents.  Now that the process's memory is NAMED         *)
+(* ([ProcPtOwn.proc_ptm P sz M] -- a [gmap] from USER VIRTUAL ADDRESS to *)
+(* byte, covering the LAZY pages too), the postcondition can say what    *)
+(* the buffer holds: ON THE SUCCESS ARM byte [j] of the destination IS   *)
+(* the byte the process has at [srcva + j].                              *)
+(*                                                                       *)
+(* [M] IS THE SAME ON BOTH SIDES.  copyin writes no user memory, and the *)
+(* pages it faults in on the way were ALREADY in the view -- as lazy     *)
+(* pages reading 0 -- so vmfault does not move it either                 *)
+(* ([SpecVmfault.wp_vmfault_sconf_mem]).  The descriptor still grows     *)
+(* ([uptd_ext_sz]); the view does not.  That is what lets the promise be *)
+(* stated against the [M] the caller handed in.                          *)
+(*                                                                       *)
+(* THE -1 ARM PROMISES NOTHING about the buffer.  A run that gives up    *)
+(* part-way has copied a prefix, and which prefix is not observable from *)
+(* the return value.                                                     *)
+(*                                                                       *)
+(* THE ∃-[M] COROLLARY IS GONE.  It was the [proc_pt]-altitude form for  *)
+(* callers that say nothing about the bytes; its last one (piperead)     *)
+(* switched to this contract with tier 3 of the image campaign,          *)
+(* and a leaf whose last ∃-caller converts loses the corollary rather    *)
+(* than keeping it "in case" (see SpecCopyinstr.v's note).  The recipe   *)
+(* for re-deriving one is four lines: [ProcPtOwn.proc_pt_ptm] in and     *)
+(* [proc_ptm_pt] on the way out.                                         *)
+(* ===================================================================== *)
+
+(* byte [j] of the destination is the process's byte at [srcva + j] *)
+Definition copyin_got (M : gmap Z (bv 8)) (srcva : mword 64) (len : nat)
+    (dst_new : nat -> bv 8) : Prop :=
+  forall j : nat, (j < len)%nat ->
+    M !! uint (add_vec_int srcva (Z.of_nat j)) = Some (dst_new j).
+
+(* ...AND THE SAME FACT ABOUT A WORD.  A copy of eight bytes into a
+   caller's [uint64] out-parameter is read back as one 64-bit value, so the
+   image-indexed vocabulary needs a WORD row beside the byte one:
+   [uimg_word_at M a w] says the eight little-endian bytes of [w] are the
+   image's at [a .. a+7].  [a] is a plain [Z] and the eight addresses are
+   consecutive in [Z], not modulo 2^64 -- which costs nothing, because
+   every producer is guarded by a range test that already rules the wrap
+   out ([SpecFetchaddr.fetch_ok]: [uint addr + 8 <= uint p->sz <= MAXVA]).
+   Its consumers are [SpecFetchaddr.fetchaddr_got] (the producer) and
+   [SpecSysExec.exec_args_of] (the argv vector's pointer row). *)
+Definition uimg_word_at (M : gmap Z (bv 8)) (a : Z) (w : mword 64) : Prop :=
+  forall k, (k < 8)%nat ->
+    M !! (a + Z.of_nat k) = bv_to_little_endian 8 8 (bv_unsigned w) !! k.
+
+(* ===================================================================== *)
+(*  THE SAME FACT ABOUT A BYTE LIST -- the receipt layers' spelling.       *)
+(*                                                                        *)
+(*  [copyin_got]'s carrier is a FUNCTION because that is what the copy     *)
+(*  loops hand back.  Everything that RECEIPTS a copy carries a LIST       *)
+(*  instead: console-write's acceptance receipts ([SpecConsolewrite]),  *)
+(*  the write chain's per-chunk buffer tie ([FsAbsWriteFire]'s two arms).  *)
+(*  Stating the tie once here is what keeps those layers from re-deriving  *)
+(*  the indexing -- and [ubytes_at_of_got] is the single bridge between    *)
+(*  the two spellings, applied at exactly one place per chain.             *)
+(*                                                                        *)
+(*  RULING A (2026-08-31), the write/copyin content seam.                  *)
+(* ===================================================================== *)
+
+(* [bs] IS the process's byte run at user va [ua] *)
+Definition ubytes_at (M : gmap Z (bv 8)) (ua : mword 64)
+    (bs : list (bv 8)) : Prop :=
+  forall (d : nat) (c : bv 8), bs !! d = Some c ->
+    M !! uint (add_vec_int ua (Z.of_nat d)) = Some c.
+
+Lemma ubytes_at_nil (M : gmap Z (bv 8)) (ua : mword 64) : ubytes_at M ua [].
+Proof. intros d c Hd. rewrite lookup_nil in Hd. discriminate. Qed.
+
+(* ADJACENT RUNS APPEND, at the bumped base -- the chunked writer's step.
+   No no-wrap side condition, because [add_vec_int] composes modulo 2^64
+   ([UserPtTree.add_vec_int_nat_assoc]). *)
+Lemma ubytes_at_app (M : gmap Z (bv 8)) (ua : mword 64) (bs1 bs2 : list (bv 8)) :
+  ubytes_at M ua bs1 ->
+  ubytes_at M (add_vec_int ua (Z.of_nat (length bs1))) bs2 ->
+  ubytes_at M ua (bs1 ++ bs2).
+Proof.
+  intros H1 H2 d c Hd.
+  destruct (decide (d < length bs1)%nat) as [Hlt | Hge].
+  - apply H1. rewrite lookup_app_l in Hd; [exact Hd | exact Hlt].
+  - rewrite lookup_app_r in Hd; [| lia].
+    specialize (H2 (d - length bs1)%nat c Hd).
+    rewrite add_vec_int_nat_assoc in H2.
+    rewrite (_ : (length bs1 + (d - length bs1))%nat = d) in H2;
+      [exact H2 | lia].
+Qed.
+
+(* THE BRIDGE from the function spelling.  [f <$> seq 0 len] is the shape
+   every receipt in the tree already builds its byte list at. *)
+Lemma ubytes_at_of_got (M : gmap Z (bv 8)) (ua : mword 64) (len : nat)
+    (f : nat -> bv 8) :
+  copyin_got M ua len f -> ubytes_at M ua (f <$> seq 0 len).
+Proof.
+  intros Hg d c Hd.
+  rewrite list_lookup_fmap in Hd.
+  destruct (seq 0 len !! d) as [e |] eqn:Hs; [| discriminate].
+  rewrite lookup_seq in Hs. destruct Hs as [He Hlt].
+  cbn in Hd. injection Hd as <-. rewrite He. exact (Hg d Hlt).
+Qed.
+
+(* the run's length is the count it was received at *)
+Lemma ubytes_at_of_got_len (M : gmap Z (bv 8)) (ua : mword 64) (len : nat)
+    (f : nat -> bv 8) : length (f <$> seq 0 len) = len.
+Proof. rewrite length_fmap length_seq //. Qed.
+
+(* TWO RUNS OF THE SAME LENGTH AT THE SAME BASE ARE THE SAME RUN (lane
+   WRITE-RELAY, RELAY 3).  [ubytes_at] is prefix-closed -- it constrains
+   only the indices [bs] itself has -- so it identifies a run ONLY once the
+   length is known beside it.  This is the whole of what the chunk's length
+   conjunct ([SysWriteDefs.wchunk_at]) buys a client that already holds
+   [ubytes_at] for the bytes it MEANT to write: the fire's [bs] is them. *)
+Lemma ubytes_at_inj (M : gmap Z (bv 8)) (ua : mword 64) (bs bs' : list (bv 8)) :
+  ubytes_at M ua bs -> ubytes_at M ua bs' ->
+  length bs = length bs' -> bs = bs'.
+Proof.
+  intros H1 H2 Hlen. apply list_eq. intro d.
+  destruct (decide (d < length bs)%nat) as [Hlt | Hge].
+  - destruct (lookup_lt_is_Some_2 bs d Hlt) as [c Hc].
+    destruct (lookup_lt_is_Some_2 bs' d ltac:(lia)) as [c' Hc'].
+    rewrite Hc Hc'. f_equal.
+    pose proof (H1 d c Hc) as E1. pose proof (H2 d c' Hc') as E2.
+    congruence.
+  - rewrite (lookup_ge_None_2 bs d ltac:(lia)).
+    rewrite (lookup_ge_None_2 bs' d ltac:(lia)). reflexivity.
+Qed.
+
+(* THE BASE COMMUTES with the loop's [add rd,ri,rbase] spelling: gcc emits
+   the INDEX first at both of this seam's chunk loops, and the receipt is
+   stated at the base.  (Not a lemma about copyin; it lives here because
+   both users of [ubytes_at] need it and neither can see the other.) *)
+Lemma add_vec_moi_comm (p : mword 64) (i : Z) :
+  add_vec (mword_of_int i : mword 64) p = add_vec_int p i.
+Proof.
+  unfold add_vec_int. apply bv_eq. rewrite !add_vec64_unsigned. f_equal. ring.
+Qed.
+
+(* ===================================================================== *)
+(*  WHAT THE TWO EXITS SAY, IN ONE PREDICATE (lane TRAP-ROWS, T1).        *)
+(*                                                                       *)
+(*  [SpecCopyout.copyout_wrote] is the mould, and the two are twins: the  *)
+(*  success exit names the bytes, and the FAILURE exit names A REASON --  *)
+(*  a byte of the run whose page the copy could not reach.  copyin's only *)
+(*  failing test is walkaddr's, taken again after vmfault declined, so    *)
+(*  the reason is [~ uva_rmapped] (present and V&U) and not               *)
+(*  [~ uva_wmapped]: there is no PTE_R re-walk on this side.              *)
+(*                                                                       *)
+(*  IT IS STATED AT THE ENTRY DESCRIPTOR [P], not at the grown [P'], and  *)
+(*  that is the useful direction: the map only grows                      *)
+(*  ([UserPtTree.uva_rmapped_mono]), so “not readable at the table the    *)
+(*  round had” implies "not readable at the table the call was handed",   *)
+(*  which is the one the caller can name and refute against.              *)
+(*                                                                       *)
+(*  WHICH byte is EXISTENTIAL and has to be: copyin walks whole pages, so *)
+(*  the round that fails may have copied a prefix of its own page run     *)
+(*  first.  The consumer refutes the arm from its own permission map,     *)
+(*  which knows every byte of its buffer, so the existential costs it     *)
+(*  nothing.                                                             *)
+(* ===================================================================== *)
+Definition copyin_read (P : uptd) (M : gmap Z (bv 8)) (srcva : mword 64)
+    (len : nat) (dst_new : nat -> bv 8) (res : mword 64) : Prop :=
+  (res = (mword_of_int 0 : mword 64) /\ copyin_got M srcva len dst_new)
+  \/ (res = (mword_of_int (-1) : mword 64)
+      /\ exists d : nat, (d < len)%nat
+           /\ ~ uva_rmapped P (uint (add_vec_int srcva (Z.of_nat d)))).
+
+(* the shape every caller that says nothing about the reason still reads *)
+Lemma copyin_read_ret (P : uptd) (M : gmap Z (bv 8)) (srcva : mword 64)
+    (len : nat) (dst_new : nat -> bv 8) (res : mword 64) :
+  copyin_read P M srcva len dst_new res ->
+  (res = (mword_of_int 0 : mword 64) /\ copyin_got M srcva len dst_new)
+  \/ res = (mword_of_int (-1) : mword 64).
+Proof. intros [[H1 H2] | [H1 _]]; [ by left | by right ]. Qed.
+
+Definition wp_copyin_sconf_mem_body `{!riscvGS Σ, !xv6G Σ, !wchG Σ, !bioslotG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (ktb : ktier) `{!KtierLe ktb KT1} (γa : gname) (mm : regfile)
+    (P : uptd) (M : gmap Z (bv 8)) (szv : mword 64) (len : nat)
+    (dst_olds : nat -> bv 8)
+    (K lvl : nat) (eb : bool) (p : mword 64) (b : bool) (lks : gset string) (k : nat) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.copyin in
+  let dst := mm !!! Regidx (mword_of_int 12) in
+  let srcva := mm !!! Regidx (mword_of_int 13) in
+  let ret_tgt := ret_pc (mm !!! Regidx (mword_of_int 1)) in
+  (50 <= K)%nat ->
+  mm !!! Regidx (mword_of_int 10) = page_base P.(ud_root) ->
+  mm !!! Regidx (mword_of_int 11) = szv ->
+  mm !!! Regidx (mword_of_int 14) = (mword_of_int (Z.of_nat len) : mword 64) ->
+  (Z.of_nat len < 2 ^ 64)%Z ->
+  (uint szv <= 2 ^ 38)%Z ->
+  (Z.of_nat lvl + 1 < 2 ^ 31)%Z ->
+  locks_below lks "kmem" ->
+  sie_cap_gpr KT1 mm K b p -∗
+  cpu_own lvl eb p b lks -∗
+  kernel_text -∗
+  pc_is pcE -∗
+  proc_ptm P (uint szv) M -∗
+  kalloc_env γa None -∗
+  (* THE LEND (permit sweep L1b): the caller's event counter, for the
+     kalloc a lazy fault inside the copy makes *)
+  act_lend p k -∗
+  ([∗ list] j ∈ seq 0 len, (pa_add dst j) ↦ₘ[ktb] dst_olds j) -∗
+  wp_next b p (fun (CID : CpuId) =>
+    ∀ (mr : regfile) (P' : uptd) (dst_new : nat -> bv 8),
+    sie_cap_gpr KT1 mr K b p -∗
+    cpu_own lvl eb p b lks -∗
+    (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend p k') -∗
+    pc_is ret_tgt -∗
+    proc_ptm P' (uint szv) M -∗
+    ([∗ list] j ∈ seq 0 len, (pa_add dst j) ↦ₘ[ktb] dst_new j) -∗
+    ⌜callee_saved mm mr⌝ -∗
+    ⌜uptd_ext_sz szv P P'⌝ -∗
+    ⌜ copyin_read P M srcva len dst_new (mr !!! Regidx (mword_of_int 10)) ⌝ -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type COPYIN.
+  Parameter wp_copyin_sconf_mem :
+    forall `{!riscvGS Σ, !xv6G Σ, !wchG Σ, !bioslotG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (ktb : ktier) `{!KtierLe ktb KT1} (γa : gname) (mm : regfile)
+      (P : uptd) (M : gmap Z (bv 8)) (szv : mword 64) (len : nat)
+      (dst_olds : nat -> bv 8)
+      (K lvl : nat) (eb : bool) (p : mword 64) (b : bool) (lks : gset string) (k : nat),
+      wp_copyin_sconf_mem_body ktb γa mm P M szv len dst_olds K lvl eb p b lks k.
+End COPYIN.

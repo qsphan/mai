@@ -1,0 +1,306 @@
+(* SpecDevintr.v -- the public interface of devintr(), stated independently of
+   its proof.  Requires only the definitional layer and its callees' Spec files
+   -- never a whole-function proof file.
+
+     int devintr(void) {
+       uint64 scause = r_scause();
+       if (scause == 0x8000000000000009L) {          // supervisor external, via PLIC
+         int irq = plic_claim();
+         if      (irq == UART0_IRQ)   uartintr(0);
+         else if (irq == UART1_IRQ)   uartintr(1);
+         else if (irq == VIRTIO0_IRQ) virtio_disk_intr();
+         else if (irq)                printk("unexpected interrupt irq=%d\n", irq);
+         if (irq) plic_complete(irq);
+         return 1;
+       } else if (scause == 0x8000000000000005L) {   // timer
+         clockintr();
+         return 2;
+       } else return 0;
+     }
+
+   @ KernelSyms.devintr, 134 bytes, 52 instructions, a 32-byte frame
+   (ra/s0 always, s1 SHRINK-WRAPPED into the PLIC arm).
+
+   THIS IS THE MACHINE'S INTERRUPT DEMULTIPLEXER, and the contract is
+   correspondingly the point at which the whole device complement becomes ONE
+   object.  Every credential devintr needs is PERSISTENT, so they are bundled
+   as [devintr_caps] rather than listed: a caller threads one hypothesis, and
+   adding a device to the machine changes the bundle rather than every
+   contract on the trap path.
+
+   THE RETURN VALUE IS A FUNCTION OF scause, and the spec says so
+   ([devintr_ret]).  That is why the [scause] cell is threaded EXPLICITLY and
+   at a PINNED value rather than taken from [IntrDefs.trap_csrs], whose scause
+   is existential: a caller receiving only "the result is 0, 1 or 2" could not
+   tell which, and the three-way branch is the entire content of the function.
+   The cell comes back untouched (nothing devintr calls owns it, and with
+   interrupts off no trap rewrites it).  [dq] is any fraction: the read pins
+   the value and does not need the cell exclusively.
+
+   THE printk ARM IS STILL DEAD, and the second UART did not weaken the
+   argument -- [PlicPlan.plic_claim_ret_ok] stays CLOSED, it merely gained an
+   arm: a claim returns 0, [uart_irq_id Uart0], [uart_irq_id Uart1] or
+   [virtio_irq_id].  So there are now THREE [beq]s above it, they are
+   exhaustive on the nonzero cases, and the [c.bnez a4] at +0x48 provably
+   falls through.  Nothing on this path calls printk -- which matters, because
+   only printk's PANIC path is proved.
+
+   INTERRUPTS ARE OFF ([b = false]), and not as a convenience: plic_claim,
+   plic_complete and clockintr are each [false]-ONLY (they call cpuid()
+   unbracketed, and cpuid reads tp mid-body), and clockintr's [tick_keeper] is
+   hart-indexed.  xv6 agrees -- devintr runs only from usertrap()/kerneltrap(),
+   the latter of which PANICS if it finds interrupts enabled.  So the contract
+   carries no [wp_next] wrapper ([wp_next_off] would collapse it anyway).
+
+   WHAT THE CONTRACT DELIBERATELY DOES NOT SAY: anything about what the
+   handlers did.  A completion reaches the process that was waiting for it
+   through [disk_res] / [tx_res] / the proc array, never through devintr's
+   postcondition -- so the post is just "callee-saved registers preserved, a0
+   = [devintr_ret scause], everything handed back". *)
+From Stdlib Require Import ZArith List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language weakestpre lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import RegFile.
+Require Import InstrBytes.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpLock.
+Require Import FdSlots.
+Require Import ProcGeom CpuOwn.
+Require Import SchedCtx.
+Require Import DiskPtsto WpUart DiskInv.
+Require Import TimerCap.
+Require Import SpecClockintr.
+Require Import SpecConsoleintr.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+From Kernel Require KernelSyms.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx CtxMorphTac.
+Local Open Scope Z_scope.
+Import Defs.
+
+
+(* ===================================================================== *)
+(* The two causes devintr recognises.                                     *)
+(* ===================================================================== *)
+
+(* scause for a supervisor EXTERNAL interrupt: the interrupt bit (63) plus
+   cause 9.  The code materialises it as [li -1; slli 63; addi 9]. *)
+Definition SCAUSE_SEXT : Z := 0x8000000000000009.
+
+(* ... and for a supervisor TIMER interrupt: bit 63 plus cause 5. *)
+Definition SCAUSE_STIMER : Z := 0x8000000000000005.
+
+(* devintr's return value, as the C comment gives it: 1 for "some other
+   device" (the PLIC arm), 2 for a timer interrupt, 0 for "not recognised".
+   The tests are in source order -- external first, then timer. *)
+Definition devintr_ret (sc : mword 64) : mword 64 :=
+  if eq_vec sc (mword_of_int SCAUSE_SEXT : mword 64)
+  then (mword_of_int 1 : mword 64)
+  else if eq_vec sc (mword_of_int SCAUSE_STIMER : mword 64)
+       then (mword_of_int 2 : mword 64)
+       else (mword_of_int 0 : mword 64).
+
+(* ===================================================================== *)
+(* The device complement, as one persistent credential.                   *)
+(* ===================================================================== *)
+
+Section DevintrCaps.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  (* ------------------------------------------------------------------ *)
+  (* THE SECOND PORT, AS ONE ROW WITH ITS GHOST NAME BURIED.              *)
+  (* ------------------------------------------------------------------ *)
+  (* [irq == UART1_IRQ] calls the SAME uartintr at [Uart1], and that
+     contract is stated port-generically, so devintr owes four things it
+     did not owe before:
+
+       [uart_inv Uart1 γ1]   the second port's own invariant.  The console
+                             bundle [dev_inv] deliberately does not contain
+                             it (WpUart.v: "the bundle is the console
+                             port's");
+       [plic_inv γu γ1]      the PLIC at a NAMED second bundle.  [dev_inv]
+                             does carry the PLIC, but at an EXISTENTIAL
+                             second name -- which is all a client that only
+                             claims and completes needs, and is what keeps
+                             the console bundle at arity 2.  devintr needs
+                             more: it CONSUMES source 12's payload at a
+                             named [γ1] and hands it to uartintr;
+       [uart_inited γ1]      the second port's one-shot, PAST its deposit.
+                             Port 1 has a real pre-state -- uartinitone
+                             threads [uart_rx_tok γ1] through its FCR flush
+                             and deposits it (SpecUartinit.v) -- so
+                             [plic_slots_claim] has to refute that arm at
+                             source 12 exactly as it does at source 10
+                             before it can hand the payload out.  Hence a
+                             witness per port, not one;
+       [uart_dlab_off γ1]    DLAB IS OFF AT THE SECOND PORT.  uartintr's RHR
+                             pop reads offset 0, which is the divisor latch
+                             while DLAB is set, and it pops at BOTH ports.
+                             At the console the fact rides inside
+                             [SpecConsoleintr.console_caps]'s [is_txlock];
+                             port 1 has no such bundle here, so it is a row
+                             of its own.  [uartinit] freezes it at both
+                             ports and hands both out ([SpecUartinit.v]).
+
+     WHAT LEFT THIS BUNDLE, and where it went.  It used to carry
+     [UartsFields.uarts_pinned] -- the two immutable `uarts[]` fields at the
+     RAW PHYSICAL tier -- because uartintr took that form.  It does not any
+     more: an S-mode load leaf consumes the CONTEXT tier and no law crosses
+     the two ([SpecUartintr.v]), so the credential a driver must be handed
+     is the VA-tier [SpecUartPutc.uarts_words].  That row is
+     CONTEXT-RELATIVE, and this bundle may not hold one: it is rebuilt at a
+     foreign context by [UsertrapRes.ut_caps_of_park], which holds no
+     domination and can transport nothing.  So all four words -- BOTH ports'
+     -- ride [SpecConsoleintr.console_caps], which the resumer's
+     [park_globals] supplies at its own context, and this bundle stays
+     entirely ξ-free.  The [Uart1] arm of [ProofDevintr] projects port 1's
+     pair out of the console bundle it is holding anyway.
+
+     THE NAME IS EXISTENTIAL HERE FOR THE SAME REASON IT IS IN [dev_inv].
+     devintr's postcondition says nothing whatever about the second port --
+     the owner's ruling is that UART1's output is unconstrained -- so no
+     caller ever has to agree with devintr about WHICH bundle it is; the
+     function only needs the invariant and the payload to be at the same
+     one.  Burying it is what keeps this an ADDITIVE row: [devintr_caps],
+     [UsertrapRes.devintr_caps_any], [SpecKerneltrap], [SpecKernelvec] and
+     [SpecUserinit] all keep their arity, and the five construction sites
+     gain one row instead of a parameter each.  A reader of the [Uart1] arm
+     still sees exactly which resource paid for it, which is the test that
+     distinguishes bundling from burying. *)
+  Definition uart1_caps (γu : uart_names) : iProp Σ :=
+    (∃ γ1 : uart_names,
+       uart_inv Uart1 γ1 ∗ plic_inv γu γ1 ∗ uart_inited γ1 ∗
+       uart_dlab_off γ1)%I.
+
+  Global Instance uart1_caps_persistent γu : Persistent (uart1_caps γu).
+  Proof using . rewrite /uart1_caps. apply _. Qed.
+
+  (* Everything the five handlers ask of a caller, in the order the branches
+     reach them:
+
+       [dev_inv]      the memory-mapped device invariant (UART + PLIC +
+                      virtio-mmio), which plic_claim/plic_complete open around
+                      their MMIO transactions and which the UART leaves need.
+                      IT IS ALSO ALL uartintr ITSELF WANTS: ae96fd0's handler
+                      takes no lock and moves no device ghost;
+       [console_caps]  what uartintr PASSES ON.  consoleintr is proven now, and
+                      its proof cannot be silent about the echo: it takes
+                      cons.lock and, through consputc, tx_lock.  So the two
+                      lock credentials come back into this bundle -- bundled,
+                      with both ghost names existential, so this is one
+                      conjunct and no parameter (SpecConsoleintr.v).  NOTHING
+                      CONSTRUCTS IT YET: see claude-notes/projects/console.md
+                      for the boot wiring it waits on;
+       [disk_geom]    +
+       [is_lock ... disk_res]
+                      virtio_disk_intr's;
+       [timer_cap]    +
+       [tick_keeper]  clockintr's: the persistent mcounteren/stimecmp
+                      capability every hart needs, and the tick machinery only
+                      hart 0 does (a disjunction the other harts discharge for
+                      free);
+       [procs_inv]    the proc array's locks -- wakeup, reached from three of
+                      the handlers;
+       [uart1_caps]   THE SECOND PORT (XV6_REV 163d39b), LAST and persistent.
+                      See its own header, just above. *)
+  Definition devintr_caps (γu : uart_names) (γv : disk_names)
+      (γdk γtl : gname)  (γs : list gname)
+      (pd pav pu : mword 64) : iProp Σ :=
+    ( dev_inv γu γv ∗
+      console_caps γu ∗
+      disk_geom γv pd pav pu ∗
+      is_lock γdk d_lock "virtio_disk"%string (disk_res_at γv pd pav pu) ∗
+      timer_cap ∗
+      tick_keeper γtl γs ∗
+      procs_inv γs ∗
+      uart1_caps γu )%I.
+
+  Global Instance devintr_caps_persistent γu γv γdk γtl γs pd pav pu :
+    Persistent (devintr_caps γu γv γdk γtl γs pd pav pu).
+  Proof using . rewrite /devintr_caps. apply _. Qed.
+
+End DevintrCaps.
+
+(* A6.139: THE BUNDLE CROSSES CONTEXTS -- every ξ-relative member is a lock
+   handle ([CtxMorph] via [SchedCtx.is_lock_morph]) and the rest are
+   context-free.  This is what funds [SpecKernelvec.kernelvec_env]'s packed
+   crossing witness.  Stated after the section so the bundle's context is
+   explicit (SchedCtx's A6.129 pattern): the transport class names no hart,
+   while the bundle's hart is a PARAMETER of the payload -- a parked world's
+   credentials stay at the parked hart while the mover runs wherever it
+   runs.  [disk_geom] is carried by [DiskInv.disk_geom_morph]; the console
+   bundle's own name is qualified because [SpecMainSecondary] states the
+   same payload's instance on a sibling branch of the import graph. *)
+Section DevintrCapsMorph.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId}.
+
+  Global Instance tick_keeper_morph (CIDc : CpuId) γtl γs :
+    CtxMorph (λ ξ, tick_keeper (XI := ξ) (CID := CIDc) γtl γs).
+  Proof using . rewrite /tick_keeper /TicksInv.is_tickslock. ctx_morph_solve. Qed.
+  Global Instance devintr_caps_morph (CIDc : CpuId) γu γv γdk γtl γs pd pav pu :
+    CtxMorph (λ ξ, devintr_caps (XI := ξ) (CID := CIDc)
+                     γu γv γdk γtl γs pd pav pu).
+  Proof using . rewrite /devintr_caps. ctx_morph_solve. Qed.
+End DevintrCapsMorph.
+
+(* devintr's own frame is 4 slots; the deepest callee is uartintr at
+   [SpecUartintr.uartintr_stack] = 36 (virtio_disk_intr wants 22, clockintr
+   20, plic_complete 6, plic_claim 4).  The second port reaches no deeper
+   than the console -- uartintr's own bound is already the MAXIMUM over the
+   ports -- so the number is unchanged. *)
+Notation devintr_stack := (52%nat) (only parsing).
+Definition wp_devintr_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γu : uart_names) (γv : disk_names) (γdk γtl : gname)
+    (γs : list gname) (pd pav pu : mword 64)
+    (m : regfile) (av lvl : nat) (eb : bool) (p : mword 64)
+    (dq : dfrac) (sc : mword 64) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.devintr in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  length γs = NPROC ->
+  (* the transient noff increments inside the handlers' acquire/wakeup pairs
+     stay in int range *)
+  (Z.of_nat lvl + 2 < 2 ^ 31)%Z ->
+  (devintr_stack <= av)%nat ->
+  (* devintr itself acquires nothing, but it dispatches three cones and the
+     premise has to be stated at the MINIMUM rank over all of them -- a bound
+     is STRENGTHENED by lowering it, and [locks_below_mono] only RAISES, so a
+     bound at "time" would not deliver the one uartintr wants.  The three:
+     clockintr -> tickslock ("time", 8); virtio_disk_intr -> "virtio_disk"
+     (9); uartintr -> consoleintr -> cons.lock ("cons", 5).  Minimum is 5.
+     Trivial at every real call site: devintr always runs at trap entry,
+     where [lks = ∅]. *)
+  locks_below lks "cons" ->
+  sie_cap_gpr KT1 m av false p -∗
+  cpu_own lvl eb p false lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  scause ↦ᵣ{dq} sc -∗
+  devintr_caps γu γv γdk γtl γs pd pav pu -∗
+  ( ∀ mf : regfile,
+      ⌜ callee_saved m mf /\ mf !!! Regidx (mword_of_int 10 : mword 5) = devintr_ret sc ⌝ -∗
+      sie_cap_gpr KT1 mf av false p -∗
+      cpu_own lvl eb p false lks -∗
+      scause ↦ᵣ{dq} sc -∗
+      pc_is ret_tgt -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type DEVINTR.
+  Parameter wp_devintr_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γu : uart_names) (γv : disk_names) (γdk γtl : gname)
+      (γs : list gname) (pd pav pu : mword 64)
+      (m : regfile) (av lvl : nat) (eb : bool) (p : mword 64)
+      (dq : dfrac) (sc : mword 64) (lks : gset string),
+      wp_devintr_sconf_body γu γv γdk γtl γs pd pav pu m av lvl eb p dq sc lks.
+End DEVINTR.

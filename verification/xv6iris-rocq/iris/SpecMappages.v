@@ -1,0 +1,89 @@
+(* SpecMappages.v -- the public interface of Mappages, stated independently of its
+   proof.  Requires only the definitional layer -- never a whole-function proof
+   file -- so every function proof can be checked in parallel. *)
+From Stdlib Require Import Eqdep_dec ZArith Lia List.
+From stdpp Require Import gmap list list_monad bitvector.definitions bitvector.tactics.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import excl.
+From iris.base_logic.lib Require Import gen_heap invariants ghost_var.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.Base SailStdpp.Operators_mwords SailStdpp.Values.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import RiscvPtsto RiscvLang.
+Require Import RiscvExtras.
+Require Import InstrBytes KernelText.
+Require Import LockRank.
+Require Import RegFile WpNext.
+Require Import CalleeSaved.
+Require Import IntrDefs.
+Require Import CpuOwn.
+Require Import KallocInv.
+Require Import PtTree.
+Require Import PtBuild KvmSpec.
+From Kernel Require KernelSyms.
+Require Import SlotGen.   (* [act_lend]: the permit sweep, L2 *)
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import CtxIdDefs.
+
+
+Definition wp_mappages_sconf_body `{!riscvGS Σ, !xv6G Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (kt : ktier) (γa : gname) (γk : gname * gname) (mm : regfile) (t : ptree) (m : gmap (mword 27) (mword 64)) (npages : nat) (perm : Z) (lvl K : nat) (eb : bool) (p : mword 64) (on : option nat) (b : bool) (lks : gset string) (k : nat) :=
+  let va := mm !!! Regidx (mword_of_int 11) in
+  let pa := mm !!! Regidx (mword_of_int 13) in
+  let vpn0 := svpn_of va in
+  let ppn0 := (autocast (T := mword) (subrange_vec_dec pa 55 12) : mword 44) in
+  let ret_tgt := ret_pc (mm !!! Regidx (mword_of_int 1)) in
+  (* the kalloc chain below keeps its transient noff increment in int
+     range; [lvl] is otherwise generic (the identity pin this replaced was
+     an artifact of the boot-time callers) *)
+  (Z.of_nat lvl + 1 < 2 ^ 31)%Z ->
+  (32 <= K)%nat ->
+  mm !!! Regidx (mword_of_int 10)
+    = zero_extend' 64 (concat_vec (pt_base t) (zeros' 12 : mword 12)) ->
+  subrange_vec_dec va 11 0 = (zeros' 12 : mword 12) ->
+  subrange_vec_dec pa 11 0 = (zeros' 12 : mword 12) ->
+  mm !!! Regidx (mword_of_int 12) = mword_of_int (Z.of_nat npages * 4096) ->
+  (1 <= npages)%nat ->
+  mm !!! Regidx (mword_of_int 14) = mword_of_int perm ->
+  mappages_perm_ok perm ->
+  (uint va + Z.of_nat npages * 4096 <= 2 ^ 38)%Z ->
+  (uint pa + Z.of_nat npages * 4096 < 2 ^ 56)%Z ->
+  pt_rep0 t m ->
+  (forall i, (i < npages)%nat -> m !! vpn_at vpn0 i = None) ->
+  (* order premise at the lowest rank this cone reaches. *)
+  locks_below lks "kmem" ->
+  sie_cap_gpr kt mm K b p -∗
+  cpu_own lvl eb p b lks -∗ kernel_text -∗
+  pc_is (mword_of_int KernelSyms.mappages) -∗
+  ptree_own 2 (DfracOwn 1) t -∗
+  kalloc_env_at γa γk on -∗
+  (* THE LEND (permit sweep L2): the caller's event counter, for the
+     allocator the callee reaches *)
+  act_lend p k -∗
+  wp_next b p (fun (CID : CpuId) =>
+    ∀ (mr : regfile) (t' : ptree) (nm : nat) (g : nat),
+    sie_cap_gpr kt mr K b p -∗
+    cpu_own lvl eb p b lks -∗
+    (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend p k') -∗
+    pc_is ret_tgt -∗
+    ptree_own 2 (DfracOwn 1) t' -∗
+    ⌜pt_nodes t' = (pt_nodes t + g)%nat⌝ -∗
+    kalloc_env_at γa γk (avail_sub on g) -∗
+    ⌜callee_saved mm mr⌝ -∗
+    ⌜pt_base t' = pt_base t⌝ -∗
+    ⌜pt_rep0 t' (pt_insert_run m vpn0 ppn0 perm nm)⌝ -∗
+    ⌜pt_present_mono t t'⌝ -∗
+    ⌜(g <= pt_missing t vpn0 npages)%nat⌝ -∗
+    ⌜ (nm = npages /\ mr !!! Regidx (mword_of_int 10) = mword_of_int 0)
+      \/ ((nm < npages)%nat /\
+          mr !!! Regidx (mword_of_int 10) = mword_of_int (-1) /\
+          avail_zero (avail_sub on g)) ⌝ -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type MAPPAGES.
+  Parameter wp_mappages_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (kt : ktier) (γa : gname) (γk : gname * gname) (mm : regfile) (t : ptree) (m : gmap (mword 27) (mword 64)) (npages : nat) (perm : Z) (lvl K : nat) (eb : bool) (p : mword 64) (on : option nat) (b : bool) (lks : gset string) (k : nat),
+      wp_mappages_sconf_body kt γa γk mm t m npages perm lvl K eb p on b lks k.
+End MAPPAGES.

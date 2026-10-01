@@ -1,0 +1,2038 @@
+(* UexecExecInst.v -- THE KERNEL-SIDE INSTANCE of the per-syscall deposit
+   class [UexecSG.uexecSG], and of the generic program's [UexecSG.uprogSG]
+   beside it.
+
+   UexecSG.v states the U-mode trap contract's returning arm over an
+   ambient class whose family
+   [sbundle : (uvis -d> iPropO Σ) -> Z -> uvis -> iProp Σ] says what the
+   program hands over at an ecall of number [n], AT THE RECURSIVE
+   OCCURRENCE: exec's bundle carries a slot wand, so the family is applied
+   to the fixpoint variable and at the fixpoint it concludes at [uslot] --
+   the slot the kernel returns for the new process.  The class is what
+   keeps the whole U-mode fixpoint's cone clear of the fs tower.  THIS file
+   is where the two meet.
+
+   WHICH NUMBERS HAVE A BUNDLE.  Nine: read 5, exec 7, chdir 9, open 15,
+   write 16, mknod 17, unlink 18, link 19, mkdir 20 -- every syscall with an
+   AU contract.  Each branch is that contract's own landed INPUT, read off
+   the key: the process's families, the image, the three argument words, the
+   descriptor view and the working directory, and nothing else.  Every other
+   number's [sbundle_at] is [emp].
+
+   WHICH NUMBERS PAY A POST.  Eight: read 5, chdir 9, open 15, write 16,
+   mknod 17, unlink 18, link 19, mkdir 20.  Six of them pay that contract's
+   own armed post verbatim, read off the same key projections its input is;
+   chdir and open pay their contract's RECEIPT ([SpecSysChdir.chdir_receipt],
+   [SpecSysOpen.open_receipt]) -- the process-nameable half of the arms,
+   whose kernel half ([ProcInv.proc_priv], the descriptor fragments,
+   [FdSlots.fd_slot]) the dispatcher keeps.  exec 7 pays [emp], and alone:
+   its bundle is consumed and its process never resumes on success.  Every
+   number without a contract pays [emp] too.
+
+   THE POST IS READ AT THE RESUME KEY, which is what makes the three
+   receipts statable: read's whole effect on its caller is the bytes it put
+   in the caller's buffer, which are entries of the image it resumes at
+   ([M']); chdir's is the working directory it resumes at ([cw']) and
+   open's is one row of the descriptor table it resumes at ([fdv']); none
+   is a projection of the TRAP key.  So [UexecSG.spost_at] takes all three
+   beside the returned a0, bound by the same [∀] of the arm that binds the
+   four pure rows, and the receipts SHARPEN the rows
+   [UsysMemOk.usys_mem_ok], [usys_cwd_ok] and [usys_fd_ok] state there:
+   "the file's bytes from your offset" rather than "some byte function",
+   "the directory you named" rather than "a failed chdir did not move", and
+   "the console, at your omode" rather than "some slot became open".  The
+   route back to the process is [SpecUsertrap.ut_sys_out] as a row of
+   [usertrap_post], produced by the dispatcher's
+   [SpecSyscall.sysc_sys_out].
+
+   THE DEPOSIT'S FAMILIES ([UexecSG.sfam]) are a RECORD with one field per
+   contracted syscall, so that the arm can bind them once in front of both
+   legs and the post comes back at the receipts the process chose.  At this
+   instance the record is [xfam]: exec's four, and the walk cursors, piece
+   pairs, write's prefix cursor and console seed the other eight contracts
+   take.  [xfam_exec] builds one at exec's four with every other field at
+   the trivial family -- which is exactly what the two supply laws hand
+   back, since those laws ARE [FsAbsInvFire]'s dischargers.
+
+   THE DESCRIPTOR KEY IS [FdSlots.fd_st_of_key], NOT [sys_fd_st], and that
+   is what makes read's and write's bundles statable here at all: [sys_fd_st]
+   reads the process's [ofile] POINTER array, a kernel-side reading no
+   process has.  [SpecArgfd.sys_fd_st_of_key] is the equation between the
+   two and the DISPATCHER pays it, out of the fragment length,
+   [ProcInv.proc_priv]'s length and [ProcInv.proc_priv_states_agree]
+   ([ProofSyscall.sysc_fd_key]).
+
+   NOTHING HERE READS A [CtxIdDefs.CurCtx], and that is a requirement rather
+   than an accident (the section note below).  Getting there cost the dead
+   context binders on [FsAbsDelta.delta_trunc],
+   [SysOpenDefs.atrunc_commit_at] and the [om_*] mode readers,
+   [SpecSysOpen.open_in] and [SpecSysMkdir.mkdir_au_at]/[mkdir_arms] --
+   TSO-rebase appends that no body ever read.
+
+   WHAT EXEC'S BUNDLE IS.  [SpecSysExec.sys_exec_au_pre] at the TRAPPING
+   KEY's own data -- and open's and mknod's rows (15 and 17) read the same
+   two, the image and argument 0, for the same reason: their walks are at
+   the path THEIR argument 0 names ([ArgPath.arg_path_of]):
+     - the image [uvis_M W]: the arguments are read off the image the
+       process trapped at ([wp_sys_exec_sconf_body] takes the bundle at
+       [us_M U], and the trap-out key's image IS that image -- the loop
+       hands [uvis_M W] to the dispatcher);
+     - the argv pointer [tf_w (uvis_tf W) (tf_arg_idx 1)]: sys_exec's
+       argument 1, read off the key's trapframe.  ([wp_sys_exec_sconf_body]
+       names it [v1] and pins it by [pv_tf (us_V U) !! tf_arg_idx 1 =
+       Some v1]; [tf_w] is the total reader of the same word.)
+     - the descriptor view [uvis_fd W] as [sts]: the table the NEW process
+       starts with is the one the caller had, which is exactly the key's
+       ([exec_slot_pre]'s [sts] rides straight into [exec_key U' sts na]).
+   The ghost/logical parameters [P], [Pmiss], [Fo] and the slot piece's
+   refund are EXISTENTIAL here: the U-mode contract cannot name the
+   caller's era predicates, so the arm says only "some AU bundle at this
+   key", and the dispatch route re-binds them when it consumes the bundle.
+
+   THE KEY CONGRUENCE is [UexecSG.skey_eq]'s six rows: the bundle reads the
+   image, argument word 1, the descriptor view and the working directory,
+   and nothing else off its key.
+
+   MONOTONICITY IN THE SLOT FAMILY is the one field whose proof is not a
+   projection: the family occurs only as the CONCLUSION of the slot piece's
+   two wands (one per success arm), so the upgrader walks in under
+   [sys_exec_slot_pre]'s ∀s and [PieceFam.pf_at]'s [∧]-refund, twice.
+
+   THE SUPPLY [ssupply] IS THE APPLICATION'S PREDICATE HELD OF EVERY VIEW
+   ([AppInv.app_sup]).  That is the credential an UNVERIFIED program runs
+   on: it is what makes a view-moving commit's [AppInv.app_step] free, and
+   so what every syscall bundle with a write-kind commit is paid out of.
+   Exec's own bundle needs none of it -- [FsAbsInvFire.fsabs_exec_half]
+   hands back the walk premise and open's commit at [True] receipts as a
+   closed fact, and a generic slot family answers the slot wand at every
+   key -- which is why both supply laws below still ignore their argument.
+   The supply is spelled here anyway, because it is what the OTHER numbers'
+   bundles will be paid from when they are turned on, and because the
+   credential has to exist before the dischargers can be re-based on it.
+   That is also why this file sits ABOVE the fire tower rather than beside
+   SpecSysExec.v: the supply law is a class field, and its exec case is
+   [fsabs_exec_half].
+
+   WHERE THE SUPPLY COMES FROM, AND WHY IT IS NOT PARKED.  It is founded
+   by the GENERIC application alone, out of the triviality of its own
+   predicate ([AppInv.app_sup_of_triv]), at the one place that needs it:
+   its discharge of the system theorem's [Hinit_boot]
+   ([SystemAdequacy.init_boot_of_sup]), which mints the generic slot on it.
+   It cannot ride an era-owned resource -- see [AppInv]'s [app_sup_raw] --
+   because a constraining application cannot found it, and it appears in no
+   kernel contract for the same reason.
+
+   [Γ] and [γfs] are NOT existential: the whole tree runs at the single
+   ambient file system ([FsCfg.fsc_fs] with the derived view names
+   [FsBytesGamma.fs_gamma_L fsc_fs]), exactly as [wp_sys_exec_sconf_body]
+   pins them. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import FdSlots.
+Require Import ProcGeom.       (* [tf_arg_idx]                        *)
+Require Export SwtchCtx.
+Require Import Xv6Cameras.
+Require Import IrefSlots.
+Require Import FileInvDefs.
+Require Import UserFd.         (* [ufdG]                              *)
+Require Import UserPtTree.     (* [uptd] / [ud_um] -- row 5's table    *)
+Require Import UserPerm.       (* [perm_of] -- and the key's projection *)
+Require Import UexecSlot.      (* [uvis] / [tf_w]                     *)
+Require Import UsysMemOk.      (* [USYS_exec] -- the one number with a bundle *)
+Require Import UexecSG.        (* [uexecSG] / [uprogSG] -- the class   *)
+Require Import SpecSysExec.  (* [sys_exec_au_pre]                   *)
+Require Import SpecKexec.    (* [exec_slot_pre] -- the piece the
+                                  monotonicity walks through          *)
+Require FsAbsEra.              (* [ex_start] / [ax_hops_triv]: the walk
+                                  one-shot at ONE path, which is the form
+                                  exec's bundle states                    *)
+Require Import FsAbsInvFire.   (* [fsabs_exec_half] and the eight other
+                                  numbers' dischargers, all out of the
+                                  supply                              *)
+Require Import SpecFileread.   (* [fileread_in] / [fileread_extra]    *)
+Require Import SpecFilewrite.  (* [filewrite_in] / [filewrite_extra]  *)
+Require Import SpecSysRead.    (* [sys_rw_count]                      *)
+Require Import SpecFileclose.  (* [fileclose_cpay] / [fileclose_cpost_any]: close's pipe row *)
+Require Import PipeReg.        (* [pipe_row_reg]: THE REGISTRY -- what a run
+                                  carries per table row so that its exit can
+                                  pay (design/app-pipe.md SS2) *)
+Require Import PipeQueue.      (* [pipe_qfrag] / [pst0]: pipe's post *)
+Require Import SpecSysChdir.   (* [chdir_au_pre]                      *)
+Require Import SpecSysOpen.    (* [open_in]                           *)
+Require Import SpecSysMknod.   (* [mknod_au_pre] / [mknod_arms]       *)
+Require Import SysMknodDefs. (* [dev_arg]                           *)
+Require Import SpecSysUnlink.  (* [unlink_au_at] / [unlink_arms]     *)
+Require Import SpecSysLink.    (* [link_commits] / [link_arms]        *)
+Require Import SpecSysMkdir.   (* [mkdir_au_at] / [mkdir_arms]       *)
+Require Import SyncHook.       (* [hook_opt] / [Q_opt]: sync's row 22 *)
+Require Import FsTree.         (* [fname]                             *)
+Require Import WpUart.         (* [cons_licence] -- the OUTPUT LICENCE the
+                                  generic supply carries (lane OUT-FUPD) *)
+Require Import AppInv.         (* [app_sup] -- THE SUPPLY.  Required
+                                  DIRECTLY: the definition is named in a
+                                  class field's body                   *)
+Require Import PieceFam.       (* [pfam]: the one-shot piece's pair *)
+Require Import FsAbsDefs.          (* LAST (FsAbs's own rule)             *)
+Require Import FsBytesGamma.   (* [fs_gamma_L]                        *)
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.
+Require Import FsCfg.
+Import Defs.
+
+Local Open Scope Z_scope.
+
+Section UexecExecInst.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+            !irefslotG Σ, !pavG Σ, !wchG Σ, !ufdG Σ}.
+  (* NO AMBIENT [CurCtx], AND THAT IS A REQUIREMENT, not a convenience.  The
+     instance is what [UexecRet.uslot] is indexed by, and [uslot] rides
+     through the park ([ParkCap.park_token] reads it) and every other place
+     two proofs at two hart contexts meet.  A context-indexed class makes
+     those two slots DIFFERENT terms that print identically, and the unifier
+     does not stop.  A process's deposit does not depend on the context of
+     the kernel proof that consumes it, and the chain the exec bundle names
+     ([SpecSysExec.sys_exec_au_pre] down to [SysOpenDefs]'s pieces) does
+     not read one. *)
+  Context `{GEN : GenId}.
+
+  (* ================================================================== *)
+  (* THE DEPOSIT'S FAMILIES, as one record.                               *)
+  (*                                                                      *)
+  (* One field per syscall whose contract takes caller-chosen families.    *)
+  (* The arm binds the whole record ONCE in front of both legs, so what a  *)
+  (* process gets back is a post at the very receipts and refunds it       *)
+  (* deposited.  Exec's four are the only ones here -- its walk cursor and *)
+  (* miss predicate, its observation pair, and the slot piece's refund --  *)
+  (* because exec is the only number with a bundle at this round.          *)
+  (*                                                                      *)
+  (* NOT [Z]-INDEXED (UexecSG.v's header): a record makes [f] a plain      *)
+  (* value with no dependency, which is what keeps the fixpoint's          *)
+  (* contractivity proof and the trap route's transport free of [eq_rect]. *)
+  (* ================================================================== *)
+  Record xfam : Type := MkXfam {
+    (* ---- exec (7) ---- *)
+    xf_P     : nat -> Z -> iProp Σ;
+    xf_Pmiss : nat -> Z -> iProp Σ;
+    xf_Fo    : pfam Σ (aview -> Z -> anode -> iProp Σ);
+    xf_Rs    : iProp Σ;
+    (* ---- read (5): one piece, one receipt ---- *)
+    rf_F     : pfam Σ (aview -> nat -> anode -> nat -> iProp Σ);
+    (* ---- chdir (9): the walk and the terminal observation ---- *)
+    cf_P     : nat -> Z -> iProp Σ;
+    cf_Pmiss : nat -> Z -> iProp Σ;
+    cf_Fo    : pfam Σ (aview -> Z -> anode -> iProp Σ);
+    (* ---- open (15): the walk, create's four legs, the two commits ---- *)
+    of_P     : nat -> Z -> iProp Σ;
+    of_Pmiss : nat -> Z -> iProp Σ;
+    of_Farm  : pfam Σ (aview -> Z -> iProp Σ);
+    of_Fun   : pfam Σ (aview -> Z -> iProp Σ);
+    of_Fok   : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    of_Fex   : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    of_Fo    : pfam Σ (aview -> Z -> anode -> iProp Σ);
+    of_Ft    : pfam Σ (aview -> Z -> list (bv 8) -> iProp Σ);
+    (* ...AND THE OFFSET MODE THE CALLER'S OPEN INSTALLS (lane OFF-LINK-6's
+       L4).  A field of the FAMILY, not of the syscall's arguments: which
+       mode a program's opens run at is a property of the PROGRAM, and the
+       kernel reads it here and publishes at it.  Every landed family sets
+       it to [OffParked], which is what keeps the tree application's open
+       path byte-for-byte what it was. *)
+    of_om    : offmode;
+    (* ---- write (16): the chain's PREFIX CURSOR.  ONE FIELD FOR BOTH
+       ARMS since lane OUT-FUPD: the console arm is now a chain over the
+       same cursor family (one node per BYTE, [SpecConsolewrite.
+       cons_out_chain]) instead of a trace seed plus a located receipt, so
+       the trace-seed field is gone with the receipts it fed. ---- *)
+    wf_Q     : nat -> iProp Σ;
+    (* ---- mknod (17) ---- *)
+    nf_P     : nat -> Z -> iProp Σ;
+    nf_Pmiss : nat -> Z -> iProp Σ;
+    nf_Farm  : pfam Σ (aview -> Z -> iProp Σ);
+    nf_Fun   : pfam Σ (aview -> Z -> iProp Σ);
+    nf_Fok   : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    nf_Fex   : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    (* ---- unlink (18) ---- *)
+    uf_P     : nat -> Z -> iProp Σ;
+    uf_Pmiss : nat -> Z -> iProp Σ;
+    uf_Fent  : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    uf_Ftgt  : pfam Σ (aview -> Z -> iProp Σ);
+    uf_Fex   : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    uf_Fmiss : pfam Σ (aview -> Z -> fname -> iProp Σ);
+    (* ---- link (19): three commits, no walk (the contract keeps its own) ---- *)
+    lf_Ftgt  : pfam Σ (aview -> Z -> anode -> iProp Σ);
+    lf_Fent  : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    lf_Funt  : pfam Σ (aview -> Z -> iProp Σ);
+    (* ---- mkdir (20): create at T_DIR, so the DOTS leg is real ---- *)
+    df_P     : nat -> Z -> iProp Σ;
+    df_Pmiss : nat -> Z -> iProp Σ;
+    df_Farm  : pfam Σ (aview -> Z -> iProp Σ);
+    df_Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ);
+    df_Fun   : pfam Σ (aview -> Z -> iProp Σ);
+    df_Fok   : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    df_Fex   : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ);
+    (* ---- fork (1): THE CHILD'S EXIT PAYLOAD ([UexecSG.sfork_pay]) ----
+       What the process's child owes it back at exit, as a function of the
+       status.  A field of the FAMILIES and not a parameter of fork's rows
+       because the trap route splits a return into its deposit and its arm
+       and carries them past each other, and [f] is the one value that
+       travels with both -- see [UexecSG.v]'s [sfork_pay].  LAST, so every
+       positional builder only gained a trailing argument. *)
+    kf_pay   : Z -> iProp Σ;
+    (* ---- fork (1), second piece: WHAT THE PARENT LENDS ITS CHILD
+       ([UexecSG.sfork_lend]) ---- The resource the forking process hands
+       the child to run WITH, as opposed to what the child's exit owes
+       back ([kf_pay]).  A field of the FAMILIES for [kf_pay]'s reason and
+       more sharply: the lend goes DOWN on fork's deposit and comes BACK
+       on fork's failing arm, and [f] is the one value that travels with
+       both.  A generic process lends nothing ([emp]).  LAST, so every
+       positional builder only gained a trailing argument. *)
+    kf_lend  : iProp Σ;
+    (* ---- exit (2): THIS PROCESS'S OWN EXIT PAYLOAD
+       ([UexecSG.sexit_pay]) ---- What the process's own exit owes its
+       parent, on [kf_pay]'s footing and for its reason: the deposit pays
+       it and the arm reads it back, and [f] is what carries the two past
+       each other.  LAST, again. *)
+    kf_xpay  : Z -> iProp Σ;
+    (* ---- read (5), second piece: WHAT THE CALLER ASKS TO BE TOLD ABOUT
+       THE CONSOLE WINDOW ---- (app-echo.md, lane CONS-CURSOR, C3, and the
+       LEASE ruling).  A read of the console takes
+       [ConsoleInv.cons_acc fsc_cons app_sup (rf_ret f)] -- ONE ARM, whose
+       two disjuncts are a lease holder's token and a tainted caller's
+       credential -- and pays [rf_ret f cur dc] back: the position the
+       ring's committed sequence stood at, and the advance the cursor made.
+       A lease holder chooses "[cur] is my own [n], and here is my token
+       back at [cur + dc]"; a generic process chooses [fun _ _ => True].
+       A FIELD OF THE FAMILIES because the process CHOOSES it when it builds
+       an explicit deposit; the kernel only relays it.  LAST, so every
+       positional builder only gained a trailing argument. *)
+    rf_ret   : nat -> nat -> iProp Σ;
+    (* ---- read (5), third piece: WHAT THE CALLER ASKS TO BE TOLD ABOUT
+       THE INPUT IT CONSUMED ---- (app-echo.md, lane CONS-IO, milestone B,
+       B4).  The application owns the console UART's accepted-input log and
+       the sequence delivered out of it ([RiscvPtsto.riscv_cons_res]); a
+       console read moves the second, and it moves it through ONE fupd the
+       process supplies -- [WpUart.cons_read_pay (rf_in f)], carried on
+       read's deposit beside the ring's payment and fired by consoleread at
+       its final release.  [rf_in f ws] is what comes back, at the window
+       the call actually consumed, in [SpecFileread.console_receipt]'s
+       clean arm.  A generic process chooses [fun _ => True] and the
+       generic slot pays it from the input licence its supply already
+       holds ([FsAbsInvFire.fsabs_fileread_in]).
+       LAST, so every positional builder only gained a trailing argument. *)
+    rf_in    : list (list mobs * bv 8) -> iProp Σ;
+    (* ---- THE PIPE'S FOUR (design/pipe.md, "The byte queue"), LAST so every
+       positional builder only gained trailing arguments.  read (5): the
+       caller's cursor over the bytes it takes out of a pipe and its
+       observation at an empty stop; write (16): its observation at a shut
+       read end (the write cursor is [wf_Q]); close (21): the payload its
+       close link hands back at the end's last close.  A generic process
+       claims nothing at any of them, and the generic supply pays every pipe
+       arm out of the TAINT ([FsAbsInvFire]). ---- *)
+    rf_pq    : list (bv 8) -> iProp Σ;
+    rf_pqe   : list (bv 8) -> pipe_st -> iProp Σ;
+    wf_Qe    : nat -> pipe_st -> iProp Σ;
+    cl_P     : iProp Σ;
+    (* ---- sync (22): THE HOOK'S PROMISED [Q] (claude-notes/design/sync.md
+       section 4.3 item 4), [None] when the process deposits no hook.  The
+       deposit's row is [SyncHook.hook_opt gen_id] of it and the post's
+       [SyncHook.Q_opt] of it, so at [None] both rows are [emp] and 22
+       stays a free number.  LAST, so every positional builder only gained
+       a trailing argument. ---- *)
+    sy_oQ    : option (iProp Σ);
+  }.
+
+  (* THE RE-KEYING ([UexecSG.sfam_at]): the same families at another
+     payload.  Every other field passes through, so the two bundle rows are
+     unmoved and a leaf can take its supplier's [f] and put its own
+     [UkRun.ukn_pay] in it. *)
+  Definition xfam_at (Q : Z -> iProp Σ) (f : xfam) : xfam :=
+    {| xf_P := xf_P f; xf_Pmiss := xf_Pmiss f; xf_Fo := xf_Fo f;
+       xf_Rs := xf_Rs f;
+       rf_F     := rf_F f;
+       cf_P     := cf_P f; cf_Pmiss := cf_Pmiss f; cf_Fo := cf_Fo f;
+       of_P     := of_P f; of_Pmiss := of_Pmiss f;
+       of_Farm  := of_Farm f; of_Fun := of_Fun f; of_Fok := of_Fok f;
+       of_Fex   := of_Fex f; of_Fo := of_Fo f; of_Ft := of_Ft f;
+       of_om    := of_om f;
+       wf_Q     := wf_Q f;
+       nf_P     := nf_P f; nf_Pmiss := nf_Pmiss f;
+       nf_Farm  := nf_Farm f; nf_Fun := nf_Fun f; nf_Fok := nf_Fok f;
+       nf_Fex   := nf_Fex f;
+       uf_P     := uf_P f; uf_Pmiss := uf_Pmiss f;
+       uf_Fent  := uf_Fent f; uf_Ftgt := uf_Ftgt f; uf_Fex := uf_Fex f;
+       uf_Fmiss := uf_Fmiss f;
+       lf_Ftgt  := lf_Ftgt f; lf_Fent := lf_Fent f; lf_Funt := lf_Funt f;
+       df_P     := df_P f; df_Pmiss := df_Pmiss f;
+       df_Farm  := df_Farm f; df_Fdots := df_Fdots f; df_Fun := df_Fun f;
+       df_Fok   := df_Fok f; df_Fex := df_Fex f;
+       kf_pay   := kf_pay f;
+       kf_lend  := kf_lend f;
+       kf_xpay  := Q;
+       rf_ret   := rf_ret f;
+       rf_in    := rf_in f;
+       rf_pq    := rf_pq f;
+       rf_pqe   := rf_pqe f;
+       wf_Qe    := wf_Qe f;
+       cl_P     := cl_P f;
+       sy_oQ    := sy_oQ f |}.
+
+  (* THE RECORD AT EXEC'S FOUR AND THE TRIVIAL FAMILIES ELSEWHERE.  The
+     eight other numbers' fields are spelled at exactly the families the
+     [FsAbsInvFire] dischargers produce, because that is what the two supply
+     laws below hand back: a process that answers for no abstract state gets
+     its bundles AT THIS RECORD. *)
+  Definition xfam_exec_at (P Pmiss : nat -> Z -> iProp Σ)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (Rs : iProp Σ)
+      (pay : Z -> iProp Σ) (lend : iProp Σ) : xfam :=
+    {| xf_P := P; xf_Pmiss := Pmiss; xf_Fo := Fo; xf_Rs := Rs;
+       rf_F     := pfam_triv (fun _ _ _ _ => True%I);
+       cf_P     := fun _ _ => True%I;
+       cf_Pmiss := fun _ _ => True%I;
+       cf_Fo    := pfam_triv (fun _ _ _ => True%I);
+       of_P     := fun _ _ => True%I;
+       of_Pmiss := fun _ _ => True%I;
+       of_Farm  := pfam_triv (fun _ _ => True%I);
+       of_Fun   := pfam_triv (fun _ _ => True%I);
+       of_Fok   := pfam_triv (fun _ _ _ _ => True%I);
+       of_Fex   := pfam_triv (fun _ _ _ _ => True%I);
+       of_Fo    := pfam_triv (fun _ _ _ => True%I);
+       of_Ft    := pfam_triv (fun _ _ _ => True%I);
+       of_om    := OffParked;
+       wf_Q     := fun _ => True%I;
+       nf_P     := fun _ _ => True%I;
+       nf_Pmiss := fun _ _ => True%I;
+       nf_Farm  := pfam_triv (fun _ _ => True%I);
+       nf_Fun   := pfam_triv (fun _ _ => True%I);
+       nf_Fok   := pfam_triv (fun _ _ _ _ => True%I);
+       nf_Fex   := pfam_triv (fun _ _ _ _ => True%I);
+       uf_P     := fun _ _ => True%I;
+       uf_Pmiss := fun _ _ => True%I;
+       uf_Fent  := pfam_triv (fun _ _ _ _ => True%I);
+       uf_Ftgt  := pfam_triv (fun _ _ => True%I);
+       uf_Fex   := pfam_triv (fun _ _ _ _ => True%I);
+       uf_Fmiss := pfam_triv (fun _ _ _ => True%I);
+       lf_Ftgt  := pfam_triv (fun _ _ _ => True%I);
+       lf_Fent  := pfam_triv (fun _ _ _ _ => True%I);
+       lf_Funt  := pfam_triv (fun _ _ => True%I);
+       df_P     := fun _ _ => True%I;
+       df_Pmiss := fun _ _ => True%I;
+       df_Farm  := pfam_triv (fun _ _ => True%I);
+       df_Fdots := pfam_triv (fun _ _ _ _ => True%I);
+       df_Fun   := pfam_triv (fun _ _ => True%I);
+       df_Fok   := pfam_triv (fun _ _ _ _ => True%I);
+       df_Fex   := pfam_triv (fun _ _ _ _ => True%I);
+       kf_pay   := pay;
+       (* ...and what it lends its child, which a generic builder leaves
+          at [emp]: only a leaf that hands its child a protocol token
+          names one ([xfam_pay]). *)
+       kf_lend  := lend;
+       (* the process's OWN payload is the trivial one at every builder
+          here: a leaf that has a real one re-keys with [xfam_at]. *)
+       kf_xpay  := fun _ => True%I;
+       (* A GENERIC PROCESS CLAIMS NOTHING ABOUT THE CONSOLE WINDOW, and is
+          told nothing: at [fun _ _ => True] read's console arm is the
+          TAINTED disjunct of [ConsoleInv.cons_acc], payable out of
+          [AppInv.app_sup] alone, which is what keeps
+          [xv6_sbundle_of_supply_ne] -- the generic slot's supply law, a
+          FIELD of [UexecSG]'s class, stated at [□ ssupply] -- provable at
+          n = 5. *)
+       rf_ret   := fun _ _ => True%I;
+       (* ...AND IT CLAIMS NOTHING ABOUT WHAT IT READ EITHER, so read's
+          input link is payable out of [WpUart.cons_licence] alone -- which
+          is what keeps [xv6_sbundle_of_supply_ne] provable at n = 5. *)
+       rf_in    := fun _ => True%I;
+       (* ...and nothing about any pipe: the four arms are then payable out
+          of the taint the supply carries *)
+       rf_pq    := fun _ => True%I;
+       rf_pqe   := fun _ _ => True%I;
+       wf_Qe    := fun _ _ => True%I;
+       cl_P     := True%I;
+       (* ...and no sync hook: row 22 is [emp] at every generic builder *)
+       sy_oQ    := None |}.
+
+  (* ...AT THE TRIVIAL PAYLOAD, which is what every generic process forks
+     with: a generic child's exit owes its parent nothing.  The four-argument
+     name is unchanged, so no discharger moved. *)
+  Definition xfam_exec (P Pmiss : nat -> Z -> iProp Σ)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (Rs : iProp Σ) : xfam :=
+    xfam_exec_at P Pmiss Fo Rs (fun _ => True%I) emp%I.
+
+  (* the point, for the arms that carry no deposit *)
+  Definition xfam_pt : xfam :=
+    xfam_exec (fun _ _ => True%I) (fun _ _ => True%I)
+              (pfam_triv (fun _ _ _ => True%I)) True%I.
+
+  (* ...AND THE POINT AT A CHOSEN PAYLOAD, which is all a fork leaf needs:
+     fork's rows read no other field of the families
+     ([UexecSG.sfam_pay]). *)
+  Definition xfam_pay (Q : Z -> iProp Σ) (Rc : iProp Σ) : xfam :=
+    xfam_exec_at (fun _ _ => True%I) (fun _ _ => True%I)
+                 (pfam_triv (fun _ _ _ => True%I)) True%I Q Rc.
+
+  (* ...AND THE SAME FAMILIES WITH A SYNC HOOK (sync K4): [f] with its
+     row-22 field replaced, every other field passed through -- what a
+     process that deposits a hook at [sync()] names
+     ([UkSyncEntry.ksync_leaf_xv6]). *)
+  Definition xfam_sy (oQ : option (iProp Σ)) (f : xfam) : xfam :=
+    {| xf_P := xf_P f; xf_Pmiss := xf_Pmiss f; xf_Fo := xf_Fo f;
+       xf_Rs := xf_Rs f;
+       rf_F     := rf_F f;
+       cf_P     := cf_P f; cf_Pmiss := cf_Pmiss f; cf_Fo := cf_Fo f;
+       of_P     := of_P f; of_Pmiss := of_Pmiss f;
+       of_Farm  := of_Farm f; of_Fun := of_Fun f; of_Fok := of_Fok f;
+       of_Fex   := of_Fex f; of_Fo := of_Fo f; of_Ft := of_Ft f;
+       of_om    := of_om f;
+       wf_Q     := wf_Q f;
+       nf_P     := nf_P f; nf_Pmiss := nf_Pmiss f;
+       nf_Farm  := nf_Farm f; nf_Fun := nf_Fun f; nf_Fok := nf_Fok f;
+       nf_Fex   := nf_Fex f;
+       uf_P     := uf_P f; uf_Pmiss := uf_Pmiss f;
+       uf_Fent  := uf_Fent f; uf_Ftgt := uf_Ftgt f; uf_Fex := uf_Fex f;
+       uf_Fmiss := uf_Fmiss f;
+       lf_Ftgt  := lf_Ftgt f; lf_Fent := lf_Fent f; lf_Funt := lf_Funt f;
+       df_P     := df_P f; df_Pmiss := df_Pmiss f;
+       df_Farm  := df_Farm f; df_Fdots := df_Fdots f; df_Fun := df_Fun f;
+       df_Fok   := df_Fok f; df_Fex := df_Fex f;
+       kf_pay   := kf_pay f;
+       kf_lend  := kf_lend f;
+       kf_xpay  := kf_xpay f;
+       rf_ret   := rf_ret f;
+       rf_in    := rf_in f;
+       rf_pq    := rf_pq f;
+       rf_pqe   := rf_pqe f;
+       wf_Qe    := wf_Qe f;
+       cl_P     := cl_P f;
+       sy_oQ    := oQ |}.
+
+  (* ================================================================== *)
+  (* THE KEY'S THREE ARGUMENT WORDS, named once.  A bundle reads nothing  *)
+  (* else off the key but the image, the descriptor view and the cwd, and *)
+  (* that is exactly [UexecSG.skey_eq]'s six rows.                        *)
+  (* ================================================================== *)
+  Definition xk_a (W : uvis) (i : nat) : mword 64 := tf_w (uvis_tf W) (tf_arg_idx i).
+
+  (* what the program hands over at its exec ecall, at the trapping key
+     [W] and at ITS OWN families [f]; the bundle's slot wand concludes at
+     [X], the recursive occurrence (see the header) *)
+  (* THE PAY FACT RIDES IN THE BUNDLE.  exec builds a slot for the NEW
+     image, and a slot is keyed by what its process's exit owes
+     ([UkRun.ukn_pay]); exec keeps the process's generation, so the fact
+     the depositing process holds is the fact that slot needs -- and the
+     kernel can only hand it to [SpecKexec.exec_slot_pre]'s wands if it
+     was given it. *)
+  (* AT THE FAMILY'S OWN EXIT PAYLOAD [kf_xpay] ([UexecSG.sexit_pay]),
+     BECAUSE exec KEEPS THE PROCESS.  The image the kernel loads is a new
+     PROGRAM at the same process -- same generation
+     ([KexecDefs.KexecOkQ]'s [pv_gen V' = pv_gen V]), same parent, same
+     debt -- so the payload the new image's run holds IS this process's
+     own: the one its exit will pay ([UkRun.ukn_pay]) and the one the trap
+     route is carrying across this very call ([SpecSyscall.sysc_pay_in],
+     at [sexit_pay f]).  [kf_pay] ([UexecSG.sfork_pay]) is a DIFFERENT
+     payload -- what a CHILD's exit owes its parent -- and belongs to
+     fork, where a second process really is created.  The consequence is
+     CONS-ROUTE's at read, one syscall over: exec's bundle READS the
+     payload, so re-keying is no longer an identity here
+     ([UexecSG.sbundle_at_at] is guarded off exec as well as read) and
+     every supplier names its payload up front ([sbundle_pay_exec_intro],
+     [UkRun.uxsup]). *)
+  Definition exec_sbundle (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      : iProp Σ :=
+    (my_pay (uvis_gen W) (kf_xpay f) ∗
+     sys_exec_au_pre (MkPfam X (xf_Rs f)) (fs_gamma_L fsc_fs) fsc_fs
+       (uvis_cwd W) (uvis_secc W) (kf_xpay f) (xf_P f) (xf_Pmiss f) (xf_Fo f)
+       (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+       (tf_w (uvis_tf W) (tf_arg_idx 1)) (uvis_fd W) (uvis_ch W) (uvis_pid W))%I.
+
+  Lemma exec_sbundle_ne (n : nat) :
+    Proper (dist n ==> eq ==> eq ==> dist n) exec_sbundle.
+  Proof using .
+    intros X Y HXY f ? <- W ? <-. rewrite /exec_sbundle.
+    (* the pay row does not mention the slot predicate, so it is untouched
+       by the distance; only the AU half moves *)
+    rewrite (sys_exec_au_pre_ne n X Y (xf_Rs f) (fs_gamma_L fsc_fs) fsc_fs
+               (uvis_cwd W) (uvis_secc W) (kf_xpay f) (xf_P f) (xf_Pmiss f) (xf_Fo f)
+               (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+               (tf_w (uvis_tf W) (tf_arg_idx 1)) (uvis_fd W) (uvis_ch W) (uvis_pid W) HXY).
+    reflexivity.
+  Qed.
+
+  (* THE GENERATION IS A PREMISE NOW, beside the five readings the AU half
+     uses: the bundle carries the depositing process's pay fact, which is
+     keyed at the key's own generation ([UexecSG.skey_eq] carries the
+     equality, so no caller gains an obligation). *)
+  Lemma exec_sbundle_cong (X : uvis -d> iPropO Σ) (f : xfam) (W W' : uvis) :
+    uvis_M W = uvis_M W' ->
+    tf_w (uvis_tf W) (tf_arg_idx 0) = tf_w (uvis_tf W') (tf_arg_idx 0) ->
+    tf_w (uvis_tf W) (tf_arg_idx 1) = tf_w (uvis_tf W') (tf_arg_idx 1) ->
+    uvis_fd W = uvis_fd W' ->
+    uvis_cwd W = uvis_cwd W' ->
+    uvis_gen W = uvis_gen W' ->
+    (* ...and the two identity readings the AU half now carries (lane
+       EXEC-SEAM); [UexecSG.skey_eq] pins both *)
+    uvis_ch W = uvis_ch W' ->
+    uvis_pid W = uvis_pid W' ->
+    (* ...and the mask, which the slot piece's pin names (upstream a083670) *)
+    uvis_secc W = uvis_secc W' ->
+    exec_sbundle X f W ⊣⊢ exec_sbundle X f W'.
+  Proof using .
+    intros HM Hpv Hav Hfd Hcw Hgn Hch Hpi Hsc.
+    rewrite /exec_sbundle HM Hpv Hav Hfd Hcw Hgn Hch Hpi Hsc. reflexivity.
+  Qed.
+
+  (* ===================================================================== *)
+  (* THE CLASS INSTANCE.                                                     *)
+  (*                                                                         *)
+  (* [sbundle_at] is ONE MATCH ON THE NUMBER, and each branch is that         *)
+  (* syscall's landed INPUT read off the key: the process's own families      *)
+  (* [f], the image, the three argument words, the descriptor view and the    *)
+  (* working directory, and nothing else.  Every branch is a definition       *)
+  (* already proved against the code -- no parallel form is introduced here.  *)
+  (*                                                                          *)
+  (* READ AND WRITE ARE KEYED AT [FdSlots.fd_st_of_key], not at               *)
+  (* [sys_fd_st]: the latter reads the process's [ofile] POINTER array, a     *)
+  (* kernel-side reading no process has.  [SpecArgfd.sys_fd_st_of_key] is     *)
+  (* the equation, and its three premises are the DISPATCHER's (the fragment  *)
+  (* length, [proc_priv]'s length and [ProcInv.proc_priv_states_agree]), so   *)
+  (* the bridge is paid where the kernel resources are and the deposit stays  *)
+  (* statable at a key.                                                       *)
+  (* ===================================================================== *)
+  Definition xv6_sbundle (X : uvis -d> iPropO Σ) (n : Z) (f : xfam) (W : uvis)
+      : iProp Σ :=
+    (if decide (n = USYS_exec) then exec_sbundle X f W
+     else if decide (n = 5) then
+       (* A PLAIN DEPOSIT AT [emp] (lane KILL-PAY, K4(a)).  R1's shape --
+          read's deposit as a WAND from this process's exit payload, fed
+          by the dispatcher off the payment row -- is SUPERSEDED, not
+          patched: nothing at the kill status travels the trap route any
+          more (lane SELF-KILL, P6), so there is no payload for the
+          dispatcher to feed and none to feed it out of.  What pays the console arm
+          is the process's OWN hand: [ConsoleInv.cons_acc] at the reader
+          token it carries beside its position ([UkSh.ush_at]), or the
+          dirty credential a tokenless reader pays
+          ([AppInv.app_sup], which is what the generic slot's supply law
+          hands over -- [FsAbsInvFire.fsabs_fileread_in], unchanged and
+          stated at ANY [P]). *)
+       fileread_in (fd_st_of_key (xk_a W 0) (uvis_fd W))
+         (sys_rw_count (xk_a W 2)) (rf_F f) (rf_ret f)
+         (rf_in f) (rf_pq f) (rf_pqe f) True%I
+     else if decide (n = 9) then
+       chdir_au_pre (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (cf_P f) (cf_Pmiss f) (cf_Fo f)
+     else if decide (n = 15) then
+       (* ...AT THE PATH ARGUMENT, beside the omode: row 15 reads argument
+          0 (the path POINTER) through the key's own image
+          ([ArgPath.arg_path_of (uvis_M W) (xk_a W 0)]) as well as argument
+          1 (the omode), so what the process deposits is the walk at the
+          string IT passed -- what a pinned open hands in and what open's
+          receipt at row 15 below names. *)
+       open_in (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (uvis_M W) (xk_a W 0) (xk_a W 1)
+         (of_P f) (of_Pmiss f) (of_Farm f) (of_Fun f) (of_Fok f) (of_Fex f)
+         (of_Fo f) (of_Ft f)
+     else if decide (n = 16) then
+       filewrite_in (uvis_perm W) (uvis_sz W) (uvis_lazy W)
+         (fd_st_of_key (xk_a W 0) (uvis_fd W))
+         (sys_rw_count (xk_a W 2)) (uvis_M W) (xk_a W 1) (wf_Q f) (wf_Qe f)
+     else if decide (n = 17) then
+       (* ...and mknod's, at ITS path argument beside the two device
+          numbers, for open's reason *)
+       mknod_au_at (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (uvis_M W) (xk_a W 0)
+         (dev_arg (xk_a W 1)) (dev_arg (xk_a W 2))
+         (nf_P f) (nf_Pmiss f) (nf_Farm f) (nf_Fun f) (nf_Fok f) (nf_Fex f)
+     else if decide (n = 18) then
+       (* ...and unlink's, AT ITS PATH ARGUMENT (lane TL-3C, item (M)) *)
+       unlink_au_at (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (uvis_M W) (xk_a W 0)
+         (uf_P f) (uf_Pmiss f) (uf_Fent f) (uf_Ftgt f) (uf_Fex f) (uf_Fmiss f)
+     else if decide (n = 19) then
+       link_commits (fs_gamma_L fsc_fs) (lf_Ftgt f) (lf_Fent f) (lf_Funt f)
+     else if decide (n = 20) then
+       (* ...and mkdir's, AT ITS PATH ARGUMENT (lane TL-3C, item (M)): the
+          path-fixed bundle is what lets mkdir carry a parent cursor at
+          all -- [SpecSysMkdir.mkdir_au_at], [mknod_au_at]'s twin. *)
+       mkdir_au_at (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (uvis_M W) (xk_a W 0)
+         (df_P f) (df_Pmiss f) (df_Farm f) (df_Fdots f) (df_Fun f)
+         (df_Fok f) (df_Fex f)
+     else if decide (n = 6) then
+       (* KILL(6) COSTS THE CREDENTIAL (app-echo.md, lane KILL-PAY, K3(a)).
+          The one syscall whose EFFECT is a kill: sys_kill hands kkill the
+          price out of the trapping process's deposit, and the deposit is
+          this row.  A verified program never issues 6 -- so no verified
+          program pays -- and the GENERIC slot pays it out of the
+          application's supply ([xv6_ssupply] below), which is why the row
+          costs the theorem nothing.  It is the only branch of this match
+          that is not about the file system. *)
+       (app_taint)
+     else if decide (n = 21) then
+       (* CLOSE(21) PAYS THE BYTE QUEUE'S CLOSE LINK AT A PIPE KEY (design/
+          pipe.md, "The byte queue"), and nothing at any other -- the
+          generic slot pays it out of the taint, a program at the state its
+          handle names. *)
+       fileclose_cpay (fd_st_of_key (xk_a W 0) (uvis_fd W)) (cl_P f)
+     else if decide (n = USYS_exit) then
+       (* EXIT(2) PAYS THE CLOSE OF EVERY ROW OF ITS TABLE (design/pipe.md,
+          "The exit path"): kexit closes them all, and a pipe row's last
+          close steps the byte queue.  The generic slot pays it out of the
+          taint; a program at the table its key names.  LAST in the match
+          so every reader above keeps its skip count. *)
+       fileclose_cpays (uvis_fd W)
+     else if decide (n = 22) then
+       (* SYNC(22) DEPOSITS ITS OPTIONAL HOOK (claude-notes/design/sync.md
+          section 4.3 item 4): [emp] at [sy_oQ f = None] -- the generic
+          slot and every program that deposits none -- and the era's
+          [riscv_sync_hook] at [Some Q], which sys_sync fires exactly once
+          at a ghost commit.  AFTER exit's row, so no reader above moves
+          its skip count. *)
+       hook_opt gen_id (sy_oQ f)
+     else emp)%I.
+
+  (* ...AND THE ARMED POST BACK, at the same key and the same families.
+     WHICH NUMBERS PAY A POST -- eight of them.  Each branch is that syscall's own landed armed
+     post, read off the SAME key projections its input branch above is read
+     off -- so what a process gets back is a statement about the very
+     receipts, refunds and cursors it deposited:
+       5   [SpecFileread.fileread_extra] at [FdSlots.fd_st_of_key], at the
+           RESUME IMAGE [M'] and the buffer address argument 1 -- the
+           receipt names the bytes read() put in the caller's buffer -- with
+           [SpecFileread.fileread_ret] in front of it, the return value's
+           range at the key's own count (lane CONS-ROWS, B3); and 16
+           [SpecFilewrite.filewrite_extra] at the same key, with
+           [filewrite_ret] in front of it for the same reason (lane
+           NIL-RET: at a pipe or a read-only descriptor the arm is [emp],
+           so the blanket is the only thing a U-tier writer learns about
+           its answer).  The SYSCALL's own blankets ([SpecSysRead.sys_read_ret]
+           / [SpecSysWrite]'s) stay behind either way: they read
+           [pv_ofile V], a kernel array no process can name;
+       17/18/19/20  the contract's arms verbatim ([mknod_arms] /
+           [unlink_arms] / [link_arms] / [mkdir_arms]).
+       9/15  the contract's RECEIPT ([SpecSysChdir.chdir_receipt],
+           [SpecSysOpen.open_receipt]).  These two arms are the ones whose
+           landed form bundles kernel resources -- [ProcInv.proc_priv] at
+           the block the syscall wrote, the descriptor fragments and
+           [FdSlots.fd_slot] -- so what comes back here is the arms' OTHER
+           half: the walk cursor, the observed rows, the fired receipts, the
+           trunc leg, and, in place of the resources, the pure fact about
+           the key the process RESUMES at ([cw'] for chdir, one row of
+           [fdv'] for open).  [SpecSysChdir.chdir_arms_split] and
+           [SpecSysOpen.open_arms_split] are the ties, and the dispatcher
+           keeps the kernel half.
+     ONE PAYS [emp]:
+       7   exec's bundle is CONSUMED and its process never resumes on
+           success -- there is nothing to give back.
+     Every number without a contract pays [emp] too.
+
+     THE RESUME KEY'S THREE MOVING COMPONENTS, [M'], [fdv'] and [cw'], are
+     arguments here for exactly the three receipts that read them: the
+     bytes read() delivered are entries of the resume image, a descriptor
+     is a row of the table the call returns to, and a working directory IS
+     the field chdir wrote.  The other five branches ignore them, as does
+     every contract-free number.
+
+     THE SLOT FAMILY [X] DOES NOT OCCUR: a post is what comes back to the
+     process that is RESUMING, so no branch concludes at the fixpoint
+     variable the way exec's input bundle does.  That is what makes
+     non-expansiveness a [reflexivity]. *)
+  (* [cs'] is the RESUME KEY'S CHILDREN SET, beside [fdv'] and [cw'] and for
+     their reason: a receipt may be about what the call left in the resume
+     key, and wait(2)'s is about exactly that.  No entry's post reads it
+     yet -- the eight below are file-system entries -- so every branch
+     ignores it. *)
+  Definition xv6_spost (X : uvis -d> iPropO Σ) (n : Z) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z)
+      (cs' : gset gname)
+      : iProp Σ :=
+    (if decide (n = USYS_exec) then
+       (* ...EXCEPT AT exec, WHICH REFUNDS WHEN IT FAILS (app-echo.md,
+          lane KILL-PAY, K4(a), ruling R-A).  exec's deposit is a
+          [PieceFam.pfam] -- an AU beside its refund -- and a FAILED exec
+          is a piece that never fired, so [PieceFam.pf_at_refund] hands
+          [xf_Rs f] straight back.  It used to stay in the kernel's frame
+          ("a program cannot retry exec"); that is withdrawn, because no
+          run carries a payload at the kill status (lane SELF-KILL, P6)
+          and the resource a process SPENT into the exec deposit is the
+          only thing left to pay its own [exit(1)] with when the exec
+          comes back.  Guarded on the answer, because
+          only the failing exec resumes at all -- the success arm's
+          process is a different image and the wand is refuted there
+          ([SpecKexec.exec_post_ok_recv]'s [r <> -1]). *)
+       (⌜r = (mword_of_int (-1) : mword 64)⌝ -∗ xf_Rs f)
+     else if decide (n = 5) then
+       (* THE PAYLOAD IS PEELED: what the PROCESS is told is
+          [SpecFileread.fileread_extra_core], the arm's payout without the
+          borrowed payload -- the payload goes back on the trap's own
+          resume row ([UexecRet.uexec_pay_arm]), so this post is unchanged
+          in force by R1.
+
+          ...AND THE TABLE IS EXISTENTIAL, AT THE KEY'S OWN PROJECTION
+          (app-echo.md, lane CONS-SWALLOW, W4).  The receipt is stated at
+          the process's PAGE TABLE -- whether a byte read() popped reached
+          the caller's buffer is a fact about that table
+          ([SpecFileread.console_receipt]) -- and the key carries no
+          table, only the per-page permission map [uvis_perm] it projects
+          to.  So what the process is told here is that SOME table
+          projecting to its own key's permission map was the one the call
+          ran on: the honest weak form, since the projection cannot see
+          which pages are lazily unmapped ([UserPerm]'s note on
+          [perm_fill], and [ProcPtOwn.perm_of_uptd_ext_sz] -- MAP-KEY is
+          what would strengthen it).  The dispatcher supplies the
+          process's own [pv_upt (us_V U)] and the equation holds by
+          [UexecSlot.uvis_of]'s definition ([ProofSyscall.sysc_out_read]).
+          READING THE KEY HERE IS WHY [UexecSG.skey_eq] FIXES THE
+          PERMISSION MAP AND THE SIZE. *)
+       (* ...AND THE TABLE IS WELL-FORMED AND THE KEY'S LAZY BIT IS A CLAIM
+          ABOUT IT (lane LAZY-FLAG, L5).  The projection cannot tell a page
+          vmfault has yet to serve from a mapped RW page, and copyout can
+          write only the second kind -- so the ∃ table is exhibited WITH
+          what the key's bit claims about it ([UserPerm.lazy_free]) and with
+          the well-formedness [UserPerm.lazy_free_wmapped] consumes.  At
+          [uvis_lazy W = false] a process that owns a byte of its own buffer
+          can then refute the receipt's copyout-fault disjunct; at [true] it
+          learns nothing new, which is the honest reading of a process that
+          may have called sbrklazy.  Both come off the DISPATCHER's own
+          block: well-formedness from [ProcPtOwn.proc_ptm], and the claim
+          from [ProcInv.proc_priv_core]'s invariant on
+          [ProcDefs.pv_lazy]. *)
+       (* ...AND THE RETURN VALUE IS IN RANGE (app-echo.md, lane CONS-ROWS,
+          B3).  [SpecFileread.fileread_ret] is [PipeInvDefs.pipe_rw_ret] --
+          -1, or a count between 0 and the request -- and it reads nothing
+          but the count the key carries at argument 2 and the answer, so
+          unlike the syscall's own blanket ([SpecSysRead.sys_read_ret],
+          which reads [pv_ofile V]) it is statable at the process's key.
+          The round's [UsysMemOk.usys_mem_ok] bounds the bytes WRITTEN and
+          says nothing about [r], so without this row a process cannot tie
+          its answer to its request at all -- and every reader of the
+          console receipt needs exactly that tie to spend the two
+          control-flow rows the receipt carries. *)
+       (⌜fileread_ret (sys_rw_count (xk_a W 2)) r⌝ ∗
+        ∃ P : uptd,
+          ⌜perm_of (ud_um P) (uvis_sz W) = uvis_perm W⌝ ∗
+          ⌜ProcPtOwn.proc_pt_wf P⌝ ∗
+          ⌜uvis_lazy W = false -> lazy_free (ud_um P) (uvis_sz W)⌝ ∗
+          fileread_extra_core (uvis_gen W) P (fd_st_of_key (xk_a W 0) (uvis_fd W))
+            (sys_rw_count (xk_a W 2)) (rf_F f) (rf_ret f) (rf_in f)
+            (rf_pq f) (rf_pqe f) r M' (xk_a W 1))
+     else if decide (n = 9) then
+       chdir_receipt (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (cf_P f) (cf_Pmiss f) (cf_Fo f) r cw'
+     else if decide (n = 15) then
+       open_receipt (of_om f) (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (uvis_M W) (xk_a W 0) (xk_a W 1)
+         (of_P f) (of_Pmiss f) (of_Farm f) (of_Fun f) (of_Fok f) (of_Fex f)
+         (of_Fo f) (of_Ft f) (uvis_fd W) r fdv'
+     else if decide (n = 16) then
+       (* ...AND ROW 16 IS ROW 5's TWIN NOW (lane TRAP-ROWS, T1): the
+          console arm's SHORT return is a fact about which of the caller's
+          buffer bytes the kernel could read through the process's page
+          table ([SpecFilewrite.write_cons_arms]'s reason), and the key
+          carries no table -- only the permission map it projects to.  So
+          the table is existential at the key's own projection, exhibited
+          with the well-formedness and the lazy-bit claim exactly as read's
+          is, which is what lets a process that owns its buffer and is not
+          lazy refute the short arm. *)
+       (* ...AND THE RETURN VALUE IS IN RANGE, exactly as row 5's is (lane
+          NIL-RET): [SpecFilewrite.filewrite_ret] IS [fileread_ret]
+          ([PipeInvDefs.pipe_rw_ret] at the key's own count), the walk has
+          it off [SpecSysWrite.sys_write_arms]' blanket, and it is the one
+          fact about the answer a writer at a PIPE or a READ-ONLY
+          descriptor gets, since [filewrite_extra] is [emp] there. *)
+       (⌜filewrite_ret (sys_rw_count (xk_a W 2)) r⌝ ∗
+        ∃ P : uptd,
+          ⌜perm_of (ud_um P) (uvis_sz W) = uvis_perm W⌝ ∗
+          ⌜ProcPtOwn.proc_pt_wf P⌝ ∗
+          ⌜uvis_lazy W = false -> lazy_free (ud_um P) (uvis_sz W)⌝ ∗
+          filewrite_extra (uvis_gen W) P (fd_st_of_key (xk_a W 0) (uvis_fd W))
+            (sys_rw_count (xk_a W 2)) (uvis_M W) (xk_a W 1)
+            (wf_Q f) (wf_Qe f) r)
+     else if decide (n = 17) then
+       mknod_arms (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (uvis_M W) (xk_a W 0)
+         (dev_arg (xk_a W 1)) (dev_arg (xk_a W 2))
+         (nf_P f) (nf_Pmiss f) (nf_Farm f) (nf_Fun f) (nf_Fok f) (nf_Fex f) r
+     else if decide (n = 18) then
+       unlink_arms (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (uf_P f) (uf_Pmiss f) (uf_Fent f) (uf_Ftgt f) (uf_Fex f) (uf_Fmiss f)
+         (uvis_M W) (xk_a W 0) r
+     else if decide (n = 19) then
+       link_arms (fs_gamma_L fsc_fs) (lf_Ftgt f) (lf_Fent f) (lf_Funt f) r
+     else if decide (n = 20) then
+       mkdir_arms (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+         (df_P f) (df_Pmiss f) (df_Farm f) (df_Fdots f) (df_Fun f)
+         (df_Fok f) (df_Fex f) (uvis_M W) (xk_a W 0) r
+     else if decide (n = USYS_pipe) then
+       (* PIPE(4) HANDS THE PROCESS THE NEW PIPE'S FRAGMENT (design/pipe.md,
+          "The byte queue"): the two descriptors it installed name one
+          pipe, and its byte queue's exact fragment comes out at the birth
+          state.  Which two descriptors is restated here rather than read
+          off [UsysMemOk.usys_fd_ok]'s pipe row, because that row binds
+          its witnesses independently; the two scans make them the same. *)
+       (⌜uint r = 0⌝ -∗
+        ∃ (a b : nat) (γp : pipe_names),
+          ⌜a <> b /\ fd_least_closed (uvis_fd W) a
+           /\ fd_least_closed (<[a := FdOpen true false (FdPipe γp)]> (uvis_fd W)) b
+           /\ fdv' = <[b := FdOpen false true (FdPipe γp)]>
+                        (<[a := FdOpen true false (FdPipe γp)]> (uvis_fd W))⌝ ∗
+          pipe_qfrag (pn_queue γp) pst0)
+     else if decide (n = 21) then
+       (* CLOSE(21): the close payment's answer -- the link fired (the
+          end's last close), or the payment back *)
+       fileclose_cpost_any (fd_st_of_key (xk_a W 0) (uvis_fd W)) (cl_P f)
+     else if decide (n = 22) then
+       (* SYNC(22): the hook's [Q], fired once at a ghost commit covering
+          every change linearised before the call ([SpecSysSync]) *)
+       Q_opt (sy_oQ f)
+     else emp)%I.
+
+  (* THE SLOT FAMILY OCCURS IN ONE BRANCH OF THE DEPOSIT -- exec's slot wand
+     -- so that non-expansiveness proof is that branch and eight
+     [reflexivity]s, and the POST's is one [reflexivity]: no post concludes
+     at the fixpoint variable. *)
+  Ltac xv6_num_cases :=
+    repeat (match goal with
+            | |- context [decide (?n = ?k)] =>
+                destruct (decide (n = k)) as [_ | _]; [| ]
+            end).
+
+  Lemma xv6_sbundle_ne (k : nat) :
+    Proper (dist k ==> eq ==> eq ==> eq ==> dist k) xv6_sbundle.
+  Proof using .
+    intros X Y HXY n ? <- f ? <- W ? <-. rewrite /xv6_sbundle.
+    destruct (decide (n = USYS_exec)) as [_ | _];
+      [ exact (exec_sbundle_ne k X Y HXY f f eq_refl W W eq_refl) | ].
+    xv6_num_cases; reflexivity.
+  Qed.
+
+  Lemma xv6_spost_ne (k : nat) :
+    Proper (dist k ==> eq ==> eq ==> eq ==> eq ==> eq ==> eq ==> eq ==> eq ==> dist k)
+      xv6_spost.
+  Proof using .
+    intros X Y _ n ? <- f ? <- W ? <- r ? <- M' ? <- fdv' ? <- cw' ? <- cs' ? <-.
+    reflexivity.
+  Qed.
+
+  (* THE KEY CONGRUENCE, off [UexecSG.skey_eq]: every branch reads the image,
+     one of the three argument words, the descriptor view or the working
+     directory, and [skey_eq] pins all six. *)
+  Lemma xv6_sbundle_cong (X : uvis -d> iPropO Σ) (n : Z) (f : xfam)
+      (W W' : uvis) :
+    skey_eq W W' -> xv6_sbundle X n f W ⊣⊢ xv6_sbundle X n f W'.
+  Proof using .
+    intros Hk.
+    pose proof Hk as (HM & Ha0 & Ha1 & Ha2 & Hfd & Hcw & Hgn & Hch & Hpi
+                      & Hpm & Hsz & Hlz & Hsc).
+    rewrite /xv6_sbundle.
+    destruct (decide (n = USYS_exec)) as [_ | _];
+      [ exact (exec_sbundle_cong X f W W' HM Ha0 Ha1 Hfd Hcw Hgn Hch Hpi Hsc) | ].
+    (* RULING WR-TB: row 16 now reads the key's permission map, break and
+       lazy bit too, and [UexecSG.skey_eq] already fixes all three. *)
+    rewrite /xk_a /tf_w HM Ha0 Ha1 Ha2 Hfd Hcw Hpm Hsz Hlz.
+    reflexivity.
+  Qed.
+
+  (* ...and the post's, at the same rows PLUS the permission map and the
+     size, which read(2)'s receipt reads ([xv6_spost]'s row 5 names the
+     table its key projects from) and [skey_eq] pins for that reason. *)
+  Lemma xv6_spost_cong (X : uvis -d> iPropO Σ) (n : Z) (f : xfam)
+      (W W' : uvis) (r : mword 64) (M' : gmap Z (bv 8))
+      (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    skey_eq W W' ->
+    xv6_spost X n f W r M' fdv' cw' cs' ⊣⊢ xv6_spost X n f W' r M' fdv' cw' cs'.
+  Proof using .
+    intros Hk.
+    pose proof Hk as (HM & Ha0 & Ha1 & Ha2 & Hfd & Hcw & Hgn & _ & _ & Hpi & Hsz
+                      & Hlz & Hsc).
+    rewrite /xv6_spost /xk_a /tf_w HM Ha0 Ha1 Ha2 Hfd Hcw Hgn Hpi Hsz Hlz.
+    reflexivity.
+  Qed.
+
+  (* MONOTONICITY IN THE SLOT FAMILY.  The family occurs in exactly one
+     branch -- the CONCLUSION of both of exec's slot piece's wands
+     ([exec_slot_pre]) -- so the upgrader walks in under the piece's ∀s and
+     its [∧]-refund, once per success arm, and every other branch is the
+     identity. *)
+  Lemma xv6_sbundle_mono (X Y : uvis -d> iPropO Σ) (n : Z) (f : xfam)
+      (W : uvis) :
+    ⊢ □ (∀ W' : uvis, X W' -∗ Y W') -∗
+      xv6_sbundle X n f W -∗ xv6_sbundle Y n f W.
+  Proof using .
+    iIntros "#Hup Hb". rewrite /xv6_sbundle.
+    destruct (decide (n = USYS_exec)) as [_ | _];
+      [ | xv6_num_cases; iExact "Hb" ].
+    rewrite /exec_sbundle.
+    rewrite /sys_exec_au_pre.
+    (* the pay row is untouched by the slot's monotonicity: it mentions no
+       slot predicate *)
+    iDestruct "Hb" as "(#Hmp & Hwalk & Hcommit & Hslot)".
+    iFrame "Hmp Hwalk Hcommit".
+    rewrite /pf_at. cbn [pf_recv pf_refund].
+    iSplit; [ | iDestruct "Hslot" as "[_ $]" ].
+    iDestruct "Hslot" as "[Hslot _]".
+    rewrite /sys_exec_slot_pre.
+    iIntros (pl na alen afun) "%Hpsh %Hsh".
+    iDestruct ("Hslot" $! pl na alen afun with "[%] [%]") as "Hslot";
+      [ exact Hpsh | exact Hsh | ].
+    (* BOTH success arms' wands conclude at the family, so the upgrader
+       walks in twice. *)
+    rewrite /exec_slot_pre.
+    iDestruct "Hslot" as "[Hsa Hsb]".
+    iSplitL "Hsa".
+    - iIntros (av i ff nl W') "HP Ho %Hld %Him %Hcwq %Hlzq %Hscw %Hchq %Hpiq Hpy".
+      iApply "Hup".
+      iApply ("Hsa" $! av i ff nl W' with "HP Ho [%] [%] [%] [%] [%] [%] [%] Hpy");
+        [ exact Hld | exact Him | exact Hcwq | exact Hlzq | exact Hscw | exact Hchq
+        | exact Hpiq ].
+    - iIntros (av i a W') "HP Ho %Hnl %Hkk %Hcwq %Hlzq %Hscw %Hchq %Hpiq Hpy".
+      iApply "Hup".
+      iApply ("Hsb" $! av i a W' with "HP Ho [%] [%] [%] [%] [%] [%] [%] Hpy");
+        [ exact Hnl | exact Hkk | exact Hcwq | exact Hlzq | exact Hscw | exact Hchq
+        | exact Hpiq ].
+  Qed.
+
+  (* THE SUPPLY.  Opaque in the class, and at THIS instance it is the
+     application's predicate held of EVERY view ([AppInv.app_sup]) -- the
+     credential that makes a write-kind commit's [AppInv.app_step] free, and
+     hence the one an unverified program's bundles are paid from.  Every
+     branch of the two laws below is one [FsAbsInvFire] discharger at the
+     trivial families, which is exactly the record [xfam_pt] names. *)
+  (* ...AND SINCE lanes KILL-PAY (§1c) AND OUT-FUPD IT IS THE TRIPLE: the
+     application's predicate at every view, the application's KILL
+     CREDENTIAL, and the application's OUTPUT LICENCE.  The generic slot is
+     what runs an UNVERIFIED program, and an unverified program may call
+     kill(2), may trap with a cause the kernel cannot rule out -- both of
+     which cost the credential ([xv6_sbundle]'s row 6,
+     [UexecRet.uexec_ret_F]'s non-ecall arm) -- and may [write(2)] on the
+     CONSOLE, which since lane OUT-FUPD costs the licence: the console
+     UART's invariant carries the application's own claim about the bytes
+     it has accepted ([RiscvPtsto.riscv_cons_res]), so putting a byte out is
+     no longer free.  All three are bought by the application at the SAME
+     place ([App.al_kill] and [App.al_sup]: the supply buys both),
+     so bundling them here charges an application nothing it was not
+     already paying, and keeps every verified program -- whose slot is at
+     [uprogSG_free] and touches none of the three -- free.  The licence is
+     LAST. *)
+  (* ...AND THEN IT WAS A TRIPLE (redesign R4).  Lane CONS-IO made it a
+     quadruple because the port carried TWO claims and so needed two
+     licences -- one for [write(2)] and one for consoleintr's shift and
+     [read(2)] on fd 0.  There is ONE claim ([RiscvPtsto.riscv_cons_res])
+     and therefore ONE law over it ([WpUart.cons_licence]), which the
+     application prices once. *)
+  (* ...AND IT IS BACK TO THE PAIR (lane SUP-ONE, survey R1).  The
+     LICENCE is not a credential any more: the application's kill price
+     buys it outright ([RiscvPtsto.app_iface]'s [ai_lic], read here as
+     [WpUart.cons_licence_of_taint]), so what the generic slot carries is
+     the application's claim at every view and the application's TAINT,
+     and every generic-tier signature below lost its [cons_licence]
+     argument.  THE PAIR DOES NOT COLLAPSE FURTHER -- see the lane's
+     findings: [app_sup] lives on [AppCfg.appcfg] (through
+     [FileInvDefs.file_app]) and the taint on [RiscvPtsto.app_iface]
+     (through [riscvFixedGS]), and the equation that ties the two records
+     is a PREMISE of each boot obligation, ambient nowhere. *)
+  Definition xv6_ssupply : iProp Σ :=
+    (app_sup ∗ app_taint)%I.
+
+  (* THE BUPD IS WRITE'S, AND ONLY WRITE'S: the console arm carries the trace
+     seed [WpUart.uart_sent γu []], a mono-list lower bound at the empty
+     list -- the algebra's unit, mintable by anyone but not derivable from
+     [emp].  Every other branch is a closed fact or a wand off the supply. *)
+  (* AT THE PAYLOAD THE CALLER NAMES (app-echo.md, "SH-LINE RULING", R1).
+     The point re-keyed at [Q] ([xfam_at]) is the witness: every branch but
+     read's ignores the payload, and read's -- the console arm -- is
+     payable out of the persistent credential at ANY [P]
+     ([FsAbsInvFire.fsabs_fileread_in]), because what it owes back is
+     [∀ cur dc, |==> P ∗ True] and a [∀] over a constant IS that constant.
+     Nothing is duplicated: the caller gets its [P] back at the ONE
+     position the read landed on. *)
+  Lemma xv6_sbundle_of_supply_ne (X : uvis -d> iPropO Σ) (n : Z) (W : uvis)
+      (Q : Z -> iProp Σ) :
+    n <> USYS_exec ->
+    ⊢ □ xv6_ssupply ==∗ ∃ f : xfam, ⌜kf_xpay f = Q⌝ ∗ xv6_sbundle X n f W.
+  Proof using .
+    intros Hne. rewrite /xv6_ssupply. iIntros "#(Hsup & Hkc)".
+    iAssert (|==> xv6_sbundle X n (xfam_at Q xfam_pt) W)%I with "[]" as "Hb";
+      [ | iMod "Hb" as "Hb"; iModIntro; iExists (xfam_at Q xfam_pt);
+          iSplitR; [ done | iExact "Hb" ] ].
+    rewrite /xv6_sbundle /xfam_at /xfam_pt /xfam_exec /=.
+    destruct (decide (n = USYS_exec)) as [He | _];
+      [ exfalso; exact (Hne He) | ].
+    destruct (decide (n = 5)) as [_ | _];
+      [ iModIntro; iApply (fsabs_fileread_in with "Hsup Hkc") | ].
+    destruct (decide (n = 9)) as [_ | _];
+      [ iModIntro; iApply fsabs_chdir_pre | ].
+    destruct (decide (n = 15)) as [_ | _];
+      [ iModIntro; iApply (fsabs_open_in with "Hsup") | ].
+    destruct (decide (n = 16)) as [_ | _];
+      [ iApply (fsabs_filewrite_in with "Hsup Hkc") | ].
+    destruct (decide (n = 17)) as [_ | _];
+      [ iModIntro; iApply (fsabs_mknod_pre with "Hsup") | ].
+    destruct (decide (n = 18)) as [_ | _];
+      [ iModIntro; iApply (fsabs_unlink_pre with "Hsup") | ].
+    destruct (decide (n = 19)) as [_ | _];
+      [ iModIntro; iApply (fsabs_link_pre with "Hsup") | ].
+    destruct (decide (n = 20)) as [_ | _];
+      [ iModIntro; iApply (SpecSysMkdir.mkdir_au_at_unit with "Hsup") | ].
+    (* row 6: the kill price, straight off the supply's second conjunct *)
+    destruct (decide (n = 6)) as [_ | _];
+      [ iModIntro; iExact "Hkc" | ].
+    (* row 21: a pipe's close link, paid by the taint -- the same
+       credential, read as [PipeQueue.app_taint] *)
+    destruct (decide (n = 21)) as [_ | _];
+      [ iModIntro; iApply (fileclose_cpay_taint with "Hkc") | ].
+    (* row 2: the table's close links, paid by the same taint *)
+    destruct (decide (n = USYS_exit)) as [_ | _];
+      [ iModIntro; iApply (fileclose_cpays_taint with "Hkc") | ].
+    (* row 22: the point deposits no hook *)
+    destruct (decide (n = 22)) as [_ | _];
+      [ iModIntro; cbv [hook_opt sy_oQ xfam_exec_at]; by iEmpIntro | ].
+    by iModIntro.
+  Qed.
+
+  (* ...and the half the generic inhabitants use: the same eight branches
+     plus exec, whose fs half is [fsabs_exec_half] out of the invariant and
+     whose slot wand a generic family answers at every key. *)
+  (* THE FAMILY IS INDEXED BY THE PAY FACT ([UexecSG]'s own law): a slot
+     that is safe at every key has to be able to pay exit's deposit, and
+     the credential for that is the key's own generation at the payload
+     the slot runs at.  AT A CONSTANT PAYLOAD [fun _ => R] (GENERIC-PAY):
+     the generic slot HOLDS one [R] and pays exit's additive
+     [R ∧ R] out of it.  The exec branch RELAYS it -- both slot wands hand
+     the pay fact AND [kf_xpay f (-1)] in at the resume key, and at a
+     constant payload that resource is the [R] the next image's slot is
+     minted from.  [R := True] is the trivial instance. *)
+  (* ...AND THE PAYLOAD IS PERSISTENT (lane SELF-KILL, P6b).  The exec
+     branch below must answer BOTH of [SpecKexec.exec_slot_pre]'s
+     [∗]-separated slot wands, and nothing hands the new image a payload
+     any more ([exec_slot_pre] lost its [Q (-1)] premise), so the resource
+     the generic family runs on arrives here as [□ R] -- which is the
+     caller's [□ (app_taint -∗ R)] cashed against the taint it holds
+     ([UexecRet.uexec_dep_F_of_supply]).  The wand's antecedent is dropped
+     at this altitude and only here: this is [UexecSG]'s class field and
+     the class carries [ctokG] alone. *)
+  Lemma xv6_sbundle_of_supply (X : uvis -d> iPropO Σ) (n : Z) (W : uvis)
+      (R : iProp Σ) :
+    ⊢ my_pay (uvis_gen W) (fun _ => R)%I -∗ □ xv6_ssupply -∗ □ R -∗
+      □ (∀ W' : uvis, my_pay (uvis_gen W') (fun _ => R)%I -∗ □ R -∗ X W') ==∗
+      ∃ f : xfam, ⌜kf_xpay f = (fun _ => R)%I⌝ ∗ xv6_sbundle X n f W.
+  Proof using .
+    rewrite /xv6_ssupply.
+    iIntros "#Hpay #(Hsup & Hkc) #HR #Hs".
+    destruct (decide (n = USYS_exec)) as [He | Hne].
+    - iModIntro. iExists (xfam_at (fun _ => R)%I xfam_pt). iSplitR; [done |].
+      rewrite /xv6_sbundle. destruct (decide (n = USYS_exec)) as [_ | Hc];
+        [ | exfalso; exact (Hc He) ].
+      rewrite /exec_sbundle /xfam_at /xfam_pt /xfam_exec /xfam_exec_at /=.
+      (* the bundle's own pay row, which the exec'ing process hands the
+         kernel so that the kernel can hand it to the new image's slot *)
+      iSplitR; [ iExact "Hpay" | ].
+      (* read-kind only ([fsabs_exec_half]): the environment is carried, not
+         spent *)
+      iDestruct (fsabs_exec_half (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W))
+        as "[#Hwalk #Hcommit]".
+      rewrite /sys_exec_au_pre.
+      (* THE WALK, AT WHATEVER PATH.  A family that tracks nothing owes the
+         one-shot at every string, and every hop of it says yes -- proved
+         here rather than converted from [Hwalk] through
+         [FsAbsOpenFire.opf_start_of_open], whose own [CurCtx] binder this
+         file has no instance for (the header's "NO AMBIENT [CurCtx]"). *)
+      iSplitR;
+        [ iIntros (pl) "_";
+          rewrite /FsAbsEra.ex_start /FsAbsEra.ex_hops_from;
+          iIntros (r) "_"; iModIntro; iSplit;
+          [ done | iApply FsAbsEra.ax_hops_triv ] | ].
+      iSplitR; [iExact "Hcommit" |].
+      rewrite /pf_at. cbn [pf_recv pf_refund]. iSplit; [| done].
+      rewrite /sys_exec_slot_pre. iIntros (pl na alen afun) "_ _".
+      (* the generic family answers BOTH success arms' wands, out of the
+         one PERSISTENT copy of the payload this law is handed (lane
+         SELF-KILL, P6b): the wands are [∗]-separated, so a linear [R]
+         could answer only one of them, and the new image is handed no
+         payload by the kernel any more. *)
+      rewrite /exec_slot_pre. iSplitR.
+      + iIntros (av' i ff nl W') "_ _ _ _ _ _ _ _ _ Hp".
+        iApply ("Hs" with "Hp HR").
+      + iIntros (av' i a W') "_ _ _ _ _ _ _ _ _ Hp".
+        iApply ("Hs" with "Hp HR").
+    - iApply (xv6_sbundle_of_supply_ne X n W (fun _ => R)%I Hne).
+      rewrite /xv6_ssupply. iModIntro.
+      iSplit; [ iExact "Hsup" | iExact "Hkc" ].
+  Qed.
+
+  (* THE RE-KEYING PASSES THROUGH BOTH BUNDLE ROWS ([UexecSG.sbundle_at_at]
+     / [spost_at_at]): neither reads [kf_xpay], so re-keying the payload
+     leaves what the process deposits and what it is handed back alone.
+     [destruct f] rather than [eq_refl]: it turns the record into its
+     constructor, so the projections in both bodies reduce by iota instead
+     of by unfolding this file's twelve-number dispatch twice. *)
+  (* ...AT EVERY NUMBER BUT read AND exec, the two branches that read
+     [kf_xpay]: read's deposit is a wand from it (R1) and exec's carries it
+     to the new image's slot (EXEC-PAY). *)
+  Lemma xfam_at_sbundle (X : uvis -d> iPropO Σ) (n : Z) (Q : Z -> iProp Σ)
+      (f : xfam) (W : uvis) :
+    n <> USYS_read -> n <> USYS_exec ->
+    xv6_sbundle X n (xfam_at Q f) W = xv6_sbundle X n f W.
+  Proof using .
+    intros Hne Hnx. rewrite /xv6_sbundle. destruct f.
+    destruct (decide (n = USYS_exec)) as [He | _]; [exfalso; exact (Hnx He) |].
+    destruct (decide (n = 5)) as [He | _]; [exfalso; exact (Hne He) |].
+    reflexivity.
+  Qed.
+
+  Lemma xfam_at_spost (X : uvis -d> iPropO Σ) (n : Z) (Q : Z -> iProp Σ)
+      (f : xfam) (W : uvis) :
+    xv6_spost X n (xfam_at Q f) W = xv6_spost X n f W.
+  Proof using . destruct f; reflexivity. Qed.
+
+  (* ...AND THE POST AT exec IS THE REFUND (lane KILL-PAY, K4(a), R-A) *)
+  Lemma xv6_spost_exec (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z)
+      (cs' : gset gname) :
+    xv6_spost X USYS_exec f W r M' fdv' cw' cs'
+      = (⌜r = (mword_of_int (-1) : mword 64)⌝ -∗ xf_Rs f)%I.
+  Proof using .
+    rewrite /xv6_spost.
+    destruct (decide (USYS_exec = USYS_exec)) as [_ | Hc];
+      [ reflexivity | exfalso; exact (Hc eq_refl) ].
+  Qed.
+
+  Global Instance uexecSG_xv6 : uexecSG Σ :=
+    {| sfam := xfam;
+       sfam_pt := xfam_pt;
+       sfork_pay := kf_pay;
+       sfork_lend := kf_lend;
+       sfam_pay := xfam_pay;
+       sfork_pay_pay := fun Q Rc => eq_refl;
+       sfork_lend_pay := fun Q Rc => eq_refl;
+       sfork_pay_pt := eq_refl;
+       sfork_lend_pt := eq_refl;
+       sexit_pay := kf_xpay;
+       sfam_at := xfam_at;
+       sexit_pay_at := fun Q f => eq_refl;
+       sfork_pay_at := fun Q f => eq_refl;
+       sfork_lend_at := fun Q f => eq_refl;
+       sexit_pay_pt := eq_refl;
+       sbundle_at_at := xfam_at_sbundle;
+       spost_at_at := xfam_at_spost;
+       sbundle_at := xv6_sbundle;
+       spost_at := xv6_spost;
+       sbundle_at_ne := xv6_sbundle_ne;
+       spost_at_ne := xv6_spost_ne;
+       sbundle_at_cong := xv6_sbundle_cong;
+       spost_at_cong := xv6_spost_cong;
+       sbundle_at_mono := xv6_sbundle_mono;
+       ssupply := xv6_ssupply;
+       sbundle_of_supply_ne := xv6_sbundle_of_supply_ne;
+       sbundle_of_supply := xv6_sbundle_of_supply;
+       (* lane KILL-PAY, K4(a), ruling R-A: a failed exec refunds *)
+       sexec_refund := xf_Rs;
+       spost_at_exec := xv6_spost_exec;
+       sexec_refund_at := fun Q f => eq_refl;
+       (* lane PIPE-REG: a descriptor row's REGISTRATION, the resource
+          [UkRun.urun_nopipe] carries per row so that a pipe-holding
+          program's exit can pay its own tear-down.  The field exists
+          because [UkRun] binds no pipe ghost class and must not start
+          (design/app-pipe.md SS2 and this lane's finding); the value is
+          the registry itself. *)
+       srow_reg := pipe_row_reg;
+       srow_reg_persistent := pipe_row_reg_persistent;
+       srow_reg_nopipe := pipe_row_reg_nopipe |}.
+
+  (* ...AND THE TWO READINGS OF THE ROW AT THIS INSTANCE, which is the only
+     place they can be stated: [UexecSG.srow_reg] is an abstract field to
+     everything below, and here it IS [PipeReg.pipe_row_reg] by
+     [reflexivity].  A file that holds a pipe's registration (lane
+     PIPE-PROTO's invariant handle) or the taint turns it into the run's
+     row through these. *)
+  Lemma srow_reg_of_pipe_reg (rb wb : bool) (γp : pipe_names) :
+    pipe_reg γp -∗ srow_reg (FdOpen rb wb (FdPipe γp)).
+  Proof using . iIntros "H". iExact "H". Qed.
+
+  Lemma srow_reg_of_taint (st : fdstate) :
+    app_taint -∗ srow_reg st.
+  Proof using .
+    iIntros "#Ht". iApply (pipe_row_reg_of_taint st with "Ht").
+  Qed.
+
+  (* ...AND THE GENERIC PROGRAM'S OWN DEPOSIT DATA ([UexecSG.uprogSG]): the
+     supply itself, and every number admitted -- which is what makes the
+     generic slot's minting law hold at every key ([sbundle_of_supply_ne] is
+     the whole proof).  A verified program with a weaker supplier declares
+     its own instance beside its constructor. *)
+  Global Instance uprogSG_gen : uprogSG Σ :=
+    {| Dsup := xv6_ssupply;
+       psok := fun _ : Z => True |}.
+
+  (* ===================================================================== *)
+  (* THE FREE SUPPLY (lane SUPPLY-SPLIT, P2).                               *)
+  (*                                                                        *)
+  (* [xv6_sbundle] is ONE MATCH ON THE NUMBER and eight of its branches      *)
+  (* read the application's abstract state; every OTHER number's branch is   *)
+  (* [emp], and 9 (chdir) -- whose branch is a walk premise and a READ-kind  *)
+  (* commit -- is discharged by a closed fact                                *)
+  (* ([FsAbsInvFire.fsabs_chdir_pre] takes no [app_sup]).  So a program that *)
+  (* calls only those numbers owes NOTHING for its deposits, and that is     *)
+  (* what this predicate names.                                             *)
+  (*                                                                        *)
+  (* THE EIGHT EXCLUDED are exactly the branches whose discharge consumes    *)
+  (* the supply:                                                            *)
+  (*   7  exec   -- the law never admits it (its bundle reads the key); the  *)
+  (*                deposit goes the EXPLICIT route ([UkRun.uxsup]).         *)
+  (*   5  read   -- the CONSOLE arm ([ConsoleInv.cons_acc]'s tainted         *)
+  (*                disjunct); the inode arm is free.  A LEASE holder pays   *)
+  (*                it at its own claim ([UkRun.udepwf_std]).                *)
+  (*   15 open   -- create / trunc / child are write-kind [AppInv.app_step]s.*)
+  (*                A PINNED open pays them ([UkRun.udepwf_at]).             *)
+  (*   16 write  -- the INODE arm is the write chain.  The law is KEY-FREE,  *)
+  (*                so admitting 16 means paying it at a key whose fd is an  *)
+  (*                inode; the console arm alone is free                     *)
+  (*                ([FsAbsInvFire.fsabs_filewrite_in]'s device leg mints    *)
+  (*                only the trace seed), so 16's honest supplier is         *)
+  (*                LEDGER-FIXED, not key-free.                              *)
+  (*   17 mknod, 18 unlink, 19 link, 20 mkdir -- write-kind commits.          *)
+  (* ===================================================================== *)
+  (* ...and it IS the program tier's own predicate ([UexecSG.free_num]),
+     not a copy: the two ends of this lane -- a program file saying "my
+     numbers are free" and this instance saying "those numbers cost
+     nothing" -- are on opposite sides of the file-system tower, and
+     making them the SAME definition is what lets them meet by [eq_refl]
+     instead of by a bridge lemma nobody would keep in step. *)
+  Definition xv6_free (n : Z) : Prop := free_num n.
+
+  (* the FREE column of the classification, as one lemma: at a free number
+     the deposit is minted from nothing, at whatever payload the leaf names *)
+  Lemma xv6_sbundle_free (X : uvis -d> iPropO Σ) (n : Z) (W : uvis)
+      (Q : Z -> iProp Σ) :
+    xv6_free n ->
+    ⊢ |==> ∃ f : xfam, ⌜kf_xpay f = Q⌝ ∗ xv6_sbundle X n f W.
+  Proof using .
+    intros (Hx & H5 & H6 & H15 & H16 & H17 & H18 & H19 & H20 & H21 & H2).
+    iAssert (|==> xv6_sbundle X n (xfam_at Q xfam_pt) W)%I with "[]" as "Hb";
+      [ | iMod "Hb" as "Hb"; iModIntro; iExists (xfam_at Q xfam_pt);
+          iSplitR; [ done | iExact "Hb" ] ].
+    rewrite /xv6_sbundle /xfam_at /xfam_pt /xfam_exec /=.
+    destruct (decide (n = USYS_exec)) as [He | _]; [ exfalso; exact (Hx He) | ].
+    destruct (decide (n = 5)) as [He | _]; [ exfalso; exact (H5 He) | ].
+    (* 9 -- chdir: open's walk premise and open's PLAIN commit, both closed *)
+    destruct (decide (n = 9)) as [_ | _];
+      [ iModIntro; iApply fsabs_chdir_pre | ].
+    destruct (decide (n = 15)) as [He | _]; [ exfalso; exact (H15 He) | ].
+    destruct (decide (n = 16)) as [He | _]; [ exfalso; exact (H16 He) | ].
+    destruct (decide (n = 17)) as [He | _]; [ exfalso; exact (H17 He) | ].
+    destruct (decide (n = 18)) as [He | _]; [ exfalso; exact (H18 He) | ].
+    destruct (decide (n = 19)) as [He | _]; [ exfalso; exact (H19 He) | ].
+    destruct (decide (n = 20)) as [He | _]; [ exfalso; exact (H20 He) | ].
+    destruct (decide (n = 6)) as [He | _]; [ exfalso; exact (H6 He) | ].
+    destruct (decide (n = 21)) as [He | _]; [ exfalso; exact (H21 He) | ].
+    destruct (decide (n = USYS_exit)) as [He | _]; [ exfalso; exact (H2 He) | ].
+    (* 22 -- sync: the point deposits no hook, so the row is [emp] *)
+    destruct (decide (n = 22)) as [_ | _];
+      [ iModIntro; cbv [hook_opt sy_oQ xfam_exec_at]; by iEmpIntro | ].
+    by iModIntro.
+  Qed.
+
+  (* ...AND CLOSE'S ROW AT A DESCRIPTOR THAT IS NOT A PIPE (design/pipe.md,
+     "The byte queue").  21 left [xv6_free] because at a PIPE key its row is
+     a step of the pipe's exact ghost state; everywhere else the row is
+     [emp] and the deposit is minted from nothing, exactly as a free
+     number's is.  The guard is the KEY's own reading of argument 0, which
+     is what a close leaf holding the descriptor's handle can discharge
+     ([UkRun.ukey_nonpipe]). *)
+  Lemma xv6_sbundle_close_nonpipe (X : uvis -d> iPropO Σ) (W : uvis)
+      (Q : Z -> iProp Σ) :
+    (forall (rb wb : bool) (gp : pipe_names),
+       fd_st_of_key (xk_a W 0) (uvis_fd W) <> FdOpen rb wb (FdPipe gp)) ->
+    ⊢ |==> ∃ f : xfam, ⌜kf_xpay f = Q⌝ ∗ xv6_sbundle X 21 f W.
+  Proof using .
+    intros Hnp.
+    iAssert (|==> xv6_sbundle X 21 (xfam_at Q xfam_pt) W)%I with "[]" as "Hb";
+      [ | iMod "Hb" as "Hb"; iModIntro; iExists (xfam_at Q xfam_pt);
+          iSplitR; [ done | iExact "Hb" ] ].
+    rewrite /xv6_sbundle /xfam_at /xfam_pt /xfam_exec /=.
+    destruct (decide ((21 : Z) = USYS_exec)) as [He | _];
+      [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 5)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 9)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 15)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 16)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 17)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 18)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 19)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 20)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 6)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 21)) as [_ | Hc];
+      [ | exfalso; exact (Hc eq_refl) ].
+    iModIntro. rewrite /fileclose_cpay.
+    destruct (fd_st_of_key (xk_a W 0) (uvis_fd W))
+      as [| rb wb [i g om | gp | mj]] eqn:Hst; try by iEmpIntro.
+    (* [destruct ... eqn:] rewrote the guard's own hypothesis too, so what
+       is left of it is the reflexive instance *)
+    exfalso. exact (Hnp rb wb gp eq_refl).
+  Qed.
+
+  (* ...AND THE SAME ROW AT A DESCRIPTOR THAT IS A REGISTERED PIPE END
+     (design/app-pipe.md SS2, lane PIPE-REG).  The guard is again the KEY's
+     own reading of argument 0, which a close leaf holding the descriptor's
+     handle discharges ([UkRun.udepw_cl]'s right arm is where this goes:
+     [UkRun.udepw] takes an explicit bundle, so no arm of [udepw_cl] has to
+     move).  AT THE POINT FAMILY'S PAYLOAD, which is [True] -- a registered
+     row pays its own close for a caller that reads nothing back, and
+     cannot pay one that wants a resource out of it
+     ([PipeReg.pipe_cpay_of_reg_true] says why).  This is what lets a
+     pipe-holding program close its own two ends; sh does it twice a
+     round. *)
+  Lemma xv6_sbundle_close_of_reg (X : uvis -d> iPropO Σ) (W : uvis)
+      (Q : Z -> iProp Σ) (rb wb : bool) (γp : pipe_names) :
+    fd_st_of_key (xk_a W 0) (uvis_fd W) = FdOpen rb wb (FdPipe γp) ->
+    pipe_reg γp -∗
+    |==> ∃ f : xfam, ⌜kf_xpay f = Q⌝ ∗ xv6_sbundle X 21 f W.
+  Proof using .
+    intros Hst. iIntros "#Hr".
+    iAssert (|==> xv6_sbundle X 21 (xfam_at Q xfam_pt) W)%I with "[]" as "Hb";
+      [ | iMod "Hb" as "Hb"; iModIntro; iExists (xfam_at Q xfam_pt);
+          iSplitR; [ done | iExact "Hb" ] ].
+    rewrite /xv6_sbundle /xfam_at /xfam_pt /xfam_exec /=.
+    destruct (decide ((21 : Z) = USYS_exec)) as [He | _];
+      [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 5)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 9)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 15)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 16)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 17)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 18)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 19)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 20)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 6)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide ((21 : Z) = 21)) as [_ | Hc];
+      [ | exfalso; exact (Hc eq_refl) ].
+    iModIntro. rewrite Hst.
+    iApply (fileclose_cpay_of_reg_true (FdOpen rb wb (FdPipe γp))).
+    iExact "Hr".
+  Qed.
+
+  (* ...AND EXIT'S ROW AT A TABLE THAT HOLDS NO PIPE (design/pipe.md, "The
+     exit path").  2 left [xv6_free] because at a table with a pipe row its
+     row is a step of the pipe's exact ghost state; at a pipe-free table
+     every row's payment is [emp] and the deposit is minted from nothing.
+     The guard is on the KEY's own table, which an exit leaf holding the
+     descriptor view can discharge. *)
+  (* ...AND THE SAME ROW OFF THE TABLE'S REGISTRATIONS (design/app-pipe.md
+     SS2, lane PIPE-REG), WHICH IS THE GENERAL ONE.  exit's row is
+     [SpecFileclose.fileclose_cpays] of the key's table -- a [∗ list] of
+     INDEPENDENT payments -- and at a pipe row that payment is one instance
+     of the row's registry ([PipeReg.fileclose_cpays_of_regs]).  So a
+     program that HOLDS a pipe mints its own tear-down here, out of a
+     persistent handle and not out of the taint: the wall
+     completed/pipe-queue.md recorded under "Open, recorded" comes down at
+     this line.  [_nopipe] below is this lemma read at a table of
+     self-registering rows, and [_taint] is still its own arm because the
+     credential pays every row of every table. *)
+  Lemma xv6_sbundle_exit_regs (X : uvis -d> iPropO Σ) (W : uvis)
+      (Q : Z -> iProp Σ) :
+    ([∗ list] st ∈ uvis_fd W, pipe_row_reg st) -∗
+    |==> ∃ f : xfam, ⌜kf_xpay f = Q⌝ ∗ xv6_sbundle X USYS_exit f W.
+  Proof using .
+    iIntros "Hregs".
+    iAssert (|==> xv6_sbundle X USYS_exit (xfam_at Q xfam_pt) W)%I
+      with "[Hregs]" as "Hb";
+      [ | iMod "Hb" as "Hb"; iModIntro; iExists (xfam_at Q xfam_pt);
+          iSplitR; [ done | iExact "Hb" ] ].
+    rewrite /xv6_sbundle /xfam_at /xfam_pt /xfam_exec /=.
+    destruct (decide (USYS_exit = USYS_exec)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 5)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 9)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 15)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 16)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 17)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 18)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 19)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 20)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 6)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 21)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = USYS_exit)) as [_ | Hc];
+      [ | exfalso; exact (Hc eq_refl) ].
+    iModIntro. iApply (fileclose_cpays_of_regs (uvis_fd W) with "Hregs").
+  Qed.
+
+  Lemma xv6_sbundle_exit_nopipe (X : uvis -d> iPropO Σ) (W : uvis)
+      (Q : Z -> iProp Σ) :
+    (forall st : fdstate, st ∈ uvis_fd W ->
+       forall (rb wb : bool) (gp : pipe_names), st <> FdOpen rb wb (FdPipe gp)) ->
+    ⊢ |==> ∃ f : xfam, ⌜kf_xpay f = Q⌝ ∗ xv6_sbundle X USYS_exit f W.
+  Proof using .
+    intros Hnp. iApply (xv6_sbundle_exit_regs X W Q).
+    iApply big_sepL_intro. iIntros "!>" (k st Hk).
+    assert (Hst : fdst_nopipe st).
+    { destruct st as [| rb wb [i g om | gp | mj]];
+        [ exact I | exact I | | exact I ].
+      exfalso.
+      exact (Hnp _ (list_elem_of_lookup_2 _ _ _ Hk) rb wb gp eq_refl). }
+    iApply (pipe_row_reg_nopipe st Hst).
+  Qed.
+
+  (* ...AND THE SAME ROW OUT OF THE TAINT, AT ANY TABLE AT ALL
+     (design/pipe.md, "The exit path").  A pipe row's close payment is
+     [PipeQueue.pipe_cpay], which is a close link OR the credential, so a
+     process that holds the credential owes nothing whatever its table
+     holds ([SpecFileclose.fileclose_cpays_taint]).  This is the arm a
+     program that CALLED pipe(2) exits by. *)
+  Lemma xv6_sbundle_exit_taint (X : uvis -d> iPropO Σ) (W : uvis)
+      (Q : Z -> iProp Σ) :
+    app_taint -∗
+    |==> ∃ f : xfam, ⌜kf_xpay f = Q⌝ ∗ xv6_sbundle X USYS_exit f W.
+  Proof using .
+    iIntros "#Ht".
+    iAssert (|==> xv6_sbundle X USYS_exit (xfam_at Q xfam_pt) W)%I with "[]" as "Hb";
+      [ | iMod "Hb" as "Hb"; iModIntro; iExists (xfam_at Q xfam_pt);
+          iSplitR; [ done | iExact "Hb" ] ].
+    rewrite /xv6_sbundle /xfam_at /xfam_pt /xfam_exec /=.
+    destruct (decide (USYS_exit = USYS_exec)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 5)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 9)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 15)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 16)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 17)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 18)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 19)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 20)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 6)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = 21)) as [He | _]; [ exfalso; discriminate He | ].
+    destruct (decide (USYS_exit = USYS_exit)) as [_ | Hc];
+      [ | exfalso; exact (Hc eq_refl) ].
+    iModIntro. iApply (fileclose_cpays_taint _ with "Ht").
+  Qed.
+
+  (* ...AND THE VERIFIED PROGRAM'S OWN DEPOSIT DATA: NO SUPPLIER AT ALL and
+     the free numbers.  NOT a [Global Instance] -- [uprogSG_gen] is the one
+     instance typeclass resolution may find, and a second one would make
+     every [udep] in the tree ambiguous.  A caller names this one
+     explicitly ([UexecExecMint.udep_free] is its law). *)
+  Definition uprogSG_free : uprogSG Σ :=
+    {| Dsup := True%I;
+       psok := xv6_free |}.
+
+  (* ...and the two at the class field, which is [exec_sbundle] at 7: what
+     a consumer that speaks [UexecSG.sbundle_at] reads it back at.  The
+     INTRO is at the families the caller chose (packed into the record);
+     the ELIM is at the [∃] the family-free reader carries. *)
+  (* ================================================================== *)
+  (* THE PER-NUMBER READERS the dispatcher's arms take the deposit back    *)
+  (* through.  Each is the match at one literal, and nothing else: an arm  *)
+  (* knows its own number ([sysc_arm_goal]'s [Hnum]) and reads its own     *)
+  (* branch.                                                               *)
+  (* ================================================================== *)
+  Local Ltac xv6_skip :=
+    match goal with
+    | |- context [ @decide (?a = ?b) _ ] =>
+        let Hc := fresh "Hc" in
+        destruct (decide (a = b)) as [Hc | _]; [ exfalso; by vm_compute in Hc | ]
+    end.
+  Local Ltac xv6_take :=
+    match goal with
+    | |- context [ @decide (?a = ?b) _ ] =>
+        let Hc := fresh "Hc" in
+        destruct (decide (a = b)) as [_ | Hc]; [ | exfalso; by apply Hc ]
+    end.
+
+  Lemma sbundle_at_read_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 5 f W -∗
+    fileread_in (fd_st_of_key (tf_w (uvis_tf W) (tf_arg_idx 0)) (uvis_fd W))
+      (sys_rw_count (tf_w (uvis_tf W) (tf_arg_idx 2)))
+      (rf_F f) (rf_ret f) (rf_in f) (rf_pq f) (rf_pqe f) True%I.
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  (* ...and close's (design/pipe.md): the pipe arm's close payment *)
+  Lemma sbundle_at_close_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 21 f W -∗
+    fileclose_cpay (fd_st_of_key (tf_w (uvis_tf W) (tf_arg_idx 0)) (uvis_fd W)) (cl_P f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    do 10 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  (* exit's row: the table's close payments, which kexit spends *)
+  Lemma sbundle_at_exit_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X USYS_exit f W -∗ fileclose_cpays (uvis_fd W).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    do 11 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma sbundle_at_chdir_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 9 f W -∗
+    chdir_au_pre (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (cf_P f) (cf_Pmiss f) (cf_Fo f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma sbundle_at_open_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 15 f W -∗
+    open_in (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (tf_w (uvis_tf W) (tf_arg_idx 1))
+      (of_P f) (of_Pmiss f) (of_Farm f) (of_Fun f) (of_Fok f) (of_Fex f)
+      (of_Fo f) (of_Ft f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma sbundle_at_write_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 16 f W -∗
+    filewrite_in (uvis_perm W) (uvis_sz W) (uvis_lazy W)
+      (fd_st_of_key (tf_w (uvis_tf W) (tf_arg_idx 0)) (uvis_fd W))
+      (sys_rw_count (tf_w (uvis_tf W) (tf_arg_idx 2))) (uvis_M W)
+      (tf_w (uvis_tf W) (tf_arg_idx 1)) (wf_Q f) (wf_Qe f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma sbundle_at_mknod_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 17 f W -∗
+    mknod_au_at (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (dev_arg (tf_w (uvis_tf W) (tf_arg_idx 1)))
+      (dev_arg (tf_w (uvis_tf W) (tf_arg_idx 2)))
+      (nf_P f) (nf_Pmiss f) (nf_Farm f) (nf_Fun f) (nf_Fok f) (nf_Fex f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma sbundle_at_unlink_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 18 f W -∗
+    unlink_au_at (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (uf_P f) (uf_Pmiss f) (uf_Fent f) (uf_Ftgt f) (uf_Fex f) (uf_Fmiss f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip.
+    xv6_take. iExact "H".
+  Qed.
+
+  Lemma sbundle_at_link_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 19 f W -∗
+    link_commits (fs_gamma_L fsc_fs) (lf_Ftgt f) (lf_Fent f) (lf_Funt f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip.
+    xv6_take. iExact "H".
+  Qed.
+
+  Lemma sbundle_at_mkdir_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 20 f W -∗
+    mkdir_au_at (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (df_P f) (df_Pmiss f) (df_Farm f) (df_Fdots f) (df_Fun f)
+      (df_Fok f) (df_Fex f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip.
+    xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  (* ROW 6, READ OFF (lane KILL-PAY, K3(a)): what a process trapping with
+     the kill number deposited.  [ProofSyscall.sysc_arm_kill] takes it out
+     here and hands it to [SpecSysKill], which relays it to kkill -- which
+     needs it because writing [p->killed] nonzero has to re-establish
+     [SchedCtx.proc_pub]'s killed row. *)
+  Lemma sbundle_at_kill_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 6 f W -∗ app_taint.
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip.
+    xv6_skip. xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  (* THE PAY ROW COMES IN BESIDE THE AU HALF, and at the TRIVIAL payload:
+     [xfam_exec] is the record at the generic payloads (both [kf_pay] and
+     [kf_xpay] of [xfam_exec] are [fun _ => True]), which is what a process
+     that answers for no abstract state forks and execs with.  A process
+     with a real payload introduces its bundle at it instead
+     ([sbundle_pay_exec_intro]). *)
+  Lemma sbundle_at_exec_intro (X : uvis -d> iPropO Σ) (W : uvis)
+      (P Pmiss : nat -> Z -> iProp Σ)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (Rs : iProp Σ) :
+    my_pay (uvis_gen W) (fun _ => True)%I -∗
+    sys_exec_au_pre (MkPfam X Rs) (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W) (uvis_secc W)
+      (fun _ => True)%I P Pmiss Fo
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (tf_w (uvis_tf W) (tf_arg_idx 1)) (uvis_fd W) (uvis_ch W) (uvis_pid W) -∗
+    sbundle_at X USYS_exec (xfam_exec P Pmiss Fo Rs) W.
+  Proof using .
+    iIntros "Hmp H". rewrite /sbundle_at /= /xv6_sbundle.
+    destruct (decide (USYS_exec = USYS_exec)) as [_ | Hc];
+      [ | exfalso; exact (Hc eq_refl) ].
+    rewrite /exec_sbundle /=. iFrame "Hmp". iExact "H".
+  Qed.
+
+  Lemma sbundle_exec_intro (X : uvis -d> iPropO Σ) (W : uvis)
+      (P Pmiss : nat -> Z -> iProp Σ)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (Rs : iProp Σ) :
+    my_pay (uvis_gen W) (fun _ => True)%I -∗
+    sys_exec_au_pre (MkPfam X Rs) (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W) (uvis_secc W)
+      (fun _ => True)%I P Pmiss Fo
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (tf_w (uvis_tf W) (tf_arg_idx 1)) (uvis_fd W) (uvis_ch W) (uvis_pid W) -∗
+    sbundle X USYS_exec W.
+  Proof using .
+    iIntros "Hmp H". rewrite /sbundle. iExists (xfam_exec P Pmiss Fo Rs).
+    iApply (sbundle_at_exec_intro X W P Pmiss Fo Rs with "Hmp H").
+  Qed.
+
+  (* ...AND THE SAME AT THE DEPOSITING PROCESS'S OWN PAYLOAD, which is what
+     a leaf actually owes now (app-echo.md, "SH-LINE RULING", R1, at exec):
+     exec's bundle READS the payload -- it is the one the kernel hands the
+     new image's slot ([SpecKexec.exec_slot_pre]) -- so a supplier cannot
+     mint at some family and re-key afterwards ([UexecSG.sbundle_at_at] no
+     longer licenses it at exec); it states its payload up front and this
+     is the introduction that names it. *)
+  Lemma sbundle_pay_exec_intro (X : uvis -d> iPropO Σ) (W : uvis)
+      (Q : Z -> iProp Σ)
+      (P Pmiss : nat -> Z -> iProp Σ)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (Rs : iProp Σ) :
+    my_pay (uvis_gen W) Q -∗
+    sys_exec_au_pre (MkPfam X Rs) (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W) (uvis_secc W)
+      Q P Pmiss Fo
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (tf_w (uvis_tf W) (tf_arg_idx 1)) (uvis_fd W) (uvis_ch W) (uvis_pid W) -∗
+    sbundle_pay X USYS_exec Q W.
+  Proof using .
+    iIntros "Hmp H". rewrite /sbundle_pay.
+    iExists (xfam_at Q (xfam_exec P Pmiss Fo Rs)).
+    iSplitR; [ done | ].
+    rewrite /sbundle_at /= /xv6_sbundle.
+    destruct (decide (USYS_exec = USYS_exec)) as [_ | Hc];
+      [ | exfalso; exact (Hc eq_refl) ].
+    rewrite /exec_sbundle /=. iFrame "Hmp". iExact "H".
+  Qed.
+
+  (* ...AND THE SAME WITH THE FAILING exec's REFUND (lane KILL-PAY, K4(a),
+     ruling R-A).  The extra premise is the one consequence a leaf can
+     state of a refund it cannot name: whatever [Rs] is, it pays this
+     record's own exit at the kill status. *)
+  Lemma sbundle_pay_exec_intro_ref (X : uvis -d> iPropO Σ) (W : uvis)
+      (Q : Z -> iProp Σ)
+      (P Pmiss : nat -> Z -> iProp Σ)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (Rs : iProp Σ) :
+    □ (Rs -∗ Q (-1)) -∗
+    my_pay (uvis_gen W) Q -∗
+    sys_exec_au_pre (MkPfam X Rs) (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W) (uvis_secc W)
+      Q P Pmiss Fo
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (tf_w (uvis_tf W) (tf_arg_idx 1)) (uvis_fd W) (uvis_ch W) (uvis_pid W) -∗
+    sbundle_pay_ref X Q W.
+  Proof using .
+    iIntros "#Hrf Hmp H". rewrite /sbundle_pay_ref.
+    iExists (xfam_at Q (xfam_exec P Pmiss Fo Rs)).
+    iSplitR; [ done | ].
+    iSplitR; [ iExact "Hrf" | ].
+    rewrite /sbundle_at /= /xv6_sbundle.
+    destruct (decide (USYS_exec = USYS_exec)) as [_ | Hc];
+      [ | exfalso; exact (Hc eq_refl) ].
+    rewrite /exec_sbundle /=. iFrame "Hmp". iExact "H".
+  Qed.
+
+  Lemma sbundle_at_exec_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X USYS_exec f W -∗
+    my_pay (uvis_gen W) (kf_xpay f) ∗
+    sys_exec_au_pre (MkPfam X (xf_Rs f)) (fs_gamma_L fsc_fs) fsc_fs
+      (uvis_cwd W) (uvis_secc W) (kf_xpay f) (xf_P f) (xf_Pmiss f) (xf_Fo f)
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (tf_w (uvis_tf W) (tf_arg_idx 1)) (uvis_fd W) (uvis_ch W) (uvis_pid W).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle.
+    destruct (decide (USYS_exec = USYS_exec)) as [_ | Hc];
+      [ | exfalso; exact (Hc eq_refl) ].
+    rewrite /exec_sbundle. iExact "H".
+  Qed.
+
+  Lemma sbundle_exec_elim (X : uvis -d> iPropO Σ) (W : uvis) :
+    sbundle X USYS_exec W -∗
+    ∃ (Q : Z -> iProp Σ) (P Pmiss : nat -> Z -> iProp Σ)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (Rs : iProp Σ),
+      my_pay (uvis_gen W) Q ∗
+      sys_exec_au_pre (MkPfam X Rs) (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W) (uvis_secc W)
+        Q P Pmiss Fo
+        (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+        (tf_w (uvis_tf W) (tf_arg_idx 1)) (uvis_fd W) (uvis_ch W) (uvis_pid W).
+  Proof using .
+    iIntros "H". rewrite /sbundle. iDestruct "H" as (f) "H".
+    iDestruct (sbundle_at_exec_elim X f W with "H") as "H".
+    iExists (kf_xpay f), (xf_P f), (xf_Pmiss f), (xf_Fo f), (xf_Rs f).
+    iExact "H".
+  Qed.
+
+  (* ================================================================== *)
+  (* THE POST-SIDE INTRODUCTIONS, the mirror of the eight readers above:   *)
+  (* the dispatcher's arm holds its contract's armed post and needs it at  *)
+  (* the class field, at its own number and the key the process deposited  *)
+  (* from.  Each is the match at one literal and nothing else.             *)
+  (* ================================================================== *)
+  Lemma spost_at_read_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (P : uptd)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    fileread_ret (sys_rw_count (tf_w (uvis_tf W) (tf_arg_idx 2))) r ->
+    perm_of (ud_um P) (uvis_sz W) = uvis_perm W ->
+    ProcPtOwn.proc_pt_wf P ->
+    (uvis_lazy W = false -> lazy_free (ud_um P) (uvis_sz W)) ->
+    fileread_extra_core (uvis_gen W) P (fd_st_of_key (tf_w (uvis_tf W) (tf_arg_idx 0)) (uvis_fd W))
+      (sys_rw_count (tf_w (uvis_tf W) (tf_arg_idx 2))) (rf_F f) (rf_ret f)
+      (rf_in f) (rf_pq f) (rf_pqe f) r M' (tf_w (uvis_tf W) (tf_arg_idx 1)) -∗
+    spost_at X 5 f W r M' fdv' cw' cs'.
+  Proof using .
+    intros Hret Hpm Hwf Hlz. iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_take. iSplitR; [by iPureIntro |]. iExists P.
+    iSplitR; [by iPureIntro |]. iSplitR; [by iPureIntro |].
+    iSplitR; [by iPureIntro |]. iExact "H".
+  Qed.
+
+  (* ...AND THE READ ROW'S REASON, READ OFF THE POST WITHOUT SPENDING IT
+     (lane TRAP-ROWS, T2(ii)).  Both disjuncts are persistent, so the post
+     comes straight back; usertrap's second [killed] check refutes the
+     right one against <p->lock>'s own row and is left with the sign
+     guard. *)
+  Lemma spost_at_read_why (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (rb : bool) (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate)
+      (cw' : Z) (cs' : gset gname) :
+    fd_st_of_key (tf_w (uvis_tf W) (tf_arg_idx 0)) (uvis_fd W)
+      = FdOpen true rb (FdDevice ConsoleInv.CONSOLE) ->
+    r = (mword_of_int (-1) : mword 64) ->
+    spost_at X 5 f W r M' fdv' cw' cs' -∗
+    (⌜(sys_rw_count (tf_w (uvis_tf W) (tf_arg_idx 2)) < 0)%Z⌝
+     ∨ ChildTok.kill_shot (uvis_gen W)) ∗
+    spost_at X 5 f W r M' fdv' cw' cs'.
+  Proof using .
+    intros Hfd Hr.
+    pose proof (sys_rw_count_lt (tf_w (uvis_tf W) (tf_arg_idx 2))) as Hlt.
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_take.
+    iDestruct "H" as "(%Hret & %P & %Hpm & %Hwf & %Hlz & Hcore)".
+    rewrite Hfd.
+    iDestruct (fileread_extra_core_m1_why (uvis_gen W) P rb
+                 (sys_rw_count (tf_w (uvis_tf W) (tf_arg_idx 2)))
+                 (rf_F f) (rf_ret f) (rf_in f) (rf_pq f) (rf_pqe f) r M'
+                 (tf_w (uvis_tf W) (tf_arg_idx 1)) Hlt Hr
+                 with "Hcore") as "(#Hwhy & Hcore)".
+    iSplitR "Hcore"; [ iExact "Hwhy" | ].
+    iSplitR; [by iPureIntro |]. iExists P.
+    iSplitR; [by iPureIntro |]. iSplitR; [by iPureIntro |].
+    iSplitR; [by iPureIntro |]. iExact "Hcore".
+  Qed.
+
+  (* ...and chdir's, at the working directory the call RESUMES at: the arm
+     the dispatcher splits ([SpecSysChdir.chdir_arms_split]) hands the
+     kernel half back and this the process's. *)
+  Lemma spost_at_chdir_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    chdir_receipt (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (cf_P f) (cf_Pmiss f) (cf_Fo f) r cw' -∗
+    spost_at X 9 f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  (* ...and open's, at the descriptor view it resumes at
+     ([SpecSysOpen.open_arms_split]) *)
+  Lemma spost_at_open_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    open_receipt (of_om f) (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (tf_w (uvis_tf W) (tf_arg_idx 1))
+      (of_P f) (of_Pmiss f) (of_Farm f) (of_Fun f) (of_Fok f) (of_Fex f)
+      (of_Fo f) (of_Ft f) (uvis_fd W) r fdv' -∗
+    spost_at X 15 f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_skip. xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma spost_at_write_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (P : uptd)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    filewrite_ret (sys_rw_count (tf_w (uvis_tf W) (tf_arg_idx 2))) r ->
+    perm_of (ud_um P) (uvis_sz W) = uvis_perm W ->
+    ProcPtOwn.proc_pt_wf P ->
+    (uvis_lazy W = false -> lazy_free (ud_um P) (uvis_sz W)) ->
+    filewrite_extra (uvis_gen W) P (fd_st_of_key (tf_w (uvis_tf W) (tf_arg_idx 0)) (uvis_fd W))
+      (sys_rw_count (tf_w (uvis_tf W) (tf_arg_idx 2))) (uvis_M W)
+      (tf_w (uvis_tf W) (tf_arg_idx 1)) (wf_Q f) (wf_Qe f) r -∗
+    spost_at X 16 f W r M' fdv' cw' cs'.
+  Proof using .
+    intros Hret Hpm Hwf Hlz. iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_take. iSplitR; [by iPureIntro |]. iExists P.
+    iSplitR; [by iPureIntro |]. iSplitR; [by iPureIntro |].
+    iSplitR; [by iPureIntro |]. iExact "H".
+  Qed.
+
+  Lemma spost_at_mknod_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    mknod_arms (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0))
+      (dev_arg (tf_w (uvis_tf W) (tf_arg_idx 1)))
+      (dev_arg (tf_w (uvis_tf W) (tf_arg_idx 2)))
+      (nf_P f) (nf_Pmiss f) (nf_Farm f) (nf_Fun f) (nf_Fok f) (nf_Fex f) r -∗
+    spost_at X 17 f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma spost_at_unlink_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    unlink_arms (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (uf_P f) (uf_Pmiss f) (uf_Fent f) (uf_Ftgt f) (uf_Fex f) (uf_Fmiss f)
+      (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0)) r -∗
+    spost_at X 18 f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma spost_at_link_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    link_arms (fs_gamma_L fsc_fs) (lf_Ftgt f) (lf_Fent f) (lf_Funt f) r -∗
+    spost_at X 19 f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip.
+    xv6_take. iExact "H".
+  Qed.
+
+  Lemma spost_at_mkdir_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    mkdir_arms (fs_gamma_L fsc_fs) fsc_fs (uvis_cwd W)
+      (df_P f) (df_Pmiss f) (df_Farm f) (df_Fdots f) (df_Fun f)
+      (df_Fok f) (df_Fex f) (uvis_M W) (tf_w (uvis_tf W) (tf_arg_idx 0)) r -∗
+    spost_at X 20 f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip. xv6_skip.
+    xv6_take. iExact "H".
+  Qed.
+
+  (* ...and the numbers that pay nothing, in one lemma: every number
+     without a contract at all.  exec IS NO LONGER ONE OF THEM (lane
+     KILL-PAY, K4(a), ruling R-A): its post is the failing exec's refund,
+     so 7 joins the eight contract numbers in the exclusion. *)
+  Lemma spost_at_emp (X : uvis -d> iPropO Σ) (n : Z) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    ~ (n = 5 \/ n = 9 \/ n = 15 \/ n = 16 \/ n = 17 \/ n = 18 \/ n = 19
+       \/ n = 20 \/ n = 7 \/ n = 4 \/ n = 21 \/ n = 22) ->
+    ⊢ spost_at X n f W r M' fdv' cw' cs'.
+  Proof using .
+    intros Hne. rewrite /spost_at /= /xv6_spost.
+    destruct (decide (n = USYS_exec)) as [He | _];
+      [ exfalso; apply Hne; unfold USYS_exec in He; tauto |].
+    destruct (decide (n = 5)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = 9)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = 15)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = 16)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = 17)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = 18)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = 19)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = 20)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = USYS_pipe)) as [He | _];
+      [ exfalso; apply Hne; unfold USYS_pipe in He; tauto |].
+    destruct (decide (n = 21)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    destruct (decide (n = 22)) as [He | _]; [ exfalso; apply Hne; tauto |].
+    done.
+  Qed.
+
+  (* ...AND THE TWO NEW POST INTRODUCTIONS (design/pipe.md): pipe's, at the
+     descriptors the dispatcher's own arm names, and close's. *)
+  Lemma spost_at_pipe_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    (⌜uint r = 0⌝ -∗
+     ∃ (a b : nat) (γp : pipe_names),
+       ⌜a <> b /\ fd_least_closed (uvis_fd W) a
+        /\ fd_least_closed (<[a := FdOpen true false (FdPipe γp)]> (uvis_fd W)) b
+        /\ fdv' = <[b := FdOpen false true (FdPipe γp)]>
+                     (<[a := FdOpen true false (FdPipe γp)]> (uvis_fd W))⌝ ∗
+       pipe_qfrag (pn_queue γp) pst0) -∗
+    spost_at X USYS_pipe f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    do 9 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  (* ...and pipe's ELIM, the converse of the introduction above: the leaf
+     that spends the row is stated over the CLASS ([UkRunSys] binds
+     [uexecSG] as a variable), so the fragment is read out one level up
+     ([UkReadPipe.wp_uk_pipe_read_end]). *)
+  Lemma spost_at_pipe_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    spost_at X USYS_pipe f W r M' fdv' cw' cs' -∗
+    (⌜uint r = 0⌝ -∗
+     ∃ (a b : nat) (γp : pipe_names),
+       ⌜a <> b /\ fd_least_closed (uvis_fd W) a
+        /\ fd_least_closed (<[a := FdOpen true false (FdPipe γp)]> (uvis_fd W)) b
+        /\ fdv' = <[b := FdOpen false true (FdPipe γp)]>
+                     (<[a := FdOpen true false (FdPipe γp)]> (uvis_fd W))⌝ ∗
+       pipe_qfrag (pn_queue γp) pst0).
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    do 9 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma spost_at_close_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    fileclose_cpost_any (fd_st_of_key (tf_w (uvis_tf W) (tf_arg_idx 0)) (uvis_fd W)) (cl_P f) -∗
+    spost_at X 21 f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    do 10 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  (* ================================================================== *)
+  (* SYNC'S ROW 22, ALL FOUR DIRECTIONS (sync K4).  The dispatcher's pair  *)
+  (* -- the deposit's ELIM and the post's INTRO -- is what                 *)
+  (* [ProofSyscall.sysc_arm_sync] hands [SpecSysSync] and back; the        *)
+  (* process's pair is what /sync's ecall leaf states its supplier and    *)
+  (* reads its receipt through ([UkSyncEntry.ksync_leaf_xv6]).  None of    *)
+  (* the four reads the key.                                               *)
+  (* ================================================================== *)
+  Lemma sbundle_at_sync_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    sbundle_at X 22 f W -∗ hook_opt gen_id (sy_oQ f).
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    do 12 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma sbundle_at_sync_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis) :
+    hook_opt gen_id (sy_oQ f) -∗ sbundle_at X 22 f W.
+  Proof using .
+    iIntros "H". rewrite /sbundle_at /= /xv6_sbundle /xk_a.
+    do 12 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma spost_at_sync_intro (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    Q_opt (sy_oQ f) -∗ spost_at X 22 f W r M' fdv' cw' cs'.
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    do 11 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+  Lemma spost_at_sync_elim (X : uvis -d> iPropO Σ) (f : xfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z) (cs' : gset gname) :
+    spost_at X 22 f W r M' fdv' cw' cs' -∗ Q_opt (sy_oQ f).
+  Proof using .
+    iIntros "H". rewrite /spost_at /= /xv6_spost /xk_a.
+    do 11 xv6_skip. xv6_take. iExact "H".
+  Qed.
+
+End UexecExecInst.

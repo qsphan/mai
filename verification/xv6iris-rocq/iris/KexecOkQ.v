@@ -1,0 +1,547 @@
+(* ===================================================================== *)
+(*  KexecOkQ.v -- kexec's RESULT RELATION, GENERIC IN THE ENTRY POINT     *)
+(*  (claude-notes/completed/namei-pinned-lookup.md §13.3)                 *)
+(* ===================================================================== *)
+
+(*  WHY THIS EXISTS.  [KexecDefs.kexec_ok] is spelled in thirty-one places
+    across the kexec cone, and every one of them is a phase lemma RELAYING
+    kexec's own exit continuation:
+
+      wp_next true pj (fun CID => ∀ mf V' entry spv szv',
+         ⌜callee_saved m mf⌝ -∗ ⌜kexec_ok V V' (mf!!!a0) entry spv szv' ..⌝
+         -∗ .. -∗ WP Loop)
+
+    A client that wants to SAY something about [entry] cannot weaken its own
+    strengthened continuation into that shape: the missing side is a pure
+    fact about a universally quantified [entry], and no resource the exit
+    hands over determines it.  So the strengthening cannot be threaded
+    through one landed relay -- it has to be threaded through all of them,
+    and the cheap way to do that is to punch a hole in the relation once
+    and pass the plug down.  This is the eb-generic sweep's shape exactly
+    (claude-notes/completed/eb-generic-sweep.md), on the exit relation
+    rather than on the interrupt index.
+
+    THE HOLE IS IN THE SUCCESS ARM ONLY, and that is what makes the sweep
+    free: [kexec_ok]'s FAILURE arm does not mention [entry] at all, so all
+    eight of kexec's [bad:] tails prove [kexec_ok_q Q] with the SAME proof
+    term they proved [kexec_ok] with, at every [Q].  The one site that has
+    to pay is the commit block's [ld a4,-408(s0)] -- and it pays with the
+    premise [forall U', Q (kxq_entry ef) U'], which is a fact about the ELF
+    header the walk read, i.e. exactly the fact the pinned walk brings.
+
+    THE HOLE'S SECOND ARGUMENT IS THE FINAL PROCESS STATE.  [kexec_ok_q]
+    itself stays a claim on the ENTRY word alone -- its [Q] is
+    [mword 64 -> Prop], and every [bad:] tail's proof term is unchanged --
+    but [kexec_closer], which BINDS the exit's [U'], plugs the hole with
+    [fun e => Q e U'] for a client-supplied [Q : mword 64 -> ustate -> Prop].
+    A client of [SpecKexec.v] needs to say things about the image the run
+    built ([us_M U'], its size), and only the closer can see it.
+
+    [KexecDefs.v] IS UNTOUCHED: [kexec_ok] stays what it is, and
+    [kexec_ok_q_True] below is the row that says so -- at
+    [Q := fun _ _ => True] the two relations are equivalent, which is what
+    makes the hole a refinement of the landed relation rather than a
+    different one.
+
+    THE HOLE HAS ONE PLUG: [KexecBridge.exec_built_Q], the fact bundle
+    the exec contract's postcondition is stated over.  It stays a hole
+    rather than being specialised to that plug because [Q] and [QF] are
+    parameters of [kexec_closer], which every one of kexec's eight phase
+    files relays; specialising changes no statement's strength and rewrites
+    all eight.                                                            *)
+
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+(* the bi notations [⌜ ⌝] / [-∗] / [[∗ list]] that [kexec_closer] below is
+   written in *)
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import SailStdpp.Operators_mwords.
+Require Import RiscvModelBytes.
+Require Import RiscvLang.
+Require Import ProcGeom.
+Require Import UserPtTree.      (* [ud_tfp] / [ud_root] *)
+Require Import ProcInv.
+Require Import ElfEnc.          (* [le_at] -- the entry field's reader *)
+Require Import KexecDefs.       (* [kexec_ok] and its vocabulary       *)
+
+(* ...and the vocabulary [kexec_closer] below needs.  Every one of these is
+   already in this file's transitive cone through [KexecDefs]; naming them
+   here only brings them into SCOPE. *)
+Require Import Riscv.rv64d_types.  (* [Regidx]                          *)
+Require Import RegFile.         (* [regfile]                            *)
+Require Import RiscvPtsto.      (* the [↦₄]/[↦₈]/[↦ₘ] notations         *)
+Require Import InstrBytes.      (* [pc_is]                              *)
+Require Import IntrDefs.        (* [sie_cap_gpr], [trap_csrs_ext], ...  *)
+Require Import CpuOwn.          (* [cpu_own]                            *)
+Require Import CalleeSaved.     (* [callee_saved]                       *)
+Require Import BioDefs.         (* [bslots]                             *)
+Require Import IrefSlots.       (* [iref_slots]                         *)
+Require Import BitmapInv.       (* [sb_bmapstart]                       *)
+Require Import InodeInv.        (* [sb_inodestart]                      *)
+Require Import KvmSpec.         (* [kalloc_env]                         *)
+Require Import Xv6G.            (* [xv6G]                               *)
+Require Import FdSlots.         (* [fdslotG]                            *)
+Require Import FileInvDefs.     (* [fileG]                              *)
+Require Import TsoCtx.   (* the CONTEXT tier: [kexec_closer]'s cells are the
+   ambient thread's [ctx_*_pointsto], as every phase lemma that hands
+   them in or out states them (tso-cutover L2: the raw spelling here was
+   the one reason ProofKexecTail/ProofKexecD crossed the retired shim) *)
+
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(*  1.  THE RELATION WITH THE HOLE                                        *)
+(* ===================================================================== *)
+
+(*  [KexecDefs.kexec_ok] verbatim, with one conjunct [Q entry] added at the
+    FRONT of the success arm.  The failure arm is character-for-character
+    the landed one.                                                       *)
+Definition kexec_ok_q (Q : mword 64 -> Prop) (V V' : pprivate) (r : mword 64)
+    (entry spv szv' : mword 64) (na : nat) (alen : nat -> nat) : Prop :=
+  (* FAILED: nothing moved -- and, in particular, nothing is claimed about
+     [entry], which is why every [bad:] tail is generic for free. *)
+  (r = (mword_of_int (-1) : mword 64) /\
+   (* ...AND THE EVENT COUNT ONLY ROSE (permit sweep, design
+      ni-strong-instance.md §7): a failed exec may have freed the pages it
+      had built, each an actor-labelled event, so the block comes back at
+      its own record with [pv_ev] at least where it was. *)
+   exists k' : nat, (pv_ev V <= k')%nat /\ V' = upd_ev V k')
+  \/
+  (* SUCCEEDED: the landed arm, plus the caller's claim on the entry PC. *)
+  (Q entry /\
+   r = (mword_of_int (Z.of_nat na) : mword 64) /\
+   (na <= MAXARG)%nat /\
+   kxc_stack_ok (uint szv') (uint szv' - 4096) alen na /\
+   pv_sz V' = szv' /\
+   spv = (mword_of_int (kxc_sp_final (uint szv') alen na) : mword 64) /\
+   ud_tfp (pv_upt V') = ud_tfp (pv_upt V) /\
+   kxc_tf (pv_tf V) (pv_tf V') entry spv /\
+   pv_ofile V' = pv_ofile V /\
+   (* ...and its fd-state ghost name -- see [KexecDefs.kexec_ok]'s note *)
+   pv_fdg V' = pv_fdg V /\
+   pv_cwd V' = pv_cwd V /\
+   pv_cwi V' = pv_cwi V /\
+   (* ...AND THE TWO GHOST NAMES.  The identity of a process survives
+      exec -- it is the same incarnation of the same slot, with the same
+      parent expecting the same exit payload -- so [ProcDefs.pv_gen] is
+      untouched; and exec neither forks nor reaps, so the children row's
+      name is too.  [UexecSlot.uvis_gen] of the post-exec key is
+      therefore the pre-exec one, which is what the exec'ing process's
+      own child token stands on. *)
+   pv_gen V' = pv_gen V /\
+   pv_chg V' = pv_chg V /\
+   length (pv_name V') = PNAMELEN /\
+   (uint szv' - 4096 <= uint spv)%Z /\
+   (uint spv <= uint szv')%Z /\
+   (* ...and the lazy bit -- see [KexecDefs.kexec_ok]'s own row: exec's
+      image is eager, so the block the swap installs is at [false]. *)
+   pv_lazy V' = false /\
+   (* ...AND THE MASK IS KEPT (upstream a083670): exec does not touch
+      [p->seccomp], so [ProcDefs.pv_secc] survives it -- a masked process
+      stays masked across exec, which is the whole point of the mask. *)
+   pv_secc V' = pv_secc V).
+
+(* THE ROW THAT TIES THE HOLE TO THE LANDED RELATION: at a vacuous [Q] the
+   two are the same claim. *)
+Lemma kexec_ok_q_True (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) :
+  kexec_ok_q (fun _ => True) V V' r entry spv szv' na alen
+  <-> kexec_ok V V' r entry spv szv' na alen.
+Proof.
+  unfold kexec_ok_q, kexec_ok. split.
+  - intros [Hl | (_ & H)]; [by left | by right].
+  - intros [Hl | H]; [by left | right; split; [exact I | exact H]].
+Qed.
+
+(* ...and its two one-way readings, which is what the [iApply]s use. *)
+Lemma kexec_ok_q_weaken (Q : mword 64 -> Prop)
+    (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) :
+  kexec_ok_q Q V V' r entry spv szv' na alen ->
+  kexec_ok V V' r entry spv szv' na alen.
+Proof. intros [Hl | (_ & H)]; unfold kexec_ok; [by left | by right]. Qed.
+
+Lemma kexec_ok_q_of_True (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) :
+  kexec_ok V V' r entry spv szv' na alen ->
+  kexec_ok_q (fun _ => True) V V' r entry spv szv' na alen.
+Proof. intro H. by apply kexec_ok_q_True. Qed.
+
+
+(* ===================================================================== *)
+(*  1b.  THE FAILURE ARM'S OWN HOLE (S5)                                  *)
+(* ===================================================================== *)
+
+(*  WHY A SECOND PLUG.  [kexec_ok_q] above says NOTHING about a failed
+    run, which is what made the §1 sweep free -- and also what made the
+    AU composition report every post-lock failure as "out of memory".
+    The honest sentence is the one the C code actually decides: a file
+    the loader rejects fails with [EfNotLoadable], arguments that do not
+    fit the stack page with [EfArgsFit], and only a real allocation
+    failure with [EfNoMem].  So the FAILURE arm gets a hole too, and it
+    is paid at the [bad:] tail that jumped -- each of which knows, as a
+    pure fact about the file and the frame, WHY it jumped.
+
+    [kxf_cause] is [SpecKexec.exec_fail_cause] transcribed into a file
+    that sits BELOW the AU contract (the kernel-side cone must not name
+    it); the composition bridges the two by a three-row match.           *)
+Inductive kxf_cause :=
+| KfNotLoadable   (* a phdr test / a short read: the file is not one
+                     [kexec_loadable] describes                        *)
+| KfArgsFit       (* [sp < stackbase]: the arguments do not fit        *)
+| KfNoMem.        (* kalloc / uvmalloc / proc_pagetable exhaustion     *)
+
+(*  [kexec_ok_q] with the failure arm carrying a CAUSE the plug accepts.
+    The success arm is character-for-character §1's, so every site that
+    proves the run   (Q entry /\
+   r = (mword_of_int (Z.of_nat na) : mword 64) /\
+   (na <= MAXARG)%nat /\
+   kxc_stack_ok (uint szv') (uint szv' - 4096) alen na /\
+   pv_sz V' = szv' /\
+   spv = (mword_of_int (kxc_sp_final (uint szv') alen na) : mword 64) /\
+   ud_tfp (pv_upt V') = ud_tfp (pv_upt V) /\
+   kxc_tf (pv_tf V) (pv_tf V') entry spv /\
+   pv_ofile V' = pv_ofile V /\
+   pv_fdg V' = pv_fdg V /\
+   pv_cwd V' = pv_cwd V /\
+   pv_cwi V' = pv_cwi V /\
+   (* ...AND THE TWO GHOST NAMES.  The identity of a process survives
+      exec -- it is the same incarnation of the same slot, with the same
+      parent expecting the same exit payload -- so [ProcDefs.pv_gen] is
+      untouched; and exec neither forks nor reaps, so the children row's
+      name is too.  [UexecSlot.uvis_gen] of the post-exec key is
+      therefore the pre-exec one, which is what the exec'ing process's
+      own child token stands on. *)
+   pv_gen V' = pv_gen V /\
+   pv_chg V' = pv_chg V /\
+   length (pv_name V') = PNAMELEN /\
+   (uint szv' - 4096 <= uint spv)%Z /\
+   (uint spv <= uint szv')%Z)EEDED is unchanged; the [bad:] tails are the ones
+    that pay, and at [QF := fun _ => True] they pay nothing (any [c]). *)
+Definition kexec_ok_qf (Q : mword 64 -> Prop) (QF : kxf_cause -> Prop)
+    (V V' : pprivate) (r : mword 64)
+    (entry spv szv' : mword 64) (na : nat) (alen : nat -> nat) : Prop :=
+  (r = (mword_of_int (-1) : mword 64) /\
+   (exists k' : nat, (pv_ev V <= k')%nat /\ V' = upd_ev V k') /\ (exists c, QF c))
+  \/
+  (Q entry /\
+   r = (mword_of_int (Z.of_nat na) : mword 64) /\
+   (na <= MAXARG)%nat /\
+   kxc_stack_ok (uint szv') (uint szv' - 4096) alen na /\
+   pv_sz V' = szv' /\
+   spv = (mword_of_int (kxc_sp_final (uint szv') alen na) : mword 64) /\
+   ud_tfp (pv_upt V') = ud_tfp (pv_upt V) /\
+   kxc_tf (pv_tf V) (pv_tf V') entry spv /\
+   pv_ofile V' = pv_ofile V /\
+   pv_fdg V' = pv_fdg V /\
+   pv_cwd V' = pv_cwd V /\
+   pv_cwi V' = pv_cwi V /\
+   (* ...AND THE TWO GHOST NAMES.  The identity of a process survives
+      exec -- it is the same incarnation of the same slot, with the same
+      parent expecting the same exit payload -- so [ProcDefs.pv_gen] is
+      untouched; and exec neither forks nor reaps, so the children row's
+      name is too.  [UexecSlot.uvis_gen] of the post-exec key is
+      therefore the pre-exec one, which is what the exec'ing process's
+      own child token stands on. *)
+   pv_gen V' = pv_gen V /\
+   pv_chg V' = pv_chg V /\
+   length (pv_name V') = PNAMELEN /\
+   (uint szv' - 4096 <= uint spv)%Z /\
+   (uint spv <= uint szv')%Z /\
+   (* ...and the lazy bit -- see [KexecDefs.kexec_ok]'s own row: exec's
+      image is eager, so the block the swap installs is at [false]. *)
+   pv_lazy V' = false /\
+   (* ...AND THE MASK IS KEPT (upstream a083670): exec does not touch
+      [p->seccomp], so [ProcDefs.pv_secc] survives it -- a masked process
+      stays masked across exec, which is the whole point of the mask. *)
+   pv_secc V' = pv_secc V).
+
+(* the landed reading, dropping both holes *)
+Lemma kexec_ok_qf_weaken (Q : mword 64 -> Prop) (QF : kxf_cause -> Prop)
+    (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) :
+  kexec_ok_qf Q QF V V' r entry spv szv' na alen ->
+  kexec_ok V V' r entry spv szv' na alen.
+Proof.
+  intros [(Hr & HV & _) | (_ & H)]; unfold kexec_ok; [by left | by right].
+Qed.
+
+(* ...and the two holes, monotone *)
+Lemma kexec_ok_qf_mono (Q Q' : mword 64 -> Prop) (QF QF' : kxf_cause -> Prop)
+    (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) :
+  (forall e, Q e -> Q' e) -> (forall c, QF c -> QF' c) ->
+  kexec_ok_qf Q QF V V' r entry spv szv' na alen ->
+  kexec_ok_qf Q' QF' V V' r entry spv szv' na alen.
+Proof.
+  intros HQ HF [(Hr & HV & (c & Hc)) | (Hq & H)]; unfold kexec_ok_qf;
+    [left; split_and!; [exact Hr | exact HV | exists c; exact (HF c Hc)]
+    | right; split; [exact (HQ _ Hq) | exact H]].
+Qed.
+
+(* ...and dropping only the cause *)
+Lemma kexec_ok_q_of_qf (Q : mword 64 -> Prop) (QF : kxf_cause -> Prop)
+    (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) :
+  kexec_ok_qf Q QF V V' r entry spv szv' na alen ->
+  kexec_ok_q Q V V' r entry spv szv' na alen.
+Proof. intros [(Hr & HV & _) | H]; unfold kexec_ok_q; [by left | by right]. Qed.
+
+(* THE ROW THE LANDED AND PINNED RUNS GO THROUGH: at the vacuous cause
+   plug every [bad:] tail pays with [KfNoMem] and nothing is claimed. *)
+Lemma kexec_ok_qf_of_q (Q : mword 64 -> Prop)
+    (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) :
+  kexec_ok_q Q V V' r entry spv szv' na alen ->
+  kexec_ok_qf Q (fun _ => True) V V' r entry spv szv' na alen.
+Proof.
+  intros [(Hr & HV) | H]; unfold kexec_ok_qf;
+    [left; split_and!; [exact Hr | exact HV | exists KfNoMem; exact I]
+    | by right].
+Qed.
+
+Lemma kexec_ok_qf_True (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) :
+  kexec_ok V V' r entry spv szv' na alen ->
+  kexec_ok_qf (fun _ => True) (fun _ => True) V V' r entry spv szv' na alen.
+Proof. intro H. apply kexec_ok_qf_of_q, kexec_ok_q_of_True, H. Qed.
+
+(* ===================================================================== *)
+(*  1a.  THE EXIT CONTINUATION THAT RELAYS IT, NAMED ONCE                  *)
+(* ===================================================================== *)
+
+(*  THE OTHER HALF OF THIS FILE'S OWN OPENING PARAGRAPH.  That paragraph
+    says [kexec_ok] is spelled in thirty-one places "and every one of them
+    is a phase lemma RELAYING kexec's own exit continuation" -- and then
+    names the RELATION, leaving the CONTINUATION spelled out at all of
+    them.  It is thirteen rows, ~800 printed characters, and a count over
+    the cone found dozens of copies across the phase files (ProofKexecC
+    x13, B3 x9, B x5, Tail x4, A x3, SpecKexecB2 x3, Kexec x2, D x2),
+    differing only in bound-variable names and in which
+    of [b]/[eb] and [lks]/[emptyset] the caller passes.
+
+    claude-notes/optimization.md, "Seal a whole-function proof's
+    continuation" and the ProofSysUnlinkPure case study beside it: an inline
+    continuation is re-embedded in the term of EVERY proofmode step that
+    carries it, so it is priced by |Delta| x steps, and in the kexec block
+    lemmas it measures 35-44 % of the statement.  Naming it changes no
+    proof script -- the constant is TRANSPARENT, so the [iApply ("Hcont"
+    $! ...)] sites unify straight through.
+
+    Kept TRANSPARENT for that reason, and NOT sealed: opacity would break
+    the specialisations rather than help them.                            *)
+Definition kexec_closer `{XI : CtxIdDefs.CurCtx}
+    (* EXACTLY the classes the rows below need, which is the kexec
+       contract's list MINUS [pavG]: [proc_priv] is [ProcInv]'s, and that
+       section takes `{!riscvGS, !fileG, !xv6G, !bioslotG, !fdslotG,
+       !irefslotG}; nothing here comes from [ProcAvail].
+
+       BOTH EDGES OF THIS LIST BITE, and they fail in opposite ways.
+       Carrying [pavG] when no row needs it makes it an unresolvable evar
+       at every call site whose context does not already fix it --
+       "Could not find an instance for ProcAvail.pavG" in ProofKexecD, and
+       an UNDEFINED EVARS on a whole statement in ProofKexecC.  Dropping a
+       class a row DOES need ([fileG]/[fdslotG], via [proc_priv]) is far
+       worse: it does not error, it DIVERGES -- resolution goes hunting
+       through the gFunctors instances and this file alone reached 300 GB
+       before it was killed.  A missing class is not a clean failure here;
+       cap the memory when experimenting with this binder list. *)
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !wchG Σ}
+    `{GEN : GenId} `{CID : CpuId}
+    (* the hole, WIDENED to the final process state: [kexec_ok_q]'s own
+       slot is still a claim on [entry], and the row below plugs it with
+       [fun e => Q e U'] at the [U'] this continuation binds. *)
+    (Q : mword 64 -> ustate -> Prop)
+    (* ...and the FAILURE side's plug (S5): the reason the run gave up,
+       paid at the [bad:] tail that jumped.  [fun _ => True] is the
+       landed/pinned instantiation, at which every tail pays [KfNoMem]. *)
+    (QF : kxf_cause -> Prop)
+    (gf ga : gname) (pj : mword 64) (pidv : mword 32) (U : ustate)
+    (m : regfile) (ret_tgt : mword 64) (K : nat) (b eb : bool)
+    (lks : gset string) (dqb dqs : dfrac) (bmapstart : Z)
+    (na : nat) (alen : nat -> nat)
+    (plen : nat) (pv : mword 64) (dqpv : dfrac) (pfun : nat -> bv 8)
+    (av : mword 64) (dqa : dfrac) (avf : nat -> mword 64)
+    (aslen : nat -> nat) (dqas : dfrac) (afun : nat -> nat -> bv 8)
+    : iProp Σ :=
+  (* the moved image, exactly as [KexecDefs]'s own post binds it *)
+  (∀ (mf : regfile) (U' : ustate)
+      (entry spv szv' : mword 64),
+      ⌜callee_saved m mf⌝ -∗
+      (* the failure plug is widened the same way: a [-1] return leaves
+         the old image in place ([kxc_exit_m1] is the one prover, at
+         [U' := U]), and the AU arms need to say so *)
+      ⌜kexec_ok_qf (fun e => Q e U') (fun c => QF c /\ us_M U' = us_M U)
+                   (us_V U) (us_V U')
+                   (mf !!! Regidx (mword_of_int 10 : mword 5))
+                   entry spv szv' na alen⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      trap_csrs_ext KT1 eb -∗
+      cpu_claim_ext eb pj -∗
+      pc_is ret_tgt -∗
+      sb_bmapstart ↦₄{dqb} (mword_of_int bmapstart : mword 32) -∗
+      sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+      kalloc_env ga None -∗
+      proc_priv gf pj pidv U' -∗
+      ([∗ list] i ∈ seq 0 (S plen), pa_add pv i ↦ₘ[KT1]{dqpv} pfun i) -∗
+      ([∗ list] i ∈ seq 0 (S na), pa_add av (8 * i) ↦₈[KT1]{dqa} avf i) -∗
+      ([∗ list] i ∈ seq 0 na,
+         [∗ list] j ∈ seq 0 (aslen i), pa_add (avf i) j ↦ₘ{dqas} afun i j) -∗
+      bslots 3 -∗
+      iref_slots 2 -∗
+      mWP (Loop : expr riscv_lang))%I.
+
+(* ===================================================================== *)
+(*  1c.  THE CLOSER AT A LATER COUNT (permit sweep L1b)                   *)
+(* ===================================================================== *)
+(*  The kexec cone lends the block's event counter to proc_freepagetable
+    and uvmalloc, so a phase that ran one of them holds the block at the
+    record [upd_ev V k] with [k >= pv_ev V].  The exit it was handed is at
+    [V]; this is the one conversion it needs: a relation proved against
+    the LATER record is one against the earlier (the failure arm's count
+    only rose further; the success arm does not name [pv_ev], so its rows
+    are the same by conversion). *)
+Lemma kexec_ok_qf_ev (Q : mword 64 -> Prop) (QF : kxf_cause -> Prop)
+    (V V' : pprivate) (r entry spv szv' : mword 64)
+    (na : nat) (alen : nat -> nat) (k : nat) :
+  (pv_ev V <= k)%nat ->
+  kexec_ok_qf Q QF (upd_ev V k) V' r entry spv szv' na alen ->
+  kexec_ok_qf Q QF V V' r entry spv szv' na alen.
+Proof.
+  intros Hk [(Hr & (k' & Hk' & HV) & Hc) | (Hq & H)].
+  - left. split; [exact Hr|]. split; [|exact Hc].
+    exists k'. split; [cbn in Hk'; lia|]. rewrite HV. destruct V; reflexivity.
+  - right. split; [exact Hq | exact H].
+Qed.
+
+Lemma kexec_closer_ev (k : nat) `{XI : CtxIdDefs.CurCtx}
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !wchG Σ}
+    `{GEN : GenId} `{CID : CpuId}
+    (Q : mword 64 -> ustate -> Prop) (QF : kxf_cause -> Prop)
+    (gf ga : gname) (pj : mword 64) (pidv : mword 32) (U : ustate)
+    (m : regfile) (ret_tgt : mword 64) (K : nat) (b eb : bool)
+    (lks : gset string) (dqb dqs : dfrac) (bmapstart : Z)
+    (na : nat) (alen : nat -> nat)
+    (plen : nat) (pv : mword 64) (dqpv : dfrac) (pfun : nat -> bv 8)
+    (av : mword 64) (dqa : dfrac) (avf : nat -> mword 64)
+    (aslen : nat -> nat) (dqas : dfrac) (afun : nat -> nat -> bv 8) :
+  (pv_ev (us_V U) <= k)%nat ->
+  kexec_closer Q QF gf ga pj pidv U m ret_tgt K b eb lks dqb dqs bmapstart na alen
+    plen pv dqpv pfun av dqa avf aslen dqas afun -∗
+  kexec_closer Q QF gf ga pj pidv (upd_usV U (upd_ev (us_V U) k)) m ret_tgt K b eb
+    lks dqb dqs bmapstart na alen plen pv dqpv pfun av dqa avf aslen dqas afun.
+Proof.
+  iIntros (Hk) "H". iIntros (mf U' entry spv szv') "%Hcs %Hok".
+  iApply ("H" $! mf U' entry spv szv' with "[%] [%]"); [exact Hcs|].
+  exact (kexec_ok_qf_ev _ _ (us_V U) (us_V U') _ _ _ _ _ _ k Hk Hok).
+Qed.
+
+(* ...and under the [wp_next] every phase lemma receives it in *)
+Lemma kexec_closer_ev_next (k : nat) `{XI : CtxIdDefs.CurCtx}
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !wchG Σ}
+    `{GEN : GenId} `{CID0 : CpuId} (bn : bool) (pn : mword 64)
+    (Q : mword 64 -> ustate -> Prop) (QF : kxf_cause -> Prop)
+    (gf ga : gname) (pj : mword 64) (pidv : mword 32) (U : ustate)
+    (m : regfile) (ret_tgt : mword 64) (K : nat) (b eb : bool)
+    (lks : gset string) (dqb dqs : dfrac) (bmapstart : Z)
+    (na : nat) (alen : nat -> nat)
+    (plen : nat) (pv : mword 64) (dqpv : dfrac) (pfun : nat -> bv 8)
+    (av : mword 64) (dqa : dfrac) (avf : nat -> mword 64)
+    (aslen : nat -> nat) (dqas : dfrac) (afun : nat -> nat -> bv 8) :
+  (pv_ev (us_V U) <= k)%nat ->
+  wp_next bn pn (fun CID : CpuId =>
+    kexec_closer Q QF gf ga pj pidv U m ret_tgt K b eb lks dqb dqs bmapstart na alen
+      plen pv dqpv pfun av dqa avf aslen dqas afun) -∗
+  wp_next bn pn (fun CID : CpuId =>
+    kexec_closer Q QF gf ga pj pidv (upd_usV U (upd_ev (us_V U) k)) m ret_tgt K b eb
+      lks dqb dqs bmapstart na alen plen pv dqpv pfun av dqa avf aslen dqas afun).
+Proof.
+  iIntros (Hk) "H". iIntros (CIDx Hs).
+  iApply (kexec_closer_ev k with "[H]"); [exact Hk|]. iApply ("H" $! CIDx Hs).
+Qed.
+
+(* ...and at the [ProcInv.ev_after] spelling the phases carry *)
+Lemma kexec_closer_after_next `{XI : CtxIdDefs.CurCtx}
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !wchG Σ}
+    `{GEN : GenId} `{CID0 : CpuId} (U' : ustate) (bn : bool) (pn : mword 64)
+    (Q : mword 64 -> ustate -> Prop) (QF : kxf_cause -> Prop)
+    (gf ga : gname) (pj : mword 64) (pidv : mword 32) (U : ustate)
+    (m : regfile) (ret_tgt : mword 64) (K : nat) (b eb : bool)
+    (lks : gset string) (dqb dqs : dfrac) (bmapstart : Z)
+    (na : nat) (alen : nat -> nat)
+    (plen : nat) (pv : mword 64) (dqpv : dfrac) (pfun : nat -> bv 8)
+    (av : mword 64) (dqa : dfrac) (avf : nat -> mword 64)
+    (aslen : nat -> nat) (dqas : dfrac) (afun : nat -> nat -> bv 8) :
+  ev_after U U' ->
+  wp_next bn pn (fun CID : CpuId =>
+    kexec_closer Q QF gf ga pj pidv U m ret_tgt K b eb lks dqb dqs bmapstart na alen
+      plen pv dqpv pfun av dqa avf aslen dqas afun) -∗
+  wp_next bn pn (fun CID : CpuId =>
+    kexec_closer Q QF gf ga pj pidv U' m ret_tgt K b eb
+      lks dqb dqs bmapstart na alen plen pv dqpv pfun av dqa avf aslen dqas afun).
+Proof.
+  intros (k & Hk & ->). iIntros "H". iApply (kexec_closer_ev_next k with "H"). exact Hk.
+Qed.
+
+(* ===================================================================== *)
+(*  2.  THE ONE VALUE THE HOLE IS EVER PLUGGED WITH                       *)
+(* ===================================================================== *)
+
+(*  The word the commit block loads at +0x2f0 ([ld a4,-408(s0)], byte 24 of
+    the frame's [struct elfhdr]) and stores into [trapframe->epc] --
+    spelled here EXACTLY as [ProofKexecD.kxd_commit] produces it, so its
+    [Q entry U'] obligation is discharged from the premise
+    [forall U', Q (kxq_entry ef) U'].  It is [ElfEnc.eh_entry] at the
+    64-bit width.                                                         *)
+Definition kxq_entry (ef : nat -> bv 8) : mword 64 :=
+  (Z_to_bv 64 (le_at ef 24 8) : mword 64).
+
+(*  [le_at] reads eight bytes from offset 24, so two headers that agree
+    below 64 give the same entry point.  This is the whole of what the
+    pinned walk has to prove at the commit. *)
+Lemma kxq_entry_ext (ef ef' : nat -> bv 8) :
+  (forall j : nat, (j < 64)%nat -> ef j = ef' j) ->
+  kxq_entry ef = kxq_entry ef'.
+Proof.
+  intro Hj. unfold kxq_entry, le_at. do 2 f_equal.
+  apply map_ext_in. intros x Hx. apply in_seq in Hx. apply Hj. lia.
+Qed.
+
+(* ===================================================================== *)
+(*  3.  THE HEADER CLAIM THE WALK CARRIES ACROSS THE +0x090 SEAM          *)
+(* ===================================================================== *)
+
+(*  Phase A reads [struct elfhdr elf] and phase B reads two fields out of
+    it; between them sits the +0x090 seam, which the landed walk crosses
+    with the buffer as existential [stack_own].  [ProofKexecTail.kxc_frameA6x]
+    carries it NAMED instead, and this is the claim that rides beside the
+    name: NOTHING at all for the landed instantiation, and "these are
+    /init's first 64 bytes" for the pinned one.  An option rather than a
+    predicate because the landed side must not have to prove anything.    *)
+Definition kxq_hdr_ok (HD : option (nat -> bv 8)) (ef : nat -> bv 8) : Prop :=
+  match HD with
+  | None => True
+  | Some h => forall j : nat, (j < 64)%nat -> ef j = h j
+  end.
+
+Lemma kxq_hdr_ok_none (ef : nat -> bv 8) : kxq_hdr_ok None ef.
+Proof. exact I. Qed.
+
+(* transport along agreement below 64 -- what phase A's readi gives it *)
+Lemma kxq_hdr_ok_ext (HD : option (nat -> bv 8)) (ef ef' : nat -> bv 8) :
+  (forall j : nat, (j < 64)%nat -> ef j = ef' j) ->
+  kxq_hdr_ok HD ef' -> kxq_hdr_ok HD ef.
+Proof.
+  intros Hj. destruct HD as [h |]; [| by intros _]. cbn.
+  intros Hh j Hlt. rewrite (Hj j Hlt). exact (Hh j Hlt).
+Qed.
+
+(* ...and what the commit block's obligation reduces to under it *)
+Lemma kxq_entry_of_hdr (h ef : nat -> bv 8) :
+  kxq_hdr_ok (Some h) ef -> kxq_entry ef = kxq_entry h.
+Proof. intro H. by apply kxq_entry_ext. Qed.

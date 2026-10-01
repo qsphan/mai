@@ -1,0 +1,137 @@
+(* SpecArgstr.v -- the public interface of argstr(), stated independently of
+   its proof.
+
+     int argstr(int n, char *buf, int max) {
+       uint64 addr;
+       argaddr(n, &addr);
+       return fetchstr(addr, buf, max);
+     }
+
+   @ KernelSyms.argstr = 0x8000283c, twenty instructions / 40 bytes.
+
+   ARGADDR IS INLINED, and that is the only surprise in the machine code:
+   there is no [uint64 addr] on the stack and no call to argaddr, only a
+   [jal argraw] whose [a0] is handed straight to fetchstr.  So this contract
+   is stated over argraw's resources, not argaddr's, and the local [addr]
+   never appears -- there is no out-parameter cell to own.
+
+   THE ALTITUDE IS argfd's, and for the same reason: argstr is a syscall
+   helper whose caller holds [proc_priv], and both of its callees want a
+   PIECE of that block -- argraw the trapframe page (split out with
+   [ProcInv.proc_priv_tf]), fetchstr the page table (split out inside
+   fetchstr's own proof with [proc_priv_copy]).  Taking [proc_priv] whole and
+   splitting inside is what keeps the two splits from meeting in a caller.
+
+   WHAT THE CALLER MUST SAY, and what it gets:
+
+   - the argument index [i] is in range ([i < NARG]) and word
+     [tf_arg_idx i] of this process's trapframe holds [v] -- argraw's
+     premises, spelled through [pv_tf V] so [proc_priv] supplies them;
+   - [buf] names [max] owned bytes.  The contract says nothing about [v]
+     afterwards: fetchstr does no range test on it (SpecFetchstr.v), so the
+     user-supplied address is either mapped or it is not, and either way the
+     answer is [fetchstr_ret];
+   - [max < 2^31], inherited from strlen's [int] return through fetchstr.
+
+   The postcondition is fetchstr's verbatim, both halves.  The SHAPE is
+   [fetchstr_ret max new r]: either the buffer holds a NUL-terminated string
+   of length [k < max] and [r = k], or [r = -1].  The CONTENT is
+   [fetchstr_got (us_M U) v max new r] -- those bytes are the process's own,
+   read out of the block's image at [v], the trapframe word this contract
+   already names.  That is why the relay is free here: argraw hands [v]
+   straight to fetchstr, so the address the content clause is stated at is
+   the one the caller already supplied.  [proc_priv] comes back at the image
+   it went in at; only its DESCRIPTOR grows, by whatever copyinstr faulted
+   in. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language weakestpre lifting.
+From iris.base_logic.lib Require Import gen_heap invariants ghost_var.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import RiscvModelBytes RiscvPtsto RiscvLang.
+Require Import InstrBytes KernelText KernelDataInv.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import LockRank.
+Require Import ProcGeom CpuOwn.
+Require Import FdSlots ProcInv.
+Require Import FileInvDefs.
+Require Import SpecFetchstr.
+Require Import KvmSpec.
+Require Import UserPtTree.
+Require Import ProcPtOwn.
+From Kernel Require KernelSyms.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Import Defs.
+Local Open Scope Z_scope.
+
+
+(* 4 slots for argstr's own frame (`addi sp,sp,-32`); fetchstr's 56 dominates
+   argraw's 14.
+
+   56, NOT 26, because copyinstr changed altitude: its `pa0 == 0` arm now calls
+   vmfault (SpecCopyinstr.v), so its own budget went 20 -> 50 and fetchstr's
+   went 26 -> 56 (SpecFetchstr.v).  argstr's whole body is the fetchstr call,
+   so it takes the rise straight through: 4 + 56 = 60. *)
+Notation argstr_stack := (60%nat) (only parsing).
+Definition wp_argstr_sconf_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γf : gname)
+    (m : regfile) (av : nat) (n : nat) (eb : bool) (p : mword 64)
+    (i : nat) (v : mword 64)
+    (pid : mword 32) (U : ustate) (maxn : nat) (buf_olds : nat -> bv 8) (b : bool) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.argstr in
+  let buf := m !!! Regidx (mword_of_int 11 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* the syscall argument index, in range: argraw's panic arm *)
+  (i < NARG)%nat ->
+  m !!! Regidx (mword_of_int 10 : mword 5) = mword_of_int (Z.of_nat i) ->
+  pv_tf (us_V U) !! tf_arg_idx i = Some v ->
+  (Z.of_nat n + 1 < 2 ^ 31)%Z ->
+  (argstr_stack <= av)%nat ->
+  m !!! Regidx (mword_of_int 12 : mword 5) = (mword_of_int (Z.of_nat maxn) : mword 64) ->
+  (Z.of_nat maxn < 2 ^ 31)%Z ->
+  (* argstr -> fetchstr -> copyinstr -> walkaddr -> walk *)
+  locks_below lks "kmem" ->
+  sie_cap_gpr KT1 m av b p -∗
+  cpu_own n eb p b lks -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  proc_priv γf p pid U -∗
+  kalloc_env γa None -∗
+  ([∗ list] j ∈ seq 0 maxn, (pa_add buf j) ↦ₘ[KT1] buf_olds j) -∗
+  wp_next b p (fun (CID : CpuId) =>
+    (* THE IMAGE DOES NOT MOVE: the whole cone below argstr only READS user
+       memory, and the pages copyinstr faults in were already in the block's
+       lazy view (SpecFetchstr.v).  Only the DESCRIPTOR grows. *)
+    ∀ (mf : regfile) (P' : uptd) (buf_new : nat -> bv 8) (k' : nat),
+      ⌜callee_saved m mf⌝ -∗
+      ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+      (* THE EVENT COUNTER (permit sweep L1b): fetchstr lends the block's
+         counter to copyinstr, which may step it, so the block comes back
+         at a count at least the one it left at *)
+      ⌜(pv_ev (us_V U) <= k')%nat⌝ -∗
+      sie_cap_gpr KT1 mf av b p -∗
+      cpu_own n eb p b lks -∗
+      pc_is ret_tgt -∗
+      proc_priv γf p pid (us_upt (upd_usV U (upd_ev (us_V U) k')) P') -∗
+      ([∗ list] j ∈ seq 0 maxn, (pa_add buf j) ↦ₘ[KT1] buf_new j) -∗
+      ⌜fetchstr_ret maxn buf_new (mf !!! Regidx (mword_of_int 10 : mword 5))⌝ -∗
+      ⌜fetchstr_got (us_M U) v maxn buf_new
+         (mf !!! Regidx (mword_of_int 10 : mword 5))⌝ -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type ARGSTR.
+  Parameter wp_argstr_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γf : gname) (m : regfile) (av : nat) (n : nat) (eb : bool) (p : mword 64)
+      (i : nat) (v : mword 64)
+      (pid : mword 32) (U : ustate) (maxn : nat) (buf_olds : nat -> bv 8) (b : bool) (lks : gset string),
+      wp_argstr_sconf_body γa γf m av n eb p i v pid U maxn buf_olds b lks.
+End ARGSTR.

@@ -1,0 +1,1492 @@
+(* ===================================================================== *)
+(* UsysMemOk.v -- WHICH USER BYTES A SYSCALL MAY HAVE MOVED, restated on   *)
+(* the TRAPFRAME WORD LIST, so that a file below the kernel proofs can     *)
+(* import it.                                                              *)
+(*                                                                         *)
+(* See claude-notes/design/user-wp-slot.md, “The ruled design for the      *)
+(* user/kernel trap contract”.  [SpecSyscall.sysc_mem_ok V V' M M'] is the *)
+(* kernel dispatcher's table -- keyed by the syscall number in the a7 word *)
+(* of the entry trapframe -- and it is stated over [pprivate], which lives *)
+(* far above the user-execution tier.  [usys_mem_ok] below is THE SAME     *)
+(* TABLE stated over the word list alone (plus the return value, which the *)
+(* exec row needs), and [UsysMemOkSpec.sysc_mem_ok_usys] -- above          *)
+(* SpecSyscall.v -- is the proof that the two agree, so the kernel can     *)
+(* discharge this one from the dispatcher's post at milestone J.           *)
+(*                                                                         *)
+(* THE PERMISSION MAP RIDES BESIDE THE IMAGE.  The key carries the        *)
+(* user-visible per-page permission view ([UserPerm.perm_of], the leaf   *)
+(* bits with the lazy pages filled in RW), so every row also says how    *)
+(* [π] moves: unchanged on the sixteen quiet entries, the four windows   *)
+(* and the exec failure arm; sbrk's row is [usys_sbrk_perm], which SAYS  *)
+(* WHAT HAPPENS -- the new live pages appear at {X := false; W := true}  *)
+(* (the lazy fill; [vmfault] later maps exactly that), or the map is cut *)
+(* down to the pages that are still live.  Both are FUNCTIONS OF THE TWO *)
+(* SIZES, which alone stay existential: the word list does not carry     *)
+(* [pv_sz].                                                              *)
+(*                                                                         *)
+(* THE ROWS, one for one with [sysc_mem_ok]:                               *)
+(*   exec (7)   -- the FAILURE arm only: [r = -1] and the image is intact. *)
+(*                 A successful exec never returns to this WP at all: the  *)
+(*                 new program's WP is MINTED by exec from the new         *)
+(*                 trapframe and image, so the success arm has no row.     *)
+(*   sbrk (12)  -- EITHER EXTEND THE MEMORY UP WITH ZEROED PAGES, OR CUT   *)
+(*                 THEM DOWN, at an existential pair of sizes: exactly     *)
+(*                 what the kernel's table says (the sizes are the entry   *)
+(*                 and outgoing records' [pv_sz], which the word list does *)
+(*                 not carry).  Tying the old size to the return value     *)
+(*                 ([r = a0] on success) is sbrk own contract              *)
+(*                 refinement, not this table's.                          *)
+(*   wait (3)   -- four bytes at argument 0, the zombie's [xstate].        *)
+(*   pipe (4)   -- eight bytes at argument 0, the two fds.                 *)
+(*   read (5)   -- at most the caller's own count, at argument 1.          *)
+(*   fstat (8)  -- one 24-byte [struct stat], at argument 1.               *)
+(*   fork (1)   -- no byte moves, but the RETURN VALUE is pinned: -1, or a *)
+(*                 pid in [1, PIDMAX].  Both nonzero, which is what makes  *)
+(*                 the trap loop's parent arm unconditional.               *)
+(*   the other fifteen -- [M' = M].                                        *)
+(*                                                                         *)
+(* PURE, and deliberately NOT importing SpecSyscall (whose cone is the     *)
+(* whole kernel).  The word-index map is ProcGeom.v's ([tf_arg_idx],       *)
+(* [tf_epc_idx]); the image algebra is UserPtTree.v's ([umem_wr],          *)
+(* [umem_grow], [umem_del]); [pgroundup] on words is ProcPtOwn.v's.        *)
+(* ===================================================================== *)
+From Stdlib Require Import ZArith Bool Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+(* [gname] alone -- the generation row is a statement about a ghost NAME and
+   about no resource, so this file stays a pure one *)
+From iris.base_logic.lib Require Import own.
+Require Import SailStdpp.Base SailStdpp.Values SailStdpp.MachineWord SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types.
+Require Import Riscv.rv64d.   (* [sign_extend'] -- sbrk's argument, sign-extended *)
+Require Import ProcGeom.     (* [tf_arg_idx] / [tf_epc_idx] / [TFWORDS] *)
+Require Import TfUser.       (* [tf_ueq] -- the resume-visible word equality *)
+Require Import UserPtTree.   (* [umem_wr] / [umem_grow] / [umem_del] *)
+Require Import ProcPtOwn.    (* [pgroundup] on words *)
+Require Import UserPerm.     (* [uperm] / [uperm_rw] -- the permission view *)
+Require Import RiscvExtras.  (* [trunc32] -- the C [int] reading *)
+Require Import FdSlots.
+Require Import PipeNames.   (* [pipe_names]: what a pipe descriptor's state carries *)      (* [fdstate] / [fdtype] -- the descriptor view *)
+Require Import RiscvModelBytes. (* [nth_byte] -- pipe's two stored words *)
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(* SS1 The number, read as the dispatcher reads it.                        *)
+(*                                                                         *)
+(* [p->trapframe->a7] as a SIGNED 32-bit value (the C reads it into an     *)
+(* [int]); trapframe word [tf_arg_idx 7] = 21.  Definitionally             *)
+(* [SpecSyscall.sysc_num V] at [tf := pv_tf V].                            *)
+(* ===================================================================== *)
+Definition usys_num (tf : list (mword 64)) : Z :=
+  bv_signed (subrange_vec_dec (tf !!! tf_arg_idx 7) 31 0 : mword 32).
+
+(* the number is ONE WORD of the trapframe, so two frames that agree at a7
+   name the same entry.  What wants this is a boundary that restates a row
+   at a different-but-agreeing trapframe -- uservec's save walk stores the
+   31 user registers and then speaks [tf_of g], where usertrap spoke the
+   saved list. *)
+Lemma usys_num_arg_cong (tf1 tf2 : list (mword 64)) :
+  tf1 !!! tf_arg_idx 7 = tf2 !!! tf_arg_idx 7 -> usys_num tf1 = usys_num tf2.
+Proof. intros He. unfold usys_num. rewrite He. reflexivity. Qed.
+
+(* the syscall numbers this table names (kernel/syscall.h) *)
+Definition USYS_fork : Z := 1.
+Definition USYS_exit : Z := 2.
+Definition USYS_exec : Z := 7.
+Definition USYS_sbrk : Z := 12.
+
+(* ===================================================================== *)
+(* SS2 The table.                                                          *)
+(* ===================================================================== *)
+
+(* the four entries that write user memory, by number *)
+Definition USYS_wait  : Z := 3.
+Definition USYS_pipe  : Z := 4.
+Definition USYS_read  : Z := 5.
+Definition USYS_fstat : Z := 8.
+
+(* ...and the four that move the DESCRIPTOR table (kernel/syscall.h).
+   [USYS_pipe] is in both lists, and that is the point: it is the one entry
+   that writes user memory AND allocates descriptors, so the two tables have
+   to agree about it. *)
+Definition USYS_dup   : Z := 10.
+Definition USYS_open  : Z := 15.
+Definition USYS_close : Z := 21.
+
+(* ...and the one that moves the WORKING DIRECTORY (kernel/syscall.h): the
+   cwd's inum is in the key ([UexecSlot.uvis_cwd]), and this is the only
+   entry that may change it. *)
+Definition USYS_chdir : Z := 9.
+
+(* ...and the one that ANSWERS with a reading of the key (kernel/syscall.h):
+   getpid(2) returns [p->pid], which is [UexecSlot.uvis_pid].  It moves
+   nothing at all -- it is the only entry whose whole content is its return
+   value, and SS2g below is that content. *)
+Definition USYS_getpid : Z := 11.
+
+(* [read]'s count, as the C reads it: argument 2 into an [int].  The read
+   row is the one whose length is not a constant.  Definitionally
+   [SpecSyscall.sysc_rdcount V] at [tf := pv_tf V]. *)
+Definition usys_rdcount (tf : list (mword 64)) : Z :=
+  bv_signed (subrange_vec_dec (tf !!! tf_arg_idx 2) 31 0 : mword 32).
+
+(* WHAT read ANSWERED, and it is the row a program on the free path needs:
+   the call failed ([-1]) or it delivered a count no larger than the one it
+   was asked for.  The image row below bounds the bytes WRITTEN; this bounds
+   the number REPORTED, which is what a caller's loop tests.  Every arm of
+   fileread states it ([SpecFileread.fileread_ret] -- pipe, device and inode
+   alike -- and argfd's own failure is its [-1]); the dispatcher relays it
+   ([SpecSyscall]'s read clause) and [UsysMemOkSpec.sysc_mem_ok_usys]
+   brings it here, on sbrk's and fork's footing.  Read on the SIGNED 64-bit
+   reading, at the count as the C reads it ([usys_rdcount]); a negative
+   count licenses only [0]. *)
+Definition usys_read_ret (tf : list (mword 64)) (r : mword 64) : Prop :=
+  bv_signed r = -1 \/ (0 <= bv_signed r <= Z.max 0 (usys_rdcount tf))%Z.
+
+(* ...and the kernel's spelling of it ([PipeInvDefs.pipe_rw_ret], which is
+   [SpecFileread.fileread_ret]) at the same count, unfolded so this file
+   need not import either: the word is [-1], or it is a small non-negative
+   integer.  A count read out of a 32-bit [int] is below [2^31], so the
+   integer IS the word's signed reading. *)
+Lemma usys_read_ret_of_rw (tf : list (mword 64)) (r : mword 64) :
+  (r = (mword_of_int (-1) : mword 64)
+   \/ exists i : Z, r = (mword_of_int i : mword 64)
+                    /\ (0 <= i <= Z.max 0 (usys_rdcount tf))%Z) ->
+  usys_read_ret tf r.
+Proof.
+  intros [-> | (i & -> & Hi)]; [ left; vm_compute; reflexivity | right ].
+  assert (Hc : (usys_rdcount tf < 2 ^ 31)%Z).
+  { unfold usys_rdcount.
+    pose proof (bv_signed_in_range _
+                  (subrange_vec_dec (tf !!! tf_arg_idx 2) 31 0 : mword 32)
+                  ltac:(discriminate)) as [_ Hh].
+    exact Hh. }
+  assert (Hs : bv_signed (mword_of_int i : mword 64) = i).
+  { unfold bv_signed, bv_swrap. rewrite moi64_unsigned. unfold bv_wrap.
+    assert (Eh : bv_half_modulus (MachineWord.Z_idx 64) = (2 ^ 63)%Z)
+      by (vm_compute; reflexivity).
+    assert (Em : bv_modulus (MachineWord.Z_idx 64) = (2 ^ 64)%Z)
+      by (vm_compute; reflexivity).
+    rewrite Eh Em.
+    rewrite (Z.mod_small i (2 ^ 64)); [ | lia ].
+    rewrite (Z.mod_small (i + 2 ^ 63) (2 ^ 64)); lia. }
+  rewrite Hs. exact Hi.
+Qed.
+
+(* sbrk's ARGUMENT, as the kernel reads it back: [argint] stores the low
+   32 bits of a0 into the caller's [int] cell and the [lw] that reloads it
+   sign-extends, so the value that reaches growproc -- and the value the
+   break moves by -- is this one.  Definitionally [SpecSysSbrk.sbrk_arg]
+   at [tf !!! tf_arg_idx 0]. *)
+Definition usys_sbrk_arg (tf : list (mword 64)) : mword 64 :=
+  sign_extend' 64 (trunc32 (tf !!! tf_arg_idx 0)).
+
+(* WHAT sbrk ANSWERED, and it is the row the ALLOCATOR needs.  The image and
+   permission rows below say how memory moved; neither says WHERE the new
+   memory is, because neither mentions the return value -- and a [malloc]
+   that cannot say [sbrk(n)] returned the OLD break cannot own the block it
+   just asked for.  So:
+
+     FAILURE is total: [-1] back, and the break did not move.  (All three
+     of sys_sbrk's failure arms return before writing anything.)
+     SUCCESS returns the OLD break -- sbrk's contract with userspace -- and,
+     WHEN THE ARGUMENT IS NON-NEGATIVE, the break went up by exactly it.
+
+   The grow direction alone is pinned on purpose: a SHRINK whose sum wraps
+   past the old size leaves [p->sz] where it was (uvmdealloc does nothing),
+   so an equation would be false there, and no caller of this row shrinks.
+   [SpecSysSbrk.sys_sbrk_ok] is where both halves come from; the bridge is
+   [UsysMemOkSpec.sysc_mem_ok_usys_sbrk]. *)
+Definition usys_sbrk_ret (tf : list (mword 64)) (r : mword 64)
+    (szv szv' : Z) : Prop :=
+  (r = (mword_of_int (-1) : mword 64) /\ szv' = szv)
+  \/ (r = (mword_of_int szv : mword 64) /\
+      ((0 <= sint (usys_sbrk_arg tf))%Z ->
+         szv' = szv + sint (usys_sbrk_arg tf))).
+
+(* ...and it reads ONE trapframe word, so it crosses any frame that agrees
+   there -- the epc rewrite the dispatcher's record carries, in particular. *)
+Lemma usys_sbrk_ret_arg (tf tf' : list (mword 64)) (r : mword 64)
+    (szv szv' : Z) :
+  tf !!! tf_arg_idx 0 = tf' !!! tf_arg_idx 0 ->
+  usys_sbrk_ret tf r szv szv' -> usys_sbrk_ret tf' r szv szv'.
+Proof.
+  intros H0 H. unfold usys_sbrk_ret, usys_sbrk_arg in H |- *.
+  rewrite <- H0. exact H.
+Qed.
+
+(* sbrk's row on the IMAGE, at the OLD size [szv] and the NEW one [szv'].
+   EITHER EXTEND THE MEMORY UP WITH ZEROED PAGES, OR CUT IT DOWN -- the C's
+   own two directions, and nothing existential in either.  [umem_grow] IS
+   "extend with zeroed bytes" ([UserPtTree.umem_grow M sz = M ∪
+   gset_to_gmap 0 (live_set sz)]), and the cut's page count is
+   [ProcPtOwn.uvmd_np] of the two sizes -- uvmdealloc's own run length,
+   guarded on the shrink actually happening, so the [szv' = szv] arms (a
+   failure, [n = 0], and growproc's WRAP sub-case) sit in the first branch
+   and read [M' = umem_grow M (uint szv)], which is [M] itself at the lazy
+   view ([UserPtTree.umem_grow_id]: every live byte is already recorded). *)
+Definition usys_sbrk_img (M M' : gmap Z (bv 8)) (szv szv' : mword 64) : Prop :=
+  if decide (uint szv <= uint szv')%Z
+  then M' = umem_grow M (uint szv')
+  else M' = umem_del M (uint (ProcPtOwn.pgroundup szv'))
+                       (4096 * ProcPtOwn.uvmd_np szv szv').
+
+(* ...and on the PERMISSION MAP, and IT COMES OUT TABLE-FREE, which is what
+   the U tier needs since it cannot see the page table.
+
+   GROW.  Everything the table maps lies BELOW the old size
+   ([ProcPtOwn.um_below], [ProcInv.proc_priv]'s own conjunct), so the pages
+   that become live are all unmapped and [UserPerm.perm_of]'s fill supplies
+   every one of them at [uperm_rw] -- the "minus the mapped pages" caveat
+   [UsysMemOkSpec.perm_of_grow] carries is VACUOUS here.  The eager path,
+   which really does map the run, maps it at vmfault's own RW-user leaf, so
+   the projection does not notice the difference
+   ([UserPerm.perm_of_uptd_ext_sz]).
+
+   SHRINK.  Everything in [π] is inside [live_pages] of the old size (the
+   leaves by [um_below], the fill by construction), so cutting the map down
+   to the pages that are still live IS dropping the dealloc run
+   ([UserPerm.perm_of_del_run]). *)
+Definition usys_sbrk_perm (π π' : gmap (mword 27) uperm)
+    (szv szv' : mword 64) : Prop :=
+  if decide (uint szv <= uint szv')%Z
+  then π' = π ∪ gset_to_gmap uperm_rw
+                 (live_pages (uint szv') ∖ live_pages (uint szv))
+  else π' = base.filter
+              (fun kv : mword 27 * uperm => kv.1 ∈ live_pages (uint szv')) π.
+
+(* ===================================================================== *)
+(* THE LAZY FLAG'S ROW (app-echo.md, lane LAZY-FLAG, L3).                 *)
+(*                                                                        *)
+(* [UexecSlot.uvis_lazy] is “this process MAY have pages the kernel has    *)
+(* promised and not yet mapped”, i.e. [UserPerm.perm_of]'s fill is not     *)
+(* known to be empty.  ONE DIRECTION IS ALL ANY ENTRY OWES: a process      *)
+(* whose fill was empty still has an empty one.  It is an IMPLICATION and  *)
+(* not an equation because nothing needs the other direction -- a process  *)
+(* at [true] learns nothing from any call but exec -- and because the      *)
+(* equation is FALSE at the one entry that can fill a hole (vmfault, which *)
+(* the transparent arm folds into every row).                             *)
+(*                                                                        *)
+(* WHY EVERY QUIET ENTRY PAYS IT: the only thing a quiet syscall does to   *)
+(* the table is what its copyin/copyout did, which is to take page faults  *)
+(* -- and [ProcPtOwn.uptd_ext_sz] says that ADDS leaves inside the live    *)
+(* region.  [UserPerm.lazy_free] is monotone in the table's domain and     *)
+(* antitone in the break ([UserPerm.lazy_free_mono]), so both halves go    *)
+(* the right way.                                                          *)
+(* ===================================================================== *)
+Definition usys_lazy_keep (lz lz' : bool) : Prop := lz = false -> lz' = false.
+
+Lemma usys_lazy_keep_refl (lz : bool) : usys_lazy_keep lz lz.
+Proof. unfold usys_lazy_keep. exact (fun H => H). Qed.
+
+Lemma usys_lazy_keep_false (lz : bool) : usys_lazy_keep lz false.
+Proof. unfold usys_lazy_keep. exact (fun _ => eq_refl). Qed.
+
+(* SBRK'S SECOND ARGUMENT, as the kernel reads it back -- [usys_sbrk_arg]'s
+   twin one slot over.  Definitionally [SpecSysSbrk.sbrk_arg] at
+   [tf !!! tf_arg_idx 1], and SBRK_EAGER is 1 (kernel/riscv.h). *)
+Definition usys_sbrk_eager (tf : list (mword 64)) : Prop :=
+  sign_extend' 64 (trunc32 (tf !!! tf_arg_idx 1)) = (mword_of_int 1 : mword 64).
+
+(* SBRK'S OWN ROW ON THE FLAG, and it is the ONE row that is not the plain
+   keep.  sys_sbrk has three paths (SpecSysSbrk.sys_sbrk_ok):
+
+     FAILED           nothing moved, so the flag does not move;
+     EAGER (t == SBRK_EAGER, or n < 0)  growproc ran -- a grow MAPS the run
+                      of pages that just became live, a shrink lowers the
+                      break BELOW everything uvmdealloc unmapped -- so an
+                      empty fill stays empty;
+     LAZY (n > 0, t != SBRK_EAGER)      [p->sz] rises with the table
+                      untouched, which is exactly how a hole is made.
+
+   So the row PROMISES NOTHING on the lazy-grow arm and the plain keep on
+   the other two.  The guard is the disjunction the C branches on, read off
+   the trapframe and the two breaks; a process whose own call passed
+   SBRK_EAGER therefore learns it kept the flag. *)
+(* THE GUARD IS A STRICT SHRINK, not [<=].  sbrk's LAZY path runs whenever
+   [t != SBRK_EAGER && n >= 0], and that includes [n = 0] -- which moves
+   nothing, but which the block-level arm ([SpecSysSbrk.sys_sbrk_ok]) still
+   files as the lazy write.  At a strict shrink the EAGER path is the one
+   that ran (the C branches on [t == SBRK_EAGER || n < 0]), and that path
+   keeps the bit.  A caller that passed SBRK_EAGER reads its bit back off
+   the left disjunct either way. *)
+Definition usys_sbrk_lazy (lz lz' : bool) (tf : list (mword 64))
+    (szv szv' : Z) : Prop :=
+  (usys_sbrk_eager tf \/ (szv' < szv)%Z) -> usys_lazy_keep lz lz'.
+
+(* THE TABLE: syscall [n], entered with trapframe words [tf], returned
+   [r], may take the image from [M] to [M'] and the permission map from
+   [π] to [π']. *)
+Definition usys_mem_ok (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M : gmap Z (bv 8)) (π : gmap (mword 27) uperm) (szv : Z) (lz : bool)
+    (M' : gmap Z (bv 8)) (π' : gmap (mword 27) uperm) (szv' : Z) (lz' : bool)
+    : Prop :=
+  if decide (n = USYS_exec) then
+    r = (mword_of_int (-1) : mword 64) /\ M' = M /\ π' = π /\ szv' = szv
+    (* exec's FAILURE row keeps the bit on the nose: a failed exec writes no
+       field.  Exec's SUCCESS does not return through this table at all --
+       the process resumes on the new image's slot, whose key
+       [SpecKexec] builds at [false] ([ProcInv.upd_exec] clears
+       [ProcDefs.pv_lazy]). *)
+    /\ lz' = lz
+  else if decide (n = USYS_sbrk) then
+    (* THE TWO SIZES ARE NAMED.  They used to be existential, because the
+       trapframe word list does not carry [p->sz]; now the KEY does, so the
+       row says what happens at the process's actual break rather than at
+       some pair of sizes.  A caller of sbrk therefore learns [szv'], which
+       is what makes the return value meaningful -- and [usys_sbrk_ret]
+       says what the ANSWER was, which is what makes it usable. *)
+    usys_sbrk_img M M' (mword_of_int szv) (mword_of_int szv') /\
+    usys_sbrk_perm π π' (mword_of_int szv) (mword_of_int szv') /\
+    usys_sbrk_ret tf r szv szv'
+    (* ...AND THE LAZY BIT (lane LAZY-FLAG, K3).  sbrk is the ONE entry that
+       writes [ProcDefs.pv_lazy]: its LAZY-grow arm raises the bit (a ghost
+       write of the block, no C variable behind it), its EAGER and shrink
+       arms keep it.  So the row promises nothing on the lazy-grow arm and
+       the plain keep on the other two, and a caller that passed SBRK_EAGER
+       reads its own bit back.  WHAT PAYS IT: [SpecSysSbrk.sys_sbrk_ok]
+       says which arm ran at the BLOCK level and [SpecSyscall.sysc_sbrk_ok]
+       relays it. *)
+    /\ usys_sbrk_lazy lz lz' tf szv szv'
+  else if decide (n = USYS_wait) then
+    (* copyout of the zombie's four-byte [xstate] at argument 0 -- and a
+       NULL destination is not a destination, so a caller passing a null
+       status pointer keeps every byte it held. *)
+    (exists (d : nat) (bs : nat -> bv 8),
+       (d <= 4)%nat /\
+       (uint (tf !!! tf_arg_idx 0) = 0 -> d = 0%nat) /\
+       M' = umem_wr M (tf !!! tf_arg_idx 0) d bs)
+    /\ π' = π /\ szv' = szv /\ lz' = lz
+  else if decide (n = USYS_pipe) then
+    (* two four-byte fds, back to back at argument 0 *)
+    (exists (d : nat) (bs : nat -> bv 8),
+       (d <= 8)%nat /\ M' = umem_wr M (tf !!! tf_arg_idx 0) d bs)
+    /\ π' = π /\ szv' = szv /\ lz' = lz
+  else if decide (n = USYS_read) then
+    (* at most the caller's own count, at argument 1 *)
+    (exists (d : nat) (bs : nat -> bv 8),
+       (Z.of_nat d <= Z.max 0 (usys_rdcount tf))%Z /\
+       M' = umem_wr M (tf !!! tf_arg_idx 1) d bs)
+    /\ π' = π /\ szv' = szv /\ lz' = lz
+    (* ...AND WHAT IT ANSWERED: -1, or a count no larger than the one asked
+       for ([usys_read_ret]).  Last, so every reader of the four rows before
+       it is unmoved. *)
+    /\ usys_read_ret tf r
+  else if decide (n = USYS_fstat) then
+    (* one [struct stat]: dev@0 ino@4 type@8 nlink@10 size@16, so 24 *)
+    (exists (d : nat) (bs : nat -> bv 8),
+       (d <= 24)%nat /\ M' = umem_wr M (tf !!! tf_arg_idx 1) d bs)
+    /\ π' = π /\ szv' = szv /\ lz' = lz
+  else if decide (n = USYS_fork) then
+    (* fork (1) MOVES NO BYTE -- the child gets a copy of the image, the
+       caller's own is untouched -- but its RETURN VALUE is the one thing
+       about a return value this table has to say, for the same reason
+       sbrk's row says where the break went: the process's continuation is
+       keyed on it.  The parent gets a pid, which <allocpid> allocates in
+       [1, PIDMAX] (kernel/param.h) under <pid_lock>, and a failed fork
+       gets -1.  BOTH ARE NONZERO, which is what tells the trap loop's
+       round that a returning fork is a PARENT
+       ([UexecRet.uexec_fork_parent_F]'s guard) -- the child never returns
+       through this round at all, it resumes on fork's deposit.  The
+       dispatcher's own clause is [SpecSyscall]'s fork row, bridged by
+       [UsysMemOkSpec.sysc_mem_ok_usys]. *)
+    (r = (mword_of_int (-1) : mword 64) \/ (1 <= sint r <= PIDMAX)%Z)
+    /\ M' = M /\ π' = π /\ szv' = szv /\ lz' = lz
+  else M' = M /\ π' = π /\ szv' = szv /\ lz' = lz.
+
+(* ===================================================================== *)
+(* SS2b THE DESCRIPTOR TABLE'S OWN ROWS.                                   *)
+(*                                                                        *)
+(* [usys_mem_ok] above says what a syscall does to the process's IMAGE;    *)
+(* this says what it does to the process's DESCRIPTORS, in the same shape  *)
+(* and keyed on the same number.  The two are separate predicates rather   *)
+(* than one because they are separate obligations -- a syscall proof       *)
+(* discharges each against different resources (the page table on one      *)
+(* side, [FdSlots.fd_frags] on the other) -- but they are stated together  *)
+(* so that "what this entry moves" is one thing to read.                   *)
+(*                                                                        *)
+(* THE SHAPE OF EVERY ROW IS THE SAME: on failure the table is untouched,  *)
+(* and on success ONE OR TWO SLOTS MOVE and the rest do not.  That second  *)
+(* half is the whole content -- [list_insert] is what says a descriptor a  *)
+(* program was holding is still what it was, which is what lets a proof    *)
+(* carry a fd across an unrelated syscall.                                 *)
+(*                                                                        *)
+(* LENGTH IS PRESERVED BY CONSTRUCTION ([list_insert] on a list keeps its  *)
+(* length, and an out-of-range index is a no-op), which matters because    *)
+(* [FdSlots.fd_frags] carries [length sts = NOFILE] inside it.  See        *)
+(* [usys_fd_ok_length] below.                                             *)
+(* ===================================================================== *)
+
+(* THE DESCRIPTOR ARGUMENT, AS THE KERNEL DECODES IT.  [argfd] reads
+   argument 0 as a C [int] -- [bv_signed] of the low 32 bits -- not as the
+   full 64-bit word.  The two differ on any argument above 2^32, so a row
+   that read [uint] of the whole word would be describing a different
+   function from the one the kernel runs.  Same reading for the returned
+   descriptor, which is likewise an [int]. *)
+Definition usys_argfd (tf : list (mword 64)) : Z :=
+  bv_signed (trunc32 (tf !!! tf_arg_idx 0)).
+
+(* THE RETURNED DESCRIPTOR, MATCHED RATHER THAN DECODED.  A row that reports
+   an fd could say "read the return register back as an int"; saying instead
+   "the return register IS this descriptor's encoding" is the same fact in
+   the direction every party already has it -- the kernel arm returns
+   [mword_of_int (Z.of_nat fd)] and [SpecArgfd.arg_fd_lookup] reports exactly
+   this shape.  It also keeps the row free of a round-trip lemma. *)
+Definition usys_ret_is (r : mword 64) (fd : nat) : Prop :=
+  r = (mword_of_int (Z.of_nat fd) : mword 64).
+
+(* PIPE'S FAILURE ARM, AS A NAME (lane PIPE-NEG1, second pass).  The
+   content is the same conjunction the open and dup rows spell inline --
+   the call answered -1 and the table did not move -- and it is a
+   [Definition] rather than two conjuncts in the row's body for a reason
+   that cost a whole build to find: [usys_fd_ok]'s BODY is on the
+   conversion path of a [Qed] in the largest file in the tree
+   ([UShRound.Hopen_hand], which takes the nopipe row as a premise), and
+   that [Qed] sat close enough to the kernel's stack that turning the pipe
+   branch's [sts' = sts] into [_ /\ _] tipped it over -- `Segmentation
+   fault' at [Qed], and, with the stack raised, the divergence
+   durable-notes.md says to read as a CONVERSION rather than a big proof.
+   Behind a constant the row's body is one head symbol per branch again
+   (smaller, in fact, than before the -1 landed), and every consumer reads
+   the arm through [usys_fd_ok_pipe_neg1] below rather than by unfolding
+   this. *)
+Definition usys_pipe_fail (r : mword 64) (sts sts' : list fdstate) : Prop :=
+  r = (mword_of_int (-1) : mword 64) /\ sts' = sts.
+
+Definition usys_fd_ok (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (sts sts' : list fdstate) : Prop :=
+  if decide (n = USYS_close) then
+    (* close(fd): argument 0 IS the descriptor number, and the slot becomes
+       CLOSED.  sys_close returns 0 on success and -1 when [argfd] rejects
+       the number -- out of range, or already closed -- and a rejected close
+       moves nothing, which is what a program that closes twice needs. *)
+    ((if decide (uint r = 0)
+      then sts' = <[Z.to_nat (usys_argfd tf) := FdClosed]> sts
+      else sts' = sts)
+     (* ...AND CLOSING AN OPEN DESCRIPTOR CANNOT FAIL.  The guard above is
+        sound and, alone, useless to a caller that does not check the return
+        value -- which is every caller: xv6's sh writes [close(fd);
+        open(path)] and reads neither result, and a row that leaves [r] free
+        leaves the descriptor still open on an arm no program can rule out.
+        [argfd] rejects exactly two things, an index outside [0, NOFILE) and
+        a null [p->ofile] slot, and a caller naming an OPEN descriptor has
+        refuted both -- so the return is a function of the slot's state, and
+        this says so in the direction a caller has it.
+
+        The premise is stated at a [nat] index rather than on [usys_argfd]
+        directly because that is what makes it true: [Z.to_nat] of a
+        NEGATIVE argument is 0, and close(-1) must not be licensed to
+        conclude anything about slot 0.  [ProofSyscall]'s arm 21 proves it
+        from [ProcInv.proc_priv_states_agree]. *)
+     /\ (forall (fd : nat) (st : fdstate),
+           usys_argfd tf = Z.of_nat fd -> sts !! fd = Some st ->
+           st <> FdClosed -> uint r = 0))
+  else if decide (n = USYS_dup) then
+    (* dup(fd): the RETURNED descriptor is a COPY of the argument's -- same
+       type, same mode -- because filedup only bumps [f->ref] and the two
+       descriptors then name the same [struct file].  The old slot keeps
+       what it had, which [list_insert] says by leaving it alone. *)
+    ((exists fd1 : nat,
+        usys_ret_is r fd1 /\
+        (* ...AND IT IS THE LOWEST FREE SLOT.  This used to say only that
+           the slot was free, which is what the code does but not all of
+           it: fdalloc scans from 0 and takes the FIRST null entry, so the
+           descriptor is DETERMINED by the table rather than merely
+           constrained by it ([SpecFdalloc.fd_frees] is that scan, and its
+           head is this).  Without the strengthening dup would be licensed
+           to retype a descriptor the caller is already using; with only
+           the weak form a caller that closes a descriptor and reallocates
+           still cannot say which one it got back, which is what sh's REDIR
+           turns on.  [UserFd.ufd_dup] is the consumer. *)
+        fd_least_closed sts fd1 /\
+        (* ...AND THE SOURCE WAS OPEN.  [argfd] let the call past, and it
+           rejects a null [p->ofile] slot, so a dup that RETURNED A
+           DESCRIPTOR was reading an open one.  Without this the success
+           arm is not refutable by a caller whose source is CLOSED -- a
+           copy of [FdClosed] lands on a slot the scan already found
+           closed, so the table does not move and nothing else in the arm
+           gives the caller a contradiction -- and such a caller could not
+           name the [-1] the kernel actually returns.  /init's failed-open
+           arm is exactly that caller ([UkRunSys.wp_uk_ecall_dup_closed]).
+
+           NO NEGATIVE-INDEX HAZARD, unlike the failure arm's first reason:
+           on THIS arm [arg_fd] succeeded, so the argument is in
+           [0, NOFILE) and [Z.to_nat] is faithful -- which is why it is
+           stated at the total index directly and not under a [nat]
+           premise. *)
+        sts !! Z.to_nat (usys_argfd tf) <> Some FdClosed /\
+        sts' = <[fd1 := sts !!! Z.to_nat (usys_argfd tf)]> sts)
+     (* ...OR THE CALL FAILED, AND THE ROW SAYS SO BY NAMING [-1] AND WHY.
+        An unguarded [sts' = sts] here would be useless to a caller: it
+        would permit "returned a descriptor and changed nothing", which
+        sys_dup never does, and a caller holding [r] could not tell the two
+        arms apart.  Both failure exits of sys_dup return -1.
+
+        AND THERE ARE EXACTLY TWO OF THEM, which is what lets the arm carry
+        a reason a caller can REFUTE.  sys_dup is [argfd; fdalloc; filedup]
+        and nothing else: [argint] cannot fail, [argfd] rejects exactly an
+        index outside [0, NOFILE) and a null [p->ofile] slot, [fdalloc]
+        fails exactly when its scan finds no null slot, and [filedup] never
+        fails.  So a dup that returned -1 did so because
+
+          - THE ARGUMENT IS NOT AN OPEN DESCRIPTOR of the caller.  Stated
+            at a [nat] index rather than on [usys_argfd] directly, for the
+            same reason close's row is: [Z.to_nat] of a NEGATIVE argument
+            is 0, and dup(-1) must not be licensed to say anything about
+            slot 0.  An out-of-range index leaves the premise vacuous,
+            which is right -- that is a failure the caller reads off the
+            number alone and needs no table for;
+          - ...OR THE TABLE IS FULL: the scan found no closed slot at all,
+            which is [fd_lowest_closed] answering [None].
+
+        WHY THE FAILURE ARM AND NOT THE SUCCESS ARM.  The success arm is
+        left exactly as it was; what a caller needs to pin its descriptors
+        is the ability to REFUTE -1, and that is this arm's business.
+
+        [ProofSyscall]'s arm 10 proves both disjuncts from
+        [SpecSysDup.sys_dup_post]'s own two failure arms -- which say
+        [arg_fd ... = None] and [fd_frees ... = []] on p->ofile's POINTERS
+        -- read at the state list through
+        [ProcInv.proc_priv_states_agree].
+
+        THE DRIVING CONSUMER is /init: after [open("console", O_RDWR)]
+        returns fd 0 its ledger has slot 0 OPEN and slots 1 and 2 CLOSED,
+        which refutes both disjuncts, so neither of its two dups can fail
+        and fds 1 and 2 are the console. *)
+     \/ (r = (mword_of_int (-1) : mword 64) /\ sts' = sts
+         /\ ((forall (fd : nat) (st : fdstate),
+                 usys_argfd tf = Z.of_nat fd -> sts !! fd = Some st ->
+                 st = FdClosed)
+              \/ fd_lowest_closed sts = None)))
+  else if decide (n = USYS_open) then
+    (* open(path, omode): the returned descriptor becomes OPEN at some type
+       and mode.  Both are existential HERE and both are pinnable: the mode
+       is a function of [omode] (argument 1 -- xv6 sets [f->readable] to
+       [!(omode & O_WRONLY)] and [f->writable] to [(omode & O_WRONLY) ||
+       (omode & O_RDWR)]) and the type is [FdDevice] exactly when the inode
+       it resolved is [T_DEVICE], [FdInode] otherwise.  Pinning either needs
+       vocabulary this table does not have yet -- the mode wants omode's
+       bits decoded, the type wants the path lookup -- so the row says what
+       it can honestly say: the slot is now OPEN, and no other slot moved. *)
+    ((exists (fd : nat) (rd wr : bool) (t : fdtype),
+        usys_ret_is r fd /\
+        (* ...AND IT IS THE LOWEST FREE SLOT -- same fdalloc scan, same
+           reason as dup's row above.  This is the conjunct sh's REDIR
+           needs: [close(fd); open(path)] reopens the descriptor just
+           closed precisely because the scan starts at 0. *)
+        fd_least_closed sts fd /\
+        sts' = <[fd := FdOpen rd wr t]> sts /\
+        (* THE DESCRIPTOR'S OFFSET MODE IS NOT PINNED HERE ANY MORE (lane
+           OFF-LINK-6's L4).  This row used to carry [FdSlots.fdst_parked
+           (FdOpen rd wr t)], because the guarded generic WP read
+           all-parkedness off the successor key's table; that discipline
+           and its whole kit ([usys_fd_ok_parked], [usys_fd_ok_parked_ne_
+           open], [fdv_all_parked]) are gone, and an open now installs the
+           descriptor at the mode its CALLER'S FAMILY asked for
+           ([UConsOpen.xfam]'s [of_om], read by [SpecSysOpen]'s arms).
+           Nothing in the tier reads the mode off this predicate. *)
+        (* ...AND NOT A PIPE (design/pipe.md, "The exit path"): open
+           installs an inode or a device, never a pipe end, and this is
+           what lets a program that never calls pipe(2) say its table
+           holds none -- which is what makes exit's close payments free
+           for it ([FdSlots.fdv_nopipe]). *)
+        fdst_nopipe (FdOpen rd wr t))
+     (* ...or the call failed, which it reports as -1 -- see dup's row for
+        why the failure arm is guarded rather than bare. *)
+     \/ (r = (mword_of_int (-1) : mword 64) /\ sts' = sts))
+  else if decide (n = USYS_pipe) then
+    (* pipe(fdarray): TWO descriptors, and the row says which end is which
+       -- [FdOpen true false FdPipe] reads and [FdOpen false true FdPipe]
+       writes, per [FdSlots]'s note that on a pipe the mode flags ARE the
+       identity of the end.  sys_pipe returns 0 on success.
+
+       THE TWO NUMBERS ARE EXISTENTIAL, and that is the row's one real gap:
+       pipe reports them by WRITING them, as the two four-byte words the
+       image row above puts at [tf_arg_idx 0], so tying [a] and [b] to the
+       descriptors a caller can actually use means relating them to that
+       row's [bs].  The two tables would have to be read together, which is
+       the refinement this entry is waiting on. *)
+    (if decide (uint r = 0)
+     then (exists (a b : nat) (γp : pipe_names),
+             a <> b /\
+             (* ...AND EACH IS THE LOWEST FREE SLOT AT THE MOMENT ITS OWN
+                fdalloc RAN, which is what makes the pair deterministic.
+                sys_pipe allocates the READ end first
+                ([fd0 = fdalloc(rf)]) and the WRITE end second against the
+                table the first call left, so the second scan is stated at
+                [<[a := ...]> sts] and not at [sts].  The inserts below are
+                written in that same order for the same reason; they
+                commute ([a <> b]), so a caller may read them either way. *)
+             fd_least_closed sts a /\
+             fd_least_closed (<[a := FdOpen true false (FdPipe γp)]> sts) b /\
+             sts' = <[b := FdOpen false true (FdPipe γp)]>
+                      (<[a := FdOpen true false (FdPipe γp)]> sts))
+     (* ...OR THE CALL FAILED, AND IT REPORTS THAT AT -1, exactly as the
+        open and dup rows above do (lane PIPE-NEG1; lane SH-PIPE's finding
+        R-1).  An unguarded [sts' = sts] here said only "nonzero", and
+        "nonzero" DOES NOT DECIDE A SIGN: sh's instruction after [pipe(p)]
+        is [bltz a0] ([user/sh.c]'s PIPE arm, `if(pipe(p) < 0) panic'), so
+        at [r = 1] the branch is not taken and the pipeline would run on
+        two garbage descriptors -- an arm no walk can enter and no caller
+        can refute.  It cannot be repaired at a caller either: a premise
+        [forall r, uint r <> 0 -> r = -1] is FALSE, and one stated over
+        the old row is false too (take [r = 1], [sts' = sts]), so anything
+        built on either would be VACUOUS (durable-notes.md, "Vacuity").
+
+        AND THE KERNEL REALLY DOES SAY -1, on every failure path: sys_pipe
+        is [pipealloc; fdalloc; fdalloc; copyout; copyout] and all five
+        failures leave through one of its three bare `return -1's
+        ([kernel/sysfile.c]).  [SpecSysPipe.sys_pipe_post] has therefore
+        always had ONE failure arm and it always read
+        [r = mword_of_int (-1)] -- [ProofSysPipe] lands all five paths on
+        it -- so nothing about the kernel had to be proved for this row;
+        [ProofSyscall]'s arm 4 merely stopped DROPPING the fact.
+
+        BEHIND A NAME, and the note on [usys_pipe_fail] says why -- the
+        two conjuncts written out here cost a [Qed] in [UShRound.v] its
+        stack. *)
+     else usys_pipe_fail r sts sts')
+  else
+    (* EVERY OTHER ENTRY LEAVES THE TABLE ALONE -- but read that carefully
+       for the three entries where it is easy to claim too much.
+
+       EXEC.  This row does NOT say a successful exec keeps the table, and
+       cannot: the only exec that reaches this row is the FAILING one
+       ([usys_mem_ok]'s exec row pins [r = -1]).  A successful exec never
+       returns to this WP -- its successor is a kernel MINT, at an
+       arbitrary key, so the contract currently says nothing about the fd
+       view across it.  xv6 has no FD_CLOEXEC and really does keep the
+       table (that is how the shell hands a redirected descriptor to the
+       program it runs), so this is a GAP in the specification rather than
+       a property of the code: pinning it means giving exec's mint a row,
+       not changing this line.
+
+       FORK.  This row is about the PARENT, whose table fork does not
+       touch.  It says nothing about the CHILD's -- and the reason is worth
+       knowing, because it is not that the work is missing.  kfork's copy
+       loop DOES retype the child's descriptors in the ghost, one per
+       iteration: [ProofKforkB3]'s [fd_st_move _ i FdClosed stq stf] moves
+       slot [i] from closed to [stf], the type of the very file the
+       parent's slot names.  What is missing is a NAME for the result --
+       the loop's invariant is stated at [FdSlots.fd_frags_any], and
+       [fd_frags_any_acc]'s closer goes straight back to [fd_frags_any], so
+       the table the loop builds is forgotten as it is built.  "The child
+       inherits the parent's descriptors" is therefore proved and
+       unstatable, which is a different defect from unproved, and a
+       cheaper one to fix.
+
+       EXIT closes every descriptor and needs no row, because it does not
+       return. *)
+    sts' = sts.
+
+(* the entries that leave the descriptor table alone -- the fd counterpart
+   of [usys_mem_ok_quiet], and what a program carrying an open fd across an
+   unrelated syscall reads off the row *)
+Lemma usys_fd_ok_quiet (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (sts sts' : list fdstate) :
+  n <> USYS_close -> n <> USYS_dup -> n <> USYS_open -> n <> USYS_pipe ->
+  usys_fd_ok n tf r sts sts' -> sts' = sts.
+Proof.
+  intros Hc Hd Ho Hp H. unfold usys_fd_ok in H.
+  destruct (decide (n = USYS_close)); [contradiction |].
+  destruct (decide (n = USYS_dup)); [contradiction |].
+  destruct (decide (n = USYS_open)); [contradiction |].
+  destruct (decide (n = USYS_pipe)); [contradiction |].
+  exact H.
+Qed.
+
+(* THE QUIET ROW, IN THE DIRECTION A PROVER NEEDS IT.  [usys_fd_ok_quiet]
+   above READS a row ("this entry moved nothing"); an arm has to SUPPLY one,
+   and supplies it at the only table it has.  Keyed on the entry's own
+   number so a dispatch arm discharges it with its [Hnum] and four
+   [discriminate]s. *)
+Lemma usys_fd_ok_refl_at (n k : Z) (tf : list (mword 64)) (r : mword 64)
+    (sts : list fdstate) :
+  n = k ->
+  k <> USYS_close -> k <> USYS_dup -> k <> USYS_open -> k <> USYS_pipe ->
+  usys_fd_ok n tf r sts sts.
+Proof.
+  intros -> Hc Hd Ho Hp. unfold usys_fd_ok.
+  destruct (decide (k = USYS_close)); [contradiction |].
+  destruct (decide (k = USYS_dup)); [contradiction |].
+  destruct (decide (k = USYS_open)); [contradiction |].
+  destruct (decide (k = USYS_pipe)); [contradiction |].
+  reflexivity.
+Qed.
+
+(* THE ROW READS THE TRAPFRAME ONLY AT ARGUMENT 0.  Two trapframes that
+   agree there satisfy the same row, whatever else differs between them --
+   and the difference that matters is the EPC WORD, which usertrap's
+   prologue rewrites (on the way in) and its epilogue bumps (on the way
+   out).  The image table has the same fact under the same name pattern
+   ([usys_mem_ok_epc], [usys_num_epc]); this is the descriptor table's.
+
+   Note the argument is read at the ENTRY trapframe, before the return
+   value is stored over it -- [usys_argfd] is a0 as the kernel FOUND it,
+   not a0 as it left it. *)
+(* ===================================================================== *)
+(* SS2c PIPE'S TWO ROWS, JOINED.                                           *)
+(*                                                                         *)
+(* [usys_mem_ok] says pipe wrote [d <= 8] bytes at a0 -- SOME bytes, from  *)
+(* an existential [bs] -- and [usys_fd_ok] says pipe opened two free slots *)
+(* [a] and [b].  Separately, neither says the words it wrote NAME the      *)
+(* slots it opened, and that tie is the whole content of pipe() to a       *)
+(* caller: sh reads fd[0] and fd[1] back out of that buffer and closes     *)
+(* them.  This row is the join, and it is what the two halves could never  *)
+(* be strengthened into individually -- [usys_mem_ok] has no [sts] to      *)
+(* speak of and [usys_fd_ok] has no [M].                                   *)
+(*                                                                         *)
+(* GUARDED ON SUCCESS, at pipe's OWN return convention: pipe answers 0 or  *)
+(* -1, and the failure arm allocated nothing and wrote nothing.  The guard *)
+(* is [uint r = 0] rather than [r = 0] because that is the shape the       *)
+(* dispatch's [beqz] leaves behind.                                        *)
+(*                                                                         *)
+(* THE BYTES ARE STATED ON THE WRITTEN FUNCTION, not on lookups in [M'].   *)
+(* Reading them back out of [M'] needs the no-wrap side condition on a0,   *)
+(* which is the CALLER's fact about its own buffer, not pipe's -- so the   *)
+(* row hands over [bs] itself and lets the caller do that step with the    *)
+(* window lemma it already has. *)
+Definition usys_pipe_ok (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (sts sts' : list fdstate) : Prop :=
+  n = USYS_pipe ->
+  uint r = 0 ->
+  exists (a b : nat) (γp : pipe_names) (bs : nat -> bv 8),
+    a <> b /\
+    (* THE TWO SLOTS WERE THE LOWEST FREE ONES, restated here rather than
+       left to [usys_fd_ok]'s own pipe row.  The two rows bind their
+       [a]/[b] INDEPENDENTLY, so a leaf that mints handles off this one
+       cannot borrow the other's promise without first arguing the
+       witnesses agree -- and the promise costs the kernel nothing extra,
+       being the same fact [ProofSysPipe] already proves once.  Same
+       allocation order as there: read end first, write end against the
+       table the first call left. *)
+    fd_least_closed sts a /\
+    fd_least_closed (<[a := FdOpen true false (FdPipe γp)]> sts) b /\
+    M' = umem_wr M (tf !!! tf_arg_idx 0) 8 bs /\
+    (forall i : nat, (i < 8)%nat ->
+       bs i = if (i <? 4)%nat
+              then nth_byte (trunc32 (mword_of_int (Z.of_nat a) : mword 64)) i
+              else nth_byte (trunc32 (mword_of_int (Z.of_nat b) : mword 64))
+                     (i - 4)%nat) /\
+    sts' = <[b := FdOpen false true (FdPipe γp)]>
+             (<[a := FdOpen true false (FdPipe γp)]> sts).
+
+(* the quiet reading: the other twenty-one entries owe nothing here *)
+Lemma usys_pipe_ok_quiet (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (sts sts' : list fdstate) :
+  n <> USYS_pipe -> usys_pipe_ok n tf r M M' sts sts'.
+Proof. intros Hne Hp. contradiction (Hne Hp). Qed.
+
+(* THE ROW READS THE ENTRY TRAPFRAME AT ONE WORD, a0 -- the buffer pointer
+   -- so a frame that agrees there carries it across.  Stated separately
+   from the number, exactly as [usys_fd_ok_arg_cong] is, because the two
+   congruences are used at different places. *)
+Lemma usys_pipe_ok_arg_cong (n : Z) (tf1 tf2 : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (sts sts' : list fdstate) :
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  usys_pipe_ok n tf1 r M M' sts sts' -> usys_pipe_ok n tf2 r M M' sts sts'.
+Proof. intros He. unfold usys_pipe_ok. rewrite He. exact id. Qed.
+
+(* ...and the epc rewrite, invisible here for the same reason it is
+   invisible to the descriptor row: different words. *)
+Lemma usys_pipe_ok_epc (n : Z) (tf : list (mword 64)) (w r : mword 64)
+    (M M' : gmap Z (bv 8)) (sts sts' : list fdstate) :
+  (tf_epc_idx < length tf)%nat ->
+  usys_pipe_ok n (<[tf_epc_idx := w]> tf) r M M' sts sts' ->
+  usys_pipe_ok n tf r M M' sts sts'.
+Proof.
+  intros Hlen. apply usys_pipe_ok_arg_cong.
+  rewrite list_lookup_total_insert_ne; [reflexivity |].
+  unfold tf_epc_idx, tf_arg_idx. lia.
+Qed.
+
+Lemma usys_fd_ok_arg_cong (n : Z) (tf1 tf2 : list (mword 64)) (r : mword 64)
+    (sts sts' : list fdstate) :
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  usys_fd_ok n tf1 r sts sts' -> usys_fd_ok n tf2 r sts sts'.
+Proof.
+  intros He. unfold usys_fd_ok, usys_argfd. rewrite He. exact id.
+Qed.
+
+(* ...and the instance every caller wants: an epc rewrite is invisible to
+   the row, because the two indices are different words. *)
+Lemma usys_fd_ok_epc (n : Z) (tf : list (mword 64)) (w r : mword 64)
+    (sts sts' : list fdstate) :
+  (tf_epc_idx < length tf)%nat ->
+  usys_fd_ok n (<[tf_epc_idx := w]> tf) r sts sts' ->
+  usys_fd_ok n tf r sts sts'.
+Proof.
+  intros Hlen. apply usys_fd_ok_arg_cong.
+  rewrite list_lookup_total_insert_ne; [reflexivity |].
+  unfold tf_epc_idx, tf_arg_idx. lia.
+Qed.
+
+(* THE LENGTH SURVIVES EVERY ROW, which is what [FdSlots.fd_frags] needs of
+   any table it is asked to hold: it carries [length sts = NOFILE] inside
+   it, so a row that could change the length would be a row no bundle could
+   accept. *)
+Lemma usys_fd_ok_length (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (sts sts' : list fdstate) :
+  usys_fd_ok n tf r sts sts' -> length sts' = length sts.
+Proof.
+  unfold usys_fd_ok. intros H.
+  destruct (decide (n = USYS_close)) as [_ | _].
+  { destruct H as [H _].
+    destruct (decide (uint r = 0)); subst; [ apply length_insert | reflexivity ]. }
+  destruct (decide (n = USYS_dup)) as [_ | _].
+  { destruct H as [(fd1 & _ & _ & _ & ->) | (_ & -> & _)];
+      [apply length_insert | reflexivity]. }
+  destruct (decide (n = USYS_open)) as [_ | _].
+  { destruct H as [(fd & rd & wr & t & _ & _ & -> & _) | [_ ->]];
+      [apply length_insert | reflexivity]. }
+  destruct (decide (n = USYS_pipe)) as [_ | _].
+  { destruct (decide (uint r = 0)) as [_ | _].
+    - destruct H as (a & b & γp & _ & _ & _ & ->).
+      rewrite length_insert. apply length_insert.
+    - unfold usys_pipe_fail in H. destruct H as [_ ->]. reflexivity. }
+  subst. reflexivity.
+Qed.
+
+(* [usys_fd_ok_parked], THE WHOLE [fdv_held_in] FAMILY ([_of_parked],
+   [_empty], [_mono], [_insert], [_closed]) AND [usys_fd_ok_held] ARE
+   DELETED (lane OFF-LINK-2, L6).  They carried the generic tier's PARKED
+   DISCIPLINE -- "no descriptor in this table has had its offset half
+   handed out", and its set-valued over-approximation -- across a round and
+   through the Loeb step, which is the precondition design/app-file.md
+   SS3.5's principle retires: the generic tier pays the TAINT and is told
+   nothing about offsets.  Not one of them had a consumer left outside a
+   comment once lane OFF-HAND-6's H3 deleted the exec crossing's row and
+   lane OFF-LINK's L1 made the descriptor bundle persistent again, and
+   [UkRun.ukn_held] -- the record field the set lived on -- goes with them.
+
+   WHAT SURVIVES, AND WHY: [usys_fd_ok_nopipe] below.  A pipe row IS
+   still a fact the generic tier carries (exit's close payments are free
+   only at a table that holds none), and it has nothing to do with
+   offsets. *)
+
+(* ...AND THE SAME FOR "NO PIPE ROW" (design/pipe.md, "The exit path"),
+   at every number but pipe(2), which is the one call that installs one.
+   This is what lets a program that never calls pipe(2) carry
+   [FdSlots.fdv_nopipe] of its table across every trap and mint exit's
+   close payments from nothing ([UexecExecInst.xv6_sbundle_exit_nopipe]). *)
+Lemma usys_fd_ok_nopipe (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (sts sts' : list fdstate) :
+  n <> USYS_pipe ->
+  usys_fd_ok n tf r sts sts' ->
+  fdv_nopipe sts ->
+  fdv_nopipe sts'.
+Proof.
+  unfold usys_fd_ok. intros Hnp H Hpk.
+  destruct (decide (n = USYS_close)) as [_ | _].
+  { destruct H as [H _].
+    destruct (decide (uint r = 0)); subst;
+      [ apply fdv_nopipe_insert; [exact Hpk | exact fdst_nopipe_closed]
+      | exact Hpk ]. }
+  destruct (decide (n = USYS_dup)) as [_ | _].
+  { destruct H as [(fd1 & _ & _ & _ & ->) | (_ & -> & _)];
+      [ apply fdv_nopipe_insert;
+        [ exact Hpk | apply fdv_nopipe_lookup_total; exact Hpk ]
+      | exact Hpk ]. }
+  destruct (decide (n = USYS_open)) as [_ | _].
+  { destruct H as [(fd & rd & wr & t & _ & _ & He & Hop) | [_ ->]]; [| exact Hpk].
+    rewrite He. apply fdv_nopipe_insert; [ exact Hpk | exact Hop ]. }
+  destruct (decide (n = USYS_pipe)) as [He | _]; [ exfalso; exact (Hnp He) | ].
+  subst. exact Hpk.
+Qed.
+
+(* PIPE'S FAILURE ARM, IN THE DIRECTION A LEAF HAS IT (lane PIPE-NEG1).
+   A leaf spending the row case-splits on the guard the dispatch's [beqz]
+   leaves behind ([uint r = 0]) and, on the other side of that split, needs
+   the SIGN -- because that is what the caller's next instruction reads
+   ([bltz a0]).  This is the pipe row's else-branch read at exactly that
+   split, so no consumer has to unfold the row to get at it.  The twin
+   readings for open and dup are their rows' own failure disjuncts and need
+   no lemma: those are disjunctions, and this one is a guard. *)
+Lemma usys_fd_ok_pipe_neg1 (tf : list (mword 64)) (r : mword 64)
+    (sts sts' : list fdstate) :
+  usys_fd_ok USYS_pipe tf r sts sts' ->
+  uint r <> 0 ->
+  r = (mword_of_int (-1) : mword 64) /\ sts' = sts.
+Proof.
+  unfold usys_fd_ok. intros H Hnz.
+  destruct (decide (USYS_pipe = USYS_close)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_pipe = USYS_dup)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_pipe = USYS_open)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_pipe = USYS_pipe)) as [_ | Hc];
+    [ | exfalso; exact (Hc eq_refl) ].
+  destruct (decide (uint r = 0)) as [Hc | _]; [ exfalso; exact (Hnz Hc) | ].
+  unfold usys_pipe_fail in H. exact H.
+Qed.
+
+(* [usys_fd_ok_parked_ne_open] IS GONE, and its disappearance is the point:
+   it was the shape RA-1's owed premise could be read at (every entry but
+   open), and with the open arm carrying [fdst_parked] there is no entry
+   the discipline has to be excused at.  A caller that had it applies
+   [usys_fd_ok_parked] and drops its [n <> USYS_open]. *)
+
+(* ===================================================================== *)
+(* SS2d THE WORKING-DIRECTORY ROW: one number moves it.                    *)
+(*                                                                         *)
+(* [c] / [c'] are the cwd's inum before and after ([ProcDefs.pv_cwi], the  *)
+(* value [UexecSlot.uvis_cwd] carries).  NO TRAPFRAME ARGUMENT: chdir's    *)
+(* new inum is the file system's business -- which inode the path names -- *)
+(* so the plain tier pins only the FAILURE case (sys_chdir returns -1 and  *)
+(* the directory is untouched) and leaves the landed inum to the enriched  *)
+(* tier's naming.  Every other entry preserves it: exec inherits the       *)
+(* caller's ([KexecDefs.kexec_ok]'s row), fork copies it parent to child   *)
+(* (the fork arm of [UexecRet.uexec_ret_F] says so directly), and nothing  *)
+(* else touches [p->cwd].                                                  *)
+(* ===================================================================== *)
+Definition usys_cwd_ok (n : Z) (r : mword 64) (c c' : Z) : Prop :=
+  if decide (n = USYS_chdir) then (uint r <> 0 -> c' = c) else c' = c.
+
+(* the twenty-one entries that leave the working directory alone -- the cwd
+   counterpart of [usys_fd_ok_quiet] *)
+Lemma usys_cwd_ok_quiet (n : Z) (r : mword 64) (c c' : Z) :
+  n <> USYS_chdir -> usys_cwd_ok n r c c' -> c' = c.
+Proof.
+  intros Hc H. unfold usys_cwd_ok in H.
+  destruct (decide (n = USYS_chdir)); [contradiction | exact H].
+Qed.
+
+(* ...and the row in the direction a prover supplies it, keyed on the
+   entry's own number ([usys_fd_ok_refl_at]): one number is excluded, and
+   a dispatch arm discharges the exclusion with its [Hnum] and one
+   [discriminate] *)
+Lemma usys_cwd_ok_refl_at (n k : Z) (r : mword 64) (c : Z) :
+  n = k -> k <> USYS_chdir -> usys_cwd_ok n r c c.
+Proof.
+  intros -> Hc. unfold usys_cwd_ok.
+  destruct (decide (k = USYS_chdir)); [contradiction | reflexivity].
+Qed.
+
+(* ...and chdir's own arm: a failed chdir moves nothing, a successful one
+   lands anywhere the file system says.  (No [_arg_cong] / [_epc]: the row
+   reads no trapframe word.) *)
+Lemma usys_cwd_ok_chdir (r : mword 64) (c c' : Z) :
+  (uint r <> 0 -> c' = c) -> usys_cwd_ok USYS_chdir r c c'.
+Proof.
+  intros H. unfold usys_cwd_ok.
+  destruct (decide (USYS_chdir = USYS_chdir)) as [_ | Hne];
+    [ exact H | contradiction (Hne eq_refl) ].
+Qed.
+
+(* ===================================================================== *)
+(* SS2e THE GENERATION ROW: no number moves it.                            *)
+(*                                                                         *)
+(* [g] / [g'] are the process's own generation name before and after       *)
+(* ([UexecSlot.uvis_gen], the name the kernel's per-slot generation cell   *)
+(* holds).  A generation is the identity of ONE INCARNATION of a slot, and *)
+(* no syscall re-incarnates the CALLER: allocproc mints a generation for a *)
+(* new slot, freeproc drops it, and exec keeps the caller's (the identity  *)
+(* survives exec, which is why exec's row is quiet here even though it     *)
+(* replaces the whole image).  fork's CHILD gets a fresh one, but the      *)
+(* child's key is built on its own row ([UexecRet.uexec_fork_child_F]),    *)
+(* not here.  Stated as a row rather than as structural preservation in    *)
+(* [UexecRet.bump] so that the arm reads the same way as the other four,   *)
+(* and so that a later entry which did move it would have somewhere to say *)
+(* so.  NO TRAPFRAME AND NO RETURN VALUE: nothing the row could read.      *)
+(* ===================================================================== *)
+Definition usys_gen_ok (n : Z) (g g' : gname) : Prop := g' = g.
+
+Lemma usys_gen_ok_quiet (n : Z) (g g' : gname) : usys_gen_ok n g g' -> g' = g.
+Proof. exact id. Qed.
+
+(* the row in the direction a prover supplies it *)
+Lemma usys_gen_ok_refl (n : Z) (g : gname) : usys_gen_ok n g g.
+Proof. reflexivity. Qed.
+
+(* ===================================================================== *)
+(* SS2f THE CHILDREN ROW: which entries move the set of live children.     *)
+(*                                                                         *)
+(* [cs] / [cs'] are the generations of this process's live children before *)
+(* and after ([UexecSlot.uvis_ch], the reading of the [wait_lock] children *)
+(* cell).  Three entries move it -- fork ADDS the child's generation, wait *)
+(* REMOVES the one it reaped, exit hands the whole set to init -- and      *)
+(* every other entry keeps it.  fork's arm is not stated here for the      *)
+(* reason its descriptor copy is not: the fork arm of                      *)
+(* [UexecRet.uexec_ret_F] says it directly, at the generation the deposit  *)
+(* names.  Exit never returns.  So the row that remains for the generic    *)
+(* returning arm is the QUIET one at every number, and wait has an arm of  *)
+(* its own beside fork's ([UexecRet.uexec_wait_F]).  [r] rides along       *)
+(* because wait's answer reads it -- which child was reaped is the return  *)
+(* value's pid -- exactly as [usys_cwd_ok] reads it for chdir's failure    *)
+(* case.                                                                   *)
+(* ===================================================================== *)
+Definition usys_ch_ok (n : Z) (r : mword 64) (cs cs' : gset gname) : Prop :=
+  cs' = cs.
+
+Lemma usys_ch_ok_quiet (n : Z) (r : mword 64) (cs cs' : gset gname) :
+  usys_ch_ok n r cs cs' -> cs' = cs.
+Proof. exact id. Qed.
+
+Lemma usys_ch_ok_refl (n : Z) (r : mword 64) (cs : gset gname) :
+  usys_ch_ok n r cs cs.
+Proof. reflexivity. Qed.
+
+(* ===================================================================== *)
+(* SS2g THE PID ROW: what getpid(2) ANSWERS.                               *)
+(*                                                                         *)
+(* [pid] is the process's own pid ([UexecSlot.uvis_pid], the number the    *)
+(* kernel's [p->pid] cell holds and every contract on the trap route       *)
+(* carries as its [pid] index); [r] is the a0 word the round returns.      *)
+(* getpid is the one entry whose whole content is its return value:        *)
+(*                                                                         *)
+(*     uint64 sys_getpid(void) { return myproc()->pid; }                   *)
+(*                                                                         *)
+(* and the [c.lw] that loads it is a SIGNED 32-bit load widened to the     *)
+(* [uint64] return type, which is exactly [sign_extend' 64]                *)
+(* ([SpecSysGetpid]'s header).  THERE IS NO "AFTER" PID: nothing moves the *)
+(* field, so this row is about the ANSWER and not about a move -- which is *)
+(* why it has no [pid'] the way [usys_gen_ok] has a [g'], and why the      *)
+(* returning arm's [UexecRet.bump] keeps [uvis_pid] structurally rather    *)
+(* than taking a parameter for it.                                         *)
+(*                                                                         *)
+(* QUIET AT EVERY OTHER NUMBER, discharged from the arm's own index by     *)
+(* [usys_ret_pid_ne] -- the shape [SpecSyscall.sysc_fork_out_ne] has.      *)
+(* ===================================================================== *)
+Definition usys_ret_pid (n : Z) (r : mword 64) (pid : mword 32) : Prop :=
+  n = USYS_getpid -> r = (sign_extend' 64 pid : mword 64).
+
+Lemma usys_ret_pid_ne (n : Z) (r : mword 64) (pid : mword 32) :
+  n <> USYS_getpid -> usys_ret_pid n r pid.
+Proof. intros Hne Hn. contradiction (Hne Hn). Qed.
+
+(* ...and the row in the direction getpid's own arm supplies it *)
+Lemma usys_ret_pid_of (n : Z) (r : mword 64) (pid : mword 32) :
+  r = (sign_extend' 64 pid : mword 64) -> usys_ret_pid n r pid.
+Proof. intros Hr _. exact Hr. Qed.
+
+(* ...and what a program calling getpid LEARNS *)
+Lemma usys_ret_pid_getpid (r : mword 64) (pid : mword 32) :
+  usys_ret_pid USYS_getpid r pid -> r = (sign_extend' 64 pid : mword 64).
+Proof. intros H. exact (H eq_refl). Qed.
+
+(* ===================================================================== *)
+(* SS2h THE MASK (upstream a083670): the EFFECTIVE number, and the one     *)
+(* entry that moves the mask.                                             *)
+(*                                                                         *)
+(* [p->seccomp] decides whether an in-range number runs: bit [n] clear and *)
+(* the dispatcher stores -1 and runs nothing.  That is exactly what the    *)
+(* unknown-number arm does (minus its diagnostic), so A BLOCKED CALL IS    *)
+(* THE UNKNOWN-NUMBER CALL: the number every row below is keyed on is the  *)
+(* EFFECTIVE one, [usys_eff], which is the raw a7 reading where the mask   *)
+(* allows it and 0 -- a number no table entry has -- where it does not.    *)
+(* Out of range the raw reading is unknown either way, so the effective    *)
+(* one is too (a negative number tests no bit; a large one tests bit       *)
+(* [n] or none, and both answers are unknown numbers).                     *)
+(* ===================================================================== *)
+Definition usys_eff (secc : mword 64) (tf : list (mword 64)) : Z :=
+  if Z.testbit (bv_unsigned secc) (usys_num tf) then usys_num tf else 0.
+
+(* kernel/syscall.h *)
+Definition USYS_seccomp : Z := 23.
+
+(* two frames that agree on the raw number agree on the effective one *)
+Lemma usys_eff_num_cong (secc : mword 64) (tf1 tf2 : list (mword 64)) :
+  usys_num tf1 = usys_num tf2 -> usys_eff secc tf1 = usys_eff secc tf2.
+Proof. intros H. unfold usys_eff. rewrite H. reflexivity. Qed.
+
+(* the mask that allows everything, as the key reads it: every bit of the
+   64 set.  (The block's [ProcDefs.secc_all] is this word.) *)
+Lemma usys_eff_all (tf : list (mword 64)) :
+  0 <= usys_num tf < 64 ->
+  usys_eff (mword_of_int (-1)) tf = usys_num tf.
+Proof.
+  intros Hn. unfold usys_eff.
+  assert (Hu : bv_unsigned (mword_of_int (-1) : mword 64) = Z.ones 64)
+    by (vm_compute; reflexivity).
+  rewrite Hu. rewrite Z.ones_spec_low; [reflexivity | lia].
+Qed.
+
+(* a number the mask allows is itself; one it blocks is 0 *)
+Lemma usys_eff_allowed (secc : mword 64) (tf : list (mword 64)) :
+  Z.testbit (bv_unsigned secc) (usys_num tf) = true ->
+  usys_eff secc tf = usys_num tf.
+Proof. intros H. unfold usys_eff. rewrite H. reflexivity. Qed.
+
+Lemma usys_eff_blocked (secc : mword 64) (tf : list (mword 64)) :
+  Z.testbit (bv_unsigned secc) (usys_num tf) = false ->
+  usys_eff secc tf = 0.
+Proof. intros H. unfold usys_eff. rewrite H. reflexivity. Qed.
+
+(* the effective number reads the same word the raw one does *)
+Lemma usys_eff_arg_cong (secc : mword 64) (tf1 tf2 : list (mword 64)) :
+  tf1 !!! tf_arg_idx 7 = tf2 !!! tf_arg_idx 7 ->
+  usys_eff secc tf1 = usys_eff secc tf2.
+Proof.
+  intros He. unfold usys_eff. rewrite (usys_num_arg_cong tf1 tf2 He).
+  reflexivity.
+Qed.
+
+(* THE MASK ROW.  sys_seccomp (23) ANDs the mask with its argument 0 and
+   returns 0; every other entry leaves the mask alone.  Keyed, like every
+   row, on the EFFECTIVE number -- a blocked seccomp call is number 0 and
+   moves nothing. *)
+Definition usys_secc_ok (n : Z) (tf : list (mword 64))
+    (secc secc' : mword 64) (r : mword 64) : Prop :=
+  if decide (n = USYS_seccomp)
+  then secc' = and_vec secc (tf !!! tf_arg_idx 0) /\ r = (mword_of_int 0 : mword 64)
+  else secc' = secc.
+
+Lemma usys_secc_ok_quiet (n : Z) (tf : list (mword 64)) (secc secc' r : mword 64) :
+  n <> USYS_seccomp -> usys_secc_ok n tf secc secc' r -> secc' = secc.
+Proof.
+  intros Hn H. unfold usys_secc_ok in H.
+  destruct (decide (n = USYS_seccomp)); [contradiction | exact H].
+Qed.
+
+(* ...and the row in the direction a quiet entry supplies it *)
+Lemma usys_secc_ok_refl (n : Z) (tf : list (mword 64)) (secc r : mword 64) :
+  n <> USYS_seccomp -> usys_secc_ok n tf secc secc r.
+Proof.
+  intros Hn. unfold usys_secc_ok.
+  destruct (decide (n = USYS_seccomp)); [contradiction | reflexivity].
+Qed.
+
+(* ...and the row seccomp's own arm supplies *)
+Lemma usys_secc_ok_seccomp (tf : list (mword 64)) (secc r : mword 64) :
+  r = (mword_of_int 0 : mword 64) ->
+  usys_secc_ok USYS_seccomp tf secc (and_vec secc (tf !!! tf_arg_idx 0)) r.
+Proof.
+  intros Hr. unfold usys_secc_ok.
+  destruct (decide (USYS_seccomp = USYS_seccomp)) as [_ | Hc];
+    [ split; [reflexivity | exact Hr] | contradiction (Hc eq_refl) ].
+Qed.
+
+(* the row reads argument 0 and nothing else of the frame *)
+Lemma usys_secc_ok_arg_cong (n : Z) (tf1 tf2 : list (mword 64)) (secc secc' r : mword 64) :
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  usys_secc_ok n tf1 secc secc' r -> usys_secc_ok n tf2 secc secc' r.
+Proof. intros He. unfold usys_secc_ok. rewrite He. exact id. Qed.
+
+(* the sixteen quiet entries, by name: what a program calling one of them
+   learns.  Stated for the row shape rather than per number so a program
+   proof picks it up with one [apply] after [vm_compute]-ing the number. *)
+Lemma usys_mem_ok_quiet (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  n <> USYS_exec -> n <> USYS_sbrk ->
+  n <> USYS_wait -> n <> USYS_pipe -> n <> USYS_read -> n <> USYS_fstat ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz' -> M' = M /\ π' = π /\ szv' = szv.
+Proof.
+  intros Hne Hns H3 H4 H5 H8 H. unfold usys_mem_ok in H.
+  destruct (decide (n = USYS_exec)); [contradiction |].
+  destruct (decide (n = USYS_sbrk)); [contradiction |].
+  destruct (decide (n = USYS_wait)); [contradiction |].
+  destruct (decide (n = USYS_pipe)); [contradiction |].
+  destruct (decide (n = USYS_read)); [contradiction |].
+  destruct (decide (n = USYS_fstat)); [contradiction |].
+  (* fork's row is the quiet one with the return-value clause in front, so
+     the conclusion is unchanged and no caller of this reader moves *)
+  destruct (decide (n = USYS_fork));
+    [ exact (conj (proj1 (proj2 H))
+               (conj (proj1 (proj2 (proj2 H)))
+                  (proj1 (proj2 (proj2 (proj2 H)))))) |].
+  exact (conj (proj1 H) (conj (proj1 (proj2 H)) (proj1 (proj2 (proj2 H))))).
+Qed.
+
+(* ...AND THE LAZY BIT, at every entry but sbrk: the bit is a stored field
+   ([ProcDefs.pv_lazy]) and only sbrklazy's grow writes it, so every other
+   row is the equation.  Stated apart from [usys_mem_ok_quiet] because the
+   entries it covers are not the same six -- exec, wait, pipe, read, fstat
+   and fork all keep the bit while moving bytes. *)
+Lemma usys_mem_ok_lazy (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  n <> USYS_sbrk ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz' -> lz' = lz.
+Proof.
+  intros Hns H. unfold usys_mem_ok in H.
+  destruct (decide (n = USYS_exec));
+    [ exact (proj2 (proj2 (proj2 (proj2 H)))) |].
+  destruct (decide (n = USYS_sbrk)); [contradiction |].
+  destruct (decide (n = USYS_wait)); [exact (proj2 (proj2 (proj2 H))) |].
+  destruct (decide (n = USYS_pipe)); [exact (proj2 (proj2 (proj2 H))) |].
+  destruct (decide (n = USYS_read)); [exact (proj1 (proj2 (proj2 (proj2 H)))) |].
+  destruct (decide (n = USYS_fstat)); [exact (proj2 (proj2 (proj2 H))) |].
+  destruct (decide (n = USYS_fork));
+    [exact (proj2 (proj2 (proj2 (proj2 H)))) |].
+  exact (proj2 (proj2 (proj2 H))).
+Qed.
+
+
+
+(* EXEC's row pins everything: the failure arm is the only one that returns
+   here at all, and it says so.  (A successful exec never comes back to this
+   WP -- the new program's is MINTED by exec from the new trapframe and
+   image.) *)
+Lemma usys_mem_ok_exec_row (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  n = USYS_exec ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz' ->
+  r = (mword_of_int (-1) : mword 64) /\ M' = M /\ π' = π /\ szv' = szv.
+Proof.
+  intros -> H. unfold usys_mem_ok in H.
+  destruct (decide (USYS_exec = USYS_exec)) as [_ | Hc];
+    [ exact (conj (proj1 H) (conj (proj1 (proj2 H))
+                     (conj (proj1 (proj2 (proj2 H)))
+                        (proj1 (proj2 (proj2 (proj2 H)))))))
+    | exfalso; exact (Hc eq_refl) ].
+Qed.
+
+(* WAIT AT A NULL STATUS POINTER moves nothing -- which is what a program
+   passing a null status pointer to wait needs, and what the row now
+   says. *)
+Lemma usys_mem_ok_wait_null (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  n = USYS_wait -> uint (tf !!! tf_arg_idx 0) = 0 ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz' ->
+  M' = M /\ π' = π /\ szv' = szv.
+Proof.
+  intros -> Hz H. unfold usys_mem_ok in H.
+  destruct (decide (USYS_wait = USYS_exec)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_wait = USYS_sbrk)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_wait = USYS_wait)) as [_ | Hc];
+    [ | exfalso; exact (Hc eq_refl) ].
+  destruct H as ((d & bs & Hd & Hnull & Hm) & Hp & Hs & _).
+  rewrite (Hnull Hz) in Hm. exact (conj Hm (conj Hp Hs)).
+Qed.
+
+(* FORK'S ROW, READ.  Two readers: the disjunction itself, and the fact the
+   trap loop actually spends -- a fork's return is NEVER 0, so the arm the
+   process left behind ([UexecRet.uexec_fork_parent_F], guarded on a nonzero
+   return) is the arm the round instantiates, unconditionally.  The child
+   resumes on fork's DEPOSIT and never comes back through this round. *)
+Lemma usys_mem_ok_fork_ret (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  n = USYS_fork ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz' ->
+  r = (mword_of_int (-1) : mword 64) \/ (1 <= sint r <= PIDMAX)%Z.
+Proof.
+  intros -> H. unfold usys_mem_ok in H.
+  destruct (decide (USYS_fork = USYS_exec)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_fork = USYS_sbrk)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_fork = USYS_wait)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_fork = USYS_pipe)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_fork = USYS_read)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_fork = USYS_fstat)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_fork = USYS_fork)) as [_ | Hc];
+    [ exact (proj1 H) | exfalso; exact (Hc eq_refl) ].
+Qed.
+
+Lemma usys_mem_ok_fork_nz (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  n = USYS_fork ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz' ->
+  r <> (mword_of_int 0 : mword 64).
+Proof.
+  intros Hn H.
+  destruct (usys_mem_ok_fork_ret n tf r M M' π π' szv szv' lz lz' Hn H) as [Hf | Hb];
+    intros Hc.
+  - rewrite Hc in Hf.
+    assert (Hne : bv_unsigned (mword_of_int 0 : mword 64)
+                  <> bv_unsigned (mword_of_int (-1) : mword 64))
+      by (intros Hq; vm_compute in Hq; discriminate Hq).
+    exact (Hne (f_equal bv_unsigned Hf)).
+  - rewrite Hc in Hb.
+    assert (Hz : sint (mword_of_int 0 : mword 64) = 0)
+      by (vm_compute; reflexivity).
+    rewrite Hz in Hb. clear - Hb. lia.
+Qed.
+
+(* the permission map is untouched by every entry but sbrk *)
+Lemma usys_mem_ok_perm (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  n <> USYS_sbrk ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz' -> π' = π.
+Proof.
+  intros Hns H. unfold usys_mem_ok in H.
+  destruct (decide (n = USYS_exec)); [exact (proj1 (proj2 (proj2 H))) |].
+  destruct (decide (n = USYS_sbrk)); [contradiction |].
+  destruct (decide (n = USYS_wait)); [exact (proj1 (proj2 H)) |].
+  destruct (decide (n = USYS_pipe)); [exact (proj1 (proj2 H)) |].
+  destruct (decide (n = USYS_read)); [exact (proj1 (proj2 H)) |].
+  destruct (decide (n = USYS_fstat)); [exact (proj1 (proj2 H)) |].
+  destruct (decide (n = USYS_fork)); [exact (proj1 (proj2 (proj2 H))) |].
+  exact (proj1 (proj2 H)).
+Qed.
+
+(* READ'S ROW, READ: what a program calling read LEARNS about the answer,
+   beside what the window reader ([UkRunSys.usys_mem_ok_window]) says about
+   the bytes. *)
+Lemma usys_mem_ok_read_ret (n : Z) (tf : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  n = USYS_read ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz' ->
+  usys_read_ret tf r.
+Proof.
+  intros -> H. unfold usys_mem_ok in H.
+  destruct (decide (USYS_read = USYS_exec)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_read = USYS_sbrk)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_read = USYS_wait)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_read = USYS_pipe)) as [Hc | _]; [ discriminate Hc | ].
+  destruct (decide (USYS_read = USYS_read)) as [_ | Hc];
+    [ exact (proj2 (proj2 (proj2 (proj2 H)))) | exfalso; exact (Hc eq_refl) ].
+Qed.
+
+(* ===================================================================== *)
+(* SS3 THE RESUME TRAPFRAME after a returning syscall: epc advanced past   *)
+(* the ecall, a0 := the return value.  This is what the kernel's trap loop *)
+(* does to the process's trapframe between the ecall and the sret          *)
+(* ([usertrap]: [p->trapframe->epc += 4]; [syscall]: [p->trapframe->a0 =   *)
+(* syscalls[num]()]), so it is the key the returned slot is stated at.     *)
+(* ===================================================================== *)
+Definition bump_tf (tf : list (mword 64)) (r : mword 64) : list (mword 64) :=
+  <[tf_arg_idx 0 := r]> (<[tf_epc_idx := add_vec_int (tf !!! tf_epc_idx) 4]> tf).
+
+Lemma bump_tf_length (tf : list (mword 64)) (r : mword 64) :
+  length (bump_tf tf r) = length tf.
+Proof. unfold bump_tf. rewrite !length_insert. reflexivity. Qed.
+
+(* the words the resume state reads, through the bump *)
+Lemma bump_tf_epc (tf : list (mword 64)) (r : mword 64) :
+  (tf_epc_idx < length tf)%nat ->
+  bump_tf tf r !!! tf_epc_idx = add_vec_int (tf !!! tf_epc_idx) 4.
+Proof.
+  intros Hl. unfold bump_tf.
+  rewrite list_lookup_total_insert_ne; [ | unfold tf_arg_idx, tf_epc_idx; lia ].
+  apply list_lookup_total_insert_eq. exact Hl.
+Qed.
+
+Lemma bump_tf_a0 (tf : list (mword 64)) (r : mword 64) :
+  (tf_arg_idx 0 < length tf)%nat ->
+  bump_tf tf r !!! tf_arg_idx 0 = r.
+Proof.
+  intros Hl. unfold bump_tf.
+  apply list_lookup_total_insert_eq. rewrite length_insert. exact Hl.
+Qed.
+
+Lemma bump_tf_other (tf : list (mword 64)) (r : mword 64) (i : nat) :
+  i <> tf_arg_idx 0 -> i <> tf_epc_idx ->
+  bump_tf tf r !!! i = tf !!! i.
+Proof.
+  intros Ha He. unfold bump_tf.
+  rewrite list_lookup_total_insert_ne; [ | exact (not_eq_sym Ha) ].
+  rewrite list_lookup_total_insert_ne; [ reflexivity | exact (not_eq_sym He) ].
+Qed.
+
+(* the number is not moved by the bump (a7 is word 21, not 14 or 3) *)
+Lemma bump_tf_num (tf : list (mword 64)) (r : mword 64) :
+  usys_num (bump_tf tf r) = usys_num tf.
+Proof.
+  unfold usys_num. rewrite bump_tf_other; [ reflexivity | | ];
+    unfold tf_arg_idx, tf_epc_idx; lia.
+Qed.
+
+(* ===================================================================== *)
+(* SS3b THE TABLE IS BLIND TO THE FOUR KERNEL WORDS.                       *)
+(*                                                                         *)
+(* [usys_num] reads word 21 ([tf_arg_idx 7] = a7) and [usys_mem_ok] reads,  *)
+(* besides that number, only [tf !!! tf_arg_idx i] for the [i] the window   *)
+(* table names -- 0 and 1, i.e. words 14 and 15.  All three are inside      *)
+(* [5,35], so [tf_ueq] transports every row.  This is what lets the round   *)
+(* relation (UexecRound.v) be stated at whichever of the two trapframes --  *)
+(* the one the process trapped with, or the one prepare_return re-armed --  *)
+(* the kernel proof happens to hold.                                        *)
+(* ===================================================================== *)
+Lemma tf_ueq_num (tf tf' : list (mword 64)) :
+  tf_ueq tf tf' -> usys_num tf = usys_num tf'.
+Proof.
+  intros [_ Hg].
+  assert (H21 : tf !!! tf_arg_idx 7 = tf' !!! tf_arg_idx 7).
+  { apply Hg. unfold tf_arg_idx. lia. }
+  unfold usys_num. rewrite H21. reflexivity.
+Qed.
+
+(* ...and to the EPC WORD, which is what makes the number the dispatch reads
+   the number the ROUND is keyed by: usertrap's prologue writes index 3 and
+   nothing else before the [c.li a5,8] fires. *)
+Lemma usys_num_epc (tf : list (mword 64)) (v : mword 64) :
+  usys_num (<[tf_epc_idx := v]> tf) = usys_num tf.
+Proof.
+  unfold usys_num.
+  rewrite list_lookup_total_insert_ne;
+    [ reflexivity | unfold tf_arg_idx, tf_epc_idx; lia ].
+Qed.
+
+(* ...and the effective number, which reads the mask beside it *)
+Lemma usys_eff_epc (secc : mword 64) (tf : list (mword 64)) (v : mword 64) :
+  usys_eff secc (<[tf_epc_idx := v]> tf) = usys_eff secc tf.
+Proof. unfold usys_eff. rewrite usys_num_epc. reflexivity. Qed.
+
+(* THE THREE WORDS THE TABLE READS, besides the number: the two
+   destination pointers (arguments 0 and 1) and read's count (argument 2).
+   Everything below is "the table is blind to every other word". *)
+Lemma usys_mem_ok_ueq (n : Z) (tf tf' : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (π π' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  tf_ueq tf tf' ->
+  usys_mem_ok n tf r M π szv lz M' π' szv' lz'
+  -> usys_mem_ok n tf' r M π szv lz M' π' szv' lz'.
+Proof.
+  intros Hu H.
+  assert (H0 : tf !!! tf_arg_idx 0 = tf' !!! tf_arg_idx 0)
+    by (destruct Hu as [_ Hg]; apply Hg; unfold tf_arg_idx; lia).
+  assert (H1 : tf !!! tf_arg_idx 1 = tf' !!! tf_arg_idx 1)
+    by (destruct Hu as [_ Hg]; apply Hg; unfold tf_arg_idx; lia).
+  assert (H2 : tf !!! tf_arg_idx 2 = tf' !!! tf_arg_idx 2)
+    by (destruct Hu as [_ Hg]; apply Hg; unfold tf_arg_idx; lia).
+  unfold usys_mem_ok, usys_read_ret, usys_rdcount in H |- *.
+  destruct (decide (n = USYS_exec)); [ exact H | ].
+  (* sbrk's row now reads argument 0 too -- its ANSWER is stated at the
+     step the break moved by, which the C reads out of a0 *)
+  destruct (decide (n = USYS_sbrk));
+    [ unfold usys_sbrk_ret, usys_sbrk_arg, usys_sbrk_lazy, usys_sbrk_eager
+        in H |- *;
+      rewrite <- H0, <- H1; exact H | ].
+  destruct (decide (n = USYS_wait)); [ rewrite <- H0; exact H | ].
+  destruct (decide (n = USYS_pipe)); [ rewrite <- H0; exact H | ].
+  destruct (decide (n = USYS_read)); [ rewrite <- H1; rewrite <- H2; exact H | ].
+  destruct (decide (n = USYS_fstat)); [ rewrite <- H1; exact H | ].
+  exact H.
+Qed.
+
+(* ...and the table is blind to the EPC WORD too, for the reason
+   [usys_num_epc] is: the words it reads are 14, 15, 16 and 21, and the epc
+   is 3.  This is what lets the trap loop state the round at the trapframe
+   the process TRAPPED with, while the dispatcher's own row is stated at the
+   one usertrap's [p->trapframe->epc += 4] block handed on.  ([tf_ueq]
+   cannot do this job: the epc is exactly the word the two lists differ
+   in.) *)
+Lemma usys_mem_ok_epc (n : Z) (tf : list (mword 64)) (v r : mword 64)
+    (szv szv' : Z)
+    (M M' : gmap Z (bv 8)) (pi pi' : gmap (mword 27) uperm) (lz lz' : bool) :
+  usys_mem_ok n (<[tf_epc_idx := v]> tf) r M pi szv lz M' pi' szv' lz' ->
+  usys_mem_ok n tf r M pi szv lz M' pi' szv' lz'.
+Proof.
+  assert (E0 : (<[tf_epc_idx := v]> tf) !!! tf_arg_idx 0 = tf !!! tf_arg_idx 0)
+    by (apply list_lookup_total_insert_ne; unfold tf_arg_idx, tf_epc_idx; lia).
+  assert (E1 : (<[tf_epc_idx := v]> tf) !!! tf_arg_idx 1 = tf !!! tf_arg_idx 1)
+    by (apply list_lookup_total_insert_ne; unfold tf_arg_idx, tf_epc_idx; lia).
+  assert (E2 : (<[tf_epc_idx := v]> tf) !!! tf_arg_idx 2 = tf !!! tf_arg_idx 2)
+    by (apply list_lookup_total_insert_ne; unfold tf_arg_idx, tf_epc_idx; lia).
+  unfold usys_mem_ok, usys_read_ret, usys_rdcount, usys_sbrk_ret, usys_sbrk_arg,
+         usys_sbrk_lazy, usys_sbrk_eager.
+  rewrite E0; rewrite E1; rewrite E2.
+  intros H; exact H.
+Qed.
+
+(* ===================================================================== *)
+(* SS4 The scause value of an ecall from U-mode: interrupt bit 0,          *)
+(* exception code 8 ([E_U_EnvCall]).  The user-execution contract's case   *)
+(* analysis is on this value; the U-mode engine's trap tower delivers it   *)
+(* as [UserTrap.utrap_scause (Exception (E_U_EnvCall tt)) sc0], and the    *)
+(* bridge between the two spellings is the engine's to prove where it      *)
+(* raises the trap (UserTrap.v is not in this file's cone).                *)
+(* ===================================================================== *)
+Definition uecall_scause : mword 64 := mword_of_int 8.
+
+(* A number the program fixed, read off the stub: in range, and not the
+   one entry that moves the mask.  [assumption] first, for the leaves whose
+   number is a parameter carrying these as premises. *)
+Ltac usys_range :=
+  first [ assumption
+        | (unfold USYS_fork, USYS_exit, USYS_exec, USYS_sbrk, USYS_wait,
+                  USYS_pipe, USYS_read, USYS_fstat, USYS_dup, USYS_open,
+                  USYS_close, USYS_chdir, USYS_getpid, USYS_seccomp in *; lia) ].

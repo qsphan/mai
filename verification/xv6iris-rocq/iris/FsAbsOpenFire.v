@@ -1,0 +1,428 @@
+(* FsAbsOpenFire.v -- sys_open's TWO FIRE POINTS, DISCHARGED AGAINST THE
+   INVARIANT, plus the row readings and the walk-premise bridge
+   the open family's statement leaf ([SysOpenDefs]) leaves to a
+   prover: the walk premise's start, the terminal observation's fire and
+   the trunc fire.
+
+   Worklist: claude-notes/projects/fs-syscall-specs.md, lane W (the open AU
+   prover).  A NEW LEAF rather than an append to [FsAbsMknodFire.v], for the
+   mirror's reason the campaign's other leaves record ([FsAbsNpar],
+   [FsAbsPins], [FsAbsStart]): the build mirror forbids touching a tracked
+   file.  Fuse the era leaves when one of them is next edited.
+
+   ==== ITEM 1: THE WALK PREMISE, RECONCILED ============================
+
+   [SysOpenDefs]'s [namei_walk_pre_era] is the ONE-SHOT OVER ALL PATHS
+   ([FsAbsEraMknod.npar_walk_pre_era]'s shape at the FULL element list)
+   while the era contracts now take [FsAbsStart.ex_start] -- the same shot
+   at a FIXED [pl].  The reconciliation is therefore the namei-side twin of
+   [FsAbsNparMknod.np_start_of_mknod] and nothing in the contract moves:
+   [opf_start_of_open] specialises the one-shot to the string the walk
+   fetched, and the two [ROOTINO]s agree by computation
+   ([FsAbsNparMknod.np_rootino_agree], reused rather than restated).
+
+   ROUTE TAKEN, AND WHY.  The alternative offered was to restate
+   [namei_walk_pre_era] AT [ex_start] in place (statement and seal moving
+   together, as the ret-0 escape retirement did).  A discharge lemma is
+   cleaner HERE because the two shapes are not the same predicate: the
+   contract's one-shot is universally quantified over [pl] -- it is handed
+   down BEFORE argstr has fetched anything -- while [ex_start] is at the
+   string already in the buffer.  A syscall-level caller cannot name that
+   string, so the contract has to quantify; the walk is where the two meet.
+   ([SpecSysMknod] carries the same asymmetry for the same reason.)
+
+   ==== ITEM 2: THE TERMINAL FIRE =======================================
+
+   [opf_open_fire] is [FsAbsMknodFire.mkf_dlookup_fire]'s single-phase
+   read-only mold with the row read WHOLE ([abs_of n], not just its entry
+   map): open observes the node it is about to hand a descriptor to, and
+   the arms are keyed by that whole [anode].  The resource it reads off is
+   the FIRING FUNCTION'S OWN era fragment -- sys_open holds
+   [IcacheEscrow.ic_loaded]'s [top_frag] for the opened inode from its
+   [ilock] to its [iunlock], so no walk lend is involved at this instant
+   and the fragment goes straight back.
+
+   ==== ITEM 3: THE TRUNC FIRE ==========================================
+
+   [opf_atrunc_fire] is [FsAbsMknodFire.caf_acre_fire]'s two-phase mold at
+   [SysOpenDefs.delta_trunc], FUSED WITH THE ROW RETAG -- it replaces the
+   [InodeRegion.ireg_top_retag_*] sys_open performs after [itrunc] returns
+   (the O_TRUNC bridge), with one extra premise (the caller's commit) and
+   one extra payout (the receipt).  Same premise as the retag it replaces
+   ([inode_local] at the truncated record), same payout (the moved
+   fragment), plus the caller's two phases on either side of the
+   [ghost_map_update] INSIDE the one [ftopN] critical section.
+
+   THE READING BRIDGE is [opf_trunc_row]: the truncated record reads
+   [AFile []] because [SpecItrunc.di_trunc] zeroes [di_size] and
+   [fn_file_bytes] is [file_bytes _ 0 = []], while the TYPE and the COUNT
+   ride untouched -- which is what makes the delta collapse to the one-row
+   insert and what makes the receipt's nlink the OBSERVED one.
+
+   THE OBSERVED-ROW TIE ([SysOpenDefs]'s header, THE ONE DELTA; owner
+   question 2) IS PAID BY THE FRAGMENT, not by a custody argument in prose:
+   both fires read the row off the SAME [top_frag], and sys_open holds it
+   whole across the window (ilock ... filealloc/fdalloc ... itrunc), so the
+   pre-row phase 1 sees IS the row the terminal observation saw.  The
+   caller's [Ft] receipt is delivered at that state.
+
+   BINDERS: [FsAbsMknodFire]'s section list VERBATIM (which is
+   [SysMknodDefs]'s) -- [fileG] is bound and [icacheG]/[icfg] resolve only
+   through its fields. *)
+
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac dfrac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+Require Import SailStdpp.Base SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvPtsto.
+Require Import DinodeEnc.
+Require Import DirView.          (* [T_DIR_z]                               *)
+Require Import FsBlocks.         (* [fs_names]                              *)
+Require Import FsBytesGamma.     (* [fs_gamma_L]                            *)
+Require Import BlkmapDefs.
+Require Import IrefSlots.
+Require Import Xv6Cameras.
+(* the three binder classes the section list names, IMPORTED rather than
+   inherited ([FsAbsMknodFire]'s header records why). *)
+Require Import FdSlots.          (* [fdslotG]                               *)
+Require Import FileInvDefs.      (* [fileG]: carries [icacheG] and [icfg]   *)
+Require Import ProcAvail.        (* [pavG]                                  *)
+Require Import FsStateEra.       (* [era_node], [era_node_rec]              *)
+Require Import InodeRegion.      (* [ftop_inv]/[ftop_body]/[ftop_clean]     *)
+Require Import Xv6G.
+Require Import SpecItrunc.       (* [di_trunc]                              *)
+Require Import FsAbsDelta.   (* [abs_view_insert]                       *)
+Require Import SysOpenDefs.    (* the contract this file serves           *)
+Require Import FsAbsEra.       (* [ex_start]                              *)
+Require Import FsAbsMknodFire.   (* [mkf_abs_of_dir], [mkf_era_is_dir]      *)
+Require FsImg.                   (* [T_FILE_z], [ROOTINO] -- Require, NOT
+                                    Import (SysOpenDefs's reason)         *)
+Require Import AppInv.          (* [appN]/[appE]: the application's namespace, the commit mask (app-instances.md round A) *)
+Require Import PieceFam.        (* [pfam]: a one-shot piece's receipt beside its refund *)
+Require Import FsAbsDefs.            (* LAST (FsAbs's own rule)                 *)
+Require Import CtxIdDefs.   (* qualified: the class only, no notation flip *)
+
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(*  0.  THE ROW READINGS OF AN ERA NODE (pure, no binder)                 *)
+(* ===================================================================== *)
+
+Lemma opf_era_type `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap) (data : nat -> list (bv 8)) :
+  fn_type (era_node dn bm data) = bv_unsigned (di_type dn).
+Proof. by rewrite /fn_type era_node_rec. Qed.
+
+Lemma opf_era_not_dir `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) <> T_DIR_z ->
+  fn_is_dir (era_node dn bm data) = false.
+Proof.
+  intros H. rewrite /fn_is_dir opf_era_type.
+  by apply bool_decide_eq_false_2.
+Qed.
+
+(* THE FILE ROW: the abstract node is the record's bytes at its own count. *)
+Lemma opf_era_file_row `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) = FsImg.T_FILE_z ->
+  abs_row (era_node dn bm data)
+  = MkAnode (AFile (fn_file_bytes (era_node dn bm data)))
+            (fn_nlink (era_node dn bm data)).
+Proof.
+  intros Hty.
+  assert (Hnd : fn_is_dir (era_node dn bm data) = false).
+  { apply opf_era_not_dir. rewrite Hty /T_DIR_z /FsImg.T_FILE_z.
+    discriminate. }
+  rewrite /abs_row /abs_node Hnd.
+  destruct (decide (fn_type (era_node dn bm data) = FsImg.T_FILE_z))
+    as [_ | Hno]; [reflexivity |].
+  exfalso. apply Hno. rewrite opf_era_type. exact Hty.
+Qed.
+
+(* THE DEVICE ROW: the major/minor pair straight off the record. *)
+Lemma opf_era_dev_row `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) <> T_DIR_z ->
+  bv_unsigned (di_type dn) <> FsImg.T_FILE_z ->
+  abs_row (era_node dn bm data)
+  = MkAnode (ADev (bv_unsigned (di_major dn)) (bv_unsigned (di_minor dn)))
+            (fn_nlink (era_node dn bm data)).
+Proof.
+  intros Hnd Hnf.
+  rewrite /abs_row /abs_node (opf_era_not_dir dn bm data Hnd).
+  destruct (decide (fn_type (era_node dn bm data) = FsImg.T_FILE_z))
+    as [Hyes | _].
+  - exfalso. apply Hnf. rewrite -(opf_era_type dn bm data). exact Hyes.
+  - by rewrite /fn_major /fn_minor era_node_rec.
+Qed.
+
+(* THE DIRECTORY ROW, for symmetry: [FsAbsMknodFire]'s two facts joined. *)
+Lemma opf_era_dir_row `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) = T_DIR_z ->
+  abs_row (era_node dn bm data)
+  = MkAnode (ADir (dir_entries (era_node dn bm data)))
+            (fn_nlink (era_node dn bm data)).
+Proof.
+  intros Hty. pose proof (abs_row_dir _ (mkf_era_is_dir dn bm data Hty)) as H.
+  rewrite /abs_row in H |- *. cbv [an_node] in H. by rewrite H.
+Qed.
+
+(* ---- THE TRUNC READING BRIDGE (item 3) ------------------------------ *)
+
+(* [di_trunc] zeroes the size, so the truncated record's bytes are the
+   empty list; the type and the count are untouched, so the row stays a
+   FILE at the OBSERVED nlink. *)
+Lemma opf_trunc_size `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm' : blkmap)
+    (data' : nat -> list (bv 8)) :
+  fn_size (era_node (di_trunc dn) bm' data') = 0.
+Proof.
+  rewrite /fn_size era_node_rec /di_trunc /=. apply bv_0_unsigned.
+Qed.
+
+Lemma opf_trunc_bytes `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm' : blkmap)
+    (data' : nat -> list (bv 8)) :
+  fn_file_bytes (era_node (di_trunc dn) bm' data') = [].
+Proof.
+  rewrite /fn_file_bytes (opf_trunc_size dn bm' data') /=.
+  reflexivity.
+Qed.
+
+Lemma opf_trunc_nlink `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm bm' : blkmap)
+    (data data' : nat -> list (bv 8)) :
+  fn_nlink (era_node (di_trunc dn) bm' data')
+  = fn_nlink (era_node dn bm data).
+Proof. by rewrite /fn_nlink !era_node_rec. Qed.
+
+Lemma opf_trunc_row `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm bm' : blkmap)
+    (data data' : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) = FsImg.T_FILE_z ->
+  abs_row (era_node (di_trunc dn) bm' data')
+  = MkAnode (AFile []) (fn_nlink (era_node dn bm data)).
+Proof.
+  intros Hty.
+  assert (Htyt : bv_unsigned (di_type (di_trunc dn)) = FsImg.T_FILE_z)
+    by exact Hty.
+  rewrite (opf_era_file_row (di_trunc dn) bm' data' Htyt).
+  by rewrite (opf_trunc_bytes dn bm' data')
+             (opf_trunc_nlink dn bm bm' data data').
+Qed.
+
+(* ---- THE TYPED ROW, AS [abs_of] (E2-V) -------------------------------- *)
+
+(* an era node whose record has a nonzero type has a row, and it is the
+   typed row above *)
+Lemma opf_era_typed `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) <> 0 -> fn_type (era_node dn bm data) <> 0.
+Proof. intros H. rewrite opf_era_type. exact H. Qed.
+
+(* ...which every [inode_ok] payload has: its fourth clause is the type *)
+Lemma opf_era_typed_ok `{XI : CtxIdDefs.CurCtx} (cov : gset Z) (logstart : Z)
+    (dn : dinode) (bm : blkmap) (data : nat -> list (bv 8)) :
+  InodeLock.inode_ok cov logstart dn bm data -> fn_type (era_node dn bm data) <> 0.
+Proof. intros (_ & _ & _ & Hty & _). exact (opf_era_typed dn bm data Hty). Qed.
+
+(* a FILE record is typed *)
+Lemma opf_era_file_typed `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) = FsImg.T_FILE_z -> fn_type (era_node dn bm data) <> 0.
+Proof.
+  intros Hty. apply opf_era_typed. rewrite Hty. cbv [FsImg.T_FILE_z]. lia.
+Qed.
+
+(* ...and a record with a nonzero count is LIVE (E2-V2): the fact the
+   unconditional row readings below need *)
+Lemma opf_era_live `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_nlink dn) <> 0 -> fn_nlink (era_node dn bm data) <> 0%nat.
+Proof.
+  intros Hnz. rewrite /fn_nlink era_node_rec.
+  pose proof (proj1 (bv_unsigned_in_range _ (di_nlink dn))). lia.
+Qed.
+
+(* THE ROWS AS [abs_of] (E2-V, sharpened by E2-V2): a typed era node has
+   its typed row exactly when its count is nonzero.  The FIRES below do not
+   take these any more -- they take the [abs_row] reading and the type, and
+   derive the counted clause themselves ([FsAbsDefs.abs_view_arow]) -- so
+   only the two unconditional forms a LINKED node's reader wants remain. *)
+Lemma opf_era_dev_of `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) <> T_DIR_z ->
+  bv_unsigned (di_type dn) <> FsImg.T_FILE_z ->
+  bv_unsigned (di_type dn) <> 0 ->
+  bv_unsigned (di_nlink dn) <> 0 ->
+  abs_of (era_node dn bm data)
+  = Some (MkAnode (ADev (bv_unsigned (di_major dn)) (bv_unsigned (di_minor dn)))
+                  (fn_nlink (era_node dn bm data))).
+Proof.
+  intros Hnd Hnf Hnz Hnl.
+  rewrite (abs_of_live _ (opf_era_typed dn bm data Hnz) (opf_era_live dn bm data Hnl)).
+  by rewrite (opf_era_dev_row dn bm data Hnd Hnf).
+Qed.
+
+Lemma opf_era_dir_of `{XI : CtxIdDefs.CurCtx} (dn : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) = T_DIR_z ->
+  bv_unsigned (di_nlink dn) <> 0 ->
+  abs_of (era_node dn bm data)
+  = Some (MkAnode (ADir (dir_entries (era_node dn bm data)))
+                  (fn_nlink (era_node dn bm data))).
+Proof.
+  intros Hty Hnl.
+  exact (mkf_abs_of_dir _ (mkf_era_is_dir dn bm data Hty) (opf_era_live dn bm data Hnl)).
+Qed.
+
+Section OpenFire.
+  (* [FsAbsMknodFire]'s binder list, verbatim. *)
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+            !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Implicit Types Γ : fs_view_names Σ.
+
+  (* =================================================================== *)
+  (*  1.  ITEM 1: THE WALK PREMISE                                        *)
+  (* =================================================================== *)
+
+  (* The contract's one-shot, specialised to the string the walk fetched:
+     [FsAbsStart.ex_start] at that [pl] IS [namei_walk_pre_era] there (same
+     quantifier over the start, same start rule, same family over
+     [path_elems pl]), so this is a rename.
+     The namei-side twin of [FsAbsNparMknod.np_start_of_mknod]. *)
+  Lemma opf_start_of_open `{XI : CtxIdDefs.CurCtx} (γfs : fs_names) (cw : Z) (P Pmiss : nat -> Z -> iProp Σ)
+      (pl : list (bv 8)) :
+    namei_walk_pre_era γfs cw P Pmiss -∗ ex_start γfs cw P Pmiss pl.
+  Proof using .
+    iIntros "Hpre". rewrite /ex_start. iIntros (r Hr).
+    rewrite /namei_walk_pre_era.
+    iMod ("Hpre" $! pl r with "[%]") as "[$ $]"; [exact Hr | done].
+  Qed.
+
+  (* =================================================================== *)
+  (*  2.  ITEM 2: THE TERMINAL FIRE                                       *)
+  (* =================================================================== *)
+
+  (* [mkf_dlookup_fire]'s mold, at the WHOLE row.  Any share suffices: the
+     commit only reads. *)
+  Lemma opf_open_fire `{XI : CtxIdDefs.CurCtx} (γfs : fs_names) (E : coPset) (dq : dfrac)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (i : Z) (n : fs_node) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    fn_type n <> 0 ->
+    ftop_inv γfs -∗
+    pf_at (aopen_commit_at (fs_gamma_L γfs) appE) Fo -∗
+    top_frag_q (fs_gamma_L γfs) dq i n ={E}=∗
+      top_frag_q (fs_gamma_L γfs) dq i n
+      ∗ ∃ av : aview,
+          ⌜arow_at av i (abs_row n)⌝ ∗ Fo.(pf_recv) av i (abs_row n).
+  Proof using .
+    intros HE Hnz. iIntros "#Hi Hcm Hf".
+    (* THE PIECE IS SPENT: the fire eliminates to the AU side. *)
+    iDestruct (pf_at_au with "Hcm") as "Hcm".
+    (* the same re-spelling [mkf_dlookup_fire] does, and for the same
+       reason: the unifier cannot solve [γtop ?Γ =?= fs_top γfs]. *)
+    rewrite /top_frag_q /fs_gamma_L /=.
+    iMod (inv_acc E ftopN with "Hi") as "[Hbody Hclose]"; [solve_ndisj |].
+    iDestruct "Hbody" as ">Hb".
+    iDestruct "Hb" as (I A) "(Hta & Hla & Hpark & %Hcl)".
+    iDestruct (ghost_map_lookup with "Hta Hf") as %Hlk.
+    (* the row is stated on the COUNT (E2-V2): the node an open reaches
+       may have been unlinked between namei and this lock *)
+    assert (Hrow : arow_at (abs_view I) i (abs_row n))
+      by exact (abs_view_arow I i n Hlk Hnz).
+    iMod (fupd_mask_subseteq appE) as "Hcl2"; [rewrite /appE; solve_ndisj |].
+    iMod ("Hcm" $! I i (abs_row n) with "[//] Hta") as "[Hta HΦ]".
+    iMod "Hcl2".
+    iMod ("Hclose" with "[Hta Hla Hpark]") as "_".
+    { iNext. rewrite /ftop_body. iExists I, A. by iFrame. }
+    iModIntro. iFrame "Hf". iExists (abs_view I).
+    iSplitR; [by iPureIntro |]. iExact "HΦ".
+  Qed.
+
+  (* the [DfracOwn 1] reading, which is the spelling sys_open holds
+     ([top_frag] whole, from its [ilock] to its [iunlock]) *)
+  Lemma opf_open_fire_1 `{XI : CtxIdDefs.CurCtx} (γfs : fs_names) (E : coPset)
+      (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ)) (i : Z) (n : fs_node) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    fn_type n <> 0 ->
+    ftop_inv γfs -∗
+    pf_at (aopen_commit_at (fs_gamma_L γfs) appE) Fo -∗
+    top_frag (fs_gamma_L γfs) i n ={E}=∗
+      top_frag (fs_gamma_L γfs) i n
+      ∗ ∃ av : aview,
+          ⌜arow_at av i (abs_row n)⌝ ∗ Fo.(pf_recv) av i (abs_row n).
+  Proof using .
+    intros HE Hnz. rewrite top_frag_1. exact (opf_open_fire γfs E _ Fo i n HE Hnz).
+  Qed.
+
+  (* =================================================================== *)
+  (*  3.  ITEM 3: THE TRUNC FIRE, FUSED WITH THE ROW RETAG                *)
+  (* =================================================================== *)
+
+  (* [FsAbsMknodFire.caf_acre_fire]'s mold at [delta_trunc].  Replaces the
+     [InodeRegion.ireg_top_retag_*] sys_open calls after [itrunc] returns:
+     same [inode_local] premise, same payout, plus the caller's two phases
+     inside the one [ftopN] critical section.  The receipt's pre-state row
+     is the OBSERVED one -- the fragment is the same one the terminal
+     observation read. *)
+  Lemma opf_atrunc_fire `{XI : CtxIdDefs.CurCtx} (γfs : fs_names) (E : coPset)
+      (Ft : pfam Σ (aview -> Z -> list (bv 8) -> iProp Σ))
+      (i : Z) (bs0 : list (bv 8)) (nl : nat) (n n' : fs_node) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    inode_local i n' ->
+    fn_type n <> 0 ->
+    abs_row n = MkAnode (AFile bs0) nl ->
+    fn_type n' <> 0 ->
+    abs_row n' = MkAnode (AFile []) nl ->
+    ftop_inv γfs -∗ app_inv γfs -∗
+    (* THE PIECE ARRIVES KEYED AT THE INUM (lane F-OPEN-3): the permit was
+       paid where what pays it was still in hand -- create's own payout on
+       the O_CREATE surface, nothing at all on the plain one
+       ([SysOpenDefs.open_trunc_at]). *)
+    pf_at (atrunc_commit_i (fs_gamma_L γfs) appE i) Ft -∗
+    top_frag (fs_gamma_L γfs) i n ={E}=∗
+      top_frag (fs_gamma_L γfs) i n'
+      ∗ ∃ av : aview,
+          ⌜arow_at av i (MkAnode (AFile bs0) nl)⌝ ∗ Ft.(pf_recv) av i bs0.
+  Proof using .
+    intros HE Hloc Hnz Habs Hnz' Habs'. iIntros "#Hi #Hai Hcm Hf".
+    iDestruct (pf_at_au with "Hcm") as "Hcm".
+    rewrite /top_frag /fs_gamma_L /=.
+    iMod (inv_acc E ftopN with "Hi") as "[Hbody Hclose]"; [solve_ndisj |].
+    iDestruct "Hbody" as ">Hb".
+    iDestruct "Hb" as (I A) "(Hta & Hla & Hpark & %Hcl)".
+    iDestruct (ghost_map_lookup with "Hta Hf") as %Hlk.
+    (* the row is stated on the COUNT (E2-V2): the file may have been
+       unlinked between namei and this lock, and then it has no row *)
+    assert (Hrow : arow_at (abs_view I) i (MkAnode (AFile bs0) nl)).
+    { rewrite -Habs. exact (abs_view_arow I i n Hlk Hnz). }
+    (* the delta collapses to the ONE-ROW counted insert: at a nonzero
+       count the truncated record's own row, at zero nothing moves *)
+    assert (Hdelta : abs_view (<[i := n']> I) = delta_trunc i (abs_view I)).
+    { rewrite (abs_view_insert_row I i n' _ Hnz' Habs') /=.
+      case_decide as Hz.
+      - pose proof (arow_at_gone _ _ _ Hrow Hz) as Hnone.
+        rewrite (delta_trunc_absent _ _ Hnone). exact (delete_id _ _ Hnone).
+      - by rewrite (delta_trunc_file (abs_view I) i bs0 nl (arow_at_live _ _ _ Hrow Hz)). }
+    iMod (fupd_mask_subseteq appE) as "Hcl2"; [rewrite /appE; solve_ndisj |].
+    iMod ("Hcm" $! I bs0 nl with "[//] Hta") as "(Hta & Hstep & Hph2)".
+    (* THE MOVE, at the whole authority: the application's half comes out
+       of [appN] beside its claim, which the caller's step re-establishes
+       under the later ([AppInv.app_top_update]) *)
+    iMod (app_top_update appE γfs I i n n' ltac:(rewrite /appE; done)
+            with "Hai [Hstep] Hta Hf") as "[Hta Hf]".
+    { iIntros (_) "Hp". iApply (app_step_at i I _ n' Hdelta with "Hstep Hp"). }
+    iMod ("Hph2" $! (<[i := n']> I) with "[//] Hta") as "[Hta HΦ]".
+    iMod "Hcl2".
+    iMod ("Hclose" with "[Hta Hla Hpark]") as "_".
+    { iNext. rewrite /ftop_body. iExists (<[i := n']> I), A.
+      iFrame "Hta Hla Hpark". iPureIntro.
+      intros j mm Hj Hun. destruct (decide (j = i)) as [-> | Hne].
+      - rewrite lookup_insert_eq in Hj. injection Hj as <-. exact Hloc.
+      - rewrite lookup_insert_ne in Hj; [| exact (not_eq_sym Hne)].
+        exact (Hcl j mm Hj Hun). }
+    iModIntro. iFrame "Hf". iExists (abs_view I).
+    iSplitR; [by iPureIntro |]. iExact "HΦ".
+  Qed.
+
+End OpenFire.

@@ -1,0 +1,1000 @@
+(* FsAbsCreateFire.v -- CREATE'S LEGS AS COMMITS AND FIRES (round E2, lane
+   E2-C), and the authority-shaped commits of the create family, moved down
+   here from FsAbsMknodFire.v so that [SpecCreate]'s bundle can name them.
+
+   Design of record: claude-notes/design/applications.md section 2 (the
+   three mover forms), claude-notes/design/fs-syscall-specs.md section 4
+   (the legs), claude-notes/projects/app-round-e2.md sections 2(b)/3/5.
+
+   ==== WHAT MOVES HERE ================================================
+
+   The kernel performs [delta_create] as LEGS, one retag each:
+
+     the ARM     ialloc's claim box gets [ip->nlink = 1; iupdate] -- the
+                 child's row APPEARS at content [c], count 1 ([delta_arm]);
+     the DOTS    mkdir's two interior [dirlink]s -- the child's row moves
+                 from [ADir ∅] to a directory holding its dots
+                 ([delta_dots], or [delta_dot] when the [".."] fell short);
+     the PARENT  [dirlink(dp, name, ip->inum)] and mkdir's [dp->nlink++] --
+                 [acre_commit_at]'s fused [delta_create], which at an ARMED
+                 child IS the parent's one-row insert
+                 ([FsAbsDelta.delta_create_armed]);
+     the UNARM   the failure arm's [ip->nlink = 0] -- the row DISAPPEARS
+                 ([delta_unarm]).  Ruling Q-h: a failed create is the
+                 honest do-then-undo PAIR, arm then unarm, each an instant a
+                 concurrent [ilock] can observe.
+
+   Each leg is a two-phase commit in [acre_commit_at]'s mold (phase 1 hands
+   the caller's step back beside the kernel's half of the authority; phase 2
+   is quantified over the POST map and constrained by its reading), and
+   each fires INSIDE the mover's [ftopN] critical section -- for the child
+   under the ARMED registry ([InodeRegion.ireg_armed]), which is what
+   exempts the half-built directory from [ftop_body]'s [inode_local] row
+   between its count landing and its dots.
+
+   ==== THE CHILD'S CONTENT IS TYPE-INDEXED ============================
+
+   [cre_c0 tyz ma mi] is the row content the arm writes (an empty file, an
+   empty directory, a device at the two halfwords); [cre_child tyz ma mi d i]
+   the content the parent leg reads -- for a directory the dots are in, and
+   they NAME THE TWO INUMS, which is why [acre_commit_at_gen] takes the
+   content as a function of (parent, child) and [acre_commit_at c] is its
+   constant instance.  A TYPE-PINNED CALLER holds the constant form and
+   [SpecCreate.cre_commits_of_dev] / [cre_commits_of_file] move it to the
+   function; a directory child needs the function itself.
+
+   ==== THE DOTS COMMIT IS INDEXED BY WHAT LANDED =======================
+
+   mkdir's [dirlink(ip, "..", dp->inum)] can fall short after the ["."]
+   went in whole (ProofCreateMkdir's FAIL ENTRY 2); the child's row then
+   moves ONCE, to a directory holding only ["."], and the failure arm
+   unarms it.  [adots_commit_at] fires at either reading -- [full = true]
+   for both dots, [full = false] for the first alone -- and its receipt
+   says which ([FsAbsDelta.dots_delta], [dots_ents]).
+
+   BINDERS: [SpecCreate]'s section list VERBATIM (which is
+   [SysMknodDefs]'s) -- [fileG] is bound and [icacheG]/[icfg] resolve
+   only through its fields. *)
+
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac dfrac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+Require Import SailStdpp.Base SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvPtsto.
+Require Import DinodeEnc.
+Require Import DirView.          (* [T_DIR_z]                               *)
+Require Import FsTree.           (* [fname], [DOT], [DOTDOT]                *)
+Require Import FsBlocks.         (* [fs_names]                              *)
+Require Import FsBytesGamma.     (* [fs_gamma_L]                            *)
+Require Import BlkmapDefs.
+Require Import IrefSlots.
+Require Import Xv6Cameras.
+(* the binder classes, IMPORTED rather than inherited (FsAbsMknodFire's
+   note: an unbound [fileG] in a [`{! ...}] binder is silently generalised
+   into a VARIABLE) *)
+Require Import FdSlots.          (* [fdslotG]                               *)
+Require Import FileInvDefs.      (* [fileG]: carries [icacheG] and [icfg]   *)
+Require Import ProcAvail.        (* [pavG]                                  *)
+Require Import FsStateEra.       (* [era_node], [era_node_rec]              *)
+Require Import InodeRegion.      (* [ftop_inv]/[ftop_body]/[ireg_armed]     *)
+Require Import Xv6G.
+Require FsImg.                   (* [FsImg.T_FILE_z], qualified             *)
+Require Import FsAbsDelta.       (* the legs, [cre_pre], [dots_delta]       *)
+Require Import AppInv.           (* [appN]/[appE], [app_step], [app_inv]    *)
+Require Import PieceFam.        (* [pfam]: a one-shot piece's receipt beside its refund *)
+Require Import FsAbs.            (* LAST (FsAbs's own rule)                 *)
+
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(*  0-.  THE TYPE LITERALS AND THE RECORD create LEAVES BEHIND (pure)     *)
+(*                                                                        *)
+(*  create's own vocabulary, stated here rather than in [SpecCreate]      *)
+(*  because the era walk's fires ([FsAbsMknodFire]) and the mknod          *)
+(*  vocabulary leaf ([SysMknodDefs]) both read it and both sit BELOW     *)
+(*  the create contract, which names their walk package in turn.          *)
+(* ===================================================================== *)
+
+(* the two type literals the found arm's tests decide against, as the
+   halfwords the [li a5,2] / [bltu a4,a5] pair compares.  [T_DIR] is
+   SpecDirlookup's. *)
+Definition T_FILE : mword 16 := mword_of_int 2.
+Definition T_DEVICE : mword 16 := mword_of_int 3.
+
+Lemma T_FILE_value : bv_unsigned T_FILE = 2.
+Proof. reflexivity. Qed.
+
+Lemma T_DEVICE_value : bv_unsigned T_DEVICE = 3.
+Proof. reflexivity. Qed.
+
+(* (L5) at two of the three literal types the three entries pass ([T_DIR]'s
+   is [SpecCreate.T_DIR_ty_ok], where [SpecDirlookup] is in scope).  NAMED
+   rather than spliced at each call site: [ireg_ty_ok_w] is a four-way
+   disjunction and an inline [ltac:] would pick its arm before the argument
+   is unified (durable-disk 2b-inode-3). *)
+Lemma T_FILE_ty_ok : InodeRegion.ireg_ty_ok_w T_FILE.
+Proof. right. right. left. reflexivity. Qed.
+
+Lemma T_DEVICE_ty_ok : InodeRegion.ireg_ty_ok_w T_DEVICE.
+Proof. right. right. right. reflexivity. Qed.
+
+(* THE RECORD THE NON-DIRECTORY ALLOCATE ARM LEAVES BEHIND: ialloc's
+   claimed record with the three halfword stores at +0x90 / +0x94 / +0x9a
+   applied, and nothing else -- create never touches size or addrs, and
+   on the non-directory arm no dirlink runs on [ip].  Named so that
+   sys_open (S6) and sys_mknod can state their own posts against it.  On
+   the DIRECTORY arm the same three fields hold, but the size is 32 and
+   [addrs !!! 0] is the block the two entries went into, so only the
+   FIELD facts are claimed there. *)
+Definition create_made (ty major minor : mword 16) : dinode :=
+  MkDinode ty major minor (mword_of_int 1 : mword 16) (bv_0 32)
+           (replicate 13 (bv_0 32)).
+
+Lemma create_made_type ty major minor :
+  di_type (create_made ty major minor) = ty.
+Proof. reflexivity. Qed.
+
+Lemma create_made_nlink ty major minor :
+  bv_unsigned (di_nlink (create_made ty major minor)) = 1.
+Proof. reflexivity. Qed.
+
+Lemma create_made_size ty major minor :
+  bv_unsigned (di_size (create_made ty major minor)) = 0.
+Proof. reflexivity. Qed.
+
+Lemma create_made_wf ty major minor : dinode_wf (create_made ty major minor).
+Proof. rewrite /dinode_wf /create_made /=. reflexivity. Qed.
+
+(* ===================================================================== *)
+(*  0.  THE CHILD'S CONTENT, BY TYPE (pure)                               *)
+(* ===================================================================== *)
+
+(* what the ARM writes: ialloc's claim box is typed [tyz] with size 0, so
+   its row at count 1 is an empty file, an empty directory, or the device
+   at the two halfwords the stores before the count set *)
+Definition cre_c0 (tyz ma mi : Z) : absnode :=
+  if decide (tyz = T_DIR_z) then ADir ∅
+  else if decide (tyz = FsImg.T_FILE_z) then AFile [] else ADev ma mi.
+
+(* ...and what the PARENT LEG reads: a directory child has its two dots by
+   then, and they name the child ([DOT]) and the parent ([DOTDOT]) *)
+Definition cre_child (tyz ma mi : Z) (d i : Z) : absnode :=
+  if decide (tyz = T_DIR_z) then ADir (dots_ents true i d) else cre_c0 tyz ma mi.
+
+Lemma cre_c0_dir (ma mi : Z) : cre_c0 T_DIR_z ma mi = ADir ∅.
+Proof. rewrite /cre_c0. case_decide as Hd; [reflexivity | exfalso; exact (Hd eq_refl)]. Qed.
+
+Lemma cre_child_dir (ma mi d i : Z) :
+  cre_child T_DIR_z ma mi d i = ADir (dots_ents true i d).
+Proof. rewrite /cre_child. case_decide as Hd; [reflexivity | exfalso; exact (Hd eq_refl)]. Qed.
+
+Lemma cre_child_nondir (tyz ma mi d i : Z) :
+  tyz <> T_DIR_z -> cre_child tyz ma mi d i = cre_c0 tyz ma mi.
+Proof. intros Hne. rewrite /cre_child. case_decide as Hd; [exfalso; exact (Hne Hd) | reflexivity]. Qed.
+
+(* a non-directory child bumps nothing *)
+Lemma acre_bump_cre_c0 (tyz ma mi : Z) :
+  tyz <> T_DIR_z -> acre_bump (cre_c0 tyz ma mi) = 0%nat.
+Proof.
+  intros Hne. rewrite /cre_c0. case_decide as Hd; [exfalso; exact (Hne Hd) |].
+  destruct (decide (tyz = FsImg.T_FILE_z)); reflexivity.
+Qed.
+
+Lemma acre_bump_cre_child_dir (ma mi d i : Z) :
+  acre_bump (cre_child T_DIR_z ma mi d i) = 1%nat.
+Proof. rewrite cre_child_dir //. Qed.
+
+(* ...and the two PINNED readings the type-pinned consumers take: at the
+   file and the device literals the child's content does not depend on the
+   two inums at all, so the general commit is the constant one. *)
+Lemma cre_c0_file (ma mi : Z) : cre_c0 (bv_unsigned T_FILE) ma mi = AFile [].
+Proof. reflexivity. Qed.
+
+Lemma cre_child_file (ma mi d i : Z) :
+  cre_child (bv_unsigned T_FILE) ma mi d i = AFile [].
+Proof. reflexivity. Qed.
+
+Lemma cre_c0_dev (ma mi : Z) : cre_c0 (bv_unsigned T_DEVICE) ma mi = ADev ma mi.
+Proof. reflexivity. Qed.
+
+Lemma cre_child_dev (ma mi d i : Z) :
+  cre_child (bv_unsigned T_DEVICE) ma mi d i = ADev ma mi.
+Proof. reflexivity. Qed.
+
+(* ===================================================================== *)
+(*  0b.  THE ERA NODE'S ROW, AT THE THREE COUNTS A LEG SEES (pure)        *)
+(* ===================================================================== *)
+
+Lemma caf_era_type (dn : dinode) (bm : blkmap) (dat : nat -> list (bv 8)) :
+  fn_type (era_node dn bm dat) = bv_unsigned (di_type dn).
+Proof. by rewrite /fn_type era_node_rec. Qed.
+
+Lemma caf_era_nlink (dn : dinode) (bm : blkmap) (dat : nat -> list (bv 8)) :
+  fn_nlink (era_node dn bm dat) = Z.to_nat (bv_unsigned (di_nlink dn)).
+Proof. by rewrite /fn_nlink era_node_rec. Qed.
+
+(* count 0: no row (the claim box before the arm, the child after the
+   failure arm's [sh zero,74(s3)]) *)
+Lemma caf_era_none_nl0 (dn : dinode) (bm : blkmap) (dat : nat -> list (bv 8)) :
+  bv_unsigned (di_nlink dn) = 0 -> abs_of (era_node dn bm dat) = None.
+Proof.
+  intros Hnl. apply abs_of_none. right. rewrite caf_era_nlink Hnl. reflexivity.
+Qed.
+
+(* count 1 at a typed record: its typed row *)
+Lemma caf_era_row_nl1 (dn : dinode) (bm : blkmap) (dat : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) <> 0 -> bv_unsigned (di_nlink dn) = 1 ->
+  abs_of (era_node dn bm dat)
+  = Some (MkAnode (abs_node (era_node dn bm dat)) 1%nat).
+Proof.
+  intros Hty Hnl.
+  assert (Hn1 : fn_nlink (era_node dn bm dat) = 1%nat)
+    by (rewrite caf_era_nlink Hnl; reflexivity).
+  rewrite (abs_of_live (era_node dn bm dat)
+             ltac:(rewrite caf_era_type; exact Hty)
+             ltac:(rewrite Hn1; discriminate)).
+  rewrite /abs_row Hn1. reflexivity.
+Qed.
+
+(* ...and at a directory record, the entries spelled out *)
+Lemma caf_era_dir_row (dn : dinode) (bm : blkmap) (dat : nat -> list (bv 8)) :
+  bv_unsigned (di_type dn) = T_DIR_z -> bv_unsigned (di_nlink dn) = 1 ->
+  abs_of (era_node dn bm dat)
+  = Some (MkAnode (ADir (dir_entries (era_node dn bm dat))) 1%nat).
+Proof.
+  intros Hty Hnl.
+  assert (Hn1 : fn_nlink (era_node dn bm dat) = 1%nat)
+    by (rewrite caf_era_nlink Hnl; reflexivity).
+  rewrite (abs_of_dir (era_node dn bm dat)
+             ltac:(rewrite /fn_is_dir caf_era_type; by apply bool_decide_eq_true_2)
+             ltac:(rewrite Hn1; discriminate)).
+  rewrite Hn1. reflexivity.
+Qed.
+
+Section CreateFire.
+  (* [SpecCreate]'s binder list, verbatim. *)
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+            !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Implicit Types Γ : fs_view_names Σ.
+
+  (* =================================================================== *)
+  (*  1.  THE AUTHORITY-SHAPED COMMITS                                    *)
+  (*      ([dlookup_commit_at]/[acre_commit_at] moved from                *)
+  (*      FsAbsMknodFire.v, which re-exports them; the legs are new)      *)
+  (* =================================================================== *)
+
+  (* THE ARM'S RECEIPT, hoisted above the commits because the CREATE leg
+     now takes it too (see [acre_commit_at_gen]).  It says the row at [i]
+     APPEARED: at the arm's own view the map had nothing there. *)
+  Definition cre_arm_fired (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (i : Z) : iProp Σ :=
+    (∃ av : aview, ⌜av !! i = None⌝ ∗ Farm.(pf_recv) av i)%I.
+
+  (* the read-only sibling, at the raw map.  Note the receipt is handed
+     the READING [abs_view I], so a client never sees a record. *)
+  Definition dlookup_commit_at Γ (E : coPset)
+      (Φ : aview -> Z -> fname -> Z -> iProp Σ) : iProp Σ :=
+    (∀ (I : gmap Z fs_node) (d i : Z) (nm : fname) (ents : gmap fname Z)
+       (nl : nat),
+       ⌜abs_view I !! d = Some (MkAnode (ADir ents) nl)⌝ -∗
+       ⌜ents !! nm = Some i⌝ -∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ={E}=∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ∗ Φ (abs_view I) d nm i)%I.
+
+  (* THE PARENT LEG (create's success commit), two-phase, at the raw map,
+     with the child's content a FUNCTION of the two inums (a directory's
+     dots name them).  Phase 2 is quantified over the POST map and
+     constrained by its READING alone -- so the client still witnesses
+     exactly "the delta was applied" and nothing about the record the
+     mover chose. *)
+  (* THE CREATE'S CHILD IS THE ARMED INODE, and the leg now says so: it
+     takes [cre_arm_fired Farm i], exactly as [aunarm_of_arm] below does.
+
+     THE ARM'S RECEIPT IS A PERMIT, SPENT BY WHICHEVER LEG ENDS THE
+     INODE.  The child's two legs -- the create and the unarm -- are the
+     two ways one armed inode can end, and they are EXCLUSIVE on every
+     run: the unarm fires only when [dirlink] failed, which is when the
+     create commit did not.  That exclusion used to be a property of the
+     RUN and of nothing in the logic, and a constraining application could
+     not use it: a step at either leg needs the same exclusion credential
+     (an exclusive token -- the echo application's [AppEcho.cons_key],
+     which is what makes "the console is not there yet" a fact rather than
+     an arm), and an exclusive resource can sit in only ONE of two
+     [∗]-joined pieces, so whichever leg did not get it was unprovable.
+
+     Taking the arm's receipt HERE and in [aunarm_of_arm], and CONSUMING it
+     in both, makes the exclusion structural: the kernel holds one permit
+     per armed inode and can fire at most one of the two legs with it.  The
+     application parks its credential in [Farm]'s receipt and gets it back
+     through the receipt of the leg that actually fired ([Φ] here,
+     [cre_unarm_fired] there) -- nothing is lost, it moves.  The kernel
+     pays nothing: every fire site already holds the arm's receipt at the
+     instant it fires the parent leg (the arm ran at [ialloc], the create
+     at [dirlink]), and the generic supplier drops it. *)
+  (* THE PARENT CURSOR IS A PREMISE (lane TL-3K, design/user-tree.md
+     section 7.5's WALL A, fix (i)).  [d] is quantified INSIDE this
+     definition, so without [Pd] a supplier owes a step at EVERY directory
+     of every view -- including one inside a STRANGER's subtree, where a
+     constraining application has no step at all and cannot tell that case
+     from the free one ([TreeMove.v] section 4).  [Pd] is the walk's
+     TERMINAL CURSOR, i.e. [P (length (npar_elems pl))] at the syscall
+     altitude: nameiparent has already run when this leg fires, so the
+     prover HOLDS it (it is what the ret-0 arm hands back --
+     [SpecCreate.cre_ok_arms], [SpecSysMknod], [SpecSysUnlink]), and the
+     kernel side of the change is a restatement.
+
+     IT IS READ, NOT SPENT: phase 1 hands [Pd d] straight back, because the
+     cursor is also the syscall's own post and the caller's [P] is an
+     arbitrary (possibly linear) predicate the kernel may not duplicate.
+     A supplier that does not care instantiates [Pd] at anything and
+     returns it unread ([acre_commit_at_gen_unit]). *)
+  Definition acre_commit_at_gen Γ (E : coPset) (cf : Z -> Z -> absnode)
+      (Pd : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (Φ : aview -> Z -> fname -> Z -> iProp Σ) : iProp Σ :=
+    (∀ (I : gmap Z fs_node) (d i : Z) (nm : fname) (ents : gmap fname Z)
+       (nl : nat),
+       ⌜cre_pre (abs_view I) d nm ents nl i (cf d i)⌝ -∗
+       (* THE NAME CREDENTIAL (lane TL-3C, design/user-tree.md section 7.6's
+          WALL D).  [nm] is quantified INSIDE, and the tree layer's own
+          [own_wf] preservation ([TreeView.own_wf_ent], through
+          [TreeView.fs_pname]) is FALSE at a dot name -- inserting ["."] or
+          [".."] as a PROPER edge would break unique parenthood.  It is true
+          at every reachable fire and the KERNEL pays it: create's own
+          [dirlookup] returns the FOUND arm at a dot name, so [dirlink] is
+          reached only over a name the parent's record range MISSED, and a
+          live directory's records 0 and 1 ARE the two dot names
+          ([DirView.dir_dots_miss_not_dots]).  Spelled unfolded (it IS
+          [TreeView.fs_pname nm], convertible) so this file keeps its
+          altitude: the kernel tier does not require the tree layer. *)
+       ⌜nm <> DOT /\ nm <> DOTDOT⌝ -∗
+       cre_arm_fired Farm i -∗
+       Pd d -∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ={E}=∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ∗ Pd d ∗
+         (* THE CALLER'S STEP (app-instances.md section 7): its claim about
+            the pre-view survives the delta, at the RAW insert the mover
+            performs ([AppInv.app_step]; the delta is its reading) *)
+         app_step d I (delta_create d nm i (cf d i) (abs_view I)) ∗
+         (∀ I' : gmap Z fs_node,
+            ⌜abs_view I' = delta_create d nm i (cf d i) (abs_view I)⌝ -∗
+            ghost_map_auth_frac (γtop Γ) (1/2) I' ={E}=∗
+            ghost_map_auth_frac (γtop Γ) (1/2) I' ∗ Φ (abs_view I) d nm i))%I.
+
+  (* ...and the CONSTANT-content instance the two pinned AU twins carry
+     (a device at mknod, an empty file at open(O_CREATE)) *)
+  Definition acre_commit_at Γ (E : coPset) (c : absnode)
+      (Pd : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (Φ : aview -> Z -> fname -> Z -> iProp Σ) : iProp Σ :=
+    acre_commit_at_gen Γ E (fun _ _ => c) Pd Farm Φ.
+
+  (* the child-content index is used POINTWISE, so a pointwise equality
+     moves the commit.  Named because the two type-pinned readings of
+     [cre_child] are equalities between FUNCTIONS that print identically
+     and are only convertible (durable-notes, "Terms that print
+     identically"): [iApply] this rather than [rewrite]. *)
+  Lemma acre_commit_at_gen_ext Γ (E : coPset) (cf cf' : Z -> Z -> absnode)
+      (Pd : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (Φ : aview -> Z -> fname -> Z -> iProp Σ) :
+    (forall d i, cf d i = cf' d i) ->
+    acre_commit_at_gen Γ E cf Pd Farm Φ -∗ acre_commit_at_gen Γ E cf' Pd Farm Φ.
+  Proof using .
+    intros Hext. rewrite /acre_commit_at_gen. iIntros "H".
+    iIntros (I d i nm ents nl) "%Hpre %Hnm Harm HPd Ha".
+    rewrite -(Hext d i) in Hpre. rewrite -(Hext d i).
+    iApply ("H" with "[//] [//] Harm HPd Ha").
+  Qed.
+
+  (* ...and the cursor MOVES ALONG AN ISO: two readings of the same cursor
+     (the one-path form [P (length (npar_elems pl))] and the syscall
+     tier's guarded form, [SysMknodDefs.npar_cur]) carry the commit
+     between them.  BOTH directions are needed because the commit READS the
+     premise and HANDS IT BACK. *)
+  Lemma acre_commit_at_gen_mono Γ (E : coPset) (cf : Z -> Z -> absnode)
+      (Pd Pd' : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (Φ : aview -> Z -> fname -> Z -> iProp Σ) :
+    □ (∀ d : Z, Pd' d -∗ Pd d) -∗ □ (∀ d : Z, Pd d -∗ Pd' d) -∗
+    acre_commit_at_gen Γ E cf Pd Farm Φ -∗ acre_commit_at_gen Γ E cf Pd' Farm Φ.
+  Proof using .
+    rewrite /acre_commit_at_gen. iIntros "#Hin #Hout H".
+    iIntros (I d i nm ents nl) "%Hpre %Hnm Harm HPd Ha".
+    iDestruct ("Hin" $! d with "HPd") as "HPd".
+    iMod ("H" $! I d i nm ents nl with "[//] [//] Harm HPd Ha")
+      as "(Ha & HPd & Hstep & Hph2)".
+    iDestruct ("Hout" $! d with "HPd") as "HPd".
+    iModIntro. by iFrame "Ha HPd Hstep Hph2".
+  Qed.
+
+  (* THE CURSOR IS A WEAKENING, and this is the one line every GENERIC
+     supplier takes: a commit that holds at every [d] with no cursor at all
+     holds a fortiori when one is handed in.  It is why the landed unit and
+     pinned dischargers keep their proofs. *)
+  Lemma acre_commit_at_gen_cur Γ (E : coPset) (cf : Z -> Z -> absnode)
+      (Pd : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (Φ : aview -> Z -> fname -> Z -> iProp Σ) :
+    acre_commit_at_gen Γ E cf (fun _ => True%I) Farm Φ -∗
+    acre_commit_at_gen Γ E cf Pd Farm Φ.
+  Proof using .
+    rewrite /acre_commit_at_gen. iIntros "H".
+    iIntros (I d i nm ents nl) "%Hpre %Hnm Harm HPd Ha".
+    iMod ("H" $! I d i nm ents nl with "[//] [//] Harm [//] Ha")
+      as "(Ha & _ & Hstep & Hph2)".
+    iModIntro. by iFrame "Ha HPd Hstep Hph2".
+  Qed.
+
+  (* THE ARM: the row APPEARS.  The view has no row at [i] (the claim box
+     is at count 0) but the MAP has one -- the child's inum is a region
+     row.  The [is_Some] premise is the MOVER's, not the step's: the
+     generic discharger pays the step off the supply, which holds of every
+     view ([AppInv.app_step_acc]). *)
+  Definition aarm_commit_at Γ (E : coPset) (c : absnode)
+      (Φ : aview -> Z -> iProp Σ) : iProp Σ :=
+    (∀ (I : gmap Z fs_node) (i : Z),
+       ⌜abs_view I !! i = None⌝ -∗ ⌜is_Some (I !! i)⌝ -∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ={E}=∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ∗
+         app_step i I (delta_arm i c (abs_view I)) ∗
+         (∀ I' : gmap Z fs_node,
+            ⌜abs_view I' = delta_arm i c (abs_view I)⌝ -∗
+            ghost_map_auth_frac (γtop Γ) (1/2) I' ={E}=∗
+            ghost_map_auth_frac (γtop Γ) (1/2) I' ∗ Φ (abs_view I) i))%I.
+
+  (* THE DOTS: an empty directory at count 1 gains its dot names -- both
+     ([full = true], [delta_dots i d]) or the first alone ([full = false],
+     [delta_dot i]; the [".."] write fell short).  [d] is the parent. *)
+  Definition adots_commit_at Γ (E : coPset)
+      (Φ : aview -> Z -> Z -> bool -> iProp Σ) : iProp Σ :=
+    (∀ (I : gmap Z fs_node) (i d : Z) (full : bool),
+       ⌜abs_view I !! i = Some (MkAnode (ADir ∅) 1%nat)⌝ -∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ={E}=∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ∗
+         app_step i I (dots_delta full i d (abs_view I)) ∗
+         (∀ I' : gmap Z fs_node,
+            ⌜abs_view I' = dots_delta full i d (abs_view I)⌝ -∗
+            ghost_map_auth_frac (γtop Γ) (1/2) I' ={E}=∗
+            ghost_map_auth_frac (γtop Γ) (1/2) I' ∗ Φ (abs_view I) i d full))%I.
+
+  (* THE UNARM (ruling Q-h): the row AT [i] at count 1 -- whatever its
+     content -- DISAPPEARS.  The content is quantified inside: the failure
+     arms reach it with an empty file, a device, or a directory holding no,
+     one or two dots.
+
+     THE INUM IS AN INDEX, not quantified inside.  The unarm is the UNDO of
+     an arm, and the code only ever unarms the inode [ialloc] just returned;
+     a piece quantified over every nlink-1 row would owe a delta at rows the
+     syscall never touches (/sh's row is a file at nlink 1).  [aunarm_of_arm]
+     below is how a caller hands the piece in without naming the inum in
+     advance: it produces this AU at the inum the ARM's receipt names, and at
+     no other. *)
+  Definition aunarm_commit_at Γ (E : coPset) (i : Z)
+      (Φ : aview -> Z -> iProp Σ) : iProp Σ :=
+    (∀ (I : gmap Z fs_node) (c : absnode),
+       ⌜abs_view I !! i = Some (MkAnode c 1%nat)⌝ -∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ={E}=∗
+       ghost_map_auth_frac (γtop Γ) (1/2) I ∗
+         app_step i I (delta_unarm i (abs_view I)) ∗
+         (∀ I' : gmap Z fs_node,
+            ⌜abs_view I' = delta_unarm i (abs_view I)⌝ -∗
+            ghost_map_auth_frac (γtop Γ) (1/2) I' ={E}=∗
+            ghost_map_auth_frac (γtop Γ) (1/2) I' ∗ Φ (abs_view I) i))%I.
+
+  (* ------------------------------------------------------------------ *)
+  (*  1a.  The receipts, as the contracts hand them out                   *)
+  (* ------------------------------------------------------------------ *)
+
+  (* Each with its instant's pure facts restated beside the caller's
+     receipt.  A FIRED piece pays only its receipt: the pair's refund is
+     dropped here, which is the whole content of "the investment comes
+     back through the receipt the caller chose". *)
+  Definition cre_dots_fired (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+      (i d : Z) (full : bool) : iProp Σ :=
+    (∃ av : aview, ⌜av !! i = Some (MkAnode (ADir ∅) 1%nat)⌝
+       ∗ Fdots.(pf_recv) av i d full)%I.
+
+  Definition cre_unarm_fired (Fun : pfam Σ (aview -> Z -> iProp Σ))
+      (i : Z) : iProp Σ :=
+    (∃ (av : aview) (c : absnode), ⌜av !! i = Some (MkAnode c 1%nat)⌝
+       ∗ Fun.(pf_recv) av i)%I.
+
+  Definition cre_acre_fired (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+      (d : Z) (nm : fname) (i : Z) (c : absnode) : iProp Σ :=
+    (∃ (av : aview) (ents : gmap fname Z) (nl : nat),
+       ⌜cre_pre av d nm ents nl i c⌝ ∗ Fok.(pf_recv) av d nm i)%I.
+
+  (* ...and the EXISTS OBSERVATION's receipt: the name WAS in the parent's
+     entry map at the instant create's own [dirlookup] read it, and nothing
+     moved. *)
+  Definition cre_ex_fired (Fex : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+      (d : Z) (nm : fname) (i : Z) : iProp Σ :=
+    (∃ (av : aview) (ents : gmap fname Z) (nl : nat),
+       ⌜av !! d = Some (MkAnode (ADir ents) nl)⌝ ∗ ⌜ents !! nm = Some i⌝ ∗
+       Fex.(pf_recv) av d nm i)%I.
+
+  (* THE UNARM, TIED TO ITS OWN ARM.  The unarm is the undo of the arm
+     [ialloc] just made, and that is what the caller hands in: a piece that
+     yields the unarm's AU AT THE INUM THE ARM'S RECEIPT NAMES, and at no
+     other.  The arm receipt goes in and comes back out -- the kernel holds
+     it on the [dirlink] failure path, which is the only path that unarms --
+     so the piece costs the caller nothing it did not already have, and it
+     owes a delta at ONE inum: a fresh one, which is neither a pinned inum
+     nor the root ([FsConsPin.file_pin_unarm]'s two premises).
+
+     Stated as a family so it sits under [pf_at] like every other piece: the
+     refund stays outside the wand and a caller whose arm never fired still
+     eliminates to its own [pf_refund]. *)
+  Definition aunarm_of_arm Γ (E : coPset)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (Φ : aview -> Z -> iProp Σ) : iProp Σ :=
+    (∀ i : Z, cre_arm_fired Farm i -∗ aunarm_commit_at Γ E i Φ)%I.
+
+  (* The child's two legs, as the AU twins' arms carry them: both commits
+     back UNFIRED, or the do-then-undo PAIR (ruling Q-h).  UNFIRED means
+     the whole pair the caller handed in -- the commit CONJOINED with its
+     refund -- so a caller whose leg never fired eliminates to its own
+     [pf_refund]. *)
+  Definition cre_child_unfired Γ (c : absnode)
+      (Farm Fun : pfam Σ (aview -> Z -> iProp Σ)) : iProp Σ :=
+    (pf_at (aarm_commit_at Γ appE c) Farm
+     ∗ pf_at (aunarm_of_arm Γ appE Farm) Fun)%I.
+
+  (* THE DO-THEN-UNDO PAIR (ruling Q-h), and the ARM'S RECEIPT IS NOT IN
+     IT ANY MORE: the unarm spent the permit, and what the application gets
+     back is the unarm's own receipt -- which is where it parks whatever it
+     had in the arm's ([acre_commit_at_gen]'s note). *)
+  Definition cre_child_pair (Farm Fun : pfam Σ (aview -> Z -> iProp Σ))
+      (i : Z) : iProp Σ :=
+    (cre_unarm_fired Fun i)%I.
+
+  (* ------------------------------------------------------------------ *)
+  (*  1b.  Satisfiability: the [_unit] dischargers                        *)
+  (* ------------------------------------------------------------------ *)
+
+  Lemma dlookup_commit_at_unit Γ E :
+    ⊢ dlookup_commit_at Γ E (fun _ _ _ _ => True%I).
+  Proof using .
+    rewrite /dlookup_commit_at. iIntros (I d i nm ents nl) "%Hd %Hnm Ha".
+    iModIntro. by iFrame "Ha".
+  Qed.
+
+  (* the write-kind ones owe the caller's step, paid at the live Γ out of
+     the SUPPLY ([AppInv.app_step_acc]) *)
+  Lemma acre_commit_at_gen_unit (γfs : fs_names) E (cf : Z -> Z -> absnode)
+      (Pd : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ)) :
+    app_sup -∗
+    acre_commit_at_gen (fs_gamma_L γfs) E cf Pd Farm (fun _ _ _ _ => True%I).
+  Proof using .
+    iIntros "#Hsup". rewrite /acre_commit_at_gen.
+    iIntros (I d i nm ents nl) "%Hpre %Hnm _ HPd Ha".
+    iDestruct (app_step_acc d I _ with "Hsup") as "Hstep".
+    iModIntro. iFrame "Ha HPd Hstep". iIntros (I') "%Heq Ha'". iModIntro.
+    by iFrame "Ha'".
+  Qed.
+
+  Lemma acre_commit_at_unit (γfs : fs_names) E c (Pd : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ)) :
+    app_sup -∗ acre_commit_at (fs_gamma_L γfs) E c Pd Farm (fun _ _ _ _ => True%I).
+  Proof using .
+    iIntros "#Hsup". rewrite /acre_commit_at.
+    iApply (acre_commit_at_gen_unit γfs E _ Pd Farm with "Hsup").
+  Qed.
+
+  (* the arm's step is paid although the VIEW has no row: the supply holds
+     of every view *)
+  Lemma aarm_commit_at_unit (γfs : fs_names) E c :
+    app_sup -∗ aarm_commit_at (fs_gamma_L γfs) E c (fun _ _ => True%I).
+  Proof using .
+    iIntros "#Hsup". rewrite /aarm_commit_at. iIntros (I i) "%Hnone %Hsome Ha".
+    iDestruct (app_step_acc i I _ with "Hsup") as "Hstep".
+    iModIntro. iFrame "Ha Hstep". iIntros (I') "%Heq Ha'". iModIntro.
+    by iFrame "Ha'".
+  Qed.
+
+  Lemma adots_commit_at_unit (γfs : fs_names) E :
+    app_sup -∗ adots_commit_at (fs_gamma_L γfs) E (fun _ _ _ _ => True%I).
+  Proof using .
+    iIntros "#Hsup". rewrite /adots_commit_at. iIntros (I i d full) "%Hrow Ha".
+    iDestruct (app_step_acc i I _ with "Hsup") as "Hstep".
+    iModIntro. iFrame "Ha Hstep". iIntros (I') "%Heq Ha'". iModIntro.
+    by iFrame "Ha'".
+  Qed.
+
+  Lemma aunarm_commit_at_unit (γfs : fs_names) E (i : Z) :
+    app_sup -∗ aunarm_commit_at (fs_gamma_L γfs) E i (fun _ _ => True%I).
+  Proof using .
+    iIntros "#Hsup". rewrite /aunarm_commit_at. iIntros (I c) "%Hrow Ha".
+    iDestruct (app_step_acc i I _ with "Hsup") as "Hstep".
+    iModIntro. iFrame "Ha Hstep". iIntros (I') "%Heq Ha'". iModIntro.
+    by iFrame "Ha'".
+  Qed.
+
+  (* ...and the TIED piece at the trivial family: the supply holds of every
+     view, so the arm receipt goes straight back out unread. *)
+  Lemma aunarm_of_arm_unit (γfs : fs_names) E
+      (Farm : pfam Σ (aview -> Z -> iProp Σ)) :
+    app_sup -∗ aunarm_of_arm (fs_gamma_L γfs) E Farm (fun _ _ => True%I).
+  Proof using .
+    iIntros "#Hsup". rewrite /aunarm_of_arm. iIntros (i) "_".
+    iApply (aunarm_commit_at_unit γfs E i with "Hsup").
+  Qed.
+
+  (* THE BRIDGE: a caller that can answer at EVERY nlink-1 row can answer at
+     the armed one.  The direction that matters -- the tied piece is the
+     weaker thing to supply -- and the one line every generic supplier takes. *)
+  Lemma aunarm_of_arm_of_all Γ E (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (Φ : aview -> Z -> iProp Σ) :
+    (∀ i : Z, aunarm_commit_at Γ E i Φ) -∗ aunarm_of_arm Γ E Farm Φ.
+  Proof using .
+    iIntros "H". rewrite /aunarm_of_arm. iIntros (i) "_". iApply "H".
+  Qed.
+
+  (* THE OPEN: the one move an unarm fire site takes.  It holds the arm's
+     receipt -- the unarm runs only on the [dirlink] failure path, past the
+     arm -- and SPENDS it for the unarm's AU AT THAT INUM.  The permit goes
+     with the leg that fires ([acre_commit_at_gen]'s note); what the caller
+     parked in it comes back through [cre_unarm_fired]. *)
+  Lemma aunarm_of_arm_open Γ E (Farm Fun : pfam Σ (aview -> Z -> iProp Σ))
+      (i : Z) :
+    cre_arm_fired Farm i -∗ pf_at (aunarm_of_arm Γ E Farm) Fun -∗
+      aunarm_commit_at Γ E i Fun.(pf_recv).
+  Proof using .
+    iIntros "Ha Hp". iDestruct (pf_at_au with "Hp") as "Hp".
+    rewrite /aunarm_of_arm. iApply ("Hp" $! i with "Ha").
+  Qed.
+
+  (* ------------------------------------------------------------------ *)
+  (*  1c.  Agreement against the authority, without spending it, and     *)
+  (*       the [_pinned] seeds the stable corollaries are assembled from *)
+  (* ------------------------------------------------------------------ *)
+
+  (* at ANY fraction of the authority: agreement is all a reading needs *)
+  Lemma mkf_auth_frag Γ (q : Qp) (I : gmap Z fs_node) (dq : dfrac) (i : Z)
+      (n : fs_node) :
+    ghost_map_auth_frac (γtop Γ) q I -∗ top_frag_q Γ dq i n -∗ ⌜I !! i = Some n⌝.
+  Proof using .
+    rewrite /top_frag_q. iIntros "Ha Hf".
+    by iDestruct (ghost_map_lookup with "Ha Hf") as %Hl.
+  Qed.
+
+  Lemma mkf_auth_nview Γ (q : Qp) (I : gmap Z fs_node) (dq : dfrac) (i : Z)
+      (a : anode) :
+    ghost_map_auth_frac (γtop Γ) q I -∗ nview_dq Γ dq i a -∗
+      ⌜abs_view I !! i = Some a⌝.
+  Proof using .
+    rewrite /nview_dq. iIntros "Ha Hn". iDestruct "Hn" as (n) "[Hf %Han]".
+    iDestruct (mkf_auth_frag with "Ha Hf") as %Hl.
+    iPureIntro. exact (abs_view_lookup I i n a Hl Han).
+  Qed.
+
+  Lemma dlookup_commit_at_pinned Γ E (q : Qp) (dpin : Z) (a : anode)
+      (Φ : aview -> Z -> fname -> Z -> iProp Σ) :
+    nview Γ q dpin a -∗
+    (∀ (av : aview) (d : Z) (nm : fname) (i : Z),
+       ⌜d = dpin -> av !! dpin = Some a⌝ -∗ nview Γ q dpin a -∗
+       Φ av d nm i) -∗
+    dlookup_commit_at Γ E Φ.
+  Proof using .
+    iIntros "Hn HΦ". rewrite /dlookup_commit_at.
+    iIntros (I d i nm ents nl) "%Hd %Hnm Ha".
+    destruct (decide (d = dpin)) as [-> | Hne].
+    - iDestruct (mkf_auth_nview with "Ha Hn") as %Hav.
+      iModIntro. iFrame "Ha".
+      iApply ("HΦ" $! (abs_view I) dpin nm i with "[%] Hn"). auto.
+    - iModIntro. iFrame "Ha".
+      iApply ("HΦ" $! (abs_view I) d nm i with "[%] Hn"). congruence.
+  Qed.
+
+  Lemma acre_commit_at_gen_pinned (γfs : fs_names) E (cf : Z -> Z -> absnode)
+      (Pd : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (q : Qp) (jpin : Z) (a : anode) (Φ : aview -> Z -> fname -> Z -> iProp Σ) :
+    app_sup -∗
+    nview (fs_gamma_L γfs) q jpin a -∗
+    (∀ (av : aview) (d : Z) (nm : fname) (i : Z),
+       ⌜av !! jpin = Some a⌝ -∗ nview (fs_gamma_L γfs) q jpin a -∗ Φ av d nm i) -∗
+    acre_commit_at_gen (fs_gamma_L γfs) E cf Pd Farm Φ.
+  Proof using .
+    iIntros "#Hsup Hn HΦ". rewrite /acre_commit_at_gen.
+    iIntros (I d i nm ents nl) "%Hpre %Hnm _ HPd Ha".
+    iDestruct (mkf_auth_nview with "Ha Hn") as %Hav.
+    iDestruct (app_step_acc d I _ with "Hsup") as "Hstep".
+    iModIntro. iFrame "Ha HPd Hstep". iIntros (I') "%Heq Ha'". iModIntro.
+    iFrame "Ha'". iApply ("HΦ" $! (abs_view I) d nm i with "[%] Hn"). done.
+  Qed.
+
+  Lemma acre_commit_at_pinned (γfs : fs_names) E (c : absnode)
+      (Pd : Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ)) (q : Qp) (jpin : Z)
+      (a : anode) (Φ : aview -> Z -> fname -> Z -> iProp Σ) :
+    app_sup -∗
+    nview (fs_gamma_L γfs) q jpin a -∗
+    (∀ (av : aview) (d : Z) (nm : fname) (i : Z),
+       ⌜av !! jpin = Some a⌝ -∗ nview (fs_gamma_L γfs) q jpin a -∗ Φ av d nm i) -∗
+    acre_commit_at (fs_gamma_L γfs) E c Pd Farm Φ.
+  Proof using .
+    iIntros "#Hsup Hn HΦ". rewrite /acre_commit_at.
+    iApply (acre_commit_at_gen_pinned γfs E _ Pd Farm q jpin a Φ with "Hsup Hn HΦ").
+  Qed.
+
+  Lemma aarm_commit_at_pinned (γfs : fs_names) E (c : absnode) (q : Qp) (jpin : Z)
+      (a : anode) (Φ : aview -> Z -> iProp Σ) :
+    app_sup -∗
+    nview (fs_gamma_L γfs) q jpin a -∗
+    (∀ (av : aview) (i : Z),
+       ⌜av !! jpin = Some a⌝ -∗ nview (fs_gamma_L γfs) q jpin a -∗ Φ av i) -∗
+    aarm_commit_at (fs_gamma_L γfs) E c Φ.
+  Proof using .
+    iIntros "#Hsup Hn HΦ". rewrite /aarm_commit_at.
+    iIntros (I i) "%Hnone %Hsome Ha".
+    iDestruct (mkf_auth_nview with "Ha Hn") as %Hav.
+    iDestruct (app_step_acc i I _ with "Hsup") as "Hstep".
+    iModIntro. iFrame "Ha Hstep". iIntros (I') "%Heq Ha'". iModIntro.
+    iFrame "Ha'". iApply ("HΦ" $! (abs_view I) i with "[%] Hn"). done.
+  Qed.
+
+  Lemma adots_commit_at_pinned (γfs : fs_names) E (q : Qp) (jpin : Z)
+      (a : anode) (Φ : aview -> Z -> Z -> bool -> iProp Σ) :
+    app_sup -∗
+    nview (fs_gamma_L γfs) q jpin a -∗
+    (∀ (av : aview) (i d : Z) (full : bool),
+       ⌜av !! jpin = Some a⌝ -∗ nview (fs_gamma_L γfs) q jpin a -∗ Φ av i d full) -∗
+    adots_commit_at (fs_gamma_L γfs) E Φ.
+  Proof using .
+    iIntros "#Hsup Hn HΦ". rewrite /adots_commit_at.
+    iIntros (I i d full) "%Hrow Ha".
+    iDestruct (mkf_auth_nview with "Ha Hn") as %Hav.
+    iDestruct (app_step_acc i I _ with "Hsup") as "Hstep".
+    iModIntro. iFrame "Ha Hstep". iIntros (I') "%Heq Ha'". iModIntro.
+    iFrame "Ha'". iApply ("HΦ" $! (abs_view I) i d full with "[%] Hn"). done.
+  Qed.
+
+  Lemma aunarm_commit_at_pinned (γfs : fs_names) E (i : Z) (q : Qp) (jpin : Z)
+      (a : anode) (Φ : aview -> Z -> iProp Σ) :
+    app_sup -∗
+    nview (fs_gamma_L γfs) q jpin a -∗
+    (∀ (av : aview) (i : Z),
+       ⌜av !! jpin = Some a⌝ -∗ nview (fs_gamma_L γfs) q jpin a -∗ Φ av i) -∗
+    aunarm_commit_at (fs_gamma_L γfs) E i Φ.
+  Proof using .
+    iIntros "#Hsup Hn HΦ". rewrite /aunarm_commit_at.
+    iIntros (I c) "%Hrow Ha".
+    iDestruct (mkf_auth_nview with "Ha Hn") as %Hav.
+    iDestruct (app_step_acc i I _ with "Hsup") as "Hstep".
+    iModIntro. iFrame "Ha Hstep". iIntros (I') "%Heq Ha'". iModIntro.
+    iFrame "Ha'". iApply ("HΦ" $! (abs_view I) i with "[%] Hn"). done.
+  Qed.
+
+  (* =================================================================== *)
+  (*  2.  THE TWO-PHASE RETAG ENGINES: [ftopN] opened, the caller's two   *)
+  (*      phases on either side of the [ghost_map_update]                 *)
+  (* =================================================================== *)
+
+  (* UNDER THE ARMED REGISTRY ([InodeRegion.ireg_top_retag_armed_gen]'s
+     critical section with [FsAbsMknodFire.caf_acre_fire]'s two phases
+     inside): the receipt names this inum, so the row says nothing about
+     it and the new node may be anything -- a directory with a count and
+     no dots included.  The caller's step is delivered at the RAW insert
+     (the specific fires below rewrite it from the delta), and the phase-2
+     fupd runs at the post map before the body closes. *)
+  Lemma caf_armed_retag (γfs : fs_names) (E : coPset) (k t : nat) (q : Qp)
+      (S : gset Z) (i : Z) (n n' : fs_node) (R : iProp Σ) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    i ∈ S ->
+    ftop_inv γfs -∗ app_inv γfs -∗ ireg_armed k t q S -∗
+    (∀ I : gmap Z fs_node, ⌜I !! i = Some n⌝ -∗
+       ghost_map_auth_frac (γtop (fs_gamma_L γfs)) (1/2) I ={appE}=∗
+       ghost_map_auth_frac (γtop (fs_gamma_L γfs)) (1/2) I ∗
+       app_step i I (abs_view (<[i := n']> I)) ∗
+       (ghost_map_auth_frac (γtop (fs_gamma_L γfs)) (1/2) (<[i := n']> I) ={appE}=∗
+        ghost_map_auth_frac (γtop (fs_gamma_L γfs)) (1/2) (<[i := n']> I) ∗ R)) -∗
+    top_frag (fs_gamma_L γfs) i n ={E}=∗
+      ireg_armed k t q S ∗ top_frag (fs_gamma_L γfs) i n' ∗ R.
+  Proof using .
+    iIntros (HE Hin) "#Hi #Hai Hrec Hcm Hf". rewrite /ireg_armed.
+    (* [γtop (fs_gamma_L γfs)] IS [fs_top γfs] ([FsAbs.ftop_gamma_top], by
+       reflexivity), spelled the body's way before the invariant is opened
+       -- exactly what [InodeRegion.ireg_top_retag_*] does *)
+    rewrite /top_frag /fs_gamma_L /=.
+    iMod (inv_acc E ftopN with "Hi") as "[Hbody Hclose]"; [solve_ndisj |].
+    iDestruct "Hbody" as ">Hb".
+    iDestruct "Hb" as (I A) "(Hta & Hla & Hpark & %Hcl)".
+    iDestruct (ghost_map_lookup with "Hla Hrec") as %HAt.
+    iDestruct (ghost_map_lookup with "Hta Hf") as %Hlk.
+    iMod (fupd_mask_subseteq appE) as "Hcl2"; [rewrite /appE; solve_ndisj |].
+    iMod ("Hcm" $! I with "[//] Hta") as "(Hta & Hstep & Hph2)".
+    (* THE MOVE, at the whole authority ([AppInv.app_top_update]) *)
+    iMod (app_top_update appE γfs I i n n' ltac:(rewrite /appE; done)
+            with "Hai [Hstep] Hta Hf") as "[Hta Hf]".
+    { iIntros (_) "Hp". iApply (app_step_at i I _ n' eq_refl with "Hstep Hp"). }
+    iMod ("Hph2" with "Hta") as "[Hta HR]".
+    iMod "Hcl2".
+    iMod ("Hclose" with "[Hta Hla Hpark]") as "_".
+    { iNext. rewrite /ftop_body. iExists (<[i := n']> I), A.
+      iFrame "Hta Hla Hpark". iPureIntro.
+      intros j m Hj Hun. destruct (decide (j = i)) as [-> | Hne].
+      - (* this inum IS armed, so the row's own hypothesis is refuted *)
+        exfalso. exact (Hun k t q S HAt Hin).
+      - rewrite lookup_insert_ne in Hj; [| exact (not_eq_sym Hne)].
+        exact (Hcl j m Hj Hun). }
+    iModIntro. iFrame "Hrec Hf HR".
+  Qed.
+
+  (* ...and the PLAIN one ([ireg_top_retag_gen]'s section): the new node
+     owes the row *)
+  Lemma caf_retag (γfs : fs_names) (E : coPset) (i : Z) (n n' : fs_node)
+      (R : iProp Σ) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    inode_local i n' ->
+    ftop_inv γfs -∗ app_inv γfs -∗
+    (∀ I : gmap Z fs_node, ⌜I !! i = Some n⌝ -∗
+       ghost_map_auth_frac (γtop (fs_gamma_L γfs)) (1/2) I ={appE}=∗
+       ghost_map_auth_frac (γtop (fs_gamma_L γfs)) (1/2) I ∗
+       app_step i I (abs_view (<[i := n']> I)) ∗
+       (ghost_map_auth_frac (γtop (fs_gamma_L γfs)) (1/2) (<[i := n']> I) ={appE}=∗
+        ghost_map_auth_frac (γtop (fs_gamma_L γfs)) (1/2) (<[i := n']> I) ∗ R)) -∗
+    top_frag (fs_gamma_L γfs) i n ={E}=∗ top_frag (fs_gamma_L γfs) i n' ∗ R.
+  Proof using .
+    iIntros (HE Hloc) "#Hi #Hai Hcm Hf".
+    rewrite /top_frag /fs_gamma_L /=.
+    iMod (inv_acc E ftopN with "Hi") as "[Hbody Hclose]"; [solve_ndisj |].
+    iDestruct "Hbody" as ">Hb".
+    iDestruct "Hb" as (I A) "(Hta & Hla & Hpark & %Hcl)".
+    iDestruct (ghost_map_lookup with "Hta Hf") as %Hlk.
+    iMod (fupd_mask_subseteq appE) as "Hcl2"; [rewrite /appE; solve_ndisj |].
+    iMod ("Hcm" $! I with "[//] Hta") as "(Hta & Hstep & Hph2)".
+    iMod (app_top_update appE γfs I i n n' ltac:(rewrite /appE; done)
+            with "Hai [Hstep] Hta Hf") as "[Hta Hf]".
+    { iIntros (_) "Hp". iApply (app_step_at i I _ n' eq_refl with "Hstep Hp"). }
+    iMod ("Hph2" with "Hta") as "[Hta HR]".
+    iMod "Hcl2".
+    iMod ("Hclose" with "[Hta Hla Hpark]") as "_".
+    { iNext. rewrite /ftop_body. iExists (<[i := n']> I), A.
+      iFrame "Hta Hla Hpark". iPureIntro.
+      intros j m Hj Hun. destruct (decide (j = i)) as [-> | Hne].
+      - rewrite lookup_insert_eq in Hj. injection Hj as <-. exact Hloc.
+      - rewrite lookup_insert_ne in Hj; [| exact (not_eq_sym Hne)].
+        exact (Hcl j m Hj Hun). }
+    iModIntro. iFrame "Hf HR".
+  Qed.
+
+  (* =================================================================== *)
+  (*  3.  THE FIRES, ONE PER LEG                                          *)
+  (* =================================================================== *)
+
+  (* THE ARM (sites #8/#18/#23): the claim box ([abs_of n = None] --
+     [FsAbsDefs.abs_of_bare]) becomes the row [(c, 1)]; under the registry,
+     because a directory child is half-built from here to its dots. *)
+  Lemma caf_arm_fire (γfs : fs_names) (E : coPset) (k t : nat) (q : Qp)
+      (S : gset Z) (i : Z) (c : absnode)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (n n' : fs_node) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    i ∈ S ->
+    abs_of n = None ->
+    abs_of n' = Some (MkAnode c 1%nat) ->
+    ftop_inv γfs -∗ app_inv γfs -∗ ireg_armed k t q S -∗
+    pf_at (aarm_commit_at (fs_gamma_L γfs) appE c) Farm -∗
+    top_frag (fs_gamma_L γfs) i n ={E}=∗
+      ireg_armed k t q S ∗ top_frag (fs_gamma_L γfs) i n' ∗ cre_arm_fired Farm i.
+  Proof using .
+    iIntros (HE Hin Hnone Hrow) "#Hi #Hai Hrec Hcm Hf".
+    (* THE PIECE IS SPENT: the fire eliminates to the AU side and the
+       refund goes with the arm that did not happen. *)
+    iDestruct (pf_at_au with "Hcm") as "Hcm".
+    iApply (caf_armed_retag γfs E k t q S i n n' _ HE Hin
+              with "Hi Hai Hrec [Hcm] Hf").
+    iIntros (I Hlk) "Hta".
+    assert (Hav : abs_view I !! i = None)
+      by (rewrite (abs_view_lookup_of I i n Hlk); exact Hnone).
+    assert (Hsome : is_Some (I !! i)) by (by eexists).
+    assert (Hdelta : abs_view (<[i := n']> I) = delta_arm i c (abs_view I))
+      by exact (abs_view_insert I i n' _ Hrow).
+    iMod ("Hcm" $! I i with "[//] [//] Hta") as "(Hta & Hstep & Hph2)".
+    iModIntro. iEval (rewrite -Hdelta) in "Hstep". iFrame "Hta Hstep".
+    iIntros "Hta".
+    iMod ("Hph2" $! (<[i := n']> I) with "[//] Hta") as "[Hta HΦ]".
+    iModIntro. iFrame "Hta". rewrite /cre_arm_fired.
+    iExists (abs_view I). iSplitR; [by iPureIntro |]. iExact "HΦ".
+  Qed.
+
+  (* THE DOTS (sites #13, #9, #10): the empty directory at count 1 gains
+     its dots -- both, or the first alone -- still under the registry
+     (the success arm's [cr_dirty_clear] disarms right after) *)
+  Lemma caf_dots_fire (γfs : fs_names) (E : coPset) (k t : nat) (q : Qp)
+      (S : gset Z) (i d : Z) (full : bool)
+      (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ)) (n n' : fs_node) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    i ∈ S ->
+    abs_of n = Some (MkAnode (ADir ∅) 1%nat) ->
+    abs_of n' = Some (MkAnode (ADir (dots_ents full i d)) 1%nat) ->
+    ftop_inv γfs -∗ app_inv γfs -∗ ireg_armed k t q S -∗
+    pf_at (adots_commit_at (fs_gamma_L γfs) appE) Fdots -∗
+    top_frag (fs_gamma_L γfs) i n ={E}=∗
+      ireg_armed k t q S ∗ top_frag (fs_gamma_L γfs) i n'
+      ∗ cre_dots_fired Fdots i d full.
+  Proof using .
+    iIntros (HE Hin Hrow Hrow') "#Hi #Hai Hrec Hcm Hf".
+    iDestruct (pf_at_au with "Hcm") as "Hcm".
+    iApply (caf_armed_retag γfs E k t q S i n n' _ HE Hin
+              with "Hi Hai Hrec [Hcm] Hf").
+    iIntros (I Hlk) "Hta".
+    assert (Hav : abs_view I !! i = Some (MkAnode (ADir ∅) 1%nat))
+      by (rewrite (abs_view_lookup_of I i n Hlk); exact Hrow).
+    assert (Hdelta : abs_view (<[i := n']> I) = dots_delta full i d (abs_view I)).
+    { rewrite (abs_view_insert I i n' _ Hrow').
+      by rewrite (dots_delta_fresh (abs_view I) i d full Hav). }
+    iMod ("Hcm" $! I i d full with "[//] Hta") as "(Hta & Hstep & Hph2)".
+    iModIntro. iEval (rewrite -Hdelta) in "Hstep". iFrame "Hta Hstep".
+    iIntros "Hta".
+    iMod ("Hph2" $! (<[i := n']> I) with "[//] Hta") as "[Hta HΦ]".
+    iModIntro. iFrame "Hta". rewrite /cre_dots_fired.
+    iExists (abs_view I). iSplitR; [by iPureIntro |]. iExact "HΦ".
+  Qed.
+
+  (* THE UNARM under the registry (site #13b, mkdir's fail tail): the
+     dotless or half-dotted directory at count 1 DISAPPEARS *)
+  Lemma caf_unarm_fire_armed (γfs : fs_names) (E : coPset) (k t : nat) (q : Qp)
+      (S : gset Z) (i : Z) (c : absnode)
+      (Fun : pfam Σ (aview -> Z -> iProp Σ))
+      (n n' : fs_node) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    i ∈ S ->
+    abs_of n = Some (MkAnode c 1%nat) ->
+    abs_of n' = None ->
+    ftop_inv γfs -∗ app_inv γfs -∗ ireg_armed k t q S -∗
+    aunarm_commit_at (fs_gamma_L γfs) appE i Fun.(pf_recv) -∗
+    top_frag (fs_gamma_L γfs) i n ={E}=∗
+      ireg_armed k t q S ∗ top_frag (fs_gamma_L γfs) i n' ∗ cre_unarm_fired Fun i.
+  Proof using .
+    iIntros (HE Hin Hrow Hnone) "#Hi #Hai Hrec Hcm Hf".
+    iApply (caf_armed_retag γfs E k t q S i n n' _ HE Hin
+              with "Hi Hai Hrec [Hcm] Hf").
+    iIntros (I Hlk) "Hta".
+    assert (Hav : abs_view I !! i = Some (MkAnode c 1%nat))
+      by (rewrite (abs_view_lookup_of I i n Hlk); exact Hrow).
+    assert (Hdelta : abs_view (<[i := n']> I) = delta_unarm i (abs_view I))
+      by exact (abs_view_insert_None I i n' Hnone).
+    iMod ("Hcm" $! I c with "[//] Hta") as "(Hta & Hstep & Hph2)".
+    iModIntro. iEval (rewrite -Hdelta) in "Hstep". iFrame "Hta Hstep".
+    iIntros "Hta".
+    iMod ("Hph2" $! (<[i := n']> I) with "[//] Hta") as "[Hta HΦ]".
+    iModIntro. iFrame "Hta". rewrite /cre_unarm_fired.
+    iExists (abs_view I), c. iSplitR; [by iPureIntro |]. iExact "HΦ".
+  Qed.
+
+  (* ...and at a PLAIN fragment (sites #16/#21/#26, the non-directory
+     child's fail arm: the row was never suspended) -- the zeroed record
+     owes [inode_local], which the site's re-pack proves anyway *)
+  Lemma caf_unarm_fire (γfs : fs_names) (E : coPset) (i : Z) (c : absnode)
+      (Fun : pfam Σ (aview -> Z -> iProp Σ)) (n n' : fs_node) :
+    ↑ftopN ∪ ↑appN ⊆ E ->
+    inode_local i n' ->
+    abs_of n = Some (MkAnode c 1%nat) ->
+    abs_of n' = None ->
+    ftop_inv γfs -∗ app_inv γfs -∗
+    aunarm_commit_at (fs_gamma_L γfs) appE i Fun.(pf_recv) -∗
+    top_frag (fs_gamma_L γfs) i n ={E}=∗
+      top_frag (fs_gamma_L γfs) i n' ∗ cre_unarm_fired Fun i.
+  Proof using .
+    iIntros (HE Hloc Hrow Hnone) "#Hi #Hai Hcm Hf".
+    iApply (caf_retag γfs E i n n' _ HE Hloc with "Hi Hai [Hcm] Hf").
+    iIntros (I Hlk) "Hta".
+    assert (Hav : abs_view I !! i = Some (MkAnode c 1%nat))
+      by (rewrite (abs_view_lookup_of I i n Hlk); exact Hrow).
+    assert (Hdelta : abs_view (<[i := n']> I) = delta_unarm i (abs_view I))
+      by exact (abs_view_insert_None I i n' Hnone).
+    iMod ("Hcm" $! I c with "[//] Hta") as "(Hta & Hstep & Hph2)".
+    iModIntro. iEval (rewrite -Hdelta) in "Hstep". iFrame "Hta Hstep".
+    iIntros "Hta".
+    iMod ("Hph2" $! (<[i := n']> I) with "[//] Hta") as "[Hta HΦ]".
+    iModIntro. iFrame "Hta". rewrite /cre_unarm_fired.
+    iExists (abs_view I), c. iSplitR; [by iPureIntro |]. iExact "HΦ".
+  Qed.
+
+End CreateFire.

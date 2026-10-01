@@ -1,0 +1,245 @@
+(* SpecUserretClosed.v -- userret, CLOSED: the public interface of the whole
+   trap loop, stated where the kernel first enters it.
+
+   [SpecUserret]'s [wp_userret_pt] is a CONTINUATION spec -- it hands its
+   caller a User-mode machine and asks what happens next.  This is the same
+   contract with that question answered: run userret from forkret's tail and
+   the machine keeps running, forever, through arbitrarily many rounds of
+
+     userret -> user code -> uservec -> usertrap -> userret -> ...
+
+   There is no premise about user-mode execution and none about the kernel's
+   re-entry: [SpecUser]'s WP supplies the first and the Löb induction in
+   ProofUserretClosed.v supplies the second.
+
+   WHAT IS LEFT ON THE OUTSIDE.  Three things, and each is a premise that
+   already existed one level down rather than anything this statement
+   invents:
+
+   * [loop_ok C pt] -- the four config fields the loop pins (stvec at the
+     trampoline, mie at [MIE_S], medeleg at [MEDELEG_S], the config fraction
+     whole) plus the two descriptor facts uservec's own satp switch needs.
+     Every round re-establishes it, which is what makes it a loop invariant
+     rather than an assumption about the first round.
+   * THE mstatus GAP and THE TRAPFRAME KERNEL-WORDS GAP -- [SpecUservec]'s
+     own two undischarged premises, verbatim.  They are cross-round
+     historical facts ("userret's sret set SPIE, so the trap saw it";
+     "prepare_return armed the four kernel words"), and closing them needs
+     ghost tracking that no tier carries yet.  Passing them through is the
+     honest thing: they are the same obligation, not a new one.
+   * The kernel-side residue, as [Rut_at]: the bundle usertrap hands the loop
+     and gets back unchanged on the next trap.
+
+   THE TRAPFRAME'S 31 SAVE SLOTS ARE NOT ON THIS BOUNDARY, and an earlier
+   statement of it that listed them beside the residue was UNSATISFIABLE:
+   the residue OWNS that page ([UsertrapRes.ut_res_bare] -> [proc_priv_nopt]
+   -> [ProcInv.tf_page], at full ownership), so
+   [tf_page tfp ws -∗ tf_pa tfp 40 ↦ₚ₈{dq} v -∗ False] refutes any caller
+   holding both.  userret only READS those words, and the proof opens them
+   out of the residue itself ([usertrap_res_tf_open]) and closes them back
+   before user mode -- which is also what every LOOP round already did.  A
+   caller therefore hands over the residue and nothing about the page. *)
+From Stdlib Require Import ZArith Bool Lia.
+From stdpp Require Import bitvector.definitions gmap.
+From iris.proofmode Require Import proofmode.
+(* [gname] -- the key's generation and children readings are ghost NAMES *)
+From iris.base_logic.lib Require Import own.
+From iris.program_logic Require Import language lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto RiscvFetchExec RiscvExtras.
+Require Import RegFile.
+Require Import MinstretInv InstrBytes WireInv.
+Require Import WpGpr.
+Require Import KernelText.
+Require Import PtTree.
+Require Import TrampPt UptTree KptShare UserretDefs.
+Require Import UserPtTree UserExec.
+Require Import IntrDefs.
+Require Import ProcGeom ProcPtOwn.
+Require Import ProcDefs.   (* [ustate] -- the residue's index *)
+Require Import FdSlots FileInvDefs.
+Require Import IrefSlots.
+Require Import ProcAvail.
+Require Import SpecUsertrap.
+Require Import MstatusBits.   (* [usertrap_ret_ms] *)
+Require Import UtResFits.  (* [USERTRAP_RES_PARK] -- the residue plus its producer *)
+(* [loop_ok] MOVED DOWN into UexecWp.v -- the per-process user-execution WP
+   slot's statement needs it, and that file has to sit below UsertrapRes.v.
+   Exported, not merely imported, so every consumer of this interface keeps
+   seeing [loop_ok] under the same name from the same place
+   (claude-notes/completed/user-wp-slot.md SS1.1). *)
+Require Export UexecWp.
+Require Import UserPerm.   (* [perm_of] -- the key's permission projection *)
+Require Import UserFd.   (* [ufdG] -- the class a minted user slot needs *)
+Require Import UexecRet.   (* [ukc] -- the U-mode continuation the entry runs.
+                              REQUIRED DIRECTLY: [ukc]'s body is the sealed
+                              [uvb], and the seal does not travel through a
+                              re-export (durable-notes). *)
+From Kernel Require KernelSyms.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import CtxIdDefs.   (* [CurCtx]: the residue owns a thread token *)
+Local Open Scope Z_scope.
+Import Defs.
+
+(* ===================================================================== *)
+(* THE DELEGATION WORD DELEGATES EVERY USER EXCEPTION.                  *)
+(*                                                                         *)
+(* [IntrDefs.MEDELEG_S] is what [start()]'s [csrw medeleg, 0xffff] leaves   *)
+(* ([legalize_medeleg] ignores its old-value argument), so this is a closed *)
+(* computation over the twelve exception kinds [UserExec.user_exc] admits.  *)
+(* It is the [uc_del] field of every [ucfg] the loop builds.                *)
+(* ===================================================================== *)
+Lemma medeleg_S_delegates (e : ExceptionType) :
+  user_exc e = true ->
+  bit_to_bool (access_vec_dec MEDELEG_S
+    (uint (exceptionType_bits_forwards e))) = true.
+Proof.
+  (* the payload has to go first: [exceptionType_bits_forwards] MATCHES on
+     the constructor's unit argument, so with it a variable the whole
+     computation is stuck. *)
+  destruct e; intro He; try discriminate He;
+    repeat (match goal with
+            | u : unit |- _ => destruct u
+            | b : breakpoint_cause |- _ => destruct b
+            end);
+    vm_compute; reflexivity.
+Qed.
+
+(* ===================================================================== *)
+(* THE SHAPE OF THE CONFIG RECORD EVERY ROUND RUNS AT --- the one every
+   entrant into the loop has to build, so it belongs beside [loop_ok].                  *)
+(* ===================================================================== *)
+Definition loop_tvd :
+  trapVectorMode_forwards (_get_Mtvec_Mode (mword_of_int TRAMPOLINE : mword 64))
+    = TV_Direct.
+Proof. vm_compute. reflexivity. Defined.
+
+Definition loop_ucfg (mdv0 : mword 64)
+    (Hmm : and_vec MIE_S (not_vec mdv0) = zeros' 64) : ucfg :=
+  UCfg (mword_of_int TRAMPOLINE) MIE_S mdv0 MEDELEG_S (DfracOwn 1)
+       loop_tvd Hmm medeleg_S_delegates.
+
+Lemma loop_ok_loop_ucfg (mdv0 : mword 64)
+    (Hmm : and_vec MIE_S (not_vec mdv0) = zeros' 64) (pt : uptd) :
+  ud_data pt = ud_pas pt -> proc_pt_wf pt -> loop_ok (loop_ucfg mdv0 Hmm) pt.
+Proof.
+  intros H1 H2. rewrite /loop_ok /=.
+  split; [reflexivity | split; [reflexivity | split; [reflexivity |
+    split; [reflexivity | split; [exact H1 | exact H2]]]]].
+Qed.
+
+Definition wp_userret_closed_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (* the kernel-side residue, abstract exactly as [SpecUservec] takes it *)
+    (URes : CpuId -> uptd -> mword 64 -> ustate -> list fdstate -> gset gname -> mword 32 -> iProp Σ)
+    (C : ucfg) (pt : uptd)
+    (kroot : mword 44) (j : nat) (ksp : mword 64)
+    (m : regfile) (usatp mstatus0 sepc0 sc_v stval_v : mword 64) (U : ustate)
+    (* THE DESCRIPTOR VIEW the deposited slot is keyed at.  ∀-bound at the
+       entry: whoever holds the slot holds it at some [uvis_of U sts], and
+       the entry runs it at the same one. *)
+    (fdv : list fdstate) (sts : list fdstate)
+    (* ...and the two WAIT-EXIT readings the slot is keyed at, beside
+       [fdv] and for its reason *)
+    (gn : gname) (cs : gset gname) (pidv : mword 32) :=
+  (* ---- the loop's own shape, re-established every round ---- *)
+  loop_ok C pt ->
+  (j < NPROC)%nat ->
+  (* THE RESUMED RECORD'S GENERATION IS THE BLOCK'S OWN.  The slot this
+     entry runs is keyed at [gn] and the block names [ProcDefs.pv_gen]; the
+     exit deposit crosses from one to the other at kexit
+     ([SpecKexit]'s escrow), so the loop's residue records it
+     ([ProofUserretClosed.Rut_at]).  [ParkCap.park_cap] passes the block's
+     own [pv_gen], so it is [eq_refl] at every real call. *)
+  pv_gen (us_V U) = gn ->
+  (* ---- the pre-sret mstatus: userret's own premises (the sret decodes to
+         User and does not trap) plus the pins the user-mode invariant
+         carries across the sret -- which is exactly what usertrap's exit
+         guarantees, and what both callers (the loop and forkret) hold.
+         Stated as the ONE predicate rather than its thirteen conjuncts. *)
+  usertrap_ret_ms mstatus0 ->
+  upt_map_wf (ud_um pt) ->
+  m !!! Regidx (mword_of_int 10) = usatp ->
+  satp_rooted usatp (ud_root pt) ->
+  uva_pa_inj pt ->
+  upt_acc_wf (ud_um pt) ->
+  kernel_text -∗
+  hw_config -∗
+  minstret_inv -∗
+  wire_inv -∗
+  kmap_at tramp_vpn tramp_ppn KP_rx -∗
+  kpt_inv kroot -∗
+  hart_state ↦ᵣ HART_ACTIVE tt -∗
+  cur_privilege ↦ᵣ Supervisor -∗
+  mstatus ↦ᵣ mstatus0 -∗
+  mie ↦ᵣ uc_mie C -∗
+  mideleg ↦ᵣ uc_mideleg C -∗
+  menvcfg ↦ᵣ MENVCFG_S -∗
+  senvcfg ↦ᵣ□ (mword_of_int 0 : mword 64) -∗
+  sepc ↦ᵣ sepc0 -∗
+  scause ↦ᵣ sc_v -∗
+  stval ↦ᵣ stval_v -∗
+  stvec ↦ᵣ uc_stvec C -∗
+  medeleg ↦ᵣ□ uc_medeleg C -∗
+  mstateen0 ↦ᵣ□ (mword_of_int 0 : mword 64) -∗
+  sstateen0 ↦ᵣ□ (mword_of_int 0 : mword 32) -∗
+  tlb_res_pt kroot -∗
+  pt_frame (upt_tree_spec (ud_root pt) (ud_tfp pt) (ud_um pt)) -∗
+  (* THE PAGES, AT THE NAMED LAZY IMAGE (milestone J, S3).  It used to be
+     [UserPtTree.umem_any pt], the ∃-weakened form.  Both callers already
+     hold the named one -- forkret splits it straight off
+     [ProcInv.proc_priv]'s [ProcPtOwn.proc_ptm], which IS
+     [⌜proc_pt_wf⌝ ∗ pt_frame ∗ umem_lazy] at the process's own [p->sz] --
+     so taking it here deletes a weakening rather than adding an obligation,
+     and it is the shape milestone J's loop hands on.  The two other
+     conjuncts of [proc_ptm] are the [pt_frame] row above and [loop_ok]'s
+     own [proc_pt_wf]. *)
+  umem_lazy pt (uint (pv_sz (us_V U))) (us_M U) -∗
+  pc_is (uva 0x9c) -∗
+  gpr_file m -∗
+  (* ---- THE CONTINUATION THE FIRST ROUND RUNS (milestone J, stage S5).
+         The loop MINTS nothing at its entry: what runs is the per-process
+         slot the park deposited, read at the natural state userret is about
+         to resume it at -- the file the trapframe restores, the sret'd pc,
+         the record's own image and the permission map this table and size
+         project to.  [UexecRet.ukc] is [UexecRet.uslot] at a natural state
+         ([uslot_ukc]), so a caller holding [uslot (uvis_of U)] re-keys with
+         that one lemma plus the equation between its own [sepc] value and
+         the trapframe's epc word. ---- *)
+  ukc (perm_of (ud_um pt) (uint (pv_sz (us_V U)))) (us_M U)
+      (uint (pv_sz (us_V U))) fdv (pv_cwi (us_V U)) gn cs pidv
+      (* ...AT THE RECORD'S OWN LAZY BIT ([ProcDefs.pv_lazy]).  The
+         continuation is handed the record it is being resumed under, so
+         the bit it is keyed at IS the one that record stores -- the same
+         reading the cwd's inum gets one field over. *)
+      (pv_lazy (us_V U)) (pv_secc (us_V U))
+      (tf_resume_gpr0 (pv_tf (us_V U))) (ret_pc sepc0) -∗
+  (* ---- the kernel-side bundle, at THIS hart ---- *)
+  URes CID pt ksp U sts cs pidv -∗
+  mWP (Loop : expr riscv_lang).
+
+
+Module Type USERRET_CLOSED.
+  (* the residue is the module-type parameter it is everywhere else *)
+  (* ...AND THE PARK'S ONE PRODUCER-SIDE ENTRY, threaded with the rest.
+     [UtResFits.USERTRAP_RES_PARK] is [USERTRAP_RES] plus
+     [usertrap_res_bare_park]: the residue stays opaque to every CONSUMER,
+     and the one party that has to BUILD one -- whoever parks a process that
+     has never trapped -- gets a closer instead.  See that file's "THE
+     PARK'S CHANNEL THROUGH THE MODULE TYPES". *)
+  Include UtResFits.USERTRAP_RES_PARK.
+  Parameter wp_userret_closed :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (C : ucfg) (pt : uptd)
+      (kroot : mword 44) (j : nat) (ksp : mword 64)
+      (m : regfile) (usatp mstatus0 sepc0 sc_v stval_v : mword 64) (U : ustate)
+      (* ONE LIST: [sts] indexes the residue and [fdv] keys the slot, and at
+         the entry they are the same descriptor states -- see
+         [ParkCap.park_pkg]'s shared existential, which is where the entry's
+         two halves come from. *)
+      (sts : list fdstate) (gn : gname) (cs : gset gname) (pidv : mword 32),
+      wp_userret_closed_body (fun h : CpuId => usertrap_res_bare (CID := h))
+        C pt kroot j ksp m usatp mstatus0 sepc0 sc_v stval_v U sts sts gn cs
+        pidv.
+End USERRET_CLOSED.

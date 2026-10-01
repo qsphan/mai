@@ -1,0 +1,762 @@
+(* ProofKforkB4.v -- kfork's idup / safestrcpy / pid-read stretch,
+   +0xa4 .. +0xc8 (block ends at pc = +0xca):
+
+     +0xa4  ld a0,336(s5)          a0 := p->cwd
+     +0xa8  jal ra,idup
+     +0xac  sd a0,336(s4)          np->cwd := idup's result
+     +0xb0  c.li a2,16             n := 16
+     +0xb2  addi a1,s5,344         a1 := p->name
+     +0xb6  addi a0,s4,344         a0 := np->name
+     +0xba  jal ra,safestrcpy
+     +0xc6  lw s1,48(s4)           s1 := np->pid  (THE RETURN VALUE)
+
+   Interrupts are OFF throughout (the child's lock, taken by allocproc, is
+   still held): every leaf and every callee's own [wp_next] collapses via
+   [wp_next_off_intro] at the FIXED hart [CID0], so nothing here ever
+   transports [cpu_own] or generates a fresh [CpuId].
+
+   Straight line, two calls, no branches -- so this file never states
+   [callee_saved] wrt the WHOLE FUNCTION's entry map, only wrt THIS block's
+   own entry map [m].  [s1] is the one callee-saved register this block
+   itself overwrites (with the child's pid); every other callee-saved
+   register survives because idup and safestrcpy each promise their own
+   [callee_saved] and neither touches [s1].
+
+   THE RESOURCE STORY.  [p->cwd] names icache slot [ck] ([pv_cwd Vp = ientry
+   ck], a premise of kfork's own contract because [ProcInv.cwd_ref] is [emp]
+   and cannot produce idup's argument -- see SpecKfork.v's header).  idup
+   hands back TWO halves of [inode_ref ck (cq/2) icfg_dev cinum]; this block
+   keeps one and drops the other (the child's [cwd_ref] is [emp], so there
+   is nowhere to put it).  safestrcpy's characterisation of the child's
+   new name bytes ([ssc_stop]/[ssc_post]) USED TO BE dropped on the way out.
+   It is not any more: [ProcDefs.pname_cells] carries [ProcGeom.pname_wf]
+   ("there is a NUL in p->name") and [kfk_name_wf] reads it straight off that
+   disjunction -- [ssc_post]'s zero at the stop index, [ssc_stop]'s index
+   inside the buffer.  The child's final block is still handed back as an
+   EXISTENTIAL [Vc'] agreeing with [Vc] on every field except [pv_cwd] (now
+   [ientry ck]) and [pv_name] (now some list of length [PNAMELEN], and
+   NUL-terminated).
+
+   [ProcInv.v] has an accessor for [p->cwd] ([proc_priv_cwd]) but none for
+   [p->name]; [kfk_name_open] below is the missing one, built by hand
+   exactly the way [proc_priv_cwd] is (open [proc_fields], peel off
+   [pname_cells], rebuild with the other six record fields carried
+   through) -- see the header note on [kfk_name_open] for why a
+   [ProcInv.proc_priv_name] accessor of this shape would be worth adding
+   upstream. *)
+From Stdlib Require Import Eqdep_dec ZArith Lia List.
+From stdpp Require Import gmap list list_monad bitvector.definitions bitvector.tactics.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import ghost_var gen_heap invariants.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import RegFile.
+Require Import WpNext.
+Require Import RiscvExtras.
+Require Import CalleeSaved.
+Require Import InstrBytes.
+Require Import KernelText.
+Require Import WpSconfAlu WpSconfMem WpSconfCtl.
+Require Import WpSmodeIntr.
+Require Import IntrDefs.
+Require Import CpuOwn.
+Require Import ProcGeom.
+Require Import FdSlots.
+Require Import FileInvDefs.
+Require Import WpLock.
+Require Import ProcInv.
+Require Import FirstTok.  (* [first_done] / [first_tok_of_done] *)
+Require Import Xv6Cameras.
+Require Import InodeRegion.
+Require Import IrefSlots.
+Require Import IcacheInv.
+Require Import IcacheEscrow.
+Require Import SpecIdup.
+Require Import SpecSafestrcpy.
+Require Import ProofKforkParts.
+Require Import CodeKfork.
+Require Import LogInv.  (* [logG]: [ireg_inv]'s own instance argument *)
+Require Import IcacheHeld.   (* [inode_held_at] *)
+From Kernel Require KernelSyms.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Local Open Scope Z_scope.
+Require Import TsoCtx.
+
+(* A syscall-altitude goal can carry a large [proc_priv]/[proc_pt_at]
+   conjunction; durable-notes.md's rule. *)
+Set Printing Depth 40.
+
+Notation KF := KernelSyms.kfork (only parsing).
+
+(* ===================================================================== *)
+(*  PURE HELPERS -- no [Σ], reusable regardless of the resource layer.    *)
+(* ===================================================================== *)
+
+(* [pprivate] is a plain record, so reassembling it from its own six
+   projections is a no-op -- the [MkPPriv]-eta law every [upd_*] identity
+   in this file reduces to. *)
+Lemma pprivate_eta (V : pprivate) :
+  MkPPriv (pv_sz V) (pv_upt V) (pv_tf V) (pv_ofile V) (pv_fdg V) (pv_cwd V) (pv_name V)
+          (pv_cwi V) (pv_gen V) (pv_chg V) (pv_lazy V) (pv_secc V) (pv_ev V) = V.
+Proof. destruct V; reflexivity. Qed.
+
+Lemma upd_cwd_id (V : pprivate) : upd_cwd V (pv_cwd V) = V.
+Proof. rewrite /upd_cwd. apply pprivate_eta. Qed.
+
+(* Turning a stored list into the [nat -> bv 8] naming function
+   [SpecSafestrcpy.v]'s buffers are stated over, and back.  [default]'s
+   fallback is never read: every use is guarded by [i < length bs]. *)
+Definition kfk_name_fn (bs : list (bv 8)) : nat -> bv 8 :=
+  fun i => default (bv_0 8) (bs !! i).
+
+Lemma kfk_name_fn_spec (bs : list (bv 8)) (i : nat) :
+  (i < length bs)%nat -> bs !! i = Some (kfk_name_fn bs i).
+Proof.
+  intro Hi. unfold kfk_name_fn.
+  destruct (bs !! i) as [x |] eqn:E.
+  - reflexivity.
+  - exfalso. apply lookup_ge_None in E. lia.
+Qed.
+
+(* Stack budget: idup wants 14 below kfork's 8-slot frame, safestrcpy wants
+   2.  Named lemmas over plain [nat], per durable-notes.md ("Cannot find
+   witness" under the bitvector zify hook whenever a [bv_unsigned] is merely
+   in context -- these have none, so plain [lia] is fine here). *)
+Lemma kfk_b4_stack_idup (K : nat) : (22 <= K)%nat -> (14 <= K - 8)%nat.
+Proof. lia. Qed.
+
+Lemma kfk_b4_stack_ss (K : nat) : (22 <= K)%nat -> (2 <= K - 8)%nat.
+Proof. lia. Qed.
+
+(* The one-line bridge the brief calls for: [kfk_name_base] is stated over
+   the bare 64-bit literal, while [addi a1,s5,344]'s leaf produces a
+   sign-extended 12-bit one. *)
+Lemma kfk_344_sext : (sign_extend' 64 (mword_of_int 344 : mword 12) : mword 64) = mword_of_int 344.
+Proof. apply bv_eq; vm_compute; reflexivity. Qed.
+
+(* ===================================================================== *)
+(*  THE MISSING ACCESSOR: [p->name], built exactly like [proc_priv_cwd].  *)
+(* ===================================================================== *)
+Section KforkB4Res.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ}.
+  Context `{XI : CurCtx}.
+  (* [ProcInv.proc_priv]'s new index -- the block carries
+     [FirstTok.first_tok] and its boot arm names [gen_cert]. *)
+  Context `{GEN : GenId}.
+
+  (* Worth adding to ProcInv.v as [proc_priv_name], next to [proc_priv_cwd]:
+     same shape (open [proc_fields], hand out the one field, take back a
+     REPLACEMENT of the same length), and every future name-writer (there is
+     only kfork today) would want it. *)
+  Lemma kfk_name_open (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    pname_cells pa (DfracOwn 1) (pv_name (us_V U)) ∗
+    ⌜length (pv_name (us_V U)) = PNAMELEN⌝ ∗
+    (∀ ns : list (bv 8), ⌜length ns = PNAMELEN⌝ -∗ pname_cells pa (DfracOwn 1) ns -∗
+       proc_priv γf pa pid (upd_usV U (MkPPriv (pv_sz (us_V U)) (pv_upt (us_V U)) (pv_tf (us_V U)) (pv_ofile (us_V U)) (pv_fdg (us_V U)) (pv_cwd (us_V U)) ns (pv_cwi (us_V U)) (pv_gen (us_V U)) (pv_chg (us_V U)) (pv_lazy (us_V U)) (pv_secc (us_V U)) (pv_ev (us_V U))))).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hc & Hft & Hgq & Hxs & Hgh) Ho]".
+    rewrite /proc_fields. iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    iSplitL "Hnm"; [iExact "Hnm" |].
+    iSplitR; [done |].
+    iIntros (ns) "%Hnl' Hnm'".
+    rewrite /proc_priv /proc_priv_core /proc_fields.
+    cbn [pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_gen pv_chg pv_secc].
+    iSplitR "Ho"; [| iExact "Ho"].
+    iSplitR; [done|]. iSplitR; [done|]. iFrame "Hpid".
+    iSplitL "Hsz Hcwd Hnm' Hsecc".
+    { iFrame "Hsz Hcwd Hnm' Hsecc". iPureIntro. exact Hnl'. }
+    iSplitL "Hpt"; [iExact "Hpt"|].
+    iSplitL "Htfp"; [iExact "Htfp"|].
+    iSplitL "Hc"; [iExact "Hc"|].
+    iSplitL "Hft"; [iExact "Hft"|].
+    iSplitL "Hgq"; [iExact "Hgq"|].
+    iSplitL "Hxs"; [iExact "Hxs"|]. iExact "Hgh".
+  Qed.
+
+  (* THE CHILD'S OWN cwd REFERENCE, out of the reference idup MINTS.
+
+     This is what the hole that used to sit here has become.  While
+     [ProcInv.cwd_ref] was [emp] the child's reference could be conjured at
+     any [v] and idup's result was dropped on the floor; now the two
+     are the same predicate and the store at +0xac consumes it, which
+     is the whole reason idup returns one.  No coherence premise is needed
+     to tie the itable the caller holds the LOCK for to the authority
+     [cwd_ref] is stated over: both are the same canonical
+     [IcacheInv.iref_name] by construction ([InodeRef.v]'s header explains
+     why). *)
+  (* RETIRED BY SIMP-2: [kfk_child_cwd] packed a bare reference and a bare
+     unit into a [cwd_ref].  Both of idup's results are [inode_held] now, so
+     the pack is [ProcInv.cwd_ref_of_held] and nothing else. *)
+
+End KforkB4Res.
+
+(* ===================================================================== *)
+(*  THE BLOCK ITSELF.                                                     *)
+(* ===================================================================== *)
+Module KforkB4 (ID : IDUP) (SS : SAFESTRCPY).
+
+Section KforkB4Proof.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID0 : CpuId} `{XI : CurCtx}.
+
+  Notation Rra := (mword_of_int 1 : mword 5).
+  Notation Ra0 := (mword_of_int 10 : mword 5).
+  Notation Ra1 := (mword_of_int 11 : mword 5).
+  Notation Ra2 := (mword_of_int 12 : mword 5).
+  Notation Rs1 := (mword_of_int 9 : mword 5).
+  Notation Rs3 := (mword_of_int 19 : mword 5).
+  Notation Rs4 := (mword_of_int 20 : mword 5).
+  Notation Rs5 := (mword_of_int 21 : mword 5).
+  Notation Ra5 := (mword_of_int 15 : mword 5).
+
+  Local Ltac regne := reg_ne_side.
+
+  (* [rsv] IS THE CALLER'S TRAP RESERVE, TAKEN AS A PARAMETER.
+     This block runs entirely with np->lock held, so its own arm is PINNED at
+     [false] -- and precisely because of that it cannot name the reserve its
+     caller is carrying ([trap_res] of the caller's arm, which is invisible
+     here).  It is index-generic in [rsv] and never inspects it; kfork
+     instantiates [rsv := trap_res b].  Same shape as [ProofAllocproc.ap_tail]
+     and [ProofKforkB3.kfkb3_fd_loop]. *)
+  Lemma kfk_b4
+      (γf : gname)
+      (pid_p pid_c : mword 32) (Up Uc : ustate)
+      (pme npa : mword 64)
+      (m : regfile) (rsv K lvl : nat) (eb : bool) (lks : gset string) :
+    (22 <= K)%nat ->
+    (Z.of_nat lvl + 1 < 2 ^ 31)%Z ->
+    (* the itable this block holds the lock for IS the one [cwd_ref] names,
+       by construction: both are stated over the canonical
+       [IcacheInv.iref_name].  This replaces the old [pv_cwd Vp = ientry ck]
+       premise and the [inode_ref] that came with it: the parent's
+       reference is inside its OWN block now, and the slot it names is read
+       off it. *)
+    m !!! Regidx Rs5 = pme ->
+    m !!! Regidx Rs3 = npa ->
+    (* THE FRESHNESS PREMISE: this block's [idup(p->cwd)] acquires and
+       releases [itable.lock] internally (balanced -- [lks] is unchanged),
+       so the caller must already hold only locks BELOW its rank. *)
+    locks_below lks "itable" ->
+    (* THE PARENT HAS A WORKING DIRECTORY.  [ProcInv.cwd_ref] is two-armed
+       on the pointer -- a process between [p->cwd = 0] and its next chdir
+       owns no reference -- and xv6's fork does [np->cwd = idup(p->cwd)]
+       with no null test, so this is the honest reading of the code. *)
+    sie_cap_gpr KT1 m (rsv + (K - 8))%nat false pme -∗
+    cpu_own lvl eb pme false lks -∗
+    kernel_text -∗
+    pc_is (mword_of_int (KF + 0xa4) : mword 64) -∗
+    is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst icfg_nib icfg_dev -∗
+    itable_inv -∗
+    (* THE INODE REGION -- pure pass-through to the [idup] below, whose
+       [ref++] became a ledger move in increment IVe (iclaim-ledger.md
+       §3.19).  Persistent; this block reads no dinode. *)
+    ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+    (* the child's iref units: the [1] is what [idup] spends here, and
+       [IREFSPARE] rides through to the park. *)
+    iref_slots (1 + IREFSPARE) -∗
+    proc_priv γf pme pid_p Up -∗
+    (* THE CHILD'S TOKEN'S SOURCE.  The parent's [FirstTok.first_tok] is
+       inside its own block and may be the EXCLUSIVE boot arm, so it cannot
+       be copied; [first_done] is the steady arm alone, persistent, and
+       [first_tok_of_done] is what mints the child's at the store below. *)
+    first_done -∗
+    (* THE CHILD IS STILL IN THE CONSTRUCTION WINDOW: allocproc left
+       [np->cwd] at 0 and nothing has set it, so there is no [proc_priv] at
+       this [Vc].  The [sd a0,336(s4)] below is what closes the window. *)
+    proc_priv_nocwd γf npa pid_c Uc -∗
+    (* ...AND THE CHILD'S GENERATION, cut: the KERNEL'S QUARTER and the
+       persistent [ChildTok.my_pay] beside it.  The pair joins the block at
+       the same store the working directory and the token do
+       ([ProcInv.proc_priv_split_cwd] is four-way), so a caller that has
+       already chosen the child's payload and split its generation
+       ([ChildTok.gen_set], [gen_split]) hands the two halves it keeps
+       here. *)
+    (∃ Q0 : Z -> iProp Σ,
+       gen_kq (pv_gen (us_V Uc)) npa pid_c Q0 ∗ my_pay (pv_gen (us_V Uc)) Q0) -∗
+    (* ...AND THE CHILD SLOT'S HALF OF [p->xstate], on the pair's footing:
+       it comes out of the dormant block with allocproc's hand-over and
+       joins the block at this same store ([ProcInv.proc_priv_split_cwd] is
+       five-way). *)
+    (∃ xsv : mword 32, p_xstate npa ↦₄{DfracOwn (1/2)} xsv) -∗
+    (* ...AND THE CHILD'S TWO QUARTERS ([SlotGen.gen_halves_priv]), on the
+       pair's footing and at the same store: the caller split them off the
+       wholes allocproc handed it and deposited the three quarters under
+       <wait_lock> ([WaitInv.gen_halves]). *)
+    gen_halves_priv npa pid_c (pv_gen (us_V Uc)) -∗
+    wp_next false pme (fun (CID : CpuId) =>
+      ∀ mf : regfile,
+        ⌜(forall r : mword 5, is_cs_idx r = true -> r <> Rs1 ->
+            mf !!! Regidx r = m !!! Regidx r) /\
+         mf !!! Regidx Rs1 = sign_extend' 64 pid_c⌝ -∗
+        sie_cap_gpr KT1 mf (rsv + (K - 8))%nat false pme -∗
+        cpu_own lvl eb pme false lks -∗
+        pc_is (mword_of_int (KF + 0xca) : mword 64) -∗
+        proc_priv γf pme pid_p Up -∗
+        (∃ Vc' : pprivate,
+           ⌜pv_sz Vc' = pv_sz (us_V Uc) /\ pv_upt Vc' = pv_upt (us_V Uc) /\
+            pv_tf Vc' = pv_tf (us_V Uc) /\ pv_ofile Vc' = pv_ofile (us_V Uc) /\
+            pv_cwd Vc' = pv_cwd (us_V Up) /\ pv_fdg Vc' = pv_fdg (us_V Uc) /\
+            length (pv_name Vc') = PNAMELEN /\
+            (* ...and the cwd's inum, COPIED from the parent (lane C1):
+               idup's copy carries the identity the parent's reference
+               does, and the child's block is built at it. *)
+            pv_cwi Vc' = pv_cwi (us_V Up) /\
+            (* ...AND THE TWO GHOST NAMES, which this block does not touch:
+               safestrcpy writes the name bytes and idup the cwd, and the
+               generation is what the park keys the child's slot at
+               ([ParkCap.park_cap] passes [ProcDefs.pv_gen]). *)
+            pv_gen Vc' = pv_gen (us_V Uc) /\
+            pv_chg Vc' = pv_chg (us_V Uc) /\
+            (* ...AND THE LAZY BIT, which this block does not touch either
+               (lane LAZY-FLAG): kfork writes it once, at the close after
+               uvmcopy ([ProofKforkB6]), and the child's run key reads it
+               ([KforkChild.urun_eq_kfork_child]). *)
+            pv_lazy Vc' = pv_lazy (us_V Uc) /\
+            (* ...AND THE MASK, COPIED from the parent (upstream a083670):
+               [ld a5,360(s5); sd a5,360(s3)] at +0xbe/+0xc2. *)
+            pv_secc Vc' = pv_secc (us_V Up)⌝ ∗
+           proc_priv γf npa pid_c (MkUstate Vc' ((us_M Uc)))) -∗
+        iref_slots IREFSPARE -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HK Hlvl Hms5 Hms4 Hfresh.
+    iIntros "Hcg Hown #Htext Hpc #Hitb #Hitinv #Hireg Hir Hparent #Hfdone
+             Hchild Hgq Hxb Hgh Hcont".
+    iDestruct (iref_slots_split 1 IREFSPARE with "Hir") as "[Hirs Hirsp]".
+    (* ------------------------------------------------------------- *)
+    (* +0xa4: ld a0,336(s5) -- a0 := p->cwd.                          *)
+    (* ------------------------------------------------------------- *)
+    (* THE PARENT'S OWN REFERENCE, out of its own block.  The slot index,
+       the device and the inum come out with it -- [cwd_ref] hides them
+       existentially and [IcacheInv.ientry_inj] is what makes hiding them
+       lossless -- so [pv_cwd Vp = ientry ck] is now DERIVED here rather
+       than premised on the caller. *)
+    iDestruct (proc_priv_cwd γf pme pid_p Up with "Hparent") as "(Hpcwd & Hpcref & Hpback)".
+    (* the LIVE arm, picked out by the premise, and its three hidden data:
+       the slot, the retained fraction and the inum.  The DEVICE is not
+       hidden -- it is the cache's [icfg_dev] (design §13.11's
+       single-device pin), which is what lets the itable this block holds
+       the lock for be named without a coherence premise. *)
+    iDestruct (cwd_ref_at_held_at (pv_cwd (us_V Up)) (pv_cwi (us_V Up)) with "Hpcref") as "Hpcref".
+    (* SIMP-2: the three hidden data are still read off the package -- the
+       SLOT is what [a0] is set to and the two pure facts are what the
+       child's [cwd_ref] wants back -- but the package itself now travels
+       WHOLE.  What used to stand here (the shed, and the gather after the
+       call) is idup's own business since [SpecIdup] took [inode_held]. *)
+    iDestruct "Hpcref" as (ck cq cinum) "(%Hcwd & %Hcklt & %Hcinumb & %Hcpos & %Hcinz & Hrefp)".
+    iAssert (inode_held_at (ientry ck) (pv_cwi (us_V Up))) with "[Hrefp]" as "Hpheld".
+    { iExists ck, cq, cinum.
+      iSplitR; [done |]. iSplitR; [iPureIntro; exact Hcklt |].
+      iSplitR; [iPureIntro; exact Hcinumb |]. iSplitR; [iPureIntro; exact Hcpos |].
+      iSplitR; [iPureIntro; exact Hcinz |].
+      iExact "Hrefp". }
+    (* THE SHED THAT USED TO STAND HERE IS GONE (SIMP-2).  idup still runs
+       on a count-0 share and still mints the child's reference from the
+       table's retained slice (design §14.7(3)) -- but the carve, and the
+       gather that made the parent whole again, are now inside the contract,
+       which is why this block hands over one row and gets two back.  The
+       parent's fraction is still the fraction it came in with. *)
+    assert (Hpa0a4 : add_vec (rget m Rs5) (sign_extend' 64 (mword_of_int 336 : mword 12))
+                     = p_cwd pme).
+    { rewrite (rget_ne m Rs5 ltac:(vm_compute; discriminate)) Hms5. apply p_cwd_sext. }
+    iEval (rewrite -Hpa0a4) in "Hpcwd".
+    iApply (wp_ld_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KF + 0xa4)) Ra0 Rs5 (mword_of_int 336 : mword 12)
+              m (rsv + (K - 8))%nat (pv_cwd (us_V Up)) false (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] Hpcwd").
+    { iApply (kfk_0a4 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc Hpcwd".
+    iEval (rewrite Hpa0a4) in "Hpcwd".
+    (* the parent's block cannot close yet: its reference is on its way
+       into idup.  It closes at [Hparent2] below, around idup's FIRST half
+       -- the cell never changed, only the fraction, which [cwd_ref] hides. *)
+    set (M0 := <[Regidx Ra0 := regval_into_reg (pv_cwd (us_V Up))]> m).
+    change (<[Regidx Ra0 := regval_into_reg (pv_cwd (us_V Up))]> m) with M0.
+    assert (HM0a0 : M0 !!! Regidx Ra0 = ientry ck) by (rewrite /M0 upd_eq; exact Hcwd).
+    assert (HM0s4 : M0 !!! Regidx Rs3 = npa)
+      by (rewrite /M0 upd_ne; [exact Hms4 | vm_compute; discriminate]).
+    assert (HM0s5 : M0 !!! Regidx Rs5 = pme)
+      by (rewrite /M0 upd_ne; [exact Hms5 | vm_compute; discriminate]).
+    assert (Hpp0a8 : add_vec_int (mword_of_int (KF + 0xa4) : mword 64) 4 = mword_of_int (KF + 0xa8))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp0a8) in "Hpc".
+    (* ------------------------------------------------------------- *)
+    (* +0xa8: jal ra,idup.                                            *)
+    (* ------------------------------------------------------------- *)
+    assert (Hjidup : add_vec (mword_of_int (KF + 0xa8) : mword 64)
+                       (sign_extend' 64 (mword_of_int 5438 : mword 21))
+                     = mword_of_int KernelSyms.idup)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_jal_s_sconf (mword_of_int (KF + 0xa8)) Rra (mword_of_int 5438 : mword 21)
+              M0 (rsv + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (kfk_0a8 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    iEval (rewrite Hjidup) in "Hpc".
+    set (M1 := <[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xa8) : mword 64) 4)]> M0).
+    change (<[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xa8) : mword 64) 4)]> M0)
+      with M1.
+    assert (HM1ra : M1 !!! Regidx Rra = add_vec_int (mword_of_int (KF + 0xa8) : mword 64) 4)
+      by (rewrite /M1; apply upd_eq).
+    assert (HM1a0 : M1 !!! Regidx Ra0 = ientry ck)
+      by (rewrite /M1 upd_ne; [exact HM0a0 | vm_compute; discriminate]).
+    assert (HM1s4 : M1 !!! Regidx Rs3 = npa)
+      by (rewrite /M1 upd_ne; [exact HM0s4 | vm_compute; discriminate]).
+    assert (HM1s5 : M1 !!! Regidx Rs5 = pme)
+      by (rewrite /M1 upd_ne; [exact HM0s5 | vm_compute; discriminate]).
+    (* ------------------------------------------------------------- *)
+    (* THE idup CALL.                                                 *)
+    (* ------------------------------------------------------------- *)
+    iApply (ID.wp_idup_sconf
+              ck (pv_cwi (us_V Up)) M1 lvl eb pme (rsv + (K - 8))%nat false lks
+              (* the callee's bound is stated with a NAMED constant, so go through
+                 [etransitivity] rather than [lia]: [exact] converts the name to
+                 its literal, and only the [rsv] slack is left for [lia]. *)
+              ltac:(etransitivity; [exact (kfk_b4_stack_idup K HK) | lia]) Hlvl Hcklt HM1a0
+ Hfresh
+              with "Hcg Hown Htext Hpc Hitb Hitinv Hireg Hirs Hpheld").
+    all: try lkbelow.
+    iApply wp_next_off_intro.
+    iIntros (mr) "Hcg Hown Hpc %Hidup_post Hpheld1 Hpheld2".
+    (* the parent's own package, whole and at its own fraction: straight
+       back into its block. *)
+    iDestruct (cwd_ref_at_of_held_at (ientry ck) _ with "Hpheld1") as "Hpcref1".
+    iEval (rewrite -Hcwd) in "Hpcref1".
+    iDestruct ("Hpback" $! (pv_cwd (us_V Up)) (pv_cwi (us_V Up)) with "Hpcwd Hpcref1")
+      as "Hparent2".
+    iEval (rewrite us_cwd_id us_cwi_id) in "Hparent2".
+    destruct Hidup_post as [Hcs_idup Hidup_a0].
+    assert (Hpc0ac : ret_pc (M1 !!! Regidx Rra) = mword_of_int (KF + 0xac)).
+    { rewrite HM1ra. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hpc0ac) in "Hpc".
+    assert (Hmrs4 : mr !!! Regidx Rs3 = npa).
+    { rewrite (callee_saved_lookup Hcs_idup Rs3 ltac:(vm_compute; reflexivity)). exact HM1s4. }
+    assert (Hmrs5 : mr !!! Regidx Rs5 = pme).
+    { rewrite (callee_saved_lookup Hcs_idup Rs5 ltac:(vm_compute; reflexivity)). exact HM1s5. }
+    (* ------------------------------------------------------------- *)
+    (* +0xac: sd a0,336(s4) -- np->cwd := a0 (= ientry ck).           *)
+    (* ------------------------------------------------------------- *)
+    iDestruct (proc_priv_nocwd_cwd γf npa pid_c Uc with "Hchild") as "(Hccwd & Hcback)".
+    assert (Hpa0ac : add_vec (rget mr Rs3) (sign_extend' 64 (mword_of_int 336 : mword 12))
+                     = p_cwd npa).
+    { rewrite (rget_ne mr Rs3 ltac:(vm_compute; discriminate)) Hmrs4. apply p_cwd_sext. }
+    iEval (rewrite -Hpa0ac) in "Hccwd".
+    iApply (wp_sd_s_sconf (mword_of_int (KF + 0xac)) Ra0 Rs3 (mword_of_int 336 : mword 12)
+              mr (rsv + (K - 8))%nat (pv_cwd (us_V Uc)) false
+              with "Hcg Hpc [] Hccwd").
+    { iApply (kfk_0ac with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc Hccwd".
+    iEval (rewrite Hpa0ac) in "Hccwd".
+    assert (Hstoreval : rget mr Ra0 = ientry ck).
+    { rewrite (rget_ne mr Ra0 ltac:(vm_compute; discriminate)). exact Hidup_a0. }
+    iEval (rewrite Hstoreval) in "Hccwd".
+    iDestruct (cwd_ref_at_of_held_at (ientry ck) _ with "Hpheld2") as "Hccref2".
+    iDestruct ("Hcback" $! (ientry ck) with "Hccwd") as "Hchild2".
+    (* ...AND AT THE PARENT'S INUM (lane C1): the deficit block does not
+       mention [pv_cwi], so it is relabelled to the inum idup's copy carries
+       -- the parent's ([proc_priv_nocwd_cwi]) -- and the rejoin is there. *)
+    iEval (rewrite -(proc_priv_nocwd_cwi γf npa pid_c _ (pv_cwi (us_V Up)))) in "Hchild2".
+    (* THE WINDOW CLOSES HERE: cell + reference = the real block. *)
+    iAssert (proc_priv γf npa pid_c (us_cwi (us_cwd Uc (ientry ck)) (pv_cwi (us_V Up))))
+      with "[Hchild2 Hccref2 Hgq Hxb Hgh]" as "Hchild2".
+    { iApply proc_priv_split_cwd. iFrame "Hchild2".
+      iSplitL "Hccref2";
+        [by cbn [us_cwi us_cwd upd_usV us_V upd_cwi upd_cwd pv_cwd pv_cwi pv_fdg pv_gen pv_chg] |].
+      iSplitR "Hgq Hxb Hgh";
+        [ (* THE MINT.  The child's token is the steady arm of the
+             disjunction, built from the persistent [first_done] the caller
+             threaded in. *)
+          iApply (first_tok_of_done with "Hfdone") | ].
+      (* ...AND THE GENERATION'S PAIR AND THE xstate HALF, at the block's own
+         name: the two updates the window makes ([np->cwd], [np->name]) do
+         not touch either. *)
+      iSplitL "Hgq";
+        [ by cbn [us_cwi us_cwd upd_usV us_V upd_cwi upd_cwd pv_gen pv_fdg pv_chg] |].
+      iSplitL "Hxb"; [ iExact "Hxb" |].
+      by cbn [us_cwi us_cwd upd_usV us_V upd_cwi upd_cwd pv_gen pv_fdg pv_chg]. }
+    set (Vc2 := upd_cwi (upd_cwd (us_V Uc) (ientry ck)) (pv_cwi (us_V Up))).
+    (* the store touches no register *)
+    set (M2 := mr).
+    assert (HM2a1 : M2 !!! Regidx Ra1 = M2 !!! Regidx Ra1) by reflexivity.
+    assert (Hpp0b0 : add_vec_int (mword_of_int (KF + 0xac) : mword 64) 4 = mword_of_int (KF + 0xb0))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp0b0) in "Hpc".
+    (* ------------------------------------------------------------- *)
+    (* +0xb0: c.li a2,16.                                             *)
+    (* ------------------------------------------------------------- *)
+    assert (Hwv16 : add_vec zero_reg (sign_extend' 64 (sign_extend' 12 (mword_of_int 16 : mword 6)))
+                    = (mword_of_int 16 : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_cli_s_sconf (mword_of_int (KF + 0xb0)) Ra2 (mword_of_int 16 : mword 6)
+              (mword_of_int 16 : mword 64) M2 (rsv + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok) Hwv16
+              with "Hcg Hpc []").
+    { iApply (kfk_0b0 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    set (M3 := <[Regidx Ra2 := regval_into_reg (mword_of_int 16 : mword 64)]> M2).
+    change (<[Regidx Ra2 := regval_into_reg (mword_of_int 16 : mword 64)]> M2) with M3.
+    assert (HM3a2 : M3 !!! Regidx Ra2 = mword_of_int 16) by (rewrite /M3; apply upd_eq).
+    assert (HM3s4 : M3 !!! Regidx Rs3 = npa)
+      by (rewrite /M3 upd_ne; [exact Hmrs4 | vm_compute; discriminate]).
+    assert (HM3s5 : M3 !!! Regidx Rs5 = pme)
+      by (rewrite /M3 upd_ne; [exact Hmrs5 | vm_compute; discriminate]).
+    assert (Hpp0b2 : add_vec_int (mword_of_int (KF + 0xb0) : mword 64) 2 = mword_of_int (KF + 0xb2))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp0b2) in "Hpc".
+    (* ------------------------------------------------------------- *)
+    (* +0xb2: addi a1,s5,344 -- a1 := p->name.                        *)
+    (* ------------------------------------------------------------- *)
+    iApply (wp_addi4_s_sconf (mword_of_int (KF + 0xb2)) Ra1 Rs5 (mword_of_int 344 : mword 12)
+              M3 (rsv + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0b2 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    set (M4 := <[Regidx Ra1 := regval_into_reg (add_vec (M3 !!! Regidx Rs5) (sign_extend' 64 (mword_of_int 344 : mword 12)))]> M3).
+    change (<[Regidx Ra1 := regval_into_reg (add_vec (M3 !!! Regidx Rs5) (sign_extend' 64 (mword_of_int 344 : mword 12)))]> M3)
+      with M4.
+    assert (HM4a1 : M4 !!! Regidx Ra1 = kfk_name_base pme).
+    { rewrite /M4 upd_eq HM3s5 kfk_344_sext. reflexivity. }
+    assert (HM4s4 : M4 !!! Regidx Rs3 = npa)
+      by (rewrite /M4 upd_ne; [exact HM3s4 | vm_compute; discriminate]).
+    assert (HM4a2 : M4 !!! Regidx Ra2 = mword_of_int 16)
+      by (rewrite /M4 upd_ne; [exact HM3a2 | vm_compute; discriminate]).
+    assert (Hpp0b6 : add_vec_int (mword_of_int (KF + 0xb2) : mword 64) 4 = mword_of_int (KF + 0xb6))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp0b6) in "Hpc".
+    (* ------------------------------------------------------------- *)
+    (* +0xb6: addi a0,s4,344 -- a0 := np->name.                       *)
+    (* ------------------------------------------------------------- *)
+    iApply (wp_addi4_s_sconf (mword_of_int (KF + 0xb6)) Ra0 Rs3 (mword_of_int 344 : mword 12)
+              M4 (rsv + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0b6 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    set (M5 := <[Regidx Ra0 := regval_into_reg (add_vec (M4 !!! Regidx Rs3) (sign_extend' 64 (mword_of_int 344 : mword 12)))]> M4).
+    change (<[Regidx Ra0 := regval_into_reg (add_vec (M4 !!! Regidx Rs3) (sign_extend' 64 (mword_of_int 344 : mword 12)))]> M4)
+      with M5.
+    assert (HM5a0 : M5 !!! Regidx Ra0 = kfk_name_base npa).
+    { rewrite /M5 upd_eq HM4s4 kfk_344_sext. reflexivity. }
+    assert (HM5a1 : M5 !!! Regidx Ra1 = kfk_name_base pme)
+      by (rewrite /M5 upd_ne; [exact HM4a1 | vm_compute; discriminate]).
+    assert (HM5a2 : M5 !!! Regidx Ra2 = mword_of_int 16)
+      by (rewrite /M5 upd_ne; [exact HM4a2 | vm_compute; discriminate]).
+    assert (Hpp0ba : add_vec_int (mword_of_int (KF + 0xb6) : mword 64) 4 = mword_of_int (KF + 0xba))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp0ba) in "Hpc".
+    (* ------------------------------------------------------------- *)
+    (* +0xba: jal ra,safestrcpy.                                      *)
+    (* ------------------------------------------------------------- *)
+    assert (Hjss : add_vec (mword_of_int (KF + 0xba) : mword 64)
+                     (sign_extend' 64 (mword_of_int 2093200 : mword 21))
+                   = mword_of_int KernelSyms.safestrcpy)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_jal_s_sconf (mword_of_int (KF + 0xba)) Rra (mword_of_int 2093200 : mword 21)
+              M5 (rsv + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (kfk_0ba with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    iEval (rewrite Hjss) in "Hpc".
+    set (M6 := <[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xba) : mword 64) 4)]> M5).
+    change (<[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xba) : mword 64) 4)]> M5)
+      with M6.
+    assert (HM6ra : M6 !!! Regidx Rra = add_vec_int (mword_of_int (KF + 0xba) : mword 64) 4)
+      by (rewrite /M6; apply upd_eq).
+    assert (HM6a0 : M6 !!! Regidx Ra0 = kfk_name_base npa)
+      by (rewrite /M6 upd_ne; [exact HM5a0 | vm_compute; discriminate]).
+    assert (HM6a1 : M6 !!! Regidx Ra1 = kfk_name_base pme)
+      by (rewrite /M6 upd_ne; [exact HM5a1 | vm_compute; discriminate]).
+    assert (HM6a2 : M6 !!! Regidx Ra2 = mword_of_int 16)
+      by (rewrite /M6 upd_ne; [exact HM5a2 | vm_compute; discriminate]).
+    assert (HM6s4 : M6 !!! Regidx Rs3 = npa)
+      by (rewrite /M6 upd_ne; [exact HM4s4 | vm_compute; discriminate]).
+    assert (HM6s5 : M6 !!! Regidx Rs5 = pme)
+      by (rewrite /M6 upd_ne; [exact HM3s5 | vm_compute; discriminate]).
+    (* open both name buffers *)
+    iDestruct (kfk_name_open γf pme pid_p Up with "Hparent2") as "(HnmP & %HnlP & HnmPback)".
+    iDestruct (kfk_name_open γf npa pid_c (MkUstate Vc2 _) with "Hchild2") as "(HnmC & %HnlC & HnmCback)".
+    (* past [pname_wf]: the parent's is carried through untouched (safestrcpy
+       only READS it), the child's is re-derived below from the call's own
+       postcondition. *)
+    iDestruct (pname_cells_open with "HnmP") as "(%HwfP & HnmP)".
+    iDestruct (pname_cells_open with "HnmC") as "(_ & HnmC)".
+    iDestruct (kfk_pname_bytes pme (DfracOwn 1) (pv_name (us_V Up)) (kfk_name_fn (pv_name (us_V Up)))
+                 (kfk_name_fn_spec (pv_name (us_V Up))) with "HnmP") as "HnmPseq".
+    iDestruct (kfk_pname_bytes npa (DfracOwn 1) (pv_name Vc2) (kfk_name_fn (pv_name Vc2))
+                 (kfk_name_fn_spec (pv_name Vc2)) with "HnmC") as "HnmCseq".
+    iEval (rewrite HnlP) in "HnmPseq".
+    iEval (rewrite HnlC) in "HnmCseq".
+    iEval (rewrite -HM6a1) in "HnmPseq".
+    iEval (rewrite -HM6a0) in "HnmCseq".
+    assert (HM6a2' : M6 !!! Regidx Ra2 = mword_of_int (Z.of_nat 16%nat))
+      by (rewrite HM6a2; apply bv_eq; vm_compute; reflexivity).
+    assert (Hn31 : (Z.of_nat 16%nat < 2 ^ 31)%Z) by (vm_compute; reflexivity).
+    (* ------------------------------------------------------------- *)
+    (* THE safestrcpy CALL.                                           *)
+    (* ------------------------------------------------------------- *)
+    (* [ns := n = 16]: kfork owns all sixteen bytes of [p->name], so the
+       source-ownership premise is [ssc_src_ok]'s first (budget) disjunct. *)
+    iApply (SS.wp_safestrcpy_sconf KT0 KT0 M6 16%nat 16%nat
+              (kfk_name_fn (pv_name (us_V Up))) (kfk_name_fn (pv_name Vc2))
+              (rsv + (K - 8))%nat (DfracOwn 1) false pme
+              ltac:(etransitivity; [exact (kfk_b4_stack_ss K HK) | lia]) HM6a2' Hn31
+              (SpecSafestrcpy.ssc_src_ok_full _ _)
+              with "Hcg Htext Hpc HnmPseq HnmCseq").
+    iApply wp_next_off_intro.
+    iIntros (mr2 h) "Hcg Hpc HnmPseq' HnmCseq' %Hcs_ss %Ha0_ss %Hpostdisj".
+    assert (Hpc0be : ret_pc (M6 !!! Regidx Rra) = mword_of_int (KF + 0xbe)).
+    { rewrite HM6ra. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hpc0be) in "Hpc".
+    assert (Hmr2s4 : mr2 !!! Regidx Rs3 = npa).
+    { rewrite (callee_saved_lookup Hcs_ss Rs3 ltac:(vm_compute; reflexivity)). exact HM6s4. }
+    assert (Hmr2s5 : mr2 !!! Regidx Rs5 = pme).
+    { rewrite (callee_saved_lookup Hcs_ss Rs5 ltac:(vm_compute; reflexivity)). exact HM6s5. }
+    (* re-fold the parent's name bytes back to EXACTLY [pv_name Vp] *)
+    iEval (rewrite HM6a1) in "HnmPseq'".
+    iDestruct (kfk_bytes_pname pme (DfracOwn 1) 16%nat (kfk_name_fn (pv_name (us_V Up)))
+                 with "HnmPseq'") as "HnmPfold".
+    assert (Hpname_eq : (kfk_name_fn (pv_name (us_V Up))) <$> seq 0 16%nat = pv_name (us_V Up)).
+    { pose proof (kfk_list_of_fn (pv_name (us_V Up)) (kfk_name_fn (pv_name (us_V Up)))
+                    (kfk_name_fn_spec (pv_name (us_V Up)))) as Heq.
+      rewrite HnlP in Heq. symmetry. exact Heq. }
+    iEval (rewrite Hpname_eq) in "HnmPfold".
+    iDestruct (pname_cells_intro _ _ _ HwfP with "HnmPfold") as "HnmPfold".
+    iDestruct ("HnmPback" $! (pv_name (us_V Up)) HnlP with "HnmPfold") as "Hparent3".
+    iEval (rewrite pprivate_eta) in "Hparent3".
+    (* fold the child's new name bytes and close, at the EXISTENTIAL [Vc'] *)
+    iEval (rewrite HM6a0) in "HnmCseq'".
+    iDestruct (kfk_bytes_pname npa (DfracOwn 1) 16%nat h with "HnmCseq'") as "HnmCfold".
+    assert (Hlen_hn : length (h <$> seq 0 16%nat) = PNAMELEN)
+      by (rewrite (kfk_name_len 16%nat h); reflexivity).
+    (* THE CHILD'S NUL, out of safestrcpy's own post.  This disjunction used
+       to be dropped here; carrying it is what retires the [p->name]
+       assumption at syscall()'s fallback. *)
+    iDestruct (pname_cells_intro _ _ _
+                 (kfk_name_wf 16%nat (kfk_name_fn (pv_name (us_V Up)))
+                    (kfk_name_fn (pv_name Vc2)) h ltac:(lia) Hpostdisj)
+                 with "HnmCfold") as "HnmCfold".
+    iDestruct ("HnmCback" $! (h <$> seq 0 16%nat) Hlen_hn with "HnmCfold") as "Hchild3".
+    set (Vc3 := MkPPriv (pv_sz Vc2) (pv_upt Vc2) (pv_tf Vc2) (pv_ofile Vc2)
+                  (pv_fdg Vc2) (pv_cwd Vc2) (h <$> seq 0 16%nat) (pv_cwi Vc2)
+                  (pv_gen Vc2) (pv_chg Vc2) (pv_lazy Vc2) (pv_secc Vc2) (pv_ev Vc2)).
+    (* ------------------------------------------------------------- *)
+    (* +0xbe: ld a5,360(s5) -- a5 := p->seccomp (upstream a083670).   *)
+    (* The parent's mask cell, borrowed out of its block and put back *)
+    (* at the value it held.                                          *)
+    (* ------------------------------------------------------------- *)
+    iDestruct (proc_priv_secc γf pme pid_p Up with "Hparent3") as "[HscP HscPback]".
+    iApply (wp_ld_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KF + 0xbe)) Ra5 Rs5 (mword_of_int 360 : mword 12)
+              mr2 (rsv + (K - 8))%nat (pv_secc (us_V Up)) false (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [HscP]").
+    { iApply (kfk_0be with "Htext"). }
+    { iEval (rewrite (rget_ne mr2 Rs5 ltac:(vm_compute; discriminate)) Hmr2s5). iExact "HscP". }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc HscP".
+    iEval (rewrite (rget_ne mr2 Rs5 ltac:(vm_compute; discriminate)) Hmr2s5) in "HscP".
+    iDestruct ("HscPback" with "HscP") as "Hparent3".
+    iEval (rewrite us_set_secc_id) in "Hparent3".
+    set (mr3 := <[Regidx Ra5 := regval_into_reg (pv_secc (us_V Up))]> mr2).
+    change (<[Regidx Ra5 := regval_into_reg (pv_secc (us_V Up))]> mr2) with mr3.
+    assert (Hmr3s4 : mr3 !!! Regidx Rs3 = npa)
+      by (rewrite /mr3 upd_ne; [exact Hmr2s4 | vm_compute; discriminate]).
+    assert (Hmr3a5 : mr3 !!! Regidx Ra5 = pv_secc (us_V Up))
+      by (rewrite /mr3; apply upd_eq).
+    assert (Hpp0c2 : add_vec_int (mword_of_int (KF + 0xbe) : mword 64) 4 = mword_of_int (KF + 0xc2))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp0c2) in "Hpc".
+    (* ------------------------------------------------------------- *)
+    (* +0xc2: sd a5,360(s3) -- np->seccomp := a5.  The child's block  *)
+    (* is written at its own cell and comes back at [set_secc].       *)
+    (* ------------------------------------------------------------- *)
+    iDestruct (proc_priv_secc γf npa pid_c (MkUstate Vc3 (us_M Uc)) with "Hchild3") as "[HscC HscCback]".
+    iApply (wp_sd_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KF + 0xc2)) Ra5 Rs3 (mword_of_int 360 : mword 12)
+              mr3 (rsv + (K - 8))%nat (pv_secc (us_V (MkUstate Vc3 (us_M Uc)))) false
+              with "Hcg Hpc [] [HscC]").
+    { iApply (kfk_0c2 with "Htext"). }
+    { iEval (rewrite (rget_ne mr3 Rs3 ltac:(vm_compute; discriminate)) Hmr3s4). iExact "HscC". }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc HscC".
+    iEval (rewrite (rget_ne mr3 Rs3 ltac:(vm_compute; discriminate)) Hmr3s4
+                   (rget_ne mr3 Ra5 ltac:(vm_compute; discriminate)) Hmr3a5) in "HscC".
+    iDestruct ("HscCback" with "HscC") as "Hchild3".
+    set (Vc4 := set_secc Vc3 (pv_secc (us_V Up))).
+    change (us_set_secc (MkUstate Vc3 (us_M Uc)) (pv_secc (us_V Up)))
+      with (MkUstate Vc4 (us_M Uc)) in *.
+    assert (Hpp0c6 : add_vec_int (mword_of_int (KF + 0xc2) : mword 64) 4 = mword_of_int (KF + 0xc6))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp0c6) in "Hpc".
+    (* ------------------------------------------------------------- *)
+    (* +0xc6: lw s1,48(s3) -- s1 := np->pid, THE RETURN VALUE.        *)
+    (* ------------------------------------------------------------- *)
+    iDestruct (proc_priv_pid γf npa pid_c (MkUstate Vc4 _) with "Hchild3") as "[Hcpid Hcpidback]".
+    iApply (wp_lw_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KF + 0xc6)) Rs1 Rs3 (mword_of_int 48 : mword 12)
+              mr3 (rsv + (K - 8))%nat pid_c false (dqm := DfracOwn (1/4))
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [Hcpid]").
+    { iApply (kfk_0c6 with "Htext"). }
+    { iEval (rewrite (rget_ne mr3 Rs3 ltac:(vm_compute; discriminate)) Hmr3s4). iExact "Hcpid". }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc Hcpid".
+    iEval (rewrite (rget_ne mr3 Rs3 ltac:(vm_compute; discriminate)) Hmr3s4) in "Hcpid".
+    iDestruct ("Hcpidback" with "Hcpid") as "Hchild4".
+    set (Mf := <[Regidx Rs1 := regval_into_reg (sign_extend' 64 pid_c)]> mr3).
+    change (<[Regidx Rs1 := regval_into_reg (sign_extend' 64 pid_c)]> mr3) with Mf.
+    assert (HMfs1 : Mf !!! Regidx Rs1 = sign_extend' 64 pid_c) by (rewrite /Mf; apply upd_eq).
+    (* ------------------------------------------------------------- *)
+    (* THE OVERALL callee-saved CHAIN, [m] -> [Mf], excluding [s1].   *)
+    (* ------------------------------------------------------------- *)
+    assert (HMfcs : forall r : mword 5, is_cs_idx r = true -> r <> Rs1 ->
+                      Mf !!! Regidx r = m !!! Regidx r).
+    { intros r Hr Hne.
+      rewrite /Mf upd_ne; [| congruence].
+      rewrite /mr3 upd_ne; [| regne].
+      rewrite (callee_saved_lookup Hcs_ss r Hr).
+      rewrite /M6 upd_ne; [| regne].
+      rewrite /M5 upd_ne; [| regne].
+      rewrite /M4 upd_ne; [| regne].
+      rewrite /M3 upd_ne; [| regne].
+      change (M2 !!! Regidx r) with (mr !!! Regidx r).
+      rewrite (callee_saved_lookup Hcs_idup r Hr).
+      rewrite /M1 upd_ne; [| regne].
+      rewrite /M0 upd_ne; [| regne].
+      reflexivity. }
+    assert (Hpp0ca : add_vec_int (mword_of_int (KF + 0xc6) : mword 64) 4 = mword_of_int (KF + 0xca))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp0ca) in "Hpc".
+    (* ------------------------------------------------------------- *)
+    (* Package the child's final block as the existential [Vc'].     *)
+    (* ------------------------------------------------------------- *)
+    iAssert (∃ Vc' : pprivate,
+               ⌜pv_sz Vc' = pv_sz (us_V Uc) /\ pv_upt Vc' = pv_upt (us_V Uc) /\
+                pv_tf Vc' = pv_tf (us_V Uc) /\ pv_ofile Vc' = pv_ofile (us_V Uc) /\
+                pv_cwd Vc' = pv_cwd (us_V Up) /\ pv_fdg Vc' = pv_fdg (us_V Uc) /\
+                length (pv_name Vc') = PNAMELEN /\
+                pv_cwi Vc' = pv_cwi (us_V Up) /\
+                pv_gen Vc' = pv_gen (us_V Uc) /\
+                pv_chg Vc' = pv_chg (us_V Uc) /\
+                pv_lazy Vc' = pv_lazy (us_V Uc) /\
+                pv_secc Vc' = pv_secc (us_V Up)⌝ ∗
+               proc_priv γf npa pid_c (MkUstate Vc' ((us_M Uc))))%I
+      with "[Hchild4]" as "HchildFinal".
+    { iExists Vc4.
+      iSplitR.
+      - iPureIntro. rewrite /Vc4 /Vc3 /Vc2 /set_secc /upd_cwi /upd_cwd.
+        cbn [pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_fdg pv_cwi pv_gen pv_chg
+             pv_lazy pv_secc].
+        rewrite Hcwd. repeat split; reflexivity.
+      - iExact "Hchild4". }
+    iSpecialize ("Hcont" $! CID0 with "[%]"); [intros _; reflexivity |].
+    iApply ("Hcont" $! Mf with "[%] Hcg Hown Hpc Hparent3 HchildFinal Hirsp").
+    exact (conj HMfcs HMfs1).
+  Qed.
+
+End KforkB4Proof.
+
+End KforkB4.

@@ -1,0 +1,328 @@
+(* SpecIreclaim.v -- the public interface of ireclaim, stated independently
+   of its proof.  Requires only the definitional layer -- never a whole-
+   function proof file -- so every function proof can be checked in parallel.
+
+     void ireclaim(int dev) {
+       int inum;
+       struct buf *bp;
+       struct dinode *dip;
+       struct inode *ip;
+
+       for(inum = 1; inum < sb.ninodes; inum++){
+         bp = bread(dev, IBLOCK(inum, sb));
+         dip = (struct dinode * )bp->data + inum % IPB;
+         if(dip->type != 0 && dip->nlink == 0){
+           printf("ireclaim: orphaned inode %d\n", inum);
+           ip = iget(dev, inum);
+           brelse(bp);
+           begin_op();
+           ilock(ip);
+           iunlock(ip);
+           iput(ip);                  // nlink == 0, so this truncates+frees
+           end_op();
+         } else
+           brelse(bp);
+       }
+     }
+
+   200 bytes, an EIGHT-slot frame.  Registers, off CodeIreclaim.v:
+   [s5 = dev], [s1 = inum], [s4 = &sb], [s6 = the format string],
+   [s2 = bp], [s3 = inum sign-extended, then REUSED for ip].
+
+   ---- THREE THINGS THE DECODE DOES THAT NO OTHER fs FUNCTION DOES ------
+
+   (i) TWO RETURN SITES.  [c.jr ra] at +0xc4 (the real epilogue) and again at
+   +0xc6.  The second one is reached from the [bgeu a5,a4] at +0x0a -- BEFORE
+   the [c.addi16sp sp,-64] at +0x0e -- so it returns with THE FRAME NEVER
+   PUSHED.  It is ialloc's +0x12 arm at a different offset and it is DEAD for
+   the same reason: [1 < ninodes] refutes it (SpecIalloc.v's header, and
+   SpecBalloc's [0 < size] before that).  So this contract has ONE live exit
+   and, like ialloc's, a uniform epilogue.
+
+   (ii) THE LOOP IS ENTERED IN THE MIDDLE.  [c.j +70] at +0x36 jumps past the
+   STEP block (+0x6e..+0x7a) straight to the loop BODY at +0x7c.  An invariant
+   stated at the body's top is therefore arrived at twice with different
+   histories, and the first arrival is a special case -- the proof's business,
+   but it is why the scan cannot be [ProofIalloc.ia_scan] verbatim.
+
+   (iii) THE BUFFER IS HELD ACROSS iget.  [jal iget] at +0x44 runs while
+   bread's reference from +0x8c is still outstanding; [jal brelse] at +0x4c
+   only gives it back AFTERWARDS.  The slot accounting has to cover that, and
+   [beq s3,zero] at +0x50 -- the C source's [if(ip)] -- is DEAD, refuted by
+   iget's POSTCONDITION ([mr !!! a0 = ientry k]) and not by any premise of
+   this contract.
+
+   ---- WHAT ireclaim IS, AS A CONTRACT: THE UNION OF ITS CALLEES ---------
+
+   ireclaim allocates no policy of its own.  Everything it does is a call, so
+   its precondition is the union of nine proven ones -- bread, brelse, printk,
+   iget, begin_op, ilock, iunlock, iput, end_op -- and its postcondition is
+   "everything back".  It returns [void] and it is SINGLE-ARMED: both live
+   paths through the loop body end at the same +0xc4.
+
+   Three couplings inside that union are worth naming, because they are what
+   make the union CLOSE rather than merely large:
+
+   - THE LEDGER UNIT.  [iget] spends exactly one [iref_slot] and [iput]
+     returns exactly one, so a single unit rides the whole scan and comes
+     back at the end.  This is dirlookup's discipline; here the two halves
+     are in the SAME function, which is why the contract is not two-armed.
+
+   - THE LOG RESERVATION IS BORN AND DIES INSIDE.  [begin_op] mints
+     [log_op γ MAXOPBLOCKS] and [end_op] retires it, so -- unlike ialloc,
+     iupdate and iput -- NO [log_op] crosses this contract's boundary in
+     either direction.  [iput_units = 3 <= MAXOPBLOCKS = 10] is what makes
+     the reclaim arm affordable, and it is a closed numeric fact rather than
+     a premise.
+
+   - THE REFERENCE IS CARVED AND GATHERED.  [iget] pays out
+     [inode_ref k q dev inum]; [ilock] wants an [inode_shr], which
+     [IcacheRef.inode_ref_shed] carves off; [iunlock] gives the share back
+     and [IcacheRef.inode_ref_gather] restores the reference, which [iput]
+     then spends.  Nothing about that crosses the boundary either.
+
+   So the only resources that genuinely FLOW are the buffer slots
+   (returned); the bitmap iput frees into is the persistent
+   [BitmapInv.bitmap_inv].
+
+   ---- THE ENTRY SLEEPLOCKS ARE A FAMILY, NOT A SINGLETON ---------------
+
+   ilock, iunlock and iput each take [is_sleeplock] for THEIR OWN entry, and
+   a caller that knows its slot hands over exactly one.  ireclaim does not
+   know its slot: [iget] chooses it at run time and the scan cannot name it in
+   advance.  So this contract takes [IcacheEscrow.ic_sleeplocks fsc_ic] -- the
+   fifty-fold persistent family -- with [IcacheEscrow.ic_sleeplocks_lookup]
+   to project the one the run picks.  There is one copy of each.
+
+   ---- THE BOOT MINT FITS THIS CONTRACT UNCHANGED (C7's flag, resolved) --
+
+   fs-icache C7 flagged ireclaim as "the pool's initial-contents authority",
+   i.e. the function that would have to say what the mkfs image's inodes
+   contain.  Under fs-icache.md §16.5 it does not: the pool's FREE arm is
+   just [imark], the boot mint is [IcacheBoot.icache_boot] and it already
+   produces exactly the four persistent things this contract takes
+   ([is_itable2], [itable_inv], [ic_escrows], plus the sleeplock family) at
+   the ALL-EMPTY table.  ireclaim consumes them as premises and mints
+   nothing.  The image-wf IOUs ([IcacheBoot.ipool_alloc]'s allocated-inum
+   bundles, [InodeLock.inode_ok], [DirView.dir_ok]) stay where they are --
+   sealed inside the pool by the boot client -- and this contract neither
+   states nor discharges them.  NOTHING HAD TO MOVE.
+
+   ---- WHAT IS *NOT* HERE, AND WHERE IT IS ------------------------------
+
+   The superblock geometry premises ([1 < ninodes], [ninodes <= 16 * nib],
+   [ninodes < 2^31], and inodestart's / bmapstart's coverage) are THREADED,
+   exactly as SpecIalloc.v threads its three.  Their home is [SpecFsinit]:
+   fsinit's [memmove] at +0x26 is where every superblock cell is born, so
+   that is the only place they can be about anything.
+
+   ireclaim SLEEPS (bread, and begin_op's two sleeps), so it threads the full
+   running-process bundle exactly as SpecIalloc.v / SpecIput.v do, and takes
+   the parking premise.  It enters and returns at noff 0.
+
+   *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import KernelDataInv.
+Require Import SpecPrintk.
+Require Import FdSlots.
+Require Import ProcGeom.
+Require Export SwtchCtx.
+Require Import CpuOwn.
+Require Import SchedCtx.
+Require Import ProcDefs.  (* [proc_priv_bare] *)
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import FsBlocks LogInv.
+Require Import FsCrash.
+Require Import BitmapInv.
+Require Import InodeInv.
+Require Import InodeRegion.
+Require Import AppCfg.       (* [appcfg]: the era's application record, bound beside [icfg] (app-instances.md round A) *)
+Require Import IrefSlots.
+Require Import IcacheRefDefs.
+Require Import IcacheInv.
+Require Import IcacheEscrow.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Import Defs.
+Require Import TsoCtx.
+
+Local Open Scope Z_scope.
+
+(* ireclaim's own frame is 64 bytes (8 slots) -- [c.addi16sp sp,-64] at +0x0e,
+   with ra/s0/s1/s2/s3/s4/s5/s6 pushed at 56/48/40/32/24/16/8/0.  Its deepest
+   callee is end_op (80); iput wants 78, ilock 66, bread 62, iget 62,
+   iunlock 26, begin_op 26, brelse 26. *)
+Notation K_ireclaim := (88%nat) (only parsing).
+Definition wp_ireclaim_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ,
+      ICFG : icfg, APP : appcfg Σ, FSC : fscfg, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γs : list gname) (j : nat) (γl : gname)          (* the running process *)
+  (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+    (pidv : mword 32) (dq dqb dqs dqn : dfrac)
+    (m : regfile) (K : nat) (eb : bool)
+    (b : bool) (lks : gset string) (Upr : ustate) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.ireclaim in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (K_ireclaim <= K)%nat ->
+  (* bread's / the log's block-number arithmetic, and the log's own storage *)
+  log_geom_ok fsc_cov fsc_logst ->
+  0 <= icfg_ist ->
+  (* EVERY inum the region covers lives in a covered HOME block that is not
+     log storage: bread's premise, ilock's and iput's.  The scan cannot know
+     which inum it stops at, so the premise is the quantified one
+     ([InodeInv.ireg_blocks_ok]) -- and it delivers BOTH conjuncts iput
+     wants. *)
+  ireg_blocks_ok icfg_ist icfg_nib fsc_cov fsc_logst ->
+  (* ---- itrunc's geometry, threaded through iput verbatim ---- *)
+  0 < fsc_size <= BPB ->
+  0 <= fsc_bmapstart ->
+  fsc_bmapstart ∈ fsc_cov ->
+  ~ (fsc_bmapstart ∈ log_region_set fsc_logst) ->
+  cov_below fsc_cov fsc_size ->
+  (* ---- THE THREE GEOMETRY PREMISES -- SpecIalloc.v's, verbatim.
+     [1 < ninodes] kills the [bgeu a5,a4] at +0x0a, the empty-region exit
+     that returns through the SECOND [c.jr ra] at +0xc6 without ever having
+     pushed a frame.  [ninodes <= 16 * nib] is the superblock-to-region tie
+     that lets the scan's [sb.ninodes] bound feed iget's and ilock's
+     [bv_unsigned inum < 16 * nib].  [ninodes < 2^31] is what makes the
+     [lw]-then-[bgeu] comparison at +0x70..+0x78 numeric. ---- *)
+  1 < fsc_ninodes ->
+  fsc_ninodes <= 16 * Z.of_nat icfg_nib ->
+  fsc_ninodes < 2 ^ 31 ->
+  (* THE ORPHAN ARM'S FIRST CALLEE, as a hypothesis and not a functor *)
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  (* a0 = dev: the RV64 ABI's sign extension of an [int] *)
+  m !!! Regidx (mword_of_int 10 : mword 5) = (sign_extend' 64 icfg_dev : mword 64) ->
+  (* ireclaim's cone is the union of its callees': bread/brelse ("bcache",
+     4), printk ("pr", 14), iget/iput ("itable", 2), begin_op/end_op
+     ("log", 3), ilock ("bcache", 4), iunlock ("sleep lock", 6) --
+     "itable" is the lowest, so one premise there covers the whole cone
+     via [locks_below_mono]. *)
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m K b pj -∗
+  cpu_own 0 eb pj b lks -∗
+  (* THE TRAP-CSR COMPLEMENT, in and out.  ireclaim holds no lock across its
+     scan -- every acquire it makes (iget's "itable", begin_op's "log",
+     ilock's sleeplock) is released before the next iteration -- so it is
+     push/pop balanced and what its interior sleepers need is exactly this,
+     the caller's pair at [eb = false] and [emp] at [eb = true].
+     claude-notes/completed/eb-generic-sweep.md is the recipe. *)
+  trap_csrs_ext KT1 eb -∗
+  cpu_claim_ext eb pj -∗
+  kernel_text -∗ pc_is pcE -∗
+  (* the general printk path's two PERSISTENT credentials *)
+  kernel_data -∗
+  printk_env fsc_printk fsc_uart fsc_disk -∗
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  (* end_op's crash seam and era certificate *)
+  fs_crash_seam fsc_cov fsc_logst -∗
+  gen_cert -∗
+  (* the three superblock fields, read and handed straight back *)
+  sb_ninodes ↦₄{dqn} (mword_of_int fsc_ninodes : mword 32) -∗
+  sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+  sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+  (* THE INODE REGION -- persistent.  ireclaim never claims and never writes
+     a dinode, so [DinodeSlot.diblk_slot_acc] is all its scan needs and
+     [InodeRegion.ireg_claim_au] never appears. *)
+  ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  (* THE BOOT-SHELTER TOKEN (fs-fragments.md §7.12 / §7.1.7).  ireclaim's [iget]
+     fires at a claim-SHAPED record (type ≠ 0, nlink 0); the licence alone does
+     not exclude a mid-window claim box, and the exclusion is the boot-order
+     fact that ireclaim runs before [kexec("/init")] and before any second
+     process.  This EXCLUSIVE token is that fact, made statable: while it is
+     held no slot is claimed ([IregLinkNz.ireg_boot_no_claim]).  fsinit, the
+     only caller, hands it in and takes it back. *)
+  ireg_boot -∗
+  (* ---- THE ICACHE, as iget / ilock / iput take it ---- *)
+  is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst icfg_nib icfg_dev -∗
+  itable_inv -∗
+  ic_escrows fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst -∗
+  (* THE FIFTY ENTRY SLEEPLOCKS, as a family: the scan does not know which
+     slot iget will pick.  [IcacheEscrow.ic_sleeplocks_lookup] projects it. *)
+  ic_sleeplocks fsc_ic -∗
+  (* itrunc's bitmap, through iput *)
+  bitmap_inv fsc_fs fsc_bmapstart fsc_cov fsc_logst fsc_size -∗
+  (* the caller's own pid cell (bread's / begin_op's acquiresleep records it) *)
+  proc_priv_bare pj pidv Upr -∗
+  (* the running-thread bundle and the disk fabric *)
+  procs_inv γs -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  (* THREE slot units: iput's indirect arm is what forces three.  The scan's
+     own bread holds one of them ACROSS iget (+0x8c .. +0x4c), but that
+     reference is given back before [begin_op] at +0x54, so the three never
+     have to stretch to four. *)
+  bslots 3 -∗
+  (* ONE ledger unit: iget spends it at +0x44 and iput returns it at +0x66,
+     every iteration.  It comes back. *)
+  iref_slot -∗
+  (* THE CROSSING IS THE LITERAL [true], NOT [b].  This function can SLEEP
+     (its bread / ilock / bwrite does), and a park moves the hart with
+     interrupts off, so the crossing has nothing to do with SIE -- the
+     porting guide's "a PARKING function's [wp_next] index is [true]
+     UNCONDITIONALLY".  Spelled [b] the two coincide at the only instance
+     the [eb = true] premise admits, which is why this went unnoticed; once
+     [eb = false] is reachable the [b] form would promise the caller it
+     comes back on the hart it called from, which a park makes false. *)
+  wp_next true pj (fun (CID : CpuId) =>
+  ∀ (mf : regfile),
+      ⌜callee_saved m mf⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      trap_csrs_ext KT1 eb -∗
+      cpu_claim_ext eb pj -∗
+      pc_is ret_tgt -∗
+      sb_ninodes ↦₄{dqn} (mword_of_int fsc_ninodes : mword 32) -∗
+      sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+      sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+      proc_priv_bare pj pidv Upr -∗
+      bslots 3 -∗
+      iref_slot -∗
+      (* the boot-shelter token, returned unspent (fs-fragments.md §7.12): the
+         scan refutes claims AGAINST it, never consuming it *)
+      ireg_boot -∗
+      (* ...and nothing else.  ireclaim returns void, no log reservation
+         crosses the boundary (begin_op mints and end_op retires inside),
+         and no inode reference survives (iget's is spent by iput). *)
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type IRECLAIM.
+  Parameter wp_ireclaim_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ,
+             ICFG : icfg, APP : appcfg Σ, FSC : fscfg, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γs : list gname) (j : nat) (γl : gname)
+      (pd pav pu : mword 64)
+      (pidv : mword 32) (dq dqb dqs dqn : dfrac)
+      (m : regfile) (K : nat) (eb : bool)
+      (b : bool) (lks : gset string) (Upr : ustate),
+      wp_ireclaim_sconf_body γs j γl pd pav pu
+
+ pidv dq dqb dqs dqn m K eb b lks Upr.
+End IRECLAIM.

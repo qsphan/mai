@@ -1,0 +1,2587 @@
+(* PtTree.v -- the GENERAL-PURPOSE page-table abstraction: an Iris
+   ownership predicate over a recursive tree of page-table NODES, each
+   claiming one page worth of entries (512 x 8-byte slots), with
+   recursion down the hierarchy for every present child pointer.
+
+   Motivation (see claude-notes/design/tlb-translation.md): the
+   kernel S-mode invariant [tlb_inv] enumerates the kvmmake layout slot
+   by slot with PRESET A/D bits, and the user page table (UserPt.v) is a
+   separate ad-hoc {slots, map, data} record.  This file provides ONE
+   abstraction serving both.
+
+   Design (the iProp is the core; the pure side is deliberately shallow):
+
+     - [ptree]        : an inert DESCRIPTION of a table: one node = its
+                        page's base ppn, its 512 raw slot words, and a
+                        subtree wherever the description claims a child.
+                        The slot words are ARBITRARY -- in particular
+                        the leaf A/D bits are "whatever happens to be in
+                        the page-table page", as Svadu/ADUE requires.
+     - [ptree_own]    : THE recursive definition: own every slot of the
+                        node's page (whatever words the description
+                        says) and, recursively, every described child.
+                        Separation makes page/slot disjointness free,
+                        lets a kernel build the table incrementally
+                        (graft a subtree under one slot), and absorbs
+                        the ADUE A/D write-back (the written slot is
+                        owned here, so clients never see the change).
+     - [ptree_maps] / [ptree_blocks] : SHALLOW (non-recursive) per-vpn
+                        walk facts over the description -- the explicit
+                        3-level path with the classification facts the
+                        exec walk needs (valid pointers down to a valid
+                        leaf / a stop at an invalid word).  There is no
+                        recursive well-formedness predicate and no
+                        recursive walk function: instances prove these
+                        facts per vpn directly, and determinism is free
+                        because a [ptree]'s slots are functions.
+     - [pte_set_ad]   : the A/D-variance constructor (the EXACT update
+                        shape [update_PTE_Bits] produces), used to state
+                        "same mapping, arbitrary A/D" -- both for leaf
+                        words in memory and for resident TLB entries
+                        (which may hold a stale-A/D copy of a leaf).
+     - [tlb_ok_pt]    : TLB consistency modulo A/D: every resident entry
+                        is the walk entry of some vpn the tree maps,
+                        with the leaf word an A/D variant of the tree's
+                        current leaf word.
+     - exec layer     : hypothesis-style (the abstract-word analogue of
+                        Pt4kWalk's TrampTranslate, built on CommonWalk's
+                        privilege/access-generic core) -- one success
+                        translate for any mapped vpn, one fault
+                        translate for any blocked vpn.  Tree-free: the
+                        Iris layer extracts the per-slot facts from
+                        [ptree_own] and instantiates.
+
+   Instances: the kernel S-mode table (KptTree.v) and, eventually, the
+   user table (UserPt.v -- worklist).                                    *)
+From Stdlib Require Import ZArith Bool Lia FunctionalExtensionality.
+From stdpp Require Import gmap relations bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import gen_heap ghost_map ghost_var.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes RiscvLang RiscvPtsto RiscvExec RiscvTryStep RiscvExtras.
+Require Export PtreeType.
+Require Export PageGeom.   (* [page_valid] / [page_base]: a node page is a kalloc page *)
+Require Import SmodePte.
+(* the [swp] layer's footprint vocabulary: [hval] and the [goodb] bridge.
+   Both sit BELOW this file, so the splice below adds no cycle. *)
+Require Import HartSpan HartGoodb.
+Require Import PtAdBits.
+Require Import Pt4kWalk.
+Require Import WpDecodeBridge.
+Require Import CommonWalk.
+(* A6.21: the PT-slot TIER INDEX lives here now; see [pt_slot_own]. *)
+Require Import TsoCtx.
+Require Import CtxValues.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Local Open Scope Z_scope.
+Import Defs.
+
+(* ===================================================================== *)
+(* §1 PTE-word predicates: the shapes the walk lemmas consume, over a     *)
+(*    fully abstract 64-bit slot word.  Same shapes as UserPt.v §1 but    *)
+(*    PRIVILEGE-PARAMETRIC (the walk itself is privilege-generic; only    *)
+(*    the leaf permission check mentions the privilege).                  *)
+(* ===================================================================== *)
+
+(* the word is a valid PTE (V=1, no reserved-encoding violation) *)
+Definition pte_valid (w : mword 64) : Prop :=
+  forall s, exec (pte_is_invalid (Mk_PTE_Flags (subrange_vec_dec w 7 0))
+                    (ext_bits_of_PTE w)) s = Some (false, s).
+
+(* the word is an invalid PTE: the walk stops here with PTW_Invalid_PTE *)
+Definition pte_invalid (w : mword 64) : Prop :=
+  forall s, exec (pte_is_invalid (Mk_PTE_Flags (subrange_vec_dec w 7 0))
+                    (ext_bits_of_PTE w)) s = Some (true, s).
+
+(* non-leaf (pointer to the next level) vs leaf *)
+Definition pte_ptr (w : mword 64) : Prop :=
+  pte_is_non_leaf (Mk_PTE_Flags (subrange_vec_dec w 7 0)) = true.
+Definition pte_leaf (w : mword 64) : Prop :=
+  pte_is_non_leaf (Mk_PTE_Flags (subrange_vec_dec w 7 0)) = false.
+
+(* V and U both set -- the pair of bits [walkaddr] tests in one [andi]
+   ([( *pte & (PTE_V|PTE_U)) == PTE_V|PTE_U]).  This is the verdict that
+   makes a slot word a page the process may reach FROM USER MODE, and so
+   -- for a table described by [UptTree.upt_tree_spec] -- the verdict that
+   places its vpn in the user MAP rather than at the trampoline or the
+   trapframe, whose leaves both have U = 0.  Stated over the model's flag
+   accessors; the [andi] bit-test bridge is [PtBuild.pte_vu_bits]. *)
+Definition pte_vu (w : mword 64) : Prop :=
+  _get_PTE_Flags_V (Mk_PTE_Flags (subrange_vec_dec w 7 0)) = ('b"1" : mword 1) /\
+  _get_PTE_Flags_U (Mk_PTE_Flags (subrange_vec_dec w 7 0)) = ('b"1" : mword 1).
+
+(* W set -- the single bit [copyout] tests in its own [andi a5,a5,4]
+   ([( *pte & PTE_W) == 0 -> return -1], kernel/vm.c).  It is the verdict a
+   leaf that is present and USER-reachable ([pte_vu] above) can still fail:
+   xv6's user TEXT pages are R|X|U with W clear, and a copyout to one
+   returns -1 with the page fully mapped.  So "the map has a leaf here and
+   it passes the V&U test" is NOT enough to copy a byte out, and the
+   address a copyout can write is [UserPtTree.uva_wmapped], which asks for
+   this bit beside [pte_vu].  Stated over the model's flag accessor, like
+   its two siblings, so that the [andi] bit-test bridge is proved the way
+   [PtBuild.pte_vu_bits] is. *)
+Definition pte_w (w : mword 64) : Prop :=
+  _get_PTE_Flags_W (Mk_PTE_Flags (subrange_vec_dec w 7 0)) = ('b"1" : mword 1).
+
+(* leaf extras consumed by the success walk / TLB-hit path *)
+Definition pte_no_napot (w : mword 64) : Prop :=
+  eq_vec (_get_PTE_Ext_N (ext_bits_of_PTE w)) ('b"1") = false.
+Definition pte_pbmt0 (w : mword 64) : Prop :=
+  _get_PTE_Ext_PBMT (ext_bits_of_PTE w) = ('b"00" : mword 2).
+
+(* the per-access permission check on a leaf, at privilege [p].  With the
+   leaf's R/W/X/U/A/D arbitrary, each access either passes or is denied --
+   both are safe outcomes, dispatched per access by the instance. *)
+Definition pte_check_ok (acc : MemoryAccessType mem_payload) (p : Privilege)
+    (mxr do_sum : bool) (w : mword 64) : Prop :=
+  forall s, exec (check_PTE_permission acc p mxr do_sum
+                    (Mk_PTE_Flags (subrange_vec_dec w 7 0))
+                    (ext_bits_of_PTE w) tt) s
+            = Some (PTE_Check_Success tt, s).
+Definition pte_check_denied (acc : MemoryAccessType mem_payload) (p : Privilege)
+    (mxr do_sum : bool) (f : pte_check_failure) (w : mword 64) : Prop :=
+  forall s, exec (check_PTE_permission acc p mxr do_sum
+                    (Mk_PTE_Flags (subrange_vec_dec w 7 0))
+                    (ext_bits_of_PTE w) tt) s
+            = Some (PTE_Check_Failure (tt, f), s).
+
+(* ---------------------------------------------------------------------- *)
+(* WHAT [pte_valid] PINS ABOVE THE PPN.                                    *)
+(*                                                                         *)
+(*   A model-VALID PTE has all ten extension bits (63:54) clear, so its     *)
+(*   word is below 2^54.  That is what makes the machine's PTE2PA --        *)
+(*   [(w >> 10) << 12], which keeps bits 61:54 and lands them at 63:56 --   *)
+(*   agree with [page_base (pte_ppn w)], which is bits 53:10 and is zero    *)
+(*   above bit 55.  (Counterexample without it: [w = 2^54 + 19] passes the  *)
+(*   V&U test, the machine gives 2^56 and the spec asks 0.)                 *)
+(*                                                                         *)
+(*   Bit 63 (N) and bits 62:61 (PBMT) come from the [pte_no_napot] /        *)
+(*   [pte_pbmt0] conjuncts; bits 60:59 (RSW_60t59b) and 58:54 (reserved)    *)
+(*   come from [pte_valid] ITSELF, read at a state where no extension is    *)
+(*   enabled -- [pte_valid] quantifies over ALL states, and with misa = 0   *)
+(*   the Sv39-gated Svrsw60t59b probe reads false, so the RSW/reserved      *)
+(*   disjuncts of [pte_is_invalid] degenerate to their raw field-is-nonzero *)
+(*   tests.                                                                 *)
+(* ---------------------------------------------------------------------- *)
+
+(* the extension-bit field extractions, as instances of the one width-generic
+   [RiscvExtras.subrange_dec_unsigned] *)
+Local Lemma pte_sub_4_0 (v : mword 10) :
+  bv_unsigned (subrange_vec_dec v 4 0 : mword 5) = bv_unsigned v mod 32.
+Proof. apply (subrange_dec_unsigned_lo0 v 4 32); [lia | reflexivity]. Qed.
+Local Lemma pte_sub_6_5 (v : mword 10) :
+  bv_unsigned (subrange_vec_dec v 6 5 : mword 2) = bv_unsigned v / 32 mod 4.
+Proof. apply (subrange_dec_unsigned v 6 5 32 4); [lia | lia | reflexivity | reflexivity]. Qed.
+Local Lemma pte_sub_8_7 (v : mword 10) :
+  bv_unsigned (subrange_vec_dec v 8 7 : mword 2) = bv_unsigned v / 128 mod 4.
+Proof. apply (subrange_dec_unsigned v 8 7 128 4); [lia | lia | reflexivity | reflexivity]. Qed.
+Local Lemma pte_sub_9_9 (v : mword 10) :
+  bv_unsigned (subrange_vec_dec v 9 9 : mword 1) = bv_unsigned v / 512 mod 2.
+Proof. apply (subrange_dec_unsigned v 9 9 512 2); [lia | lia | reflexivity | reflexivity]. Qed.
+Local Lemma pte_sub_63_54 (v : mword 64) :
+  bv_unsigned (subrange_vec_dec v 63 54 : mword 10)
+  = bv_unsigned v / 18014398509481984 mod 1024.
+Proof.
+  apply (subrange_dec_unsigned v 63 54 _ _);
+    [lia | lia | vm_compute; reflexivity | vm_compute; reflexivity].
+Qed.
+
+(* the arithmetic, mword-free (the zify-hook rule): four nested divisibility
+   facts collapse the whole 10-bit field to zero.  [lia] has no theory of
+   iterated division, so the chain is staged by hand. *)
+Local Lemma pte_z_ext_zero (E : Z) :
+  0 <= E < 1024 -> E mod 32 = 0 -> E / 32 mod 4 = 0 ->
+  E / 128 mod 4 = 0 -> E / 512 mod 2 = 0 -> E = 0.
+Proof.
+  intros Hr H1 H2 H3 H4.
+  assert (D1 : E = 32 * (E / 32)) by (apply Z_div_exact_2; [lia | exact H1]).
+  assert (Q1 : E / 32 / 4 = E / 128)
+    by (rewrite (Z.div_div E 32 4 ltac:(lia) ltac:(lia)); reflexivity).
+  assert (D2 : E / 32 = 4 * (E / 128))
+    by (rewrite <- Q1; apply Z_div_exact_2; [lia | exact H2]).
+  assert (Q2 : E / 128 / 4 = E / 512)
+    by (rewrite (Z.div_div E 128 4 ltac:(lia) ltac:(lia)); reflexivity).
+  assert (D3 : E / 128 = 4 * (E / 512))
+    by (rewrite <- Q2; apply Z_div_exact_2; [lia | exact H3]).
+  assert (Q3 : E / 512 / 2 = E / 1024)
+    by (rewrite (Z.div_div E 512 2 ltac:(lia) ltac:(lia)); reflexivity).
+  assert (D4 : E / 512 = 2 * (E / 1024))
+    by (rewrite <- Q3; apply Z_div_exact_2; [lia | exact H4]).
+  lia.
+Qed.
+
+Local Lemma pte_z_hi_zero (x : Z) :
+  0 <= x < 18446744073709551616 ->
+  x / 18014398509481984 mod 1024 = 0 -> x < 18014398509481984.
+Proof.
+  intros Hr H.
+  assert (Hq : 0 <= x / 18014398509481984 < 1024).
+  { split; [apply Z.div_pos; lia | apply Z.div_lt_upper_bound; lia]. }
+  rewrite (Z.mod_small _ _ Hq) in H.
+  pose proof (Z_div_mod_eq_full x 18014398509481984) as Hd.
+  pose proof (Z.mod_pos_bound x 18014398509481984 ltac:(lia)) as Hm.
+  lia.
+Qed.
+
+(* a state in which NO extension is currently enabled (misa = 0) and
+   menvcfg = 0: the Sv39-gated Svnapot/Svrsw60t59b probes and the PBMTE gate
+   all read false there. *)
+Local Definition pte_s0 : mstate := MState init_regstate ∅ dev0_state.
+
+(* THE TWO CLASSES ARE EXCLUSIVE (lane KILL-PAY, K3(b)).  Both are stated
+   as [forall s, exec (check_PTE_permission ...) s = Some (r, s)] at the
+   SAME leaf and the same access, so one state decides the question: at
+   [pte_s0] the model returns [PTE_Check_Success] and [PTE_Check_Failure]
+   at once, which it cannot.  This is what refutes the DENIED flavor of
+   [UserPtTree.u_fault_flavor] at a page whose key says the access is
+   allowed. *)
+Lemma pte_check_ok_denied_excl (acc : MemoryAccessType mem_payload)
+    (p : Privilege) (mxr do_sum : bool) (f : pte_check_failure) (w : mword 64) :
+  pte_check_ok acc p mxr do_sum w -> pte_check_denied acc p mxr do_sum f w ->
+  False.
+Proof.
+  intros Hok Hden.
+  pose proof (Hok pte_s0) as H1. pose proof (Hden pte_s0) as H2.
+  rewrite H1 in H2. discriminate H2.
+Qed.
+
+(* [pte_is_invalid] EVALUATED at [pte_s0], with ALL EIGHT disjuncts exposed
+   concretely.  The three state probes the model consults -- menvcfg.SSE,
+   [Ext_Svnapot], menvcfg.PBMTE / [Ext_Svrsw60t59b] -- are decided by that
+   state, so nothing is left existential and any consumer can read off any
+   disjunct it needs.  Two of them are read below: the RSW/reserved pair
+   (bits 60:59 and 58:54, for [pte_hi_zero]) and the NON-LEAF disjunct
+   (for [pte_ptr_ext_zero]). *)
+Local Lemma pte_piv_split (f : mword 8) (e : mword 10) :
+  exec (pte_is_invalid f e) pte_s0
+  = Some (orb (eq_vec (_get_PTE_Flags_V f) ('b"0"))
+          (orb (andb (eq_vec (_get_PTE_Flags_R f) ('b"0"))
+                  (andb (eq_vec (_get_PTE_Flags_W f) ('b"1"))
+                     (andb (eq_vec (_get_PTE_Flags_X f) ('b"0")) true)))
+          (orb (andb (eq_vec (_get_PTE_Flags_R f) ('b"0"))
+                  (andb (eq_vec (_get_PTE_Flags_W f) ('b"1"))
+                     (eq_vec (_get_PTE_Flags_X f) ('b"1"))))
+          (orb (andb (not (page_based_mem_type_forwards_matches (_get_PTE_Ext_PBMT e))) false)
+          (andb true
+          (orb (andb (pte_is_non_leaf f)
+                  (orb (eq_vec (_get_PTE_Flags_A f) ('b"1"))
+                     (orb (eq_vec (_get_PTE_Flags_D f) ('b"1"))
+                        (orb (eq_vec (_get_PTE_Flags_U f) ('b"1"))
+                             (neq_vec e (zeros' 10))))))
+          (orb (andb (neq_vec (_get_PTE_Ext_N e) (zeros' 1)) true)
+          (orb (andb (neq_vec (_get_PTE_Ext_PBMT e) (zeros' 2))
+                  (orb true (not (page_based_mem_type_forwards_matches
+                                    (_get_PTE_Ext_PBMT e)))))
+          (orb (andb (neq_vec (_get_PTE_Ext_RSW_60t59b e) (zeros' 2)) true)
+               (neq_vec (_get_PTE_Ext_reserved e) (zeros' 5)))))))))), pte_s0).
+Proof.
+  unfold pte_is_invalid.
+  eapply exec_or_v; [ apply exec_returnM | ].
+  eapply exec_or_v;
+    [ eapply exec_and_v; [ apply exec_returnM |
+        eapply exec_and_v; [ apply exec_returnM |
+          eapply exec_and_v; [ apply exec_returnM | vm_compute; reflexivity ] ] ] | ].
+  eapply exec_or_v; [ apply exec_returnM | ].
+  (* the new Svpbmt disjunct *)
+  eapply exec_or_v;
+    [ eapply exec_and_v; [ apply exec_returnM | vm_compute; reflexivity ] | ].
+  (* ...and the reserved-bits group, now gated on pte_reserved_bits_must_be_zero *)
+  eapply exec_and_v; [ apply exec_returnM | ].
+  eapply exec_or_v; [ apply exec_returnM | ].
+  eapply exec_or_v;
+    [ eapply exec_and_v; [ apply exec_returnM | vm_compute; reflexivity ] | ].
+  eapply exec_or_v;
+    [ eapply exec_and_v; [ apply exec_returnM |
+        eapply exec_or_v; [ vm_compute; reflexivity | apply exec_returnM ] ] | ].
+  eapply exec_or_v; [ | apply exec_returnM ].
+  eapply exec_and_v; [ apply exec_returnM | vm_compute; reflexivity ].
+Qed.
+
+Local Lemma pte_valid_rsw_res (w : mword 64) :
+  pte_valid w ->
+  _get_PTE_Ext_RSW_60t59b (ext_bits_of_PTE w) = zeros' 2 /\
+  _get_PTE_Ext_reserved (ext_bits_of_PTE w) = zeros' 5.
+Proof.
+  intros Hv.
+  pose proof (pte_piv_split (Mk_PTE_Flags (subrange_vec_dec w 7 0))
+                (ext_bits_of_PTE w)) as Hex.
+  specialize (Hv pte_s0). rewrite Hex in Hv. injection Hv as Hb.
+  (* the disjunction gained the Svpbmt arm, and the reserved-bit group is now
+     under an [andb pte_reserved_bits_must_be_zero] *)
+  do 7 (apply orb_false_iff in Hb; destruct Hb as [_ Hb]).
+  apply orb_false_iff in Hb. destruct Hb as [Hrsw Hres].
+  rewrite andb_true_r in Hrsw.
+  unfold neq_vec in Hrsw. unfold neq_vec in Hres.
+  apply negb_false_iff in Hrsw. apply negb_false_iff in Hres.
+  split; apply eq_vec_true_iff; assumption.
+Qed.
+
+Lemma pte_hi_zero (w : mword 64) :
+  pte_valid w -> pte_no_napot w -> pte_pbmt0 w ->
+  bv_unsigned w < 18014398509481984.
+Proof.
+  intros Hv Hn Hp.
+  destruct (pte_valid_rsw_res w Hv) as [Hrsw Hres].
+  assert (HN : _get_PTE_Ext_N (ext_bits_of_PTE w) = ('b"0" : mword 1)).
+  { destruct (mword1_cases (_get_PTE_Ext_N (ext_bits_of_PTE w))) as [H0 | H1].
+    - rewrite H0. apply bv_eq; vm_compute; reflexivity.
+    - unfold pte_no_napot in Hn. rewrite H1 in Hn. vm_compute in Hn. discriminate. }
+  assert (Hext : ext_bits_of_PTE w = (subrange_vec_dec w 63 54 : mword 10)) by reflexivity.
+  unfold pte_pbmt0 in Hp.
+  rewrite Hext in HN. rewrite Hext in Hp. rewrite Hext in Hrsw. rewrite Hext in Hres.
+  unfold _get_PTE_Ext_N in HN. unfold _get_PTE_Ext_PBMT in Hp.
+  unfold _get_PTE_Ext_RSW_60t59b in Hrsw. unfold _get_PTE_Ext_reserved in Hres.
+  apply (f_equal bv_unsigned) in HN. apply (f_equal bv_unsigned) in Hp.
+  apply (f_equal bv_unsigned) in Hrsw. apply (f_equal bv_unsigned) in Hres.
+  rewrite pte_sub_9_9 in HN. rewrite pte_sub_8_7 in Hp.
+  rewrite pte_sub_6_5 in Hrsw. rewrite pte_sub_4_0 in Hres.
+  assert (Z0a : bv_unsigned ('b"0" : mword 1) = 0) by (vm_compute; reflexivity).
+  assert (Z0b : bv_unsigned ('b"00" : mword 2) = 0) by (vm_compute; reflexivity).
+  assert (Z0c : bv_unsigned (zeros' 2 : mword 2) = 0) by (vm_compute; reflexivity).
+  assert (Z0d : bv_unsigned (zeros' 5 : mword 5) = 0) by (vm_compute; reflexivity).
+  rewrite Z0a in HN. rewrite Z0b in Hp. rewrite Z0c in Hrsw. rewrite Z0d in Hres.
+  assert (HE0 : bv_unsigned (subrange_vec_dec w 63 54 : mword 10) = 0).
+  { apply pte_z_ext_zero; [ | exact Hres | exact Hrsw | exact Hp | exact HN ].
+    pose proof (bv_unsigned_in_range _ (subrange_vec_dec w 63 54 : mword 10)) as Hr.
+    assert (Hm : bv_modulus (MachineWord.MachineWord.Z_idx 10) = 1024)
+      by (vm_compute; reflexivity).
+    rewrite Hm in Hr. exact Hr. }
+  rewrite pte_sub_63_54 in HE0.
+  apply pte_z_hi_zero; [ | exact HE0 ].
+  pose proof (bv_unsigned_in_range _ w) as Hr.
+  assert (Hm : bv_modulus (MachineWord.MachineWord.Z_idx 64) = 18446744073709551616)
+    by (vm_compute; reflexivity).
+  rewrite Hm in Hr. exact Hr.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* ...AND WHAT [pte_valid] PINS ON A POINTER PTE, WITH NO EXTRA CONJUNCTS. *)
+(*                                                                         *)
+(*   [pte_hi_zero] above needs [pte_no_napot] + [pte_pbmt0] as premises.    *)
+(*   A NON-LEAF word needs neither: [pte_is_invalid]'s fourth disjunct is   *)
+(*                                                                         *)
+(*     pte_is_non_leaf(flags) && (A=1 || D=1 || U=1 || ext != 0)            *)
+(*                                                                         *)
+(*   so on a pointer, validity forces the whole 10-bit extension field      *)
+(*   (bits 63:54) to zero all by itself, hence the word below 2^54.  That   *)
+(*   is what lets freewalk's software [(pte >> 10) << 12] agree with        *)
+(*   [page_base (pte_ppn w)], and it is why [PtFree.pt_free_ok]'s pointer   *)
+(*   case carries only [pte_valid + pte_ptr] -- exactly [ptree_blocks0]'s   *)
+(*   pointer conjuncts, which is what makes [pt_free_ok_rep0] provable.     *)
+(* ---------------------------------------------------------------------- *)
+
+Lemma pte_ptr_ext_zero (w : mword 64) :
+  pte_valid w -> pte_ptr w -> ext_bits_of_PTE w = (zeros' 10 : mword 10).
+Proof.
+  intros Hv Hp.
+  pose proof (pte_piv_split (Mk_PTE_Flags (subrange_vec_dec w 7 0))
+                (ext_bits_of_PTE w)) as Hex.
+  specialize (Hv pte_s0). rewrite Hex in Hv. injection Hv as Hb.
+  (* one more leading disjunct now (the Svpbmt arm) before the non-leaf one *)
+  do 4 (apply orb_false_iff in Hb; destruct Hb as [_ Hb]).
+  apply orb_false_iff in Hb; destruct Hb as [Hb _].
+  unfold pte_ptr in Hp. rewrite Hp in Hb. rewrite andb_true_l in Hb.
+  do 3 (apply orb_false_iff in Hb; destruct Hb as [_ Hb]).
+  unfold neq_vec in Hb. apply negb_false_iff in Hb.
+  apply eq_vec_true_iff. exact Hb.
+Qed.
+
+Lemma pte_ptr_hi_zero (w : mword 64) :
+  pte_valid w -> pte_ptr w -> (bv_unsigned w < 18014398509481984)%Z.
+Proof.
+  intros Hv Hp.
+  pose proof (pte_ptr_ext_zero w Hv Hp) as He.
+  assert (Hext : ext_bits_of_PTE w = (subrange_vec_dec w 63 54 : mword 10))
+    by reflexivity.
+  rewrite Hext in He.
+  apply (f_equal bv_unsigned) in He.
+  rewrite pte_sub_63_54 in He.
+  assert (Z0 : bv_unsigned (zeros' 10 : mword 10) = 0) by (vm_compute; reflexivity).
+  rewrite Z0 in He.
+  apply pte_z_hi_zero; [| exact He].
+  pose proof (bv_unsigned_in_range _ w) as Hr.
+  assert (Hm : bv_modulus (MachineWord.MachineWord.Z_idx 64) = 18446744073709551616)
+    by (vm_compute; reflexivity).
+  rewrite Hm in Hr. exact Hr.
+Qed.
+
+(* ===================================================================== *)
+(* §2 The description.  One node = one PT page: its base ppn, its 512     *)
+(*    raw slot words, and a subtree for every child the description       *)
+(*    claims.  Purely inert data -- all meaning comes from [ptree_own]    *)
+(*    (ownership) and [ptree_maps]/[ptree_blocks] (per-vpn walk facts).   *)
+(* ===================================================================== *)
+
+(* the type itself lives in PtreeType.v, BELOW RiscvPtsto.v, so that
+   [riscvGS] can name it (the shared kernel table's ghost is an agreement
+   over [leibnizO ptree]).  Re-exported here: every consumer keeps saying
+   [PtTree.ptree]. *)
+(* [Inductive ptree] / [pt_base] / [pt_ents] / [pt_kids] : PtreeType.v *)
+
+(* The identity vpn of a node page at ppn [b]: all 512 slots
+   ([u_pte_addr b idx], idx*8 < 4096) sit in the SAME page, so share this
+   vpn.  [node_kdata b]: that page lies wholly in RAM memory. *)
+Definition pt_page_vpn (b : mword 44) : mword 27 :=
+  svpn_of (u_pte_addr b (mword_of_int 0)).
+
+(* the node page at ppn [b] lies wholly in RAM memory.  Implies VA
+   canonicality of every slot ([b*4096+4096 <= ram_base+ram_size < 2^38]) --
+   both pure facts [mem_pointsto] needs for the [↦ₚ₈ -> ↦₈] slot reconstruction. *)
+Definition node_kdata (b : mword 44) : Prop :=
+  (ram_base <= bv_unsigned b * 4096)%Z /\
+  (bv_unsigned b * 4096 + 4096 <= ram_base + ram_size)%Z.
+
+(* A KALLOC page is a kdata node page, and lies above the kernel text.  So
+   the single premise [pt_node_claim_from_static] needs of a freshly
+   allocated node is kalloc's own [page_valid].  ([kmem_lo] > [text_end] >
+   [ram_base], and [kmem_hi] = [ram_base]+[ram_size], so this is arithmetic
+   on the four literals -- plus the page's 4096-alignment, without which
+   [uint p < kmem_hi] would not give the +4096 headroom.)  The arithmetic
+   is routed through a [Z]-only helper: any goal mentioning [bv_unsigned]
+   defeats [lia] under this file's transitive [bitvector.tactics] import. *)
+Local Lemma pt_node_kdata_z (x : Z) :
+  x mod 4096 = 0 -> (kmem_lo <= x < kmem_hi)%Z ->
+  (ram_base <= x)%Z /\ (x + 4096 <= ram_base + ram_size)%Z /\ (text_end <= x)%Z.
+Proof.
+  unfold kmem_lo, kmem_hi, ram_base, ram_size, text_end.
+  intros Hm Hr. apply Z.mod_divide in Hm; [| lia].
+  destruct Hm as [k ->]. lia.
+Qed.
+
+Lemma page_valid_node_kdata (b : mword 44) :
+  page_valid (page_base b) ->
+  node_kdata b /\ (text_end <= bv_unsigned b * 4096)%Z.
+Proof.
+  intros [Hal Hr]. unfold page_aligned, page_in_range, PGSIZE in Hal, Hr.
+  rewrite uint_unsigned in Hal, Hr.
+  unfold page_base in Hal, Hr. rewrite page_base_unsigned in Hal, Hr.
+  destruct (pt_node_kdata_z _ Hal Hr) as (H1 & H2 & H3).
+  split; [split |]; assumption.
+Qed.
+
+(* the 9-bit walk index a level-[lvl] node decodes from [vpn] (Sv39:
+   levels 2,1,0 top-down) *)
+Definition vpn_idx (lvl : nat) (vpn : mword 27) : mword 9 :=
+  match lvl with
+  | 2%nat => subrange_vec_dec vpn 26 18
+  | 1%nat => subrange_vec_dec vpn 17 9
+  | _     => subrange_vec_dec vpn 8 0
+  end.
+
+(* the three slot addresses [vpn]'s walk reads, spelled exactly as the
+   walk computes them (CommonWalk's addr2/addr1/addr0) *)
+Definition pt_addr2 (t : ptree) (vpn : mword 27) : mword 64 :=
+  u_pte_addr (pt_base t) (vpn_idx 2 vpn).
+Definition pt_addr1 (p2 : mword 64) (vpn : mword 27) : mword 64 :=
+  u_pte_addr (u_next_base p2) (vpn_idx 1 vpn).
+Definition pt_addr0 (p1 : mword 64) (vpn : mword 27) : mword 64 :=
+  u_pte_addr (u_next_base p1) (vpn_idx 0 vpn).
+
+(* ===================================================================== *)
+(* §3 Per-vpn walk facts (SHALLOW: the explicit 3-level path).            *)
+(* ===================================================================== *)
+
+(* [t] 4K-maps [vpn] through pointer words p2, p1 to the leaf word p0:
+   the description routes the walk through its own child nodes (whose
+   pages are the ones the pointers name), and the words classify as the
+   walk needs (valid pointers; a valid no-NAPOT pbmt-0 leaf).  The
+   leaf's PERMISSION/A/D bits stay arbitrary -- each access dispatches
+   on them separately ([pte_check_ok] / [update_PTE_Bits]).              *)
+Definition ptree_maps (t : ptree) (vpn : mword 27) (p2 p1 p0 : mword 64) : Prop :=
+  exists c1 c0,
+    pt_kids t (vpn_idx 2 vpn) = Some c1 /\
+    pt_kids c1 (vpn_idx 1 vpn) = Some c0 /\
+    pt_ents t (vpn_idx 2 vpn) = p2 /\
+    pt_ents c1 (vpn_idx 1 vpn) = p1 /\
+    pt_ents c0 (vpn_idx 0 vpn) = p0 /\
+    u_next_base p2 = pt_base c1 /\
+    u_next_base p1 = pt_base c0 /\
+    pte_valid p2 /\ pte_ptr p2 /\
+    pte_valid p1 /\ pte_ptr p1 /\
+    pte_valid p0 /\ pte_leaf p0 /\ pte_no_napot p0 /\ pte_pbmt0 p0.
+
+(* the walk of [vpn] page-faults: it stops at an INVALID word at level
+   2, 1 or 0 (after valid pointers above it).  A valid pointer-shaped
+   word at level 0 also faults in the model; add that disjunct here if
+   an instance ever needs it -- xv6 tables stop at zero words.           *)
+Definition ptree_blocks (t : ptree) (vpn : mword 27) : Prop :=
+  (* the root slot is invalid (no child claimed) *)
+  (pt_kids t (vpn_idx 2 vpn) = None /\ pte_invalid (pt_ents t (vpn_idx 2 vpn)))
+  (* the root descends; the mid slot is invalid *)
+  \/ (exists c1,
+        pt_kids t (vpn_idx 2 vpn) = Some c1 /\
+        pt_kids c1 (vpn_idx 1 vpn) = None /\
+        pte_valid (pt_ents t (vpn_idx 2 vpn)) /\
+        pte_ptr (pt_ents t (vpn_idx 2 vpn)) /\
+        u_next_base (pt_ents t (vpn_idx 2 vpn)) = pt_base c1 /\
+        pte_invalid (pt_ents c1 (vpn_idx 1 vpn)))
+  (* both levels descend; the leaf slot is invalid *)
+  \/ (exists c1 c0,
+        pt_kids t (vpn_idx 2 vpn) = Some c1 /\
+        pt_kids c1 (vpn_idx 1 vpn) = Some c0 /\
+        pte_valid (pt_ents t (vpn_idx 2 vpn)) /\
+        pte_ptr (pt_ents t (vpn_idx 2 vpn)) /\
+        pte_valid (pt_ents c1 (vpn_idx 1 vpn)) /\
+        pte_ptr (pt_ents c1 (vpn_idx 1 vpn)) /\
+        u_next_base (pt_ents t (vpn_idx 2 vpn)) = pt_base c1 /\
+        u_next_base (pt_ents c1 (vpn_idx 1 vpn)) = pt_base c0 /\
+        pte_invalid (pt_ents c0 (vpn_idx 0 vpn))).
+
+(* determinism: the description's slots are functions, so the mapped
+   path of a vpn is unique *)
+Lemma ptree_maps_det (t : ptree) (vpn : mword 27) (p2 p1 p0 q2 q1 q0 : mword 64) :
+  ptree_maps t vpn p2 p1 p0 -> ptree_maps t vpn q2 q1 q0 ->
+  p2 = q2 /\ p1 = q1 /\ p0 = q0.
+Proof.
+  intros (c1 & c0 & Hk2 & Hk1 & He2 & He1 & He0 & _)
+         (d1 & d0 & Hk2' & Hk1' & He2' & He1' & He0' & _).
+  assert (Hc1 : c1 = d1) by congruence. subst d1.
+  assert (Hc0 : c0 = d0) by congruence. subst d0.
+  repeat split; congruence.
+Qed.
+
+(* ===================================================================== *)
+(* §4 A/D variance: [pte_set_ad w a d] (PtAdBits.v) rewrites the A/D flag  *)
+(*    bits -- the EXACT update shape [update_PTE_Bits] produces on the    *)
+(*    Svadu/ADUE write-back path, so <<w' is an A/D variant of w>> is     *)
+(*    [exists a d, w' = pte_set_ad w a d].  The bit-level laws (refl /    *)
+(*    absorb / PPN, ext, leafness stability) live in PtAdBits.v (iris-    *)
+(*    free testbit dialect).                                              *)
+(* ===================================================================== *)
+
+(* [pte_valid] / [pte_invalid] are mutually exclusive (exec is a function;
+   witnessed at the concrete bridge state) *)
+Lemma pte_valid_invalid_excl (w : mword 64) :
+  pte_valid w -> pte_invalid w -> False.
+Proof.
+  intros Hv Hi.
+  specialize (Hv dstateM). specialize (Hi dstateM).
+  rewrite Hv in Hi. discriminate.
+Qed.
+
+(* a vpn cannot both map and block: the description's slot and kid maps
+   are functions, so the two walks agree down to the stopping word,
+   which would have to be valid and invalid at once *)
+Lemma ptree_maps_blocks_excl (t : ptree) (vpn : mword 27) (p2 p1 p0 : mword 64) :
+  ptree_maps t vpn p2 p1 p0 -> ptree_blocks t vpn -> False.
+Proof.
+  intros (c1 & c0 & Hk2 & Hk1 & He2 & He1 & He0 & Hb1 & Hb0 &
+          Hv2 & Hn2 & Hv1 & Hn1 & Hv0 & _)
+         [ (Hk2n & _)
+         | [ (c1' & Hk2' & Hk1n & _)
+           | (c1' & c0' & Hk2' & Hk1' & _ & _ & _ & _ & _ & _ & Hinv0) ] ].
+  - congruence.
+  - assert (Hc : c1' = c1) by congruence. subst c1'. congruence.
+  - assert (Hc : c1' = c1) by congruence. subst c1'.
+    assert (Hc : c0' = c0) by congruence. subst c0'.
+    rewrite He0 in Hinv0.
+    exact (pte_valid_invalid_excl p0 Hv0 Hinv0).
+Qed.
+
+(* ===================================================================== *)
+(* §5 The leaf write-back on the description side: [ptree_set_leaf]       *)
+(*    replaces the LEAF word on [vpn]'s path (what the ADUE write-back    *)
+(*    does to memory), shallowly (fixed 3-level depth, no recursion).     *)
+(* ===================================================================== *)
+
+Definition pt_upd_ent (t : ptree) (i : mword 9) (w : mword 64) : ptree :=
+  PtNode (pt_base t)
+         (fun j => if decide (j = i) then w else pt_ents t j)
+         (pt_kids t).
+Definition pt_upd_kid (t : ptree) (i : mword 9) (c : option ptree) : ptree :=
+  PtNode (pt_base t) (pt_ents t)
+         (fun j => if decide (j = i) then c else pt_kids t j).
+
+Definition ptree_set_leaf (t : ptree) (vpn : mword 27) (w : mword 64) : ptree :=
+  match pt_kids t (vpn_idx 2 vpn) with
+  | Some c1 =>
+      match pt_kids c1 (vpn_idx 1 vpn) with
+      | Some c0 =>
+          pt_upd_kid t (vpn_idx 2 vpn)
+            (Some (pt_upd_kid c1 (vpn_idx 1 vpn)
+                     (Some (pt_upd_ent c0 (vpn_idx 0 vpn) w))))
+      | None => t
+      end
+  | None => t
+  end.
+
+(* ---- vpn chunk arithmetic: the three 9-bit indices determine the vpn   *)
+(*      (27-bit clones of KptPt's subrange facts).                        *)
+
+Lemma pt_sub27_26_18 (x : mword 27) :
+  bv_unsigned (subrange_vec_dec x 26 18) = (bv_unsigned x ≫ 18) `mod` 2 ^ 9.
+Proof.
+  unfold subrange_vec_dec. rewrite autocast_id.
+  unfold to_word_idx. rewrite MachineWord.MachineWord.cast_idx_refl.
+  unfold MachineWord.MachineWord.slice.
+  rewrite bv_extract_unsigned.
+  change (Z.of_N (MachineWord.MachineWord.Z_idx 18)) with 18.
+  change (MachineWord.MachineWord.Z_idx (26 - 18 + 1)) with 9%N.
+  unfold bv_wrap, bv_modulus. reflexivity.
+Qed.
+
+Lemma pt_sub27_17_9 (x : mword 27) :
+  bv_unsigned (subrange_vec_dec x 17 9) = (bv_unsigned x ≫ 9) `mod` 2 ^ 9.
+Proof.
+  unfold subrange_vec_dec. rewrite autocast_id.
+  unfold to_word_idx. rewrite MachineWord.MachineWord.cast_idx_refl.
+  unfold MachineWord.MachineWord.slice.
+  rewrite bv_extract_unsigned.
+  change (Z.of_N (MachineWord.MachineWord.Z_idx 9)) with 9.
+  change (MachineWord.MachineWord.Z_idx (17 - 9 + 1)) with 9%N.
+  unfold bv_wrap, bv_modulus. reflexivity.
+Qed.
+
+Lemma pt_sub27_8_0 (x : mword 27) :
+  bv_unsigned (subrange_vec_dec x 8 0) = bv_unsigned x `mod` 2 ^ 9.
+Proof.
+  unfold subrange_vec_dec. rewrite autocast_id.
+  unfold to_word_idx. rewrite MachineWord.MachineWord.cast_idx_refl.
+  unfold MachineWord.MachineWord.slice.
+  rewrite bv_extract_unsigned.
+  change (MachineWord.MachineWord.Z_idx 0) with 0%N.
+  change (Z.of_N 0) with 0.
+  rewrite Z.shiftr_0_r.
+  change (MachineWord.MachineWord.Z_idx (8 - 0 + 1)) with 9%N.
+  unfold bv_wrap, bv_modulus. reflexivity.
+Qed.
+
+Lemma vpn_idx_inj (x y : mword 27) :
+  vpn_idx 2 x = vpn_idx 2 y -> vpn_idx 1 x = vpn_idx 1 y ->
+  vpn_idx 0 x = vpn_idx 0 y -> x = y.
+Proof.
+  cbn [vpn_idx]. intros H2 H1 H0.
+  apply (f_equal bv_unsigned) in H2. apply (f_equal bv_unsigned) in H1.
+  apply (f_equal bv_unsigned) in H0.
+  rewrite !pt_sub27_26_18 in H2. rewrite !pt_sub27_17_9 in H1.
+  rewrite !pt_sub27_8_0 in H0.
+  apply bv_eq.
+  pose proof (bv_unsigned_in_range _ x) as Hx.
+  pose proof (bv_unsigned_in_range _ y) as Hy.
+  assert (Hm27 : bv_modulus (MachineWord.MachineWord.Z_idx 27) = 134217728)
+    by (vm_compute; reflexivity).
+  rewrite Hm27 in Hx, Hy.
+  set (ux := bv_unsigned x) in *. set (uy := bv_unsigned y) in *.
+  rewrite !Z.shiftr_div_pow2 in H2; [| lia | lia].
+  rewrite !Z.shiftr_div_pow2 in H1; [| lia | lia].
+  change (2 ^ 9) with 512 in *. change (2 ^ 18) with 262144 in *.
+  assert (Hx2 : ux / 262144 < 512) by (apply Z.div_lt_upper_bound; lia).
+  assert (Hy2 : uy / 262144 < 512) by (apply Z.div_lt_upper_bound; lia).
+  rewrite (Z.mod_small (ux / 262144) 512) in H2;
+    [| split; [apply Z.div_pos; lia | exact Hx2]].
+  rewrite (Z.mod_small (uy / 262144) 512) in H2;
+    [| split; [apply Z.div_pos; lia | exact Hy2]].
+  pose proof (Z.div_mod ux 512 ltac:(lia)) as Dx0.
+  pose proof (Z.div_mod uy 512 ltac:(lia)) as Dy0.
+  pose proof (Z.div_mod (ux / 512) 512 ltac:(lia)) as Dx1.
+  pose proof (Z.div_mod (uy / 512) 512 ltac:(lia)) as Dy1.
+  rewrite (Z.div_div ux 512 512 ltac:(lia) ltac:(lia)) in Dx1.
+  rewrite (Z.div_div uy 512 512 ltac:(lia) ltac:(lia)) in Dy1.
+  change (512 * 512) with 262144 in Dx1, Dy1.
+  lia.
+Qed.
+
+(* contrapositive form: two distinct vpns differ in some chunk *)
+
+(* ---- projection laws of the two updates ----------------------------- *)
+
+Lemma pt_upd_ent_base (t : ptree) (i : mword 9) (w : mword 64) :
+  pt_base (pt_upd_ent t i w) = pt_base t.
+Proof. reflexivity. Qed.
+Lemma pt_upd_ent_kids (t : ptree) (i : mword 9) (w : mword 64) (j : mword 9) :
+  pt_kids (pt_upd_ent t i w) j = pt_kids t j.
+Proof. reflexivity. Qed.
+Lemma pt_upd_ent_same (t : ptree) (i : mword 9) (w : mword 64) :
+  pt_ents (pt_upd_ent t i w) i = w.
+Proof. cbn. case_decide; [reflexivity | contradiction]. Qed.
+Lemma pt_upd_ent_other (t : ptree) (i : mword 9) (w : mword 64) (j : mword 9) :
+  j <> i -> pt_ents (pt_upd_ent t i w) j = pt_ents t j.
+Proof. intros Hne. cbn. case_decide; [contradiction | reflexivity]. Qed.
+
+Lemma pt_upd_kid_base (t : ptree) (i : mword 9) (c : option ptree) :
+  pt_base (pt_upd_kid t i c) = pt_base t.
+Proof. reflexivity. Qed.
+Lemma pt_upd_kid_ents (t : ptree) (i : mword 9) (c : option ptree) (j : mword 9) :
+  pt_ents (pt_upd_kid t i c) j = pt_ents t j.
+Proof. reflexivity. Qed.
+Lemma pt_upd_kid_same (t : ptree) (i : mword 9) (c : option ptree) :
+  pt_kids (pt_upd_kid t i c) i = c.
+Proof. cbn. case_decide; [reflexivity | contradiction]. Qed.
+Lemma pt_upd_kid_other (t : ptree) (i : mword 9) (c : option ptree) (j : mword 9) :
+  j <> i -> pt_kids (pt_upd_kid t i c) j = pt_kids t j.
+Proof. intros Hne. cbn. case_decide; [contradiction | reflexivity]. Qed.
+
+(* ---- stability of the walk facts under the leaf write-back ---------- *)
+
+(* the written vpn maps to the new word (which must still be a valid
+   4K leaf -- true of every [pte_set_ad] variant of a valid leaf, cf.
+   the A/D write-back lemmas) *)
+Lemma ptree_set_leaf_maps_self (t : ptree) (vpn : mword 27) (p2 p1 p0 w : mword 64) :
+  ptree_maps t vpn p2 p1 p0 ->
+  pte_valid w -> pte_leaf w -> pte_no_napot w -> pte_pbmt0 w ->
+  ptree_maps (ptree_set_leaf t vpn w) vpn p2 p1 w.
+Proof.
+  intros (c1 & c0 & Hk2 & Hk1 & He2 & He1 & He0 & Hb1 & Hb0 &
+          Hv2 & Hn2 & Hv1 & Hn1 & _ & _ & _ & _) Hv Hl Hnap Hpb.
+  unfold ptree_set_leaf. rewrite Hk2. rewrite Hk1.
+  exists (pt_upd_kid c1 (vpn_idx 1 vpn)
+            (Some (pt_upd_ent c0 (vpn_idx 0 vpn) w))),
+         (pt_upd_ent c0 (vpn_idx 0 vpn) w).
+  rewrite !pt_upd_kid_same !pt_upd_kid_ents !pt_upd_kid_base
+          !pt_upd_ent_base !pt_upd_ent_same.
+  repeat split; try reflexivity; assumption.
+Qed.
+
+(* every OTHER vpn's mapping is untouched *)
+Lemma ptree_set_leaf_maps_other (t : ptree) (vpn vpn' : mword 27)
+    (q2 q1 q0 w : mword 64) :
+  vpn' <> vpn ->
+  ptree_maps t vpn' q2 q1 q0 ->
+  ptree_maps (ptree_set_leaf t vpn w) vpn' q2 q1 q0.
+Proof.
+  intros Hne (d1 & d0 & Hk2 & Hk1 & He2 & He1 & He0 & Hb1 & Hb0 &
+              Hv2 & Hp2 & Hv1 & Hp1 & Hv0 & Hl0 & Hnap & Hpb).
+  unfold ptree_set_leaf.
+  destruct (pt_kids t (vpn_idx 2 vpn)) as [c1|] eqn:Hc2;
+    [| exists d1, d0; repeat split; assumption].
+  destruct (pt_kids c1 (vpn_idx 1 vpn)) as [c0|] eqn:Hc1;
+    [| exists d1, d0; repeat split; assumption].
+  destruct (decide (vpn_idx 2 vpn' = vpn_idx 2 vpn)) as [Ei2|Ei2].
+  2:{ (* different root slot: everything below is the old subtree *)
+    exists d1, d0.
+    rewrite (pt_upd_kid_other _ _ _ _ Ei2) !pt_upd_kid_ents.
+    repeat split; assumption. }
+  (* same root slot: vpn' routes through the rebuilt c1 *)
+  rewrite Ei2 in Hk2. rewrite Ei2 in He2.
+  assert (Hd1 : d1 = c1) by congruence. subst d1.
+  destruct (decide (vpn_idx 1 vpn' = vpn_idx 1 vpn)) as [Ei1|Ei1].
+  2:{ exists (pt_upd_kid c1 (vpn_idx 1 vpn)
+                (Some (pt_upd_ent c0 (vpn_idx 0 vpn) w))), d0.
+    rewrite Ei2 !pt_upd_kid_same !pt_upd_kid_ents !pt_upd_kid_base
+      (pt_upd_kid_other _ _ _ _ Ei1).
+    repeat split; try reflexivity; assumption. }
+  (* same root and mid slot: vpn' routes into the rebuilt c0; its leaf
+     index must differ (else vpn' = vpn) *)
+  rewrite Ei1 in Hk1. rewrite Ei1 in He1.
+  assert (Hd0 : d0 = c0) by congruence. subst d0.
+  destruct (decide (vpn_idx 0 vpn' = vpn_idx 0 vpn)) as [Ei0|Ei0].
+  { exfalso. apply Hne. apply vpn_idx_inj; assumption. }
+  exists (pt_upd_kid c1 (vpn_idx 1 vpn)
+            (Some (pt_upd_ent c0 (vpn_idx 0 vpn) w))),
+         (pt_upd_ent c0 (vpn_idx 0 vpn) w).
+  rewrite Ei2 Ei1 !pt_upd_kid_same !pt_upd_kid_ents !pt_upd_kid_base
+    !pt_upd_ent_base (pt_upd_ent_other _ _ _ _ Ei0).
+  repeat split; try reflexivity; assumption.
+Qed.
+
+(* every blocked vpn stays blocked (the write-back targets a MAPPED
+   vpn's leaf slot, which no blocked vpn's walk reads) *)
+Lemma ptree_set_leaf_blocks (t : ptree) (vpn vpn' : mword 27)
+    (p2 p1 p0 w : mword 64) :
+  ptree_maps t vpn p2 p1 p0 ->
+  ptree_blocks t vpn' ->
+  ptree_blocks (ptree_set_leaf t vpn w) vpn'.
+Proof.
+  intros (c1 & c0 & Hk2 & Hk1 & He2 & He1 & He0 & Hb1 & Hb0 &
+          Hv2 & Hp2 & Hv1 & Hp1 & Hv0 & Hl0 & Hnap & Hpb) Hbl.
+  unfold ptree_set_leaf. rewrite Hk2. rewrite Hk1.
+  destruct Hbl as [ (Hn2 & Hi2)
+                  | [ (d1 & Hd2 & Hd1 & Hv2' & Hp2' & Hb1' & Hi1')
+                    | (d1 & d0 & Hd2 & Hd1 & Hv2' & Hp2' & Hv1' & Hp1' &
+                       Hb1' & Hb0' & Hi0') ] ].
+  - (* blocked at root: the root slot of vpn' is kid-free, so it is not
+       vpn's root slot *)
+    left.
+    destruct (decide (vpn_idx 2 vpn' = vpn_idx 2 vpn)) as [Ei2|Ei2].
+    { exfalso. rewrite Ei2 in Hn2. congruence. }
+    rewrite (pt_upd_kid_other _ _ _ _ Ei2) !pt_upd_kid_ents.
+    split; assumption.
+  - (* blocked at mid level *)
+    right. left.
+    destruct (decide (vpn_idx 2 vpn' = vpn_idx 2 vpn)) as [Ei2|Ei2].
+    2:{ exists d1.
+        rewrite (pt_upd_kid_other _ _ _ _ Ei2) !pt_upd_kid_ents.
+        repeat split; assumption. }
+    rewrite Ei2 in Hd2. rewrite Ei2 in Hv2'. rewrite Ei2 in Hp2'.
+    rewrite Ei2 in Hb1'.
+    assert (Hd1c : d1 = c1) by congruence. subst d1.
+    destruct (decide (vpn_idx 1 vpn' = vpn_idx 1 vpn)) as [Ei1|Ei1].
+    { exfalso. rewrite Ei1 in Hd1. congruence. }
+    exists (pt_upd_kid c1 (vpn_idx 1 vpn)
+              (Some (pt_upd_ent c0 (vpn_idx 0 vpn) w))).
+    rewrite Ei2 !pt_upd_kid_same !pt_upd_kid_ents !pt_upd_kid_base
+      (pt_upd_kid_other _ _ _ _ Ei1).
+    repeat split; try reflexivity; assumption.
+  - (* blocked at the leaf level: the stop word is INVALID, so its slot
+       is not vpn's (whose leaf word is a VALID leaf) *)
+    right. right.
+    destruct (decide (vpn_idx 2 vpn' = vpn_idx 2 vpn)) as [Ei2|Ei2].
+    2:{ exists d1, d0.
+        rewrite (pt_upd_kid_other _ _ _ _ Ei2) !pt_upd_kid_ents.
+        repeat split; assumption. }
+    rewrite Ei2 in Hd2. rewrite Ei2 in Hv2'. rewrite Ei2 in Hp2'.
+    rewrite Ei2 in Hb1'.
+    assert (Hd1c : d1 = c1) by congruence. subst d1.
+    destruct (decide (vpn_idx 1 vpn' = vpn_idx 1 vpn)) as [Ei1|Ei1].
+    2:{ exists (pt_upd_kid c1 (vpn_idx 1 vpn)
+                  (Some (pt_upd_ent c0 (vpn_idx 0 vpn) w))), d0.
+        rewrite Ei2 !pt_upd_kid_same !pt_upd_kid_ents !pt_upd_kid_base
+          (pt_upd_kid_other _ _ _ _ Ei1).
+        repeat split; try reflexivity; assumption. }
+    rewrite Ei1 in Hd1. rewrite Ei1 in Hv1'. rewrite Ei1 in Hp1'.
+    rewrite Ei1 in Hb0'.
+    assert (Hd0c : d0 = c0) by congruence. subst d0.
+    destruct (decide (vpn_idx 0 vpn' = vpn_idx 0 vpn)) as [Ei0|Ei0].
+    { exfalso. rewrite Ei0 in Hi0'. rewrite He0 in Hi0'.
+      exact (pte_valid_invalid_excl p0 Hv0 Hi0'). }
+    exists (pt_upd_kid c1 (vpn_idx 1 vpn)
+              (Some (pt_upd_ent c0 (vpn_idx 0 vpn) w))),
+           (pt_upd_ent c0 (vpn_idx 0 vpn) w).
+    rewrite Ei2 Ei1 !pt_upd_kid_same !pt_upd_kid_ents !pt_upd_kid_base
+      !pt_upd_ent_base (pt_upd_ent_other _ _ _ _ Ei0).
+    repeat split; try reflexivity; assumption.
+Qed.
+
+(* the pure per-slot memory facts the exec walk consumes: the slot's 8
+   bytes present in the state's heap, both ends in RAM, 8-byte aligned *)
+Definition pt_slot_mem (sg : mstate) (a : Arch.pa) (w : mword 64) : Prop :=
+  (forall j : nat, (N.of_nat j < 8)%N ->
+     sg.(mem) !! pa_add a j = Some (nth_byte w j)) /\
+  addr_is_ram a /\ addr_is_ram (pa_add a 7) /\
+  is_aligned_paddr (Physaddr a) 8 = true.
+
+(* A SLOT IS IN THE RAM PMA CLASS.  This is the walk layer's only supplier of
+   [pma_allows_pte_read] / [pma_allows_pte_write]'s address premise, and it is
+   free: [pt_slot_mem] already records both ends of the slot in RAM, which is
+   exactly what the class asks (base at or above the DRAM base, END at or
+   below its top -- the end bound being the one an all-addresses statement
+   silently skipped). *)
+Lemma pt_slot_ram_access (sg : mstate) (a : Arch.pa) (w : mword 64) :
+  pt_slot_mem sg a w -> pma_ram_access a 8.
+Proof.
+  intros (_ & Hlo & Hhi & _).
+  exact (pma_access_ram a 8 7 Hlo Hhi (pma_width_ok 8 eq_refl eq_refl) eq_refl eq_refl).
+Qed.
+
+Lemma addr_is_ram_pa0 (a : Arch.pa) : addr_is_ram (pa_add a 0) -> addr_is_ram a.
+Proof.
+  unfold addr_is_ram. intros H.
+  assert (Hnw : (uint a + Z.of_nat 0 < 18446744073709551616)%Z).
+  { rewrite uint_unsigned. change (Z.of_nat 0) with 0%Z.
+    pose proof (bv_unsigned_in_range _ a) as Hr.
+    assert (Hm : bv_modulus (MachineWord.MachineWord.Z_idx 64) = 18446744073709551616)
+      by (vm_compute; reflexivity).
+    rewrite Hm in Hr. rewrite Z.add_0_r. exact (proj2 Hr). }
+  rewrite (uint_pa_add a 0 Hnw) in H. rewrite Z.add_0_r in H. exact H.
+Qed.
+
+(* ===================================================================== *)
+(* §6 THE OWNERSHIP CORE.  One recursive definition: own every slot of    *)
+(*    the node's page (whatever words the description says), and every    *)
+(*    described child.  Everything else about a table is derived by       *)
+(*    peeling this against a [ptree_maps]/[ptree_blocks] fact.            *)
+(* ===================================================================== *)
+
+(* mword_of_int round-trips on 9-bit values *)
+Lemma pt_mword9_id (x : mword 9) : mword_of_int (bv_unsigned x) = x.
+Proof.
+  apply bv_eq.
+  cbv [mword_of_int Values.mword_of_int MachineWord.MachineWord.Z_to_word].
+  rewrite Z_to_bv_unsigned.
+  apply bv_wrap_small. apply bv_unsigned_in_range.
+Qed.
+
+Lemma pt_mword9_unsigned (i : Z) :
+  0 <= i < 512 -> bv_unsigned (mword_of_int i : mword 9) = i.
+Proof.
+  intros Hi.
+  cbv [mword_of_int Values.mword_of_int MachineWord.MachineWord.Z_to_word].
+  rewrite Z_to_bv_unsigned.
+  apply bv_wrap_small.
+  assert (Hm : bv_modulus (MachineWord.MachineWord.Z_idx 9) = 512)
+    by (vm_compute; reflexivity).
+  rewrite Hm. exact Hi.
+Qed.
+
+(* the RANGE of a 9-bit slot index, in the [0 <= _ < 512] shape every
+   [seqZ 0 512] lookup wants.  Every accessor below (and PtBuild's
+   [pt_kids_own_ins], KptTree's [u_pte_slot_facts]) opens with it. *)
+Lemma pt_bv9_range (x : mword 9) : 0 <= bv_unsigned x < 512.
+Proof.
+  pose proof (bv_unsigned_in_range _ x) as H.
+  assert (Hm : bv_modulus (MachineWord.MachineWord.Z_idx 9) = 512)
+    by (vm_compute; reflexivity).
+  rewrite Hm in H. exact H.
+Qed.
+
+(* ...and the [mword 27] (vpn-width) twin of [pt_mword9_unsigned] *)
+Lemma pt_mword27_unsigned (i : Z) :
+  0 <= i < 134217728 -> bv_unsigned (mword_of_int i : mword 27) = i.
+Proof.
+  intros Hi.
+  cbv [mword_of_int Values.mword_of_int MachineWord.MachineWord.Z_to_word].
+  rewrite Z_to_bv_unsigned.
+  apply bv_wrap_small.
+  assert (Hm : bv_modulus (MachineWord.MachineWord.Z_idx 27) = 134217728)
+    by (vm_compute; reflexivity).
+  rewrite Hm. exact Hi.
+Qed.
+
+(* ===================================================================== *)
+(* THE PT-SLOT TIER INDEX (A6.21, grown by A6.53 ruling 1).               *)
+(*                                                                       *)
+(*   [KTier B]  the SHARED KERNEL table: context-free ledger words, canon *)
+(*              PINNED at publication bound [B] (tso-pin-memo.md §5).     *)
+(*   [UTier xi] a PROCESS table: registered ledger words at xi.           *)
+(*                                                                       *)
+(* The index is CONCRETE at every real use, so the match below always     *)
+(* iota-reduces and no proof has to know it is there. *)
+(* ===================================================================== *)
+Inductive ptier : Type :=
+| KTier (B : nat)
+| UTier (xi : CtxIdDefs.CtxId).
+
+(* ===================================================================== *)
+(* THE KERNEL SLOT'S ALLOWED BYTES (tso-pin-memo.md §2/§5.5; A6.53).      *)
+(*                                                                       *)
+(* A canon-pinned kernel PT slot allows, per byte offset, exactly what    *)
+(* the Svadu A/D write-back can put there: byte 0 ranges over the         *)
+(* FOUR-element A/D class of the slot's own word and bytes 1..7 are       *)
+(* singletons, because [pte_set_ad] touches bits 6 and 7 and nothing      *)
+(* else ([PtAdBits.pte_set_ad_nth_byte_high]).  Two properties make the   *)
+(* pin work, and both are below: the family is INVARIANT under the        *)
+(* write-back (so a slot's pin survives its own store), and membership at *)
+(* every offset forces canon-equality (so the walk's certificate falls    *)
+(* out of the pin's tie by [PtAdBits.pte_bytes_canon]).                   *)
+(* ===================================================================== *)
+
+Definition pte_ad_byte0 (w : mword 64) : TsoMemPa.byteset :=
+  TsoMemPa.byteset_of4
+    (nth_byte (pte_set_ad w (mword_of_int 0) (mword_of_int 0)) 0%nat)
+    (nth_byte (pte_set_ad w (mword_of_int 0) (mword_of_int 1)) 0%nat)
+    (nth_byte (pte_set_ad w (mword_of_int 1) (mword_of_int 0)) 0%nat)
+    (nth_byte (pte_set_ad w (mword_of_int 1) (mword_of_int 1)) 0%nat).
+
+(* the model's leaf classifier as a boolean, and its A/D stability -- it
+   reads exactly X, W and R, all three untouched by [pte_set_ad]. *)
+Definition pte_nonleafb (w : mword 64) : bool :=
+  pte_is_non_leaf (Mk_PTE_Flags (subrange_vec_dec w 7 0)).
+
+Lemma pte_nonleafb_set_ad (w : mword 64) (a d : mword 1) :
+  pte_nonleafb (pte_set_ad w a d) = pte_nonleafb w.
+Proof.
+  unfold pte_nonleafb, pte_is_non_leaf.
+  rewrite (pte_set_ad_flag_X w a d) (pte_set_ad_flag_W w a d)
+          (pte_set_ad_flag_R w a d).
+  reflexivity.
+Qed.
+
+Lemma pte_nonleafb_leaf (w : mword 64) : pte_nonleafb w = false <-> pte_leaf w.
+Proof. rewrite /pte_nonleafb /pte_leaf. reflexivity. Qed.
+
+(* THE ALLOWED-BYTE FAMILY, AND IT IS CONDITIONED ON LEAF-NESS (A6.55).
+   §1's measurement -- "A/D is defined only on LEAF PTEs, and the tree
+   agrees: every write path targets [pt_addr0 p1 vpn] and nothing else" --
+   is what lets an INTERIOR slot pin to eight SINGLETONS and so be read at
+   its EXACT value.  That is the property tso-pin-memo §5.5 claimed for
+   levels 2 and 1 and A6.54 reported lost: it is not lost, it just does
+   not come from [ledger_read_at_ok] + [⌜t ≤ B⌝] (which cannot apply to a
+   pinned element at all).  It comes from the SET. *)
+Definition pte_slot_set (w : mword 64) (j : nat) : TsoMemPa.byteset :=
+  if Nat.eqb j 0
+  then (if pte_nonleafb w
+        then TsoMemPa.byteset_sing (nth_byte w 0%nat)
+        else pte_ad_byte0 w)
+  else TsoMemPa.byteset_sing (nth_byte w j).
+
+Lemma pte_ad_byte0_set_ad (w : mword 64) (a d : mword 1) :
+  nth_byte (pte_set_ad w a d) 0%nat ∈ pte_ad_byte0 w.
+Proof.
+  rewrite /pte_ad_byte0 TsoMemPa.elem_of_byteset_of4.
+  destruct (mword1_cases a) as [-> | ->]; destruct (mword1_cases d) as [-> | ->];
+    tauto.
+Qed.
+
+Lemma pte_ad_byte0_inv (w : mword 64) (b : bv 8) :
+  b ∈ pte_ad_byte0 w ->
+  exists a d : mword 1, b = nth_byte (pte_set_ad w a d) 0%nat.
+Proof.
+  rewrite /pte_ad_byte0 TsoMemPa.elem_of_byteset_of4.
+  intros [-> | [-> | [-> | ->]]]; eauto.
+Qed.
+
+(* THE INVARIANCE: a write-back does not move the family, so the pinned
+   element's payload is UNCHANGED by its own store. *)
+Lemma pte_slot_set_set_ad (w : mword 64) (a d : mword 1) (j : nat) :
+  pte_leaf w -> (j < 8)%nat ->
+  pte_slot_set (pte_set_ad w a d) j = pte_slot_set w j.
+Proof.
+  intros Hlf Hj. rewrite /pte_slot_set. destruct (Nat.eqb j 0) eqn:Hj0.
+  - rewrite pte_nonleafb_set_ad (proj2 (pte_nonleafb_leaf w) Hlf).
+    rewrite /pte_ad_byte0 !pte_set_ad_absorb //.
+  - apply Nat.eqb_neq in Hj0.
+    by rewrite (pte_set_ad_nth_byte_high w a d j ltac:(lia)).
+Qed.
+
+(* THE STORE'S SIDE CONDITION: every write-back byte of a LEAF slot is
+   allowed.  The leaf premise is exactly §1's measurement, and it is
+   available at the only site that discharges this -- the walk's O3 arm,
+   whose [Hvar] gives [pte_leaf] of the variant. *)
+Lemma pte_slot_set_mem_set_ad (w : mword 64) (a d : mword 1) (j : nat) :
+  pte_leaf w -> (j < 8)%nat ->
+  nth_byte (pte_set_ad w a d) j ∈ pte_slot_set w j.
+Proof.
+  intros Hlf Hj. rewrite /pte_slot_set. destruct (Nat.eqb j 0) eqn:Hj0.
+  - apply Nat.eqb_eq in Hj0. subst j.
+    rewrite (proj2 (pte_nonleafb_leaf w) Hlf). apply pte_ad_byte0_set_ad.
+  - apply Nat.eqb_neq in Hj0.
+    rewrite (pte_set_ad_nth_byte_high w a d j ltac:(lia)).
+    apply TsoMemPa.byteset_sing_in.
+Qed.
+
+(* THE READ'S CONCLUSION AT AN INTERIOR SLOT: all eight sets are
+   singletons, so the value is EXACT. *)
+Lemma pte_slot_set_exact (w w' : mword 64) :
+  pte_nonleafb w = true ->
+  (forall j : nat, (j < 8)%nat -> nth_byte w' j ∈ pte_slot_set w j) ->
+  forall j : nat, (j < 8)%nat -> nth_byte w' j = nth_byte w j.
+Proof.
+  intros Hnl H j Hj. pose proof (H j Hj) as Hm.
+  rewrite /pte_slot_set in Hm.
+  destruct (Nat.eqb j 0) eqn:Hj0.
+  - apply Nat.eqb_eq in Hj0. subst j.
+    rewrite Hnl in Hm. by apply TsoMemPa.elem_of_byteset_sing in Hm.
+  - by apply TsoMemPa.elem_of_byteset_sing in Hm.
+Qed.
+
+Lemma pte_slot_set_nonleaf_sing (w : mword 64) (j : nat) :
+  pte_nonleafb w = true ->
+  pte_slot_set w j = TsoMemPa.byteset_sing (nth_byte w j).
+Proof.
+  intros Hnl. rewrite /pte_slot_set. destruct (Nat.eqb j 0) eqn:Hj0.
+  - apply Nat.eqb_eq in Hj0. subst j. by rewrite Hnl.
+  - reflexivity.
+Qed.
+
+(* THE READ'S CONCLUSION AT A LEAF: membership at every offset forces
+   canon-equality (tso-pin-memo §5.5's reassembly, via
+   [PtAdBits.pte_bytes_canon]).  Stated unconditionally: at an interior
+   slot it holds a fortiori, since the value is exact. *)
+Lemma pte_slot_set_canon (w w' : mword 64) :
+  (forall j : nat, (j < 8)%nat -> nth_byte w' j ∈ pte_slot_set w j) ->
+  pte_canon w' = pte_canon w.
+Proof.
+  intros H. destruct (pte_nonleafb w) eqn:Hnl.
+  - assert (Hw : w' = w).
+    { apply (bv_eq_of_bytes (n := 8%N)). intros j Hj.
+      apply (pte_slot_set_exact w w' Hnl H). lia. }
+    by rewrite Hw.
+  - assert (H0 : nth_byte w' 0%nat ∈ pte_ad_byte0 w).
+    { have := H 0%nat ltac:(lia). rewrite /pte_slot_set /= Hnl. done. }
+    destruct (pte_ad_byte0_inv w _ H0) as (a & d & Hb0).
+    apply (pte_bytes_canon w w' a d Hb0).
+    intros j Hj. have := H j ltac:(lia). rewrite /pte_slot_set.
+    destruct (Nat.eqb j 0) eqn:Hj0.
+    { apply Nat.eqb_eq in Hj0. lia. }
+    by rewrite TsoMemPa.elem_of_byteset_sing.
+Qed.
+
+(* ...and therefore the family is determined by the CANON CLASS of a LEAF,
+   which is what lets a value-generic payer wand keep the pin. *)
+Lemma pte_slot_set_eq_of_mem (w w' : mword 64) :
+  pte_leaf w ->
+  (forall j : nat, (j < 8)%nat -> nth_byte w' j ∈ pte_slot_set w j) ->
+  forall j : nat, (j < 8)%nat -> pte_slot_set w' j = pte_slot_set w j.
+Proof.
+  intros Hlf H. pose proof (pte_slot_set_canon w w' H) as Hc.
+  destruct (pte_canon_inv w w' Hc) as (a & d & ->).
+  intros j Hj. by apply pte_slot_set_set_ad.
+Qed.
+
+(* THE WRITE-BACK'S SIDE CONDITION, named once: the slot being written is a
+   LEAF (§1: A/D is defined only on leaves, and every write path in the tree
+   targets [pt_addr0 p1 vpn]) and the new word is allowed at every byte.
+   This is what the payer wand carries; it is TIER-GENERIC (the [UTier] arm
+   ignores it) and it is exactly what the pinned store gate needs. *)
+Definition pte_wb_ok (wold wnew : mword 64) : Prop :=
+  pte_leaf wold /\
+  forall j : nat, (j < 8)%nat -> nth_byte wnew j ∈ pte_slot_set wold j.
+
+Lemma pte_wb_ok_set_ad (w : mword 64) (a d : mword 1) :
+  pte_leaf w -> pte_wb_ok w (pte_set_ad w a d).
+Proof.
+  intros Hlf. split; [exact Hlf |].
+  intros j Hj. by apply pte_slot_set_mem_set_ad.
+Qed.
+
+Lemma pte_wb_ok_mem (wold wnew : mword 64) :
+  pte_wb_ok wold wnew ->
+  forall j : nat, (j < 8)%nat -> nth_byte wnew j ∈ pte_slot_set wold j.
+Proof. by intros [_ Hm]. Qed.
+
+(* the pin's payload does not move: the written word's family IS the old
+   one, which is why a slot survives its own write-back pinned. *)
+Lemma pte_wb_ok_sets (wold wnew : mword 64) :
+  pte_wb_ok wold wnew ->
+  forall j : nat, (j < 8)%nat -> pte_slot_set wnew j = pte_slot_set wold j.
+Proof. intros [Hlf Hm]. by apply pte_slot_set_eq_of_mem. Qed.
+
+Lemma pte_wb_ok_canon (wold wnew : mword 64) :
+  pte_wb_ok wold wnew -> pte_canon wnew = pte_canon wold.
+Proof. intros [_ Hm]. by apply pte_slot_set_canon. Qed.
+
+Section PtTreeIris.
+  Context `{!riscvGS Σ}.
+
+  (* ------------------------------------------------------------------ *)
+  (* THE PT-SLOT TIER INDEX (tso-machine-flip.md §6 amendment A6.21,      *)
+  (* ratified).  [pt_page_own_at]'s slots are ledger cells since the machine  *)
+  (* flip, and WHICH ledger is not uniform:                                *)
+  (*                                                                      *)
+  (*   [None]    the KERNEL page table -- owned by a BARE [inv]            *)
+  (*             ([KptShare.kpt_inv]) shared across every S-mode thread,   *)
+  (*             so its body may not name a context (tso-port.md §0.8'     *)
+  (*             ruling 2); read by the HARDWARE walker at [Read_ttw],     *)
+  (*             RULING 1's flat arm, so no load licence is ever wanted;   *)
+  (*             written by the Svadu A/D write-back, which owes the       *)
+  (*             append.  Context-free ledger ([TsoCtxLedger.phys_ledger_word],  *)
+  (*             A6.20) is the only sound shape and also the cheapest.     *)
+  (*                                                                      *)
+  (*   [Some ξ]  a USER page table -- owned by a THREAD, read by SOFTWARE  *)
+  (*             ([walk]) at [Read_plain] through                          *)
+  (*             [MemClaim.wordw_pointsto], which needs a plain-load     *)
+  (*             licence.  That is the REGISTERED ledger word              *)
+  (*             ([TsoCtx.ctx_phys_word_pointsto], A6.16).                 *)
+  (*                                                                      *)
+  (* SOUNDNESS OF THE INDEX: [ctx_phys_word_ledger] proves [Some ξ ⊢ None],*)
+  (* so the registered tier is strictly stronger and the kernel invariant  *)
+  (* simply takes the weaker one.                                          *)
+  (*                                                                      *)
+  (* The index is CONCRETE at every real use ([Some cur_ctx] or [None]),   *)
+  (* so the match below always iota-reduces and no proof below has to know *)
+  (* it is there.  The old names survive as ambient-context NOTATIONS      *)
+  (* after this section, which is what keeps ~50 consumer files textually  *)
+  (* unchanged. *)
+  (* A6.53 RULING 1: the index CARRIES the kernel tier's canon-pin bound.
+     [KTier B] is the shared kernel table, whose slots are pinned at [B]
+     with their own words' [pte_slot_set] family; [UTier ξ] is a process
+     table, registered at ξ as before.  The bound rides in the index rather
+     than in an ∃ inside the arm because the port's standing rule is that
+     indices are named explicitly (§0.7' rule 1, and A6.21's [option CtxId]
+     precedent) -- and because an ∃ would force [KptGhost] BELOW this file
+     to state the agreement.  Measured cost: 40 explicit-index sites in
+     seven files; the ~50 consumer files behind the notations do not move. *)
+  Context (PTT : ptier).
+
+  (* A6.135: the kernel slot at PER-BYTE floors under the global bound
+     [B], each byte carrying the BOOT HART's persistent own-write anchor
+     (or floor 0, the image).  [Ba] is the byte's own publication floor --
+     establishment mints it at the byte's own write stamp, which is what
+     makes the publication UNCONDITIONAL (no drain, no log-top) and gives
+     hart 0 a token-free read credential ([CtxValues.cv_own]); a secondary
+     reads through [view_lb B] and [Ba <= B].  The A/D write-back restamps
+     the cell but keeps [(Ba, pte_slot_set w)] -- the [Bg]-generalized
+     store gate ([TsoCtxStore.ledger_store_win_pin_okf]). *)
+  Definition kpt_slot_pin (a : Arch.pa) (dq : dfrac) (w : bv 64)
+      (B : nat) : iProp Σ :=
+    (⌜is_aligned_paddr (Physaddr a) 8 = true⌝ ∗
+     [∗ list] j ∈ seq 0 8, ∃ (Ba t : nat), ⌜(Ba <= B)%nat⌝ ∗
+       TsoCtx.phys_ledger_pin (pa_add a j) dq (nth_byte w j) t Ba
+         (pte_slot_set w j) ∗
+       (⌜Ba = 0%nat⌝ ∨
+        CtxValues.cv_own 0%nat (pa_add a j) Ba ∨
+        TsoGhost.view_lb RiscvPtsto.view_name RiscvPtsto.loglen_name 0%nat Ba))%I.
+
+  Definition pt_slot_own (a : Arch.pa) (dq : dfrac) (w : bv 64) : iProp Σ :=
+    match PTT with
+    | KTier B => kpt_slot_pin a dq w B
+    | UTier xi => ctx_phys_word_pointsto xi a dq w
+    end.
+
+  Global Instance pt_slot_own_timeless a dq w : Timeless (pt_slot_own a dq w).
+  Proof using . rewrite /pt_slot_own. destruct PTT; apply _. Qed.
+
+  (* BOTH tiers forget to the raw physical word -- which is all the PURE
+     memory facts below ever wanted of a slot.  This is why the index costs
+     the walk lane nothing: only the two places that ACT on a slot (the
+     software walk's load, the A/D write-back's store) care which tier it
+     is. *)
+  Lemma kpt_slot_pin_forget a dq w B :
+    kpt_slot_pin a dq w B ⊢ phys_word_pointsto a dq w.
+  Proof using .
+    iIntros "[%Hal Hb]". rewrite /phys_word_pointsto. iSplitR; first done.
+    iApply (big_sepL_impl with "Hb").
+    iIntros "!>" (k j _) "(%Ba & %t & %HBa & H & _)".
+    by iApply TsoCtx.phys_ledger_pin_forget.
+  Qed.
+
+  Lemma pt_slot_own_forget a dq w :
+    pt_slot_own a dq w ⊢ phys_word_pointsto a dq w.
+  Proof using .
+    rewrite /pt_slot_own. destruct PTT as [B|xi].
+    - apply kpt_slot_pin_forget.
+    - apply ctx_phys_word_pointsto_forget.
+  Qed.
+
+  (* A6.65 THE PURE FACTS, AT THE SLOT'S OWN TIER.  A6.49's ledger-page move
+     made [pt_slot_own] the PT tower, and the ~six walk-lane proofs that
+     wanted [addr_is_ram] off a slot were still applying
+     [phys_word_pointsto_ram] to it -- a RAW law on a tiered cell.  The
+     conclusion is PURE, so this composes the forget above with the raw law
+     and costs the caller nothing: it does not consume the slot (a pure
+     conclusion is persistent), which is exactly why the walk lane can keep
+     using it inline. *)
+  Lemma pt_slot_own_ram a dq w :
+    pt_slot_own a dq w ⊢ ⌜addr_is_ram a⌝.
+  Proof using . rewrite pt_slot_own_forget. apply phys_word_pointsto_ram. Qed.
+
+  Lemma pt_slot_own_ram7 a dq w :
+    pt_slot_own a dq w ⊢ ⌜addr_is_ram (pa_add a 7)⌝.
+  Proof using . rewrite pt_slot_own_forget. apply phys_word_pointsto_ram7. Qed.
+
+  Lemma pt_slot_own_ctx (xi : CtxId) a dq w :
+    PTT = UTier xi -> pt_slot_own a dq w = ctx_phys_word_pointsto xi a dq w.
+  Proof using . intros HP. by rewrite /pt_slot_own HP. Qed.
+
+  Lemma pt_slot_own_ker (B : nat) a dq w :
+    PTT = KTier B ->
+    pt_slot_own a dq w = kpt_slot_pin a dq w B.
+  Proof using . intros HP. by rewrite /pt_slot_own HP. Qed.
+
+  (* PERSISTENT per-node identity claim (uniform-claims PHYSICAL TIER): the
+     node page's vpn maps to its own ppn at KP_rw in the kernel map, and the
+     page is kdata.  Carried inside [pt_page_own_at] so a software walk can turn a
+     physical slot [↦ₚ₈] into a VA-tier [↦₈] (reconstruct [mem_pointsto]) with
+     NOTHING but the tree itself -- [kmap_at] supplies the mapping, [node_kdata]
+     the [addr_is_ram] + canonicality conjuncts [mem_pointsto] carries.
+
+     ...AND that the node's page is a KALLOC page ([page_valid]).  Every page
+     table node in xv6 comes out of kalloc (uvmcreate's root, walk's interior
+     nodes, kvmmake's kernel table), and freewalk hands every one of them back
+     to kfree -- whose precondition is exactly [page_valid p ∗ page_own p].
+     Carrying it HERE rather than as a pure conjunct of each table-shaped spec
+     is what keeps it off walk's and mappages' contracts: it rides along with
+     the ownership, so a function that grows a tree re-establishes it once, at
+     the one place a node is created ([KptTree.pt_node_claim_from_static]),
+     and every consumer gets it for free.  [node_kdata] does NOT imply it --
+     a page between [etext] and [end] is kernel bss, in RAM but not
+     kalloc'able -- so this is a genuine strengthening. *)
+  Definition pt_node_claim (b : mword 44) : iProp Σ :=
+    (⌜node_kdata b⌝ ∗ ⌜page_valid (page_base b)⌝ ∗
+     kmap_at (pt_page_vpn b) b KP_rw)%I.
+
+  Global Instance pt_node_claim_persistent b : Persistent (pt_node_claim b).
+  Proof using . rewrite /pt_node_claim. apply _. Qed.
+
+  (* one node's page: the identity claim, plus all 512 slots (whatever words
+     the description says). *)
+  Definition pt_page_own_at (dq : dfrac) (t : ptree) : iProp Σ :=
+    (pt_node_claim (pt_base t) ∗
+     [∗ list] i ∈ seqZ 0 512,
+       pt_slot_own (u_pte_addr (pt_base t) (mword_of_int i)) dq (pt_ents t (mword_of_int i)))%I.
+
+  Fixpoint ptree_own_at (lvl : nat) (dq : dfrac) (t : ptree) {struct lvl} : iProp Σ :=
+    (pt_page_own_at dq t ∗
+     match lvl with
+     | O => emp
+     | S lvl' =>
+         [∗ list] i ∈ seqZ 0 512,
+           match pt_kids t (mword_of_int i) with
+           | Some c => ptree_own_at lvl' dq c
+           | None => emp
+           end
+     end)%I.
+
+  (* the children conjunct, as a named definition for the accessor lemmas *)
+  Definition pt_kids_own_at (lvl : nat) (dq : dfrac) (t : ptree) : iProp Σ :=
+    ([∗ list] i ∈ seqZ 0 512,
+       match pt_kids t (mword_of_int i) with
+       | Some c => ptree_own_at lvl dq c
+       | None => emp
+       end)%I.
+
+  Lemma ptree_own_S_at (lvl : nat) (dq : dfrac) (t : ptree) :
+    ptree_own_at (S lvl) dq t ⊣⊢ pt_page_own_at dq t ∗ pt_kids_own_at lvl dq t.
+  Proof using . reflexivity. Qed.
+
+  (* TIMELESS: every leaf of the tree ownership is a points-to / a pure
+     fact / a persisted ghost_map fragment.  This is what lets a SHARED
+     kernel page table live in an Iris [inv] (KptShare.v): opening the
+     invariant yields the body under a [▷], and the A/D write-back needs
+     the slot ownership NOW, in the same fupd. *)
+  Global Instance pt_page_own_timeless_at dq t : Timeless (pt_page_own_at dq t).
+  Proof using . rewrite /pt_page_own_at /pt_node_claim. apply _. Qed.
+
+  Global Instance ptree_own_timeless_at lvl dq t : Timeless (ptree_own_at lvl dq t).
+  Proof using .
+    revert t. induction lvl as [| lvl IH]; intros t.
+    - rewrite /ptree_own_at. apply _.
+    - rewrite ptree_own_S_at /pt_kids_own_at.
+      apply bi.sep_timeless; [apply _ |].
+      apply big_sepL_timeless. intros k i _.
+      destruct (pt_kids t (mword_of_int i)); [apply IH | apply _].
+  Qed.
+
+  (* the root node's page is a kalloc page -- read straight out of the claim,
+     without opening the tree.  A caller that has just been handed a table
+     ([SpecProcPagetable]'s post) and must show the returned pointer is not
+     NULL has nothing else to argue from; [page_valid_ne_null] does the rest. *)
+  Lemma ptree_own_page_valid_at (lvl : nat) (dq : dfrac) (t : ptree) :
+    ptree_own_at lvl dq t ⊢ ⌜page_valid (page_base (pt_base t))⌝.
+  Proof using .
+    destruct lvl as [| l];
+      [ rewrite /ptree_own_at | rewrite ptree_own_S_at ];
+      rewrite /pt_page_own_at /pt_node_claim;
+      iIntros "[[(_ & %Hv & _) _] _]"; iPureIntro; exact Hv.
+  Qed.
+
+  (* ---- single-node slot accessor (update form) ---------------------- *)
+  Lemma pt_page_own_acc_at (dq : dfrac) (t : ptree) (i : mword 9) :
+    pt_page_own_at dq t ⊢
+      pt_slot_own (u_pte_addr (pt_base t) i) dq (pt_ents t i) ∗
+      (∀ w' : mword 64,
+         pt_slot_own (u_pte_addr (pt_base t) i) dq w' -∗
+         pt_page_own_at dq (pt_upd_ent t i w')).
+  Proof using .
+    pose proof (pt_bv9_range i) as Hir.
+    assert (Hlk : seqZ 0 512 !! Z.to_nat (bv_unsigned i) = Some (bv_unsigned i)).
+    { apply lookup_seqZ. split; lia. }
+    iIntros "Hpg".
+    iEval (rewrite /pt_page_own_at) in "Hpg".
+    iDestruct "Hpg" as "[#Hcl Hpg]".
+    iEval (rewrite (big_sepL_delete _ _ _ _ Hlk)) in "Hpg".
+    iDestruct "Hpg" as "[Hslot Hrest]".
+    iEval (rewrite pt_mword9_id) in "Hslot".
+    iFrame "Hslot".
+    iIntros (w') "Hslot".
+    rewrite /pt_page_own_at.
+    iSplitR; [rewrite pt_upd_ent_base; iExact "Hcl" |].
+    rewrite (big_sepL_delete
+               (fun _ j => pt_slot_own
+                             (u_pte_addr (pt_base (pt_upd_ent t i w'))
+                                (mword_of_int j)) dq
+                             (pt_ents (pt_upd_ent t i w') (mword_of_int j)))
+               _ _ _ Hlk).
+    iSplitL "Hslot".
+    { rewrite pt_mword9_id pt_upd_ent_base pt_upd_ent_same. iExact "Hslot". }
+    iApply (big_sepL_mono with "Hrest").
+    intros k j Hkj. cbn beta.
+    case_decide as Hk; [reflexivity |].
+    rewrite pt_upd_ent_base.
+    rewrite pt_upd_ent_other; [reflexivity |].
+    (* mword_of_int j <> i since j <> bv_unsigned i and j in [0,512) *)
+    apply lookup_seqZ in Hkj. destruct Hkj as [-> Hjlt].
+    intros Heq. apply Hk.
+    apply (f_equal bv_unsigned) in Heq.
+    rewrite pt_mword9_unsigned in Heq; [| lia].
+    lia.
+  Qed.
+
+  (* read-only form: restore the SAME description *)
+  Lemma pt_page_own_acc_ro_at (dq : dfrac) (t : ptree) (i : mword 9) :
+    pt_page_own_at dq t ⊢
+      pt_slot_own (u_pte_addr (pt_base t) i) dq (pt_ents t i) ∗
+      (pt_slot_own (u_pte_addr (pt_base t) i) dq (pt_ents t i) -∗ pt_page_own_at dq t).
+  Proof using .
+    pose proof (pt_bv9_range i) as Hir.
+    assert (Hlk : seqZ 0 512 !! Z.to_nat (bv_unsigned i) = Some (bv_unsigned i)).
+    { apply lookup_seqZ. split; lia. }
+    iIntros "Hpg".
+    iEval (rewrite /pt_page_own_at) in "Hpg".
+    iDestruct "Hpg" as "[#Hcl Hpg]".
+    iDestruct (big_sepL_lookup_acc _ _ _ _ Hlk with "Hpg") as "[Hslot Hrest]".
+    iEval (rewrite pt_mword9_id) in "Hslot".
+    iFrame "Hslot".
+    iIntros "Hslot".
+    rewrite /pt_page_own_at. iFrame "Hcl".
+    iApply "Hrest". iEval (rewrite pt_mword9_id). iExact "Hslot".
+  Qed.
+
+  (* ---- single-node child accessor (update form) --------------------- *)
+  Lemma pt_kids_own_acc_at (lvl : nat) (dq : dfrac) (t : ptree) (i : mword 9) (c : ptree) :
+    pt_kids t i = Some c ->
+    pt_kids_own_at lvl dq t ⊢
+      ptree_own_at lvl dq c ∗
+      (∀ c' : ptree,
+         ptree_own_at lvl dq c' -∗
+         pt_kids_own_at lvl dq (pt_upd_kid t i (Some c'))).
+  Proof using .
+    intros Hk.
+    pose proof (pt_bv9_range i) as Hir.
+    assert (Hlk : seqZ 0 512 !! Z.to_nat (bv_unsigned i) = Some (bv_unsigned i)).
+    { apply lookup_seqZ. split; lia. }
+    iIntros "Hks".
+    iEval (rewrite /pt_kids_own_at (big_sepL_delete _ _ _ _ Hlk)) in "Hks".
+    iDestruct "Hks" as "[Hc Hrest]".
+    iEval (rewrite pt_mword9_id Hk) in "Hc".
+    iFrame "Hc".
+    iIntros (c') "Hc".
+    rewrite /pt_kids_own_at.
+    rewrite (big_sepL_delete
+               (fun _ j => (match pt_kids (pt_upd_kid t i (Some c')) (mword_of_int j) with
+                            | Some cc => ptree_own_at lvl dq cc
+                            | None => emp end)%I)
+               _ _ _ Hlk).
+    iSplitL "Hc".
+    { rewrite pt_mword9_id pt_upd_kid_same. iExact "Hc". }
+    iApply (big_sepL_mono with "Hrest").
+    intros k j Hkj. cbn beta.
+    case_decide as Hkk; [reflexivity |].
+    rewrite pt_upd_kid_other; [reflexivity |].
+    apply lookup_seqZ in Hkj. destruct Hkj as [-> Hjlt].
+    intros Heq. apply Hkk.
+    apply (f_equal bv_unsigned) in Heq.
+    rewrite pt_mword9_unsigned in Heq; [| lia].
+    lia.
+  Qed.
+
+  (* read-only child accessor *)
+  Lemma pt_kids_own_acc_ro_at (lvl : nat) (dq : dfrac) (t : ptree) (i : mword 9) (c : ptree) :
+    pt_kids t i = Some c ->
+    pt_kids_own_at lvl dq t ⊢
+      ptree_own_at lvl dq c ∗ (ptree_own_at lvl dq c -∗ pt_kids_own_at lvl dq t).
+  Proof using .
+    intros Hk.
+    pose proof (pt_bv9_range i) as Hir.
+    assert (Hlk : seqZ 0 512 !! Z.to_nat (bv_unsigned i) = Some (bv_unsigned i)).
+    { apply lookup_seqZ. split; lia. }
+    iIntros "Hks".
+    iEval (rewrite /pt_kids_own_at) in "Hks".
+    iDestruct (big_sepL_lookup_acc _ _ _ _ Hlk with "Hks") as "[Hc Hrest]".
+    iEval (rewrite pt_mword9_id Hk) in "Hc".
+    iFrame "Hc".
+    iIntros "Hc".
+    iApply "Hrest". iEval (rewrite pt_mword9_id Hk). iExact "Hc".
+  Qed.
+
+  (* ---- THE path accessors: peel the three slots a mapped vpn's walk   *)
+  (*      reads.  Read-only form (restore the same tree), and the write- *)
+  (*      back form (restore [ptree_set_leaf] with any new leaf word).   *)
+  Lemma ptree_own_path_ro_at (dq : dfrac) (t : ptree) (vpn : mword 27)
+      (p2 p1 p0 : mword 64) :
+    ptree_maps t vpn p2 p1 p0 ->
+    ptree_own_at 2 dq t ⊢
+      pt_slot_own (pt_addr2 t vpn) dq p2 ∗
+      pt_slot_own (pt_addr1 p2 vpn) dq p1 ∗
+      pt_slot_own (pt_addr0 p1 vpn) dq p0 ∗
+      (pt_slot_own (pt_addr2 t vpn) dq p2 -∗
+       pt_slot_own (pt_addr1 p2 vpn) dq p1 -∗
+       pt_slot_own (pt_addr0 p1 vpn) dq p0 -∗
+       ptree_own_at 2 dq t).
+  Proof using .
+    intros (c1 & c0 & Hk2 & Hk1 & He2 & He1 & He0 & Hb1 & Hb0 & _).
+    iIntros "[Hpg Hks]".
+    iDestruct (pt_page_own_acc_ro_at dq t (vpn_idx 2 vpn) with "Hpg") as "[Hs2 Hpg]".
+    rewrite He2.
+    iDestruct (pt_kids_own_acc_ro_at 1 dq t (vpn_idx 2 vpn) c1 Hk2 with "Hks") as "[Hc1 Hks]".
+    iDestruct "Hc1" as "[Hpg1 Hks1]".
+    iDestruct (pt_page_own_acc_ro_at dq c1 (vpn_idx 1 vpn) with "Hpg1") as "[Hs1 Hpg1]".
+    rewrite He1.
+    iDestruct (pt_kids_own_acc_ro_at 0 dq c1 (vpn_idx 1 vpn) c0 Hk1 with "Hks1") as "[Hc0 Hks1]".
+    iDestruct "Hc0" as "[Hpg0 Hemp]".
+    iDestruct (pt_page_own_acc_ro_at dq c0 (vpn_idx 0 vpn) with "Hpg0") as "[Hs0 Hpg0]".
+    rewrite He0.
+    unfold pt_addr2, pt_addr1, pt_addr0.
+    rewrite Hb1. rewrite Hb0.
+    iFrame "Hs2 Hs1 Hs0".
+    iIntros "Hs2 Hs1 Hs0".
+    iSplitL "Hpg Hs2".
+    { iApply "Hpg". iExact "Hs2". }
+    iApply "Hks". iSplitL "Hpg1 Hs1".
+    { iApply "Hpg1". iExact "Hs1". }
+    iApply "Hks1". iSplitL "Hpg0 Hs0".
+    { iApply "Hpg0". iExact "Hs0". }
+    iExact "Hemp".
+  Qed.
+
+  Lemma ptree_own_path_upd_at (dq : dfrac) (t : ptree) (vpn : mword 27)
+      (p2 p1 p0 : mword 64) :
+    ptree_maps t vpn p2 p1 p0 ->
+    ptree_own_at 2 dq t ⊢
+      pt_slot_own (pt_addr2 t vpn) dq p2 ∗
+      pt_slot_own (pt_addr1 p2 vpn) dq p1 ∗
+      pt_slot_own (pt_addr0 p1 vpn) dq p0 ∗
+      (∀ w' : mword 64,
+         pt_slot_own (pt_addr2 t vpn) dq p2 -∗
+         pt_slot_own (pt_addr1 p2 vpn) dq p1 -∗
+         pt_slot_own (pt_addr0 p1 vpn) dq w' -∗
+         ptree_own_at 2 dq (ptree_set_leaf t vpn w')).
+  Proof using .
+    intros (c1 & c0 & Hk2 & Hk1 & He2 & He1 & He0 & Hb1 & Hb0 & _).
+    iIntros "[Hpg Hks]".
+    iDestruct (pt_page_own_acc_ro_at dq t (vpn_idx 2 vpn) with "Hpg") as "[Hs2 Hpg]".
+    rewrite He2.
+    iDestruct (pt_kids_own_acc_at 1 dq t (vpn_idx 2 vpn) c1 Hk2 with "Hks") as "[Hc1 Hks]".
+    iDestruct "Hc1" as "[Hpg1 Hks1]".
+    iDestruct (pt_page_own_acc_ro_at dq c1 (vpn_idx 1 vpn) with "Hpg1") as "[Hs1 Hpg1]".
+    rewrite He1.
+    iDestruct (pt_kids_own_acc_at 0 dq c1 (vpn_idx 1 vpn) c0 Hk1 with "Hks1") as "[Hc0 Hks1]".
+    iDestruct "Hc0" as "[Hpg0 Hemp]".
+    iDestruct (pt_page_own_acc_at dq c0 (vpn_idx 0 vpn) with "Hpg0") as "[Hs0 Hpg0]".
+    rewrite He0.
+    unfold pt_addr2, pt_addr1, pt_addr0.
+    rewrite Hb1. rewrite Hb0.
+    iFrame "Hs2 Hs1 Hs0".
+    iIntros (w') "Hs2 Hs1 Hs0".
+    unfold ptree_set_leaf. rewrite Hk2. rewrite Hk1.
+    rewrite ptree_own_S_at.
+    iSplitL "Hpg Hs2".
+    { iApply "Hpg". iExact "Hs2". }
+    iApply "Hks".
+    rewrite ptree_own_S_at.
+    iSplitL "Hpg1 Hs1".
+    { iApply "Hpg1". iExact "Hs1". }
+    iApply "Hks1".
+    iSplitL "Hpg0 Hs0".
+    { iApply "Hpg0". iExact "Hs0". }
+    iExact "Hemp".
+  Qed.
+
+
+  (* ---- pure per-slot memory facts, extracted from ownership --------- *)
+
+  Lemma slot_mem_of_own (sg : mstate) (a : Arch.pa) (dq : dfrac) (w : mword 64) :
+    gen_heap_interp sg.(mem) -∗ pt_slot_own a dq w -∗ ⌜pt_slot_mem sg a w⌝.
+  Proof using .
+    iIntros "Hm Hw".
+    iDestruct (pt_slot_own_forget with "Hw") as "Hw".
+    iDestruct (phys_word_pointsto_aligned_p with "Hw") as %Hal.
+    iDestruct (phys_word_pointsto_bytes with "Hw") as "Hb".
+    iAssert (⌜forall j : nat, (N.of_nat j < 8)%N ->
+               sg.(mem) !! pa_add a j = Some (nth_byte w j)⌝)%I as %Hbytes.
+    { iIntros (j Hj).
+      iDestruct (big_sepL_lookup _ _ j j with "Hb") as "Hbj";
+        [rewrite lookup_seq_lt; [reflexivity | lia]|].
+      iApply (phys_valid with "Hm Hbj"). }
+    iAssert (⌜addr_is_ram (pa_add a 0)⌝)%I as %Hr0.
+    { iDestruct (big_sepL_lookup _ _ 0%nat 0%nat with "Hb") as "Hb0";
+        [rewrite lookup_seq_lt; [reflexivity | lia]|].
+      iApply (phys_ram with "Hb0"). }
+    iAssert (⌜addr_is_ram (pa_add a 7)⌝)%I as %Hr7.
+    { iDestruct (big_sepL_lookup _ _ 7%nat 7%nat with "Hb") as "Hb7";
+        [rewrite lookup_seq_lt; [reflexivity | lia]|].
+      iApply (phys_ram with "Hb7"). }
+    iPureIntro.
+    split; [exact Hbytes|].
+    split; [exact (addr_is_ram_pa0 a Hr0)|].
+    split; [exact Hr7 | exact Hal].
+  Qed.
+
+  (* the three slots of a mapped vpn's path, as pure memory facts (one
+     extraction per step; every walk of that step consumes them) *)
+  Lemma ptree_own_path_mem_at (sg : mstate) (dq : dfrac) (t : ptree)
+      (vpn : mword 27) (p2 p1 p0 : mword 64) :
+    ptree_maps t vpn p2 p1 p0 ->
+    gen_heap_interp sg.(mem) -∗ ptree_own_at 2 dq t -∗
+    ⌜(pt_slot_mem sg (pt_addr2 t vpn) p2 /\
+      pt_slot_mem sg (pt_addr1 p2 vpn) p1 /\
+      pt_slot_mem sg (pt_addr0 p1 vpn) p0)%type⌝.
+  Proof using .
+    intros Hmaps.
+    iIntros "Hm Ht".
+    iDestruct (ptree_own_path_ro_at dq t vpn p2 p1 p0 Hmaps with "Ht")
+      as "(Hs2 & Hs1 & Hs0 & _)".
+    iDestruct (slot_mem_of_own with "Hm Hs2") as %H2.
+    iDestruct (slot_mem_of_own with "Hm Hs1") as %H1.
+    iDestruct (slot_mem_of_own with "Hm Hs0") as %H0.
+    iPureIntro. auto.
+  Qed.
+
+  (* the stopping prefix of a BLOCKED vpn's walk, as pure memory facts:
+     the walk reads owned slots down to the invalid word *)
+  Lemma ptree_own_blocked_mem_at (sg : mstate) (dq : dfrac) (t : ptree)
+      (vpn : mword 27) :
+    ptree_blocks t vpn ->
+    gen_heap_interp sg.(mem) -∗ ptree_own_at 2 dq t -∗
+    ⌜ ((exists w2, pt_slot_mem sg (pt_addr2 t vpn) w2 /\ pte_invalid w2)
+       \/ (exists p2 w1,
+             pt_slot_mem sg (pt_addr2 t vpn) p2 /\ pte_valid p2 /\ pte_ptr p2 /\
+             pt_slot_mem sg (pt_addr1 p2 vpn) w1 /\ pte_invalid w1)
+       \/ (exists p2 p1 w0,
+             pt_slot_mem sg (pt_addr2 t vpn) p2 /\ pte_valid p2 /\ pte_ptr p2 /\
+             pt_slot_mem sg (pt_addr1 p2 vpn) p1 /\ pte_valid p1 /\ pte_ptr p1 /\
+             pt_slot_mem sg (pt_addr0 p1 vpn) w0 /\ pte_invalid w0))%type ⌝.
+  Proof using .
+    intros Hblk.
+    iIntros "Hm [Hpg Hks]".
+    destruct Hblk as
+      [ (Hk2 & Hinv2)
+      | [ (c1 & Hk2 & Hk1 & Hv2 & Hn2 & Hb1 & Hinv1)
+        | (c1 & c0 & Hk2 & Hk1 & Hv2 & Hn2 & Hv1 & Hn1 & Hb1 & Hb0 & Hinv0) ] ].
+    - iDestruct (pt_page_own_acc_ro_at dq t (vpn_idx 2 vpn) with "Hpg") as "[Hs2 _]".
+      iDestruct (slot_mem_of_own with "Hm Hs2") as %H2.
+      iPureIntro. left. eexists. exact (conj H2 Hinv2).
+    - iDestruct (pt_page_own_acc_ro_at dq t (vpn_idx 2 vpn) with "Hpg") as "[Hs2 _]".
+      iDestruct (slot_mem_of_own with "Hm Hs2") as %H2.
+      iDestruct (pt_kids_own_acc_ro_at 1 dq t (vpn_idx 2 vpn) c1 Hk2 with "Hks")
+        as "[[Hpg1 _] _]".
+      iDestruct (pt_page_own_acc_ro_at dq c1 (vpn_idx 1 vpn) with "Hpg1") as "[Hs1 _]".
+      iDestruct (slot_mem_of_own with "Hm Hs1") as %H1.
+      iPureIntro. right; left.
+      exists (pt_ents t (vpn_idx 2 vpn)), (pt_ents c1 (vpn_idx 1 vpn)).
+      split; [exact H2 |]. split; [exact Hv2 |]. split; [exact Hn2 |].
+      split; [| exact Hinv1].
+      unfold pt_addr1. rewrite Hb1. exact H1.
+    - iDestruct (pt_page_own_acc_ro_at dq t (vpn_idx 2 vpn) with "Hpg") as "[Hs2 _]".
+      iDestruct (slot_mem_of_own with "Hm Hs2") as %H2.
+      iDestruct (pt_kids_own_acc_ro_at 1 dq t (vpn_idx 2 vpn) c1 Hk2 with "Hks")
+        as "[[Hpg1 Hks1] _]".
+      iDestruct (pt_page_own_acc_ro_at dq c1 (vpn_idx 1 vpn) with "Hpg1") as "[Hs1 _]".
+      iDestruct (slot_mem_of_own with "Hm Hs1") as %H1.
+      iDestruct (pt_kids_own_acc_ro_at 0 dq c1 (vpn_idx 1 vpn) c0 Hk1 with "Hks1")
+        as "[[Hpg0 _] _]".
+      iDestruct (pt_page_own_acc_ro_at dq c0 (vpn_idx 0 vpn) with "Hpg0") as "[Hs0 _]".
+      iDestruct (slot_mem_of_own with "Hm Hs0") as %H0.
+      iPureIntro. right; right.
+      exists (pt_ents t (vpn_idx 2 vpn)), (pt_ents c1 (vpn_idx 1 vpn)),
+             (pt_ents c0 (vpn_idx 0 vpn)).
+      split; [exact H2 |]. split; [exact Hv2 |]. split; [exact Hn2 |].
+      split; [unfold pt_addr1; rewrite Hb1; exact H1 |].
+      split; [exact Hv1 |]. split; [exact Hn1 |].
+      split; [unfold pt_addr0; rewrite Hb0; exact H0 | exact Hinv0].
+  Qed.
+
+  (* ---- a PARKED page table: full ownership of a spec-constrained tree
+     that is not currently installed in satp.  The satp-switch lemmas
+     convert between an installed table's invariant and this frame.     *)
+  Definition pt_frame_at (S : ptree -> Prop) : iProp Σ :=
+    (∃ t : ptree, ⌜ S t ⌝ ∗ ptree_own_at 2 (DfracOwn 1) t)%I.
+
+End PtTreeIris.
+
+(* ===================================================================== *)
+(* THE TWO TIERS, BY NAME (A6.21).                                        *)
+(*                                                                       *)
+(* [pt_page_own]/[ptree_own]/... are the USER tier at the AMBIENT context, *)
+(* spelled as NOTATIONS so that [cur_ctx] is resolved AT THE USE SITE --   *)
+(* the same trick the M1 flip used for [↦ₘ], and what keeps every one of   *)
+(* the ~50 consumer files textually unchanged.  [kpt_*] are the KERNEL     *)
+(* tier ([None]), and [KptShare.kpt_body] is their one owner.             *)
+(* ===================================================================== *)
+(* the index is CONCRETE at every use, so these are [reflexivity]; they
+   exist because [iFrame] matches SYNTACTICALLY and will not iota-reduce a
+   slot on its own. *)
+(* THE SLOT'S OWN NOTATION.  The user tier is what ~50 consumer files mean
+   when they write a PT slot, and they used to write it [↦ₚ₈{dq}].  Giving
+   the tiered slot a notation of its own makes that conversion a TOKEN
+   substitution rather than a re-parenthesisation -- which matters, because
+   the old spelling is an infix and the new head is a prefix. *)
+Notation "a ↦ₚₜ{ dq } w" := (pt_slot_own (UTier CtxIdDefs.cur_ctx) a dq w)
+  (at level 20, format "a  ↦ₚₜ{ dq }  w") : bi_scope.
+Notation "a ↦ₚₜ w" := (pt_slot_own (UTier CtxIdDefs.cur_ctx) a (DfracOwn 1) w)
+  (at level 20, format "a  ↦ₚₜ  w") : bi_scope.
+(* NOTE the spacing: a fused "]{" token would break ghost_map's [↪[γ]]
+   tree-wide (durable-notes' lexer rule, and it DID -- [KstackOwn]'s
+   [↦ₘ[KT0]{dq}] stopped parsing).  So this mirrors [↦ₘ[kt] dq v]'s
+   "] dq" shape rather than [↦ₘ{dq}]'s. *)
+Notation "a ↦ₖₜ[ B ] dq w" := (pt_slot_own (KTier B) a dq w)
+  (at level 20, format "a  ↦ₖₜ[ B ]  dq  w") : bi_scope.
+
+Lemma pt_slot_own_Some `{!riscvGS Σ} (xi : CtxIdDefs.CtxId)
+    (a : Arch.pa) (dq : dfrac) (w : bv 64) :
+  pt_slot_own (UTier xi) a dq w = TsoCtx.ctx_phys_word_pointsto xi a dq w.
+Proof. reflexivity. Qed.
+
+Lemma pt_slot_own_None `{!riscvGS Σ} (B : nat)
+    (a : Arch.pa) (dq : dfrac) (w : bv 64) :
+  pt_slot_own (KTier B) a dq w = kpt_slot_pin a dq w B.
+Proof. reflexivity. Qed.
+
+Notation pt_page_own           := (pt_page_own_at (UTier CtxIdDefs.cur_ctx)).
+Notation ptree_own             := (ptree_own_at (UTier CtxIdDefs.cur_ctx)).
+Notation pt_kids_own           := (pt_kids_own_at (UTier CtxIdDefs.cur_ctx)).
+Notation pt_frame              := (pt_frame_at (UTier CtxIdDefs.cur_ctx)).
+Notation pt_page_own_acc       := (pt_page_own_acc_at (UTier CtxIdDefs.cur_ctx)).
+Notation pt_page_own_acc_ro    := (pt_page_own_acc_ro_at (UTier CtxIdDefs.cur_ctx)).
+Notation pt_kids_own_acc       := (pt_kids_own_acc_at (UTier CtxIdDefs.cur_ctx)).
+Notation pt_kids_own_acc_ro    := (pt_kids_own_acc_ro_at (UTier CtxIdDefs.cur_ctx)).
+Notation ptree_own_S           := (ptree_own_S_at (UTier CtxIdDefs.cur_ctx)).
+Notation ptree_own_page_valid  := (ptree_own_page_valid_at (UTier CtxIdDefs.cur_ctx)).
+Notation ptree_own_path_ro     := (ptree_own_path_ro_at (UTier CtxIdDefs.cur_ctx)).
+Notation ptree_own_path_upd    := (ptree_own_path_upd_at (UTier CtxIdDefs.cur_ctx)).
+Notation ptree_own_path_mem    := (ptree_own_path_mem_at (UTier CtxIdDefs.cur_ctx)).
+Notation ptree_own_blocked_mem := (ptree_own_blocked_mem_at (UTier CtxIdDefs.cur_ctx)).
+
+Notation kpt_page_own B        := (pt_page_own_at (KTier B)).
+Notation kptree_own B          := (ptree_own_at (KTier B)).
+Notation kpt_kids_own B        := (pt_kids_own_at (KTier B)).
+
+(* ===================================================================== *)
+(* §7 TLB consistency MODULO A/D.  Every resident TLB entry is the walk   *)
+(*    entry of some vpn the tree maps, with the leaf word an A/D VARIANT  *)
+(*    of the tree's current leaf word: entries may be stale in A/D only   *)
+(*    (an ADUE write-back refreshes memory and the touched entry, but     *)
+(*    other cached copies keep the old bits).  Quantified through the     *)
+(*    hash so the fill lemma needs no hash injectivity (upt_tlb_ok's      *)
+(*    shape).                                                             *)
+(* ===================================================================== *)
+
+(* the cache-provenance relation: [ent] is a legal resident of slot
+   [tlb_hash vpn'] with respect to tree [t] -- the walk entry of some
+   vpn [t] maps with the same hash, modulo A/D staleness of the leaf *)
+Definition tlb_cache_of (asid : mword 16) (t : ptree)
+    (vpn' : mword 27) (ent : TLB_Entry) : Prop :=
+  exists vpn p2 p1 p0 (a d : mword 1),
+    ptree_maps t vpn p2 p1 p0 /\
+    tlb_hash (__id 39) vpn = tlb_hash (__id 39) vpn' /\
+    ent = u_walk_entry vpn p2 p1 (pte_set_ad p0 a d) asid.
+
+Definition tlb_ok_pt (asid : mword 16) (t : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6)) : Prop :=
+  forall (vpn' : mword 27) (ent : TLB_Entry),
+    vec_access_dec tlbvec (tlb_hash (__id 39) vpn') = Some ent ->
+    tlb_cache_of asid t vpn' ent.
+
+(* an all-empty TLB is consistent with any tree *)
+Lemma tlb_ok_pt_empty (asid : mword 16) (t : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6)) :
+  (forall vpn', vec_access_dec tlbvec (tlb_hash (__id 39) vpn') = None) ->
+  tlb_ok_pt asid t tlbvec.
+Proof.
+  intros Hnone vpn' ent Hget. rewrite Hnone in Hget. discriminate.
+Qed.
+
+(* consistency survives a walk-induced fill with ANY A/D variant of the
+   mapped leaf -- covering both the no-update fill (the leaf itself, via
+   [pte_set_ad_refl]) and the ADUE write-back fill (the updated word)    *)
+Lemma tlb_ok_pt_fill (asid : mword 16) (t : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+    (vpn : mword 27) (p2 p1 p0 q0 : mword 64) :
+  ptree_maps t vpn p2 p1 p0 ->
+  (exists a d : mword 1, q0 = pte_set_ad p0 a d) ->
+  tlb_ok_pt asid t tlbvec ->
+  tlb_ok_pt asid t (vec_update_dec tlbvec (tlb_hash (__id 39) vpn)
+                      (Some (u_walk_entry vpn p2 p1 q0 asid))).
+Proof.
+  intros Hmaps (a & d & Hq) Hok vpn' ent Hget.
+  rewrite (vec64_access_update _ _ _ _ (tlb_hash_range vpn)) in Hget.
+  destruct (Z.eqb (tlb_hash (__id 39) vpn') (tlb_hash (__id 39) vpn)) eqn:Hh.
+  - apply Z.eqb_eq in Hh. injection Hget as <-.
+    exists vpn, p2, p1, p0, a, d.
+    split; [exact Hmaps|]. split; [symmetry; exact Hh|].
+    rewrite Hq. reflexivity.
+  - exact (Hok vpn' ent Hget).
+Qed.
+
+(* the fill with the tree's OWN leaf word (the update_PTE_Bits = None
+   path) is the reflexive instance *)
+Lemma tlb_ok_pt_fill_self (asid : mword 16) (t : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+    (vpn : mword 27) (p2 p1 p0 : mword 64) :
+  ptree_maps t vpn p2 p1 p0 ->
+  tlb_ok_pt asid t tlbvec ->
+  tlb_ok_pt asid t (vec_update_dec tlbvec (tlb_hash (__id 39) vpn)
+                      (Some (u_walk_entry vpn p2 p1 p0 asid))).
+Proof.
+  intros Hmaps Hok.
+  destruct (pte_set_ad_refl p0) as (a & d & Hp0).
+  apply (tlb_ok_pt_fill asid t tlbvec vpn p2 p1 p0 p0 Hmaps); [| exact Hok].
+  exists a, d. exact Hp0.
+Qed.
+
+(* consistency survives the ADUE write-back itself: replacing the mapped
+   leaf by an A/D variant keeps every resident entry a variant of the
+   NEW tree's leaf ([pte_set_ad_absorb]) *)
+Lemma tlb_cache_of_set_leaf (asid : mword 16) (t : ptree)
+    (vpn' : mword 27) (ent : TLB_Entry)
+    (vpn : mword 27) (p2 p1 p0 : mword 64) (a d : mword 1) :
+  ptree_maps t vpn p2 p1 p0 ->
+  pte_valid (pte_set_ad p0 a d) -> pte_leaf (pte_set_ad p0 a d) ->
+  pte_no_napot (pte_set_ad p0 a d) -> pte_pbmt0 (pte_set_ad p0 a d) ->
+  tlb_cache_of asid t vpn' ent ->
+  tlb_cache_of asid (ptree_set_leaf t vpn (pte_set_ad p0 a d)) vpn' ent.
+Proof.
+  intros Hmaps Hv Hl Hnap Hpb
+    (vpn0 & q2 & q1 & q0 & a' & d' & Hm0 & Hh & Hent).
+  destruct (decide (vpn0 = vpn)) as [-> | Hne].
+  - destruct (ptree_maps_det t vpn q2 q1 q0 p2 p1 p0 Hm0 Hmaps)
+      as (-> & -> & ->).
+    exists vpn, p2, p1, (pte_set_ad p0 a d), a', d'.
+    split.
+    { apply (ptree_set_leaf_maps_self t vpn p2 p1 p0 _ Hmaps Hv Hl Hnap Hpb). }
+    split; [exact Hh|].
+    rewrite Hent. rewrite pte_set_ad_absorb. reflexivity.
+  - exists vpn0, q2, q1, q0, a', d'.
+    split; [exact (ptree_set_leaf_maps_other t vpn vpn0 q2 q1 q0 _ Hne Hm0)|].
+    split; [exact Hh | exact Hent].
+Qed.
+
+Lemma tlb_ok_pt_set_leaf (asid : mword 16) (t : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+    (vpn : mword 27) (p2 p1 p0 : mword 64) (a d : mword 1) :
+  ptree_maps t vpn p2 p1 p0 ->
+  pte_valid (pte_set_ad p0 a d) -> pte_leaf (pte_set_ad p0 a d) ->
+  pte_no_napot (pte_set_ad p0 a d) -> pte_pbmt0 (pte_set_ad p0 a d) ->
+  tlb_ok_pt asid t tlbvec ->
+  tlb_ok_pt asid (ptree_set_leaf t vpn (pte_set_ad p0 a d)) tlbvec.
+Proof.
+  intros Hmaps Hv Hl Hnap Hpb Hok vpn' ent Hget.
+  exact (tlb_cache_of_set_leaf asid t vpn' ent vpn p2 p1 p0 a d
+           Hmaps Hv Hl Hnap Hpb (Hok vpn' ent Hget)).
+Qed.
+
+(* ===================================================================== *)
+(* §7a2 THE A/D-CANONICAL TABLE, AND WHY A SHARED TABLE NEEDS NOTHING     *)
+(*      MORE.  [ptree_canon t] rewrites every LEVEL-0 slot word to its    *)
+(*      A/D-canonical form and leaves every base, child pointer and       *)
+(*      level-2/1 word alone.  Two facts make it the right notion for a   *)
+(*      kernel page table shared between harts                            *)
+(*      (claude-notes/completed/kpt-share.md):                              *)
+(*        - it is INVARIANT under the Svadu write-back                    *)
+(*          ([ptree_canon_set_leaf]) -- the only mutation a running       *)
+(*          machine performs on an installed table -- so the harts can    *)
+(*          simply AGREE on it (no monotone order, no ghost update at the  *)
+(*          write-back);                                                  *)
+(*        - it determines [tlb_ok_pt] ([tlb_ok_pt_canon]) -- a hart's     *)
+(*          cached entries stay coherent with any table having the same    *)
+(*          canonical form.                                               *)
+(* ===================================================================== *)
+
+(* the classification predicates are A/D-STABLE.  [pte_no_napot] /        *)
+(* [pte_pbmt0] read only the extension bits ([pte_set_ad_ext]); leafness   *)
+(* and validity read only V/R/W/X of the flag byte plus those extension    *)
+(* bits (PtAdBits's four flag laws).                                       *)
+Lemma pte_set_ad_leaf (w : mword 64) (a d : mword 1) :
+  pte_leaf (pte_set_ad w a d) <-> pte_leaf w.
+Proof.
+  unfold pte_leaf, pte_is_non_leaf.
+  rewrite pte_set_ad_flag_X pte_set_ad_flag_W pte_set_ad_flag_R.
+  reflexivity.
+Qed.
+
+(* THE TWO VERDICTS A COPY-OUT READS ARE A/D-STABLE TOO.  [walkaddr]'s V|U
+   test and copyout's [( *pte & PTE_W)] test are made on the leaf the WALK
+   finds, which is an A/D variant of the one the user map records; these are
+   what carry a failing copyout's verdict back to the map
+   ([ProcPtOwn.upt_ad_view_um_vu_w]). *)
+Lemma pte_vu_set_ad (w : mword 64) (a d : mword 1) :
+  pte_vu (pte_set_ad w a d) <-> pte_vu w.
+Proof.
+  unfold pte_vu.
+  rewrite pte_set_ad_flag_V pte_set_ad_flag_U. reflexivity.
+Qed.
+
+Lemma pte_w_set_ad (w : mword 64) (a d : mword 1) :
+  pte_w (pte_set_ad w a d) <-> pte_w w.
+Proof. unfold pte_w. rewrite pte_set_ad_flag_W. reflexivity. Qed.
+
+Lemma pte_set_ad_ptr (w : mword 64) (a d : mword 1) :
+  pte_ptr (pte_set_ad w a d) <-> pte_ptr w.
+Proof.
+  unfold pte_ptr, pte_is_non_leaf.
+  rewrite pte_set_ad_flag_X pte_set_ad_flag_W pte_set_ad_flag_R.
+  reflexivity.
+Qed.
+
+(* VALIDITY IS A/D-STABLE ONLY FOR A LEAF -- and that is exactly where the
+   canonicalisation happens.  The model's [pte_is_invalid] treats A, D and U
+   as RESERVED in a NON-leaf PTE (the clause [pte_is_non_leaf && (A || D ||
+   U || ext<>0)]), so canonicalising a level-2/1 POINTER word would be
+   unsound: it could turn an invalid word into a valid one.  [ptree_canon]
+   rewrites level-0 words only, and [ptree_maps] requires the level-0 word
+   to be [pte_leaf], so the reserved-bit clause is dead on both sides. *)
+Lemma pte_set_ad_valid_leaf (w : mword 64) (a d : mword 1) :
+  pte_leaf w -> (pte_valid (pte_set_ad w a d) <-> pte_valid w).
+Proof.
+  intros Hl.
+  assert (Hl' : pte_is_non_leaf
+                  (Mk_PTE_Flags (subrange_vec_dec (pte_set_ad w a d) 7 0)) = false)
+    by (apply (proj2 (pte_set_ad_leaf w a d)); exact Hl).
+  unfold pte_leaf in Hl.
+  unfold pte_valid, pte_is_invalid.
+  rewrite pte_set_ad_ext.
+  rewrite pte_set_ad_flag_V pte_set_ad_flag_R pte_set_ad_flag_W pte_set_ad_flag_X.
+  rewrite Hl' Hl !andb_false_l.
+  reflexivity.
+Qed.
+
+Lemma pte_set_ad_no_napot (w : mword 64) (a d : mword 1) :
+  pte_no_napot (pte_set_ad w a d) <-> pte_no_napot w.
+Proof. unfold pte_no_napot. rewrite pte_set_ad_ext. reflexivity. Qed.
+
+Lemma pte_set_ad_pbmt0 (w : mword 64) (a d : mword 1) :
+  pte_pbmt0 (pte_set_ad w a d) <-> pte_pbmt0 w.
+Proof. unfold pte_pbmt0. rewrite pte_set_ad_ext. reflexivity. Qed.
+
+(* the canonical table: level 0 canonicalised, everything else verbatim *)
+Definition pt_canon_l0 (t : ptree) : ptree :=
+  PtNode (pt_base t) (fun i => pte_canon (pt_ents t i)) (pt_kids t).
+Definition pt_canon_l1 (t : ptree) : ptree :=
+  PtNode (pt_base t) (pt_ents t) (fun i => option_map pt_canon_l0 (pt_kids t i)).
+Definition ptree_canon (t : ptree) : ptree :=
+  PtNode (pt_base t) (pt_ents t) (fun i => option_map pt_canon_l1 (pt_kids t i)).
+
+Lemma ptree_maps_canon (t : ptree) (vpn : mword 27) (p2 p1 p0 : mword 64) :
+  ptree_maps t vpn p2 p1 p0 ->
+  ptree_maps (ptree_canon t) vpn p2 p1 (pte_canon p0).
+Proof.
+  intros (c1 & c0 & Hk2 & Hk1 & He2 & He1 & He0 & Hb1 & Hb0 &
+          Hv2 & Hp2 & Hv1 & Hp1 & Hv0 & Hl0 & Hn0 & Hb0').
+  exists (pt_canon_l1 c1), (pt_canon_l0 c0).
+  cbn [ptree_canon pt_canon_l1 pt_canon_l0 pt_base pt_ents pt_kids].
+  rewrite Hk2. cbn [option_map].
+  rewrite Hk1. cbn [option_map].
+  rewrite He0.
+  unfold pte_canon.
+  repeat split; try assumption.
+  - apply (proj2 (pte_set_ad_valid_leaf p0 _ _ Hl0)). exact Hv0.
+  - apply (proj2 (pte_set_ad_leaf p0 _ _)). exact Hl0.
+  - apply (proj2 (pte_set_ad_no_napot p0 _ _)). exact Hn0.
+  - apply (proj2 (pte_set_ad_pbmt0 p0 _ _)). exact Hb0'.
+Qed.
+
+Lemma ptree_maps_canon_inv (t : ptree) (vpn : mword 27) (p2 p1 w : mword 64) :
+  ptree_maps (ptree_canon t) vpn p2 p1 w ->
+  exists q0, ptree_maps t vpn p2 p1 q0 /\ w = pte_canon q0.
+Proof.
+  intros (d1 & d0 & Hk2 & Hk1 & He2 & He1 & He0 & Hb1 & Hb0 &
+          Hv2 & Hp2 & Hv1 & Hp1 & Hv0 & Hl0 & Hn0 & Hb0').
+  cbn [ptree_canon pt_base pt_ents pt_kids] in *.
+  destruct (pt_kids t (vpn_idx 2 vpn)) as [c1 |] eqn:Hc1; [| discriminate].
+  cbn [option_map] in Hk2. injection Hk2 as <-.
+  cbn [pt_canon_l1 pt_base pt_ents pt_kids] in *.
+  destruct (pt_kids c1 (vpn_idx 1 vpn)) as [c0 |] eqn:Hc0; [| discriminate].
+  cbn [option_map] in Hk1. injection Hk1 as <-.
+  cbn [pt_canon_l0 pt_base pt_ents pt_kids] in *.
+  exists (pt_ents c0 (vpn_idx 0 vpn)).
+  split; [| symmetry; exact He0].
+  exists c1, c0.
+  rewrite <- He0 in Hv0, Hl0, Hn0, Hb0'.
+  unfold pte_canon in Hv0, Hl0, Hn0, Hb0'.
+  assert (Hlq : pte_leaf (pt_ents c0 (vpn_idx 0 vpn)))
+    by exact (proj1 (pte_set_ad_leaf _ _ _) Hl0).
+  repeat split; try assumption; try reflexivity.
+  - exact (proj1 (pte_set_ad_valid_leaf _ _ _ Hlq) Hv0).
+  - exact (proj1 (pte_set_ad_no_napot _ _ _) Hn0).
+  - exact (proj1 (pte_set_ad_pbmt0 _ _ _) Hb0').
+Qed.
+
+(* node equality, extensionally (the description's slot/child fields are
+   FUNCTIONS, so this is where funext enters) *)
+Lemma ptnode_eq (b b' : mword 44) (e e' : mword 9 -> mword 64)
+    (k k' : mword 9 -> option ptree) :
+  b = b' -> (forall i, e i = e' i) -> (forall i, k i = k' i) ->
+  PtNode b e k = PtNode b' e' k'.
+Proof.
+  intros -> He Hk.
+  assert (e = e') as -> by (apply functional_extensionality; exact He).
+  assert (k = k') as -> by (apply functional_extensionality; exact Hk).
+  reflexivity.
+Qed.
+
+(* THE INVARIANCE: the Svadu write-back does not move the canonical table.
+   [ptree_set_leaf] rewrites exactly one level-0 slot, and its new word is
+   an A/D variant of the old one, whose canonical form is unchanged.       *)
+Lemma ptree_canon_set_leaf (t : ptree) (vpn : mword 27)
+    (p2 p1 p0 : mword 64) (a d : mword 1) :
+  ptree_maps t vpn p2 p1 p0 ->
+  ptree_canon (ptree_set_leaf t vpn (pte_set_ad p0 a d)) = ptree_canon t.
+Proof.
+  intros (c1 & c0 & Hk2 & Hk1 & He2 & He1 & He0 & _).
+  unfold ptree_set_leaf. rewrite Hk2 Hk1. cbn match.
+  unfold ptree_canon. apply ptnode_eq; [reflexivity | intros i; reflexivity |].
+  intros i2. cbn [pt_upd_kid pt_kids].
+  destruct (decide (i2 = vpn_idx 2 vpn)) as [-> | Hne2]; [| reflexivity].
+  rewrite Hk2. cbn [option_map]. f_equal.
+  unfold pt_canon_l1. apply ptnode_eq; [reflexivity | intros i; reflexivity |].
+  intros i1. cbn [pt_upd_kid pt_kids].
+  destruct (decide (i1 = vpn_idx 1 vpn)) as [-> | Hne1]; [| reflexivity].
+  rewrite Hk1. cbn [option_map]. f_equal.
+  unfold pt_canon_l0. apply ptnode_eq; [reflexivity | | intros i; reflexivity].
+  intros i0. cbn [pt_upd_ent pt_ents].
+  destruct (decide (i0 = vpn_idx 0 vpn)) as [-> | Hne0]; [| reflexivity].
+  rewrite <- He0. apply pte_canon_set_ad.
+Qed.
+
+(* THE TRANSFER: cached-entry coherence depends on the table only through
+   its canonical form.  This is what a hart's persistent agreement buys --
+   no order, no lower bound, no ghost update. *)
+Lemma tlb_ok_pt_canon (asid : mword 16) (t t' : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6)) :
+  ptree_canon t = ptree_canon t' ->
+  tlb_ok_pt asid t tlbvec -> tlb_ok_pt asid t' tlbvec.
+Proof.
+  intros Hcan Hok vpn' ent Hget.
+  destruct (Hok vpn' ent Hget)
+    as (vpn & p2 & p1 & p0 & a & d & Hmaps & Hh & Hent).
+  pose proof (ptree_maps_canon t vpn p2 p1 p0 Hmaps) as Hmc.
+  rewrite Hcan in Hmc.
+  destruct (ptree_maps_canon_inv t' vpn p2 p1 (pte_canon p0) Hmc)
+    as (q0 & Hmaps' & Hq).
+  destruct (pte_canon_inv q0 p0 Hq) as (a' & d' & Hp0).
+  exists vpn, p2, p1, q0, a, d.
+  split; [exact Hmaps' |]. split; [exact Hh |].
+  rewrite Hent Hp0 pte_set_ad_absorb. reflexivity.
+Qed.
+
+(* the per-entry step of [tlb_ok_pt_canon], exposed standalone for the
+   two-table (shared-side) transfer below *)
+Lemma tlb_cache_of_canon (asid : mword 16) (t t' : ptree)
+    (vpn' : mword 27) (ent : TLB_Entry) :
+  ptree_canon t = ptree_canon t' ->
+  tlb_cache_of asid t vpn' ent -> tlb_cache_of asid t' vpn' ent.
+Proof.
+  intros Hcan (vpn & p2 & p1 & p0 & a & d & Hmaps & Hh & Hent).
+  pose proof (ptree_maps_canon t vpn p2 p1 p0 Hmaps) as Hmc.
+  rewrite Hcan in Hmc.
+  destruct (ptree_maps_canon_inv t' vpn p2 p1 (pte_canon p0) Hmc)
+    as (q0 & Hmaps' & Hq).
+  destruct (pte_canon_inv q0 p0 Hq) as (a' & d' & Hp0).
+  exists vpn, p2, p1, q0, a, d.
+  split; [exact Hmaps' |]. split; [exact Hh |].
+  rewrite Hent Hp0 pte_set_ad_absorb. reflexivity.
+Qed.
+
+(* ===================================================================== *)
+(* §7b TWO-TABLE TLB consistency: the satp-switch window.  Between a      *)
+(*     [csrw satp] and the following [sfence.vma], resident entries may   *)
+(*     have been cached from EITHER the previous table [tp] or the        *)
+(*     current one [tc] -- and provenance matters beyond the leaf: a      *)
+(*     Svadu hit write-back goes to the pteAddr recorded by the           *)
+(*     INSTALLING walk, i.e. into the provenance tree's L0 slot.          *)
+(* ===================================================================== *)
+
+Definition tlb_ok_pt2 (asid : mword 16) (tp tc : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6)) : Prop :=
+  forall (vpn' : mword 27) (ent : TLB_Entry),
+    vec_access_dec tlbvec (tlb_hash (__id 39) vpn') = Some ent ->
+    tlb_cache_of asid tp vpn' ent \/ tlb_cache_of asid tc vpn' ent.
+
+(* weakening injections: a single-table-consistent vector is two-table
+   consistent with anything on the other side *)
+Lemma tlb_ok_pt2_prev (asid : mword 16) (tp tc : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6)) :
+  tlb_ok_pt asid tp tlbvec -> tlb_ok_pt2 asid tp tc tlbvec.
+Proof. intros Hok vpn' ent Hget. left. exact (Hok vpn' ent Hget). Qed.
+
+(* the TRANSFER, per side: two-table coherence depends on whichever side
+   moved only through its canonical form -- the shared-table absorption
+   (TransPtShare.v) uses this to lift a hart's SNAPSHOT-relative coherence
+   to the tree it actually just opened. *)
+Lemma tlb_ok_pt2_canon_cur (asid : mword 16) (tp tc tc' : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6)) :
+  ptree_canon tc = ptree_canon tc' ->
+  tlb_ok_pt2 asid tp tc tlbvec -> tlb_ok_pt2 asid tp tc' tlbvec.
+Proof.
+  intros Hcan Hok vpn' ent Hget.
+  destruct (Hok vpn' ent Hget) as [Hp | Hc].
+  - left. exact Hp.
+  - right. exact (tlb_cache_of_canon asid tc tc' vpn' ent Hcan Hc).
+Qed.
+
+Lemma tlb_ok_pt2_canon_prev (asid : mword 16) (tp tp' tc : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6)) :
+  ptree_canon tp = ptree_canon tp' ->
+  tlb_ok_pt2 asid tp tc tlbvec -> tlb_ok_pt2 asid tp' tc tlbvec.
+Proof.
+  intros Hcan Hok vpn' ent Hget.
+  destruct (Hok vpn' ent Hget) as [Hp | Hc].
+  - left. exact (tlb_cache_of_canon asid tp tp' vpn' ent Hcan Hp).
+  - right. exact Hc.
+Qed.
+
+
+(* walk-induced fills: the walker consults the CURRENT table, but the
+   hit-refresh path re-fills from the entry's own provenance, so both
+   sides are provided *)
+Lemma tlb_ok_pt2_fill_cur (asid : mword 16) (tp tc : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+    (vpn : mword 27) (p2 p1 p0 q0 : mword 64) :
+  ptree_maps tc vpn p2 p1 p0 ->
+  (exists a d : mword 1, q0 = pte_set_ad p0 a d) ->
+  tlb_ok_pt2 asid tp tc tlbvec ->
+  tlb_ok_pt2 asid tp tc (vec_update_dec tlbvec (tlb_hash (__id 39) vpn)
+                           (Some (u_walk_entry vpn p2 p1 q0 asid))).
+Proof.
+  intros Hmaps (a & d & Hq) Hok vpn' ent Hget.
+  rewrite (vec64_access_update _ _ _ _ (tlb_hash_range vpn)) in Hget.
+  destruct (Z.eqb (tlb_hash (__id 39) vpn') (tlb_hash (__id 39) vpn)) eqn:Hh.
+  - apply Z.eqb_eq in Hh. injection Hget as <-.
+    right. exists vpn, p2, p1, p0, a, d.
+    split; [exact Hmaps|]. split; [symmetry; exact Hh|].
+    rewrite Hq. reflexivity.
+  - exact (Hok vpn' ent Hget).
+Qed.
+
+Lemma tlb_ok_pt2_fill_prev (asid : mword 16) (tp tc : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+    (vpn : mword 27) (p2 p1 p0 q0 : mword 64) :
+  ptree_maps tp vpn p2 p1 p0 ->
+  (exists a d : mword 1, q0 = pte_set_ad p0 a d) ->
+  tlb_ok_pt2 asid tp tc tlbvec ->
+  tlb_ok_pt2 asid tp tc (vec_update_dec tlbvec (tlb_hash (__id 39) vpn)
+                           (Some (u_walk_entry vpn p2 p1 q0 asid))).
+Proof.
+  intros Hmaps (a & d & Hq) Hok vpn' ent Hget.
+  rewrite (vec64_access_update _ _ _ _ (tlb_hash_range vpn)) in Hget.
+  destruct (Z.eqb (tlb_hash (__id 39) vpn') (tlb_hash (__id 39) vpn)) eqn:Hh.
+  - apply Z.eqb_eq in Hh. injection Hget as <-.
+    left. exists vpn, p2, p1, p0, a, d.
+    split; [exact Hmaps|]. split; [symmetry; exact Hh|].
+    rewrite Hq. reflexivity.
+  - exact (Hok vpn' ent Hget).
+Qed.
+
+(* a Svadu write-back into EITHER side's tree preserves consistency *)
+Lemma tlb_ok_pt2_set_leaf_prev (asid : mword 16) (tp tc : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+    (vpn : mword 27) (p2 p1 p0 : mword 64) (a d : mword 1) :
+  ptree_maps tp vpn p2 p1 p0 ->
+  pte_valid (pte_set_ad p0 a d) -> pte_leaf (pte_set_ad p0 a d) ->
+  pte_no_napot (pte_set_ad p0 a d) -> pte_pbmt0 (pte_set_ad p0 a d) ->
+  tlb_ok_pt2 asid tp tc tlbvec ->
+  tlb_ok_pt2 asid (ptree_set_leaf tp vpn (pte_set_ad p0 a d)) tc tlbvec.
+Proof.
+  intros Hmaps Hv Hl Hnap Hpb Hok vpn' ent Hget.
+  destruct (Hok vpn' ent Hget) as [Hp | Hc].
+  - left. exact (tlb_cache_of_set_leaf asid tp vpn' ent vpn p2 p1 p0 a d
+                   Hmaps Hv Hl Hnap Hpb Hp).
+  - right. exact Hc.
+Qed.
+
+Lemma tlb_ok_pt2_set_leaf_cur (asid : mword 16) (tp tc : ptree)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+    (vpn : mword 27) (p2 p1 p0 : mword 64) (a d : mword 1) :
+  ptree_maps tc vpn p2 p1 p0 ->
+  pte_valid (pte_set_ad p0 a d) -> pte_leaf (pte_set_ad p0 a d) ->
+  pte_no_napot (pte_set_ad p0 a d) -> pte_pbmt0 (pte_set_ad p0 a d) ->
+  tlb_ok_pt2 asid tp tc tlbvec ->
+  tlb_ok_pt2 asid tp (ptree_set_leaf tc vpn (pte_set_ad p0 a d)) tlbvec.
+Proof.
+  intros Hmaps Hv Hl Hnap Hpb Hok vpn' ent Hget.
+  destruct (Hok vpn' ent Hget) as [Hp | Hc].
+  - left. exact Hp.
+  - right. exact (tlb_cache_of_set_leaf asid tc vpn' ent vpn p2 p1 p0 a d
+                    Hmaps Hv Hl Hnap Hpb Hc).
+Qed.
+
+(* ===================================================================== *)
+(* §8 The exec layer: hypothesis-style (tree-free) translate lemmas over  *)
+(*    ABSTRACT PTE words -- the analogue of Pt4kWalk's TrampTranslate,    *)
+(*    built on CommonWalk's privilege/access-generic core.  The Iris      *)
+(*    engines extract the hypotheses from [ptree_own] ([ptree_own_path_   *)
+(*    mem]) + a [ptree_maps] fact and instantiate.                        *)
+(* ===================================================================== *)
+
+(* ---- §8a a slot's read_pte fact from its [pt_slot_mem] + the ambient   *)
+(*      PMP/PMA configuration (the facts [pmp_config] stores).            *)
+Lemma pt_read_pte_slot (sg : mstate) (a w : mword 64) (region : PMA_Region) :
+  pt_slot_mem sg a w ->
+  pmpAddrMatchType_encdec_backwards
+    (_get_Pmpcfg_ent_A (vec_access_dec (register_lookup pmpcfg_n sg.(sregs)) 0)) = TOR ->
+  zopz0zKzJ_u (zeros' 64) (vec_access_dec (register_lookup pmpaddr_n sg.(sregs)) 0) = false ->
+  eq_vec (_get_Pmpcfg_ent_R (vec_access_dec (register_lookup pmpcfg_n sg.(sregs)) 0)) ('b"1") = true ->
+  (ram_base + ram_size <= uint (vec_access_dec (register_lookup pmpaddr_n sg.(sregs)) 0) * 4)%Z ->
+  matching_pma_region (register_lookup pma_regions sg.(sregs)) (Physaddr a) 8 = Some region ->
+  (override_PMA (PMA_Region_attributes region) PBMT_PMA).(PMA_supports_pte_read) = true ->
+  register_lookup htif_tohost_base sg.(sregs) = None ->
+  exec (read_pte (Physaddr a) 8) sg = Some (Ok w, sg).
+Proof.
+  intros (Hbytes & Hram & Hram7 & Halign) HA Hord HR Hcov Hmatch Hpma Hhtif.
+  assert (Hnw : (uint a + Z.of_nat 7 < 18446744073709551616)%Z).
+  { destruct Hram as [_ Hh]. unfold ram_base, ram_size in Hh.
+    change (Z.of_nat 7) with 7. lia. }
+  assert (Hfit : (uint a + 8 <= ram_base + ram_size)%Z).
+  { pose proof (uint_pa_add a 7 Hnw) as Heq.
+    destruct Hram7 as [_ Hhi7]. rewrite Heq in Hhi7.
+    change (Z.of_nat 7) with 7 in Hhi7.
+    unfold ram_base, ram_size in *. lia. }
+  assert (Hrange : pmpRangeMatch (Z.mul (uint (zeros' 64 : mword 64)) 4)
+            (Z.mul (uint (vec_access_dec (register_lookup pmpaddr_n sg.(sregs)) 0)) 4)
+            (uint a) (uint (to_bits 64 8)) = PMP_Match).
+  { apply (ram_pmp_match_w a _ 8); [lia | vm_compute; reflexivity | | exact Hfit | exact Hcov].
+    destruct Hram as [Hlo _]. exact Hlo. }
+  apply (exec_read_pte_S a region w sg HA Hord Hrange HR Hmatch Halign Hpma).
+  - apply within_clint_false; [apply addr_is_ram_not_in_clint; exact Hram | lia].
+  - apply within_sig_false; [apply addr_is_ram_not_in_sig; exact Hram | lia].
+  - apply within_htif_false. exact Hhtif.
+  - apply addr_is_ram_not_dev. exact Hram.
+  - exact Hbytes.
+Qed.
+
+(* The same slot read, but EXCLUSIVE: the fork's atomic A/D update re-reads the
+   PTE with a reservation before writing it back.  It needs exactly the same
+   facts (the reservation is invisible to this interpreter's memory, and the
+   [res] flag only reaches [pmaCheck], which an aligned in-RAM access passes
+   either way), so this is [pt_read_pte_slot] with the exclusive brick. *)
+Lemma pt_read_pte_exclusive_slot (sg : mstate) (a w : mword 64) (region : PMA_Region) :
+  pt_slot_mem sg a w ->
+  pmpAddrMatchType_encdec_backwards
+    (_get_Pmpcfg_ent_A (vec_access_dec (register_lookup pmpcfg_n sg.(sregs)) 0)) = TOR ->
+  zopz0zKzJ_u (zeros' 64) (vec_access_dec (register_lookup pmpaddr_n sg.(sregs)) 0) = false ->
+  eq_vec (_get_Pmpcfg_ent_R (vec_access_dec (register_lookup pmpcfg_n sg.(sregs)) 0)) ('b"1") = true ->
+  (ram_base + ram_size <= uint (vec_access_dec (register_lookup pmpaddr_n sg.(sregs)) 0) * 4)%Z ->
+  matching_pma_region (register_lookup pma_regions sg.(sregs)) (Physaddr a) 8 = Some region ->
+  (override_PMA (PMA_Region_attributes region) PBMT_PMA).(PMA_supports_pte_read) = true ->
+  register_lookup htif_tohost_base sg.(sregs) = None ->
+  exec (read_pte_exclusive (Physaddr a) 8) sg = Some (Ok w, sg).
+Proof.
+  intros (Hbytes & Hram & Hram7 & Halign) HA Hord HR Hcov Hmatch Hpma Hhtif.
+  assert (Hnw : (uint a + Z.of_nat 7 < 18446744073709551616)%Z).
+  { destruct Hram as [_ Hh]. unfold ram_base, ram_size in Hh.
+    change (Z.of_nat 7) with 7. lia. }
+  assert (Hfit : (uint a + 8 <= ram_base + ram_size)%Z).
+  { pose proof (uint_pa_add a 7 Hnw) as Heq.
+    destruct Hram7 as [_ Hhi7]. rewrite Heq in Hhi7.
+    change (Z.of_nat 7) with 7 in Hhi7.
+    unfold ram_base, ram_size in *. lia. }
+  assert (Hrange : pmpRangeMatch (Z.mul (uint (zeros' 64 : mword 64)) 4)
+            (Z.mul (uint (vec_access_dec (register_lookup pmpaddr_n sg.(sregs)) 0)) 4)
+            (uint a) (uint (to_bits 64 8)) = PMP_Match).
+  { apply (ram_pmp_match_w a _ 8); [lia | vm_compute; reflexivity | | exact Hfit | exact Hcov].
+    destruct Hram as [Hlo _]. exact Hlo. }
+  apply (exec_read_pte_exclusive_S a region w sg HA Hord Hrange HR Hmatch Halign Hpma).
+  - apply within_clint_false; [apply addr_is_ram_not_in_clint; exact Hram | lia].
+  - apply within_sig_false; [apply addr_is_ram_not_in_sig; exact Hram | lia].
+  - apply within_htif_false. exact Hhtif.
+  - apply addr_is_ram_not_dev. exact Hram.
+  - exact Hbytes.
+Qed.
+
+(* ---- §8b the stored-entry bridges for [u_walk_entry] (abstract leaf).  *)
+
+Lemma uwe_pte (vpn : mword 27) (p2 p1 q0 : mword 64) (asid : mword 16) :
+  tlb_get_pte 8 (u_walk_entry vpn p2 p1 q0 asid) = autocast (T := mword) q0.
+Proof.
+  unfold tlb_get_pte, u_walk_entry. cbn [TLB_Entry_pte].
+  f_equal.
+  match goal with |- @subrange_vec_dec ?w _ ?hi ?lo = _ =>
+    change hi with 63; change lo with 0 end.
+  rewrite subrange64_63_0_id.
+  rewrite zero_extend64_id. reflexivity.
+Qed.
+
+Lemma uwe_ppn (vpn vpn' : mword 27) (p2 p1 q0 : mword 64) (asid : mword 16) :
+  tlb_get_ppn 39 (u_walk_entry vpn p2 p1 q0 asid) vpn'
+  = autocast (T := mword) ((autocast (T := mword) (PPN_of_PTE q0)) : mword 44).
+Proof.
+  unfold tlb_get_ppn, u_walk_entry.
+  cbn [TLB_Entry_levelMask TLB_Entry_ppn]. cbn zeta.
+  match goal with |- context[and_vec ?x ?m] =>
+    replace (and_vec x m) with (zeros' 64 : mword 64);
+    [| symmetry; apply and64_zero_r; vm_compute; reflexivity] end.
+  rewrite or64_zeros_r.
+  match goal with |- context[and_vec ?x ?m] =>
+    replace (and_vec x m) with ((autocast (T := mword) ((autocast (T := mword) (PPN_of_PTE q0)) : mword 44)) : mword 44);
+    [| symmetry; apply and44_ones; vm_compute; reflexivity] end.
+  rewrite zero_extend44_id.
+  apply trunc44_zext.
+Qed.
+
+Lemma uwe_pbmt (vpn : mword 27) (p2 p1 q0 : mword 64) (asid : mword 16) s :
+  pte_pbmt0 q0 ->
+  exec (tlb_get_pbmt (u_walk_entry vpn p2 p1 q0 asid)) s = Some (PBMT_PMA, s).
+Proof.
+  intros Hpb.
+  unfold tlb_get_pbmt, u_walk_entry. cbn [TLB_Entry_pte]. cbn zeta.
+  rewrite zero_extend64_id. rewrite autocast_id.
+  unfold pte_pbmt0 in Hpb. rewrite Hpb.
+  vm_compute (page_based_mem_type_forwards _). apply exec_returnm.
+Qed.
+
+(* a walk entry always matches its own vpn under asid 0 (whatever its
+   global bit accumulated from the pointer words) *)
+Lemma uwe_match_self (vpn : mword 27) (p2 p1 q0 : mword 64) :
+  match_TLB_Entry (u_walk_entry vpn p2 p1 q0 (mword_of_int 0))
+    (mword_of_int 0) (sign_extend' (57 - 12) vpn) = true.
+Proof.
+  unfold match_TLB_Entry, u_walk_entry.
+  cbn [TLB_Entry_asid TLB_Entry_global TLB_Entry_vpn TLB_Entry_levelMask].
+  apply andb_true_intro. split.
+  - apply orb_true_intro. right. vm_compute. reflexivity.
+  - match goal with |- context[and_vec vpn ?m] =>
+      replace (and_vec vpn m) with vpn;
+      [| symmetry; apply and27_ones; vm_compute; reflexivity] end.
+    match goal with |- context[and_vec ?x (not_vec ?m)] =>
+      replace (and_vec x (not_vec m)) with x;
+      [| symmetry; apply and45_ones; vm_compute; reflexivity] end.
+    unfold eq_vec. rewrite MachineWord.MachineWord.eqb_true_iff.
+    reflexivity.
+Qed.
+
+(* ...and never matches a FOREIGN vpn (the 45-bit tag determines the
+   vpn), so a resident walk entry can only serve its own page *)
+Lemma uwe_match_other (vpn vpn' : mword 27) (p2 p1 q0 : mword 64) (asid : mword 16) :
+  vpn <> vpn' ->
+  match_TLB_Entry (u_walk_entry vpn p2 p1 q0 asid)
+    asid (sign_extend' (57 - 12) vpn') = false.
+Proof.
+  intros Hne.
+  unfold match_TLB_Entry, u_walk_entry.
+  cbn [TLB_Entry_asid TLB_Entry_global TLB_Entry_vpn TLB_Entry_levelMask].
+  match goal with |- context[and_vec vpn ?m] =>
+    replace (and_vec vpn m) with vpn;
+    [| symmetry; apply and27_ones; vm_compute; reflexivity] end.
+  match goal with |- context[and_vec ?x (not_vec ?m)] =>
+    replace (and_vec x (not_vec m)) with x;
+    [| symmetry; apply and45_ones; vm_compute; reflexivity] end.
+  match goal with |- (_ && ?b)%bool = false => destruct b eqn:E end.
+  - exfalso. apply Hne. apply u_sext45_inj.
+    unfold eq_vec in E. rewrite MachineWord.MachineWord.eqb_true_iff in E.
+    exact E.
+  - apply andb_false_r.
+Qed.
+
+(* ---- §8c the TLB-HIT translate on a stored walk entry whose cached     *)
+(*      leaf word [q0] (an A/D variant of the current one) passes the     *)
+(*      check and needs no update.                                        *)
+Section PtHit.
+  Context (acc : MemoryAccessType mem_payload) (p : Privilege) (mxr do_sum : bool).
+
+  Lemma exec_translate_TLB_hit_pt (vpn : mword 27) (p2 p1 q0 : mword 64)
+        (asid : mword 16) (idx : Z) s :
+    pte_check_ok acc p mxr do_sum q0 ->
+    update_PTE_Bits (autocast (T := mword) q0 : mword 64) acc = None ->
+    pte_pbmt0 q0 ->
+    exec (translate_TLB_hit 39 asid vpn acc p mxr do_sum tt idx
+            (u_walk_entry vpn p2 p1 q0 asid)) s
+    = Some (Ok (autocast (T := mword) ((autocast (T := mword) (PPN_of_PTE q0)) : mword 44), PBMT_PMA, tt), s).
+  Proof using .
+    intros Hchk Hupd Hpb.
+    unfold translate_TLB_hit. cbn zeta.
+    match goal with |- context[tlb_get_pte ?sz ?e] => change sz with 8 end.
+    rewrite uwe_pte.
+    rewrite autocast_id.
+    rewrite (exec_bind_Some _ _ _ _ _ (Hchk s)). cbn match.
+    (* [update_and_write_pte] takes the whole tablewalk context now -- including
+       the entry's LEVEL, recovered from its levelMask by [tlb_get_level] -- and
+       returns the ext_ptw alongside.  The no-write case is still one step. *)
+    match goal with |- context[update_and_write_pte ?w ?vp ?a ?pv ?lv ?ac ?pr ?mx ?ds ?e] =>
+      assert (Hu : exec (update_and_write_pte w vp a pv lv ac pr mx ds e) s
+                   = Some (Ok (None, tt), s)) end.
+    { unfold update_and_write_pte.
+      match goal with |- context[@update_PTE_Bits ?w ?pv ?ac] =>
+        change w with 64 end.
+      rewrite autocast_id in Hupd. rewrite Hupd.
+      cbn match. apply exec_returnM. }
+    rewrite (exec_bind_Some _ _ _ _ _ Hu). cbn match.
+    rewrite (exec_bind_Some _ _ _ _ _ (uwe_pbmt vpn p2 p1 q0 asid s Hpb)).
+    rewrite uwe_ppn.
+    apply exec_returnm.
+  Qed.
+
+
+  (* ------------------------------------------------------------------ *)
+  (* THE SWP SPLICE for this hit (main-cycle-port).  Under per-node       *)
+  (* stepping a rule may not compute a successor from the whole state it  *)
+  (* saw -- another hart steps between this walk's nodes -- so the [swp]  *)
+  (* layer wants the same fact as a FOOTPRINTED characterization: reads   *)
+  (* inside a declared set, no writes, and the file it lands on named.    *)
+  (*                                                                     *)
+  (* No page-table reasoning is restated to get it.  [WpDecodeBridge.     *)
+  (* goodb] certifies the footprint discipline along the SAME chain the   *)
+  (* exec proof above walks (one [goodb_bind] per step, fed by the very   *)
+  (* same sub-facts), and [HartGoodb.hval_of_goodb] pairs that with the   *)
+  (* exec lemma to produce [hval].  The hit path makes no events at all,  *)
+  (* which is why the certificate is this cheap -- the MISS path writes    *)
+  (* the TLB and reads PTEs from memory, and needs the [swp] event rules   *)
+  (* rather than a bridge.                                                *)
+  (* ------------------------------------------------------------------ *)
+
+  (* [pte_check_ok]'s EVENT-FREENESS twin.  The check reads no register on
+     the paths this kernel takes (an R|X or R|W leaf), so wherever
+     [pte_check_ok] is discharged -- at a CONCRETE flag byte -- this one
+     falls to [vm_compute] as well. *)
+  Definition pte_check_pure (Db : register -> bool) (w : mword 64) : Prop :=
+    forall s, goodb Db (check_PTE_permission acc p mxr do_sum
+                          (Mk_PTE_Flags (subrange_vec_dec w 7 0))
+                          (ext_bits_of_PTE w) tt) s = true.
+
+  Lemma goodb_translate_TLB_hit_pt (Db : register -> bool) (vpn : mword 27)
+      (p2 p1 q0 : mword 64) (asid : mword 16) (idx : Z) s :
+    pte_check_ok acc p mxr do_sum q0 ->
+    pte_check_pure Db q0 ->
+    update_PTE_Bits (autocast (T := mword) q0 : mword 64) acc = None ->
+    pte_pbmt0 q0 ->
+    goodb Db (translate_TLB_hit 39 asid vpn acc p mxr do_sum tt idx
+                (u_walk_entry vpn p2 p1 q0 asid)) s = true.
+  Proof using .
+    intros Hchk Hpure Hupd Hpb.
+    unfold translate_TLB_hit. cbn zeta.
+    match goal with |- context[tlb_get_pte ?sz ?e] => change sz with 8 end.
+    rewrite uwe_pte.
+    rewrite autocast_id.
+    rewrite (goodb_bind Db _ _ s _ (Hpure s) (Hchk s)). cbn match.
+    match goal with |- context[update_and_write_pte ?w ?vp ?a ?pv ?lv ?ac ?pr ?mx ?ds ?e] =>
+      assert (Hue : exec (update_and_write_pte w vp a pv lv ac pr mx ds e) s
+                    = Some (Ok (None, tt), s));
+      [| assert (Hug : goodb Db (update_and_write_pte w vp a pv lv ac pr mx ds e) s
+                       = true) ] end.
+    { unfold update_and_write_pte.
+      match goal with |- context[@update_PTE_Bits ?w ?pv ?ac] =>
+        change w with 64 end.
+      rewrite autocast_id in Hupd. rewrite Hupd.
+      cbn match. apply exec_returnm. }
+    { unfold update_and_write_pte.
+      match goal with |- context[@update_PTE_Bits ?w ?pv ?ac] =>
+        change w with 64 end.
+      rewrite autocast_id in Hupd. rewrite Hupd.
+      reflexivity. }
+    rewrite (goodb_bind Db _ _ s _ Hug Hue). cbn match.
+    rewrite (goodb_bind Db _ _ s _ _ (uwe_pbmt vpn p2 p1 q0 asid s Hpb)).
+    - reflexivity.
+    - unfold tlb_get_pbmt, u_walk_entry. cbn [TLB_Entry_pte]. cbn zeta.
+      rewrite zero_extend64_id. rewrite autocast_id.
+      unfold pte_pbmt0 in Hpb. rewrite Hpb.
+      vm_compute (page_based_mem_type_forwards _). reflexivity.
+  Qed.
+
+  Lemma hval_translate_TLB_hit_pt (Db : register -> bool) (D Drw : gset register)
+      (rs : regstate) (dst : mstate) (vpn : mword 27) (p2 p1 q0 : mword 64)
+      (asid : mword 16) (idx : Z) :
+    (forall r : register, Db r = true -> r ∈ D) ->
+    (forall r : register, Db r = true ->
+       register_lookup r rs = register_lookup r dst.(sregs)) ->
+    pte_check_ok acc p mxr do_sum q0 ->
+    pte_check_pure Db q0 ->
+    update_PTE_Bits (autocast (T := mword) q0 : mword 64) acc = None ->
+    pte_pbmt0 q0 ->
+    hval D Drw rs
+      (translate_TLB_hit 39 asid vpn acc p mxr do_sum tt idx
+         (u_walk_entry vpn p2 p1 q0 asid))
+      (Ok (autocast (T := mword)
+             ((autocast (T := mword) (PPN_of_PTE q0)) : mword 44),
+           PBMT_PMA, tt)) rs.
+  Proof using .
+    intros HD Hag Hchk Hpure Hupd Hpb.
+    eapply (hval_of_goodb Db D Drw _ dst rs _ HD Hag).
+    - exact (goodb_translate_TLB_hit_pt Db vpn p2 p1 q0 asid idx dst
+               Hchk Hpure Hupd Hpb).
+    - exact (exec_translate_TLB_hit_pt vpn p2 p1 q0 asid idx dst
+               Hchk Hupd Hpb).
+  Qed.
+
+  (* the hit whose cached leaf word FAILS the check: the fault surfaces
+     before any A/D update or pbmt read -- state unchanged.  (The check
+     runs FIRST on the hit path, so a denied hit never write-backs.) *)
+  Lemma exec_translate_TLB_hit_denied_pt (vpn : mword 27) (p2 p1 q0 : mword 64)
+        (asid : mword 16) (idx : Z) s :
+    pte_check_denied acc p mxr do_sum (PTE_No_Permission tt) q0 ->
+    exec (translate_TLB_hit 39 asid vpn acc p mxr do_sum tt idx
+            (u_walk_entry vpn p2 p1 q0 asid)) s
+    = Some (Err (PTW_No_Permission tt, tt), s).
+  Proof using .
+    intros Hden.
+    unfold translate_TLB_hit. cbn zeta.
+    match goal with |- context[tlb_get_pte ?sz ?e] => change sz with 8 end.
+    rewrite uwe_pte.
+    rewrite autocast_id.
+    rewrite (exec_bind_Some _ _ _ _ _ (Hden s)). cbn match.
+    apply exec_returnm.
+  Qed.
+
+  (* ---- §8d THE three-way hit-or-walk translate over abstract words:    *)
+  (*      the tree-generic successor of [exec_translate_tramp].  The      *)
+  (*      walk path installs [u_walk_entry vpn p2 p1 p0]; a hit serves    *)
+  (*      any resident A/D-variant entry (same mapping: its PPN agrees).  *)
+
+End PtHit.
+
+(* ---- §8e the S-mode translateAddr head: front matter (mstatus reads,   *)
+(*      Sv39 dispatch, canonicality, satp) + [exec_translate_pt].  The    *)
+(*      output pa is hypothesis-shaped ([Hident]) so instances plug in    *)
+(*      their own geometry (the kernel: identity via [ram_ident_4k]).     *)
+Section PtTranslateAddr.
+  Context (acc : MemoryAccessType mem_payload).
+
+
+End PtTranslateAddr.
+
+(* ---- §8f the FAULT translate: a blocked vpn's walk stops at an invalid *)
+(*      word and [translate] returns the page-fault error, state          *)
+(*      unchanged.  (The TLB slot always misses on a blocked vpn: under   *)
+(*      [tlb_ok_pt] resident entries are mapped vpns' walk entries, and   *)
+(*      [uwe_match_other] rejects a foreign tag.)                         *)
+Section PtFault.
+  Context (acc : MemoryAccessType mem_payload) (p : Privilege) (mxr do_sum : bool).
+
+  Lemma exec_translate_pt_blocks (vpn : mword 27) (root : mword 44) s :
+    (* the walk stops at an invalid word at level 2, 1 or 0 *)
+    ((exists w2,
+        exec (read_pte (Physaddr (u_pte_addr root (subrange_vec_dec vpn 26 18))) 8) s
+          = Some (Ok w2, s) /\ pte_invalid w2)
+     \/ (exists p2 w1,
+        exec (read_pte (Physaddr (u_pte_addr root (subrange_vec_dec vpn 26 18))) 8) s
+          = Some (Ok p2, s) /\ pte_valid p2 /\ pte_ptr p2 /\
+        exec (read_pte (Physaddr (u_pte_addr (u_next_base p2) (subrange_vec_dec vpn 17 9))) 8) s
+          = Some (Ok w1, s) /\ pte_invalid w1)
+     \/ (exists p2 p1 w0,
+        exec (read_pte (Physaddr (u_pte_addr root (subrange_vec_dec vpn 26 18))) 8) s
+          = Some (Ok p2, s) /\ pte_valid p2 /\ pte_ptr p2 /\
+        exec (read_pte (Physaddr (u_pte_addr (u_next_base p2) (subrange_vec_dec vpn 17 9))) 8) s
+          = Some (Ok p1, s) /\ pte_valid p1 /\ pte_ptr p1 /\
+        exec (read_pte (Physaddr (u_pte_addr (u_next_base p1) (subrange_vec_dec vpn 8 0))) 8) s
+          = Some (Ok w0, s) /\ pte_invalid w0)) ->
+    exec (lookup_TLB 39 (mword_of_int 0) vpn) s = Some (None, s) ->
+    exec (translate 39 (mword_of_int 0 : mword 16) root vpn acc p mxr do_sum tt) s
+    = Some (Err (PTW_Invalid_PTE tt, tt), s).
+  Proof using .
+    intros Hstop Hlk.
+    apply (exec_translate_walk_user_err vpn acc p mxr do_sum (mword_of_int 0) root _ s Hlk).
+    apply exec_translate_TLB_miss_user_walk_err.
+    destruct Hstop as [ (w2 & Hrd2 & Hi2)
+                      | [ (p2 & w1 & Hrd2 & Hv2 & Hn2 & Hrd1 & Hi1)
+                        | (p2 & p1 & w0 & Hrd2 & Hv2 & Hn2 & Hrd1 & Hv1 & Hn1 & Hrd0 & Hi0) ] ].
+    - exact (exec_pt_walk_user_l2_invalid vpn acc p mxr do_sum root w2 s Hrd2 Hi2).
+    - apply (exec_pt_walk_user_sub vpn acc p mxr do_sum root p2 _ s Hrd2 Hv2 Hn2).
+      intros g' a.
+      exact (exec_rec_walk_l1_invalid vpn acc p mxr do_sum (u_next_base p2) w1 g' a s Hrd1 Hi1).
+    - apply (exec_pt_walk_user_sub vpn acc p mxr do_sum root p2 _ s Hrd2 Hv2 Hn2).
+      intros g' a.
+      apply (exec_rec_walk_l1_sub vpn acc p mxr do_sum (u_next_base p2) p1 g' _ a s Hrd1 Hv1 Hn1).
+      intros g'' a'.
+      exact (exec_rec_walk_leaf_invalid vpn acc p mxr do_sum (u_next_base p1) w0 g'' a' s Hrd0 Hi0).
+  Qed.
+
+  (* mapped but DENIED: the walk reaches the leaf and the permission check
+     fails -- no fill, no write-back, state unchanged *)
+  Lemma exec_translate_pt_denied (vpn : mword 27) (root : mword 44)
+        (p2 p1 p0 : mword 64) s :
+    pte_valid p2 -> pte_ptr p2 ->
+    pte_valid p1 -> pte_ptr p1 ->
+    pte_valid p0 -> pte_leaf p0 ->
+    pte_check_denied acc p mxr do_sum (PTE_No_Permission tt) p0 ->
+    exec (read_pte (Physaddr (u_pte_addr root (subrange_vec_dec vpn 26 18))) 8) s
+      = Some (Ok p2, s) ->
+    exec (read_pte (Physaddr (u_pte_addr (u_next_base p2) (subrange_vec_dec vpn 17 9))) 8) s
+      = Some (Ok p1, s) ->
+    exec (read_pte (Physaddr (u_pte_addr (u_next_base p1) (subrange_vec_dec vpn 8 0))) 8) s
+      = Some (Ok p0, s) ->
+    exec (lookup_TLB 39 (mword_of_int 0) vpn) s = Some (None, s) ->
+    exec (translate 39 (mword_of_int 0 : mword 16) root vpn acc p mxr do_sum tt) s
+    = Some (Err (PTW_No_Permission tt, tt), s).
+  Proof using .
+    intros Hv2 Hn2 Hv1 Hn1 Hv0 Hl0 Hden Hrd2 Hrd1 Hrd0 Hlk.
+    apply (exec_translate_walk_user_err vpn acc p mxr do_sum (mword_of_int 0) root _ s Hlk).
+    apply exec_translate_TLB_miss_user_walk_err.
+    apply (exec_pt_walk_user_sub vpn acc p mxr do_sum root p2 _ s Hrd2 Hv2 Hn2).
+    intros g' a.
+    apply (exec_rec_walk_l1_sub vpn acc p mxr do_sum (u_next_base p2) p1 g' _ a s Hrd1 Hv1 Hn1).
+    intros g'' a'.
+    change (PTW_No_Permission tt) with (ext_get_ptw_error (PTE_No_Permission tt)).
+    exact (exec_rec_walk_leaf_noperm vpn acc p mxr do_sum (u_next_base p1) p0 g''
+             (PTE_No_Permission tt) a' s Hrd0 Hv0 Hl0 (fun s0 => Hden s0)).
+  Qed.
+
+  (* the soundness KEYSTONE: under [tlb_ok_pt] a BLOCKED vpn is never
+     TLB-resident -- a resident entry is some MAPPED vpn's walk entry;
+     the blocked vpn cannot be that vpn ([ptree_maps_blocks_excl]), and
+     a foreign entry's tag rejects the lookup ([uwe_match_other]). *)
+  Lemma tlb_ok_pt_lookup_blocked (t : ptree) (vpn : mword 27)
+        (tlbvec : vec (option TLB_Entry) (2 ^ 6)) s :
+    tlb_ok_pt (mword_of_int 0) t tlbvec ->
+    ptree_blocks t vpn ->
+    register_lookup tlb s.(sregs) = tlbvec ->
+    exec (lookup_TLB 39 (mword_of_int 0) vpn) s = Some (None, s).
+  Proof using .
+    intros Hok Hblk Htlb.
+    destruct (vec_access_dec tlbvec (tlb_hash (__id 39) vpn)) as [ent|] eqn:Hslot.
+    - destruct (Hok vpn ent Hslot) as (vpn0 & q2 & q1 & q0 & a' & d' & Hm0 & Hh & ->).
+      apply (exec_lookup_TLB_nomatch_s vpn (mword_of_int 0) _ tlbvec s Htlb Hslot).
+      apply (uwe_match_other vpn0 vpn q2 q1 (pte_set_ad q0 a' d') (mword_of_int 0)).
+      intros ->. exact (ptree_maps_blocks_excl t vpn q2 q1 q0 Hm0 Hblk).
+    - exact (exec_lookup_TLB_miss vpn (mword_of_int 0) tlbvec s Htlb Hslot).
+  Qed.
+
+End PtFault.

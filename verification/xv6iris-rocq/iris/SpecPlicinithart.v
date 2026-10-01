@@ -1,0 +1,116 @@
+(* SpecPlicinithart.v -- the public interface of plicinithart, stated
+   independently of its proof.  [plicinithart] (xv6-riscv/kernel/plic.c) enables
+   BOTH UARTs' and the VIRTIO interrupt for THIS hart's S-mode context and
+   drops its priority threshold to 0:
+
+     <plicinithart>:
+       ...prologue...
+       jal    cpuid            a0 = hart id
+       slliw  a4,a0,0x8
+       lui    a5,0xc002
+       add    a5,a5,a4         a5 = PLIC + 0x2000 + hart*0x100
+       c.lui  a4,0x1
+       addi   a4,a4,1026       a4 = (1<<10)|(1<<12)|(1<<1) = 0x1402
+       sw     a4,128(a5)       *PLIC_SENABLE(hart)   = 0x1402
+       slliw  a0,a0,0xd
+       lui    a5,0xc201
+       add    a5,a5,a0         a5 = PLIC + 0x201000 + hart*0x2000
+       sw     zero,0(a5)       *PLIC_SPRIORITY(hart) = 0
+       ...epilogue...
+
+   The two stores are S-mode 32-bit MMIO writes through the kernel page table's
+   PLIC identity mapping.
+
+   WHY THIS SPEC OWNS NO PLIC STATE.  plicinithart runs CONCURRENTLY on every
+   hart: no hart can own the PLIC state across its two writes, because the
+   others are writing their own contexts at the same time.  So the shared
+   [plic_frag] half stays in the device invariant [dev_inv] (WpUart.v) and this
+   spec takes that invariant -- persistent, hence shareable -- instead.  Each
+   store opens it, writes, and closes it.  (This is the same reason [plicinit],
+   which hart 0 does run alone at boot, still cannot hold the fragment raw: the
+   PLIC gateway latches whenever an irq line is up.)
+
+   What the caller gets back is therefore not this hart's PLIC context but the
+   invariant itself: the kernel's PLIC plan [plic_ok] (PlicPlan.v) still holds.
+   That plan is deliberately weak -- per-hart thresholds are unconstrained and a
+   hart's enable word may only name sources the machine has -- precisely so that
+   a hart can re-establish it from its own two writes, knowing nothing about
+   what the other harts wrote.  Even so the spec is not vacuous: the proof must
+   show both addresses decode to real PLIC context registers for this hart
+   ([plic_write] returns [Some]), which is what pins the precondition
+   [bv_unsigned tp < dev_ncpu].
+
+   Requires only the definitional layer + SpecCpuid (for [cpuid_ret]) -- never a
+   whole-function proof file. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import RegFile InstrBytes HartTp.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import DevModel PlicPlan DiskPtsto WpUart.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+From Kernel Require KernelInstrs.
+From Kernel Require KernelSyms.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import CtxIdDefs.
+Import Defs.
+
+
+(* the S-context enable word xv6 writes:
+   (1 << UART0_IRQ) | (1 << UART1_IRQ) | (1 << VIRTIO0_IRQ)
+   = (1 << 10) | (1 << 12) | (1 << 1) = 0x1402 -- exactly the kernel's
+   permitted set.  DERIVED from the plan's [plic_dev_irq_mask], never
+   transcribed: the word and the permission it must satisfy
+   ([PlicPlan.plic_senable_ok_mask]) are then the same term by construction. *)
+Definition plic_senable_word : bv 32 := Z_to_bv 32 plic_dev_irq_mask.
+
+(* INTERRUPTS MUST BE DISABLED.  plicinithart's very first instruction is an
+   unbracketed [jal cpuid] -- there is no push_off/pop_off anywhere in its
+   body -- and [cpuid]'s own contract (SpecCpuid.v) is [b = false]-ONLY (it
+   reads [tp] mid-body; see the porting guide, "A function that READS tp
+   mid-body must be stated at b = false"). A caller-supplied [b] cannot meet
+   that precondition, so plicinithart itself can only be called with
+   interrupts already off. This holds at every real call site: plicinithart
+   runs from main(), on every hart, strictly before scheduler()'s
+   [intr_on()] -- interrupts (SSTATUS.SIE) are never turned on during boot
+   (start()/main() only touch the [sie] CSR's per-source mask bits, not the
+   global enable) -- see
+   claude-notes/projects/explicit-cpuid-porting-guide.md, and
+   SpecTrapinithart.v / SpecCpuid.v for the identical boot-only shape. So the
+   contract is stated at the literal index [false] rather than a generic
+   [b], with no [wp_next] wrapper (it would collapse via [wp_next_off]
+   anyway, since the hart cannot move). *)
+Definition wp_plicinithart_sconf_body `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γd : uart_names) (γv : disk_names) (m0 : regfile) (n : nat) (p : mword 64) :=
+  let ra_idx : mword 5 := mword_of_int 1 in
+  let tp_idx : mword 5 := mword_of_int 4 in
+  let pcE := mword_of_int KernelSyms.plicinithart in
+  let ra0 := m0 !!! Regidx ra_idx in
+  let ret_tgt := ret_pc ra0 in
+  bv_unsigned (rget m0 tp_idx) < Z.of_nat dev_ncpu ->
+  (* plicinithart's own max depth: its 16-byte frame (2 slots) plus the two
+     slots cpuid's frame needs below it. *)
+  (4 <= n)%nat ->
+  sie_cap_gpr KT1 m0 n false p -∗
+  kernel_text -∗ pc_is pcE -∗
+  dev_inv γd γv -∗
+  ( ∀ m' : regfile,
+    sie_cap_gpr KT1 m' n false p -∗
+    pc_is ret_tgt -∗
+    ⌜ callee_saved m0 m' /\ m' !!! Regidx ra_idx = ra0 ⌝ -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type PLICINITHART.
+  Parameter wp_plicinithart_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γd : uart_names) (γv : disk_names) (m0 : regfile) (n : nat) (p : mword 64),
+      wp_plicinithart_sconf_body γd γv m0 n p.
+End PLICINITHART.

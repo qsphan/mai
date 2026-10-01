@@ -1,0 +1,34 @@
+(* LinkCreate.v -- the only file where create's proof meets its callees'.
+
+   Seven functor arguments, every one of them a real proof:
+
+   - the ERA nameiparent arrives through LinkNparWrapEra.v ([NparWrap]:
+     nameiparent at the trace-carrying walk, and under it namex, dirlookup,
+     iget, iput, ilock and iunlock);
+   - ilock arrives through LinkIlock.v (acquiresleep / bread / memmove /
+     brelse);
+   - iunlockput arrives through LinkIunlockput.v (iunlock / iput), and it
+     is create's ONLY route to itrunc -- the fail arm frees the inode it
+     just allocated;
+   - dirlookup arrives through LinkDirlookup.v (readi / namecmp / iget);
+   - ialloc arrives through LinkIalloc.v (bread / log_write / brelse /
+     memset / iget);
+   - iupdate arrives through LinkIupdate.v (bread / memmove / log_write /
+     brelse);
+   - dirlink arrives through LinkDirlink.v, whose writei CAN allocate --
+     balloc is itself proven (LinkBalloc.v), so nothing new is assumed.
+
+   The fresh-type span across create's own [jal ialloc] / [ilock] is NOT a
+   ninth argument: it is a stretch of create's own body rather than a
+   callee, so [ProofCreate] applies [ProofCreateFreshTy.create_fresh_ty]
+   directly.  Read that file's header for what the span is.
+
+
+   So this cone's assumption count is the five platform axioms plus
+   funext, and nothing else. *)
+Require Import LinkNparWrapEra LinkIlock LinkIunlockput LinkDirlookup
+        LinkIalloc LinkIupdate LinkDirlink
+        ProofCreate.
+
+Module Create := CreateProof NparWrap Ilock Iunlockput Dirlookup
+                             Ialloc Iupdate Dirlink.

@@ -1,0 +1,177 @@
+(*  InitBoot.v -- THE FIRST PROCESS'S EXEC BUNDLE.
+
+    THE KERNEL NEVER MINTS A USER-EXECUTION SLOT.  Every slot in the tree
+    is either a verified program's own constructor or the generic
+    inhabitant a supply pays for, and the kernel is not the party that
+    holds either: the one thing it needs about the first process's user
+    execution is what forkret's boot arm spends on [kexec("/init")], and
+    that is an exec bundle like any other caller's -- a walk cursor, an
+    observation receipt, and a SLOT PIECE that answers with the slot at
+    the key kexec builds.
+
+    So the boot bundle is what the whole-system theorem asks its
+    application for ([SystemAdequacy.xv6_power_adequacy_gen]'s
+    [Hinit_boot]), and the kernel merely carries it: main hands it to
+    userinit, userinit's park captures it, forkret's boot arm takes it out
+    of the park package and hands it to kexec, and the receipt kexec
+    returns IS the first process's slot.  The generic theorem discharges
+    it from the trivial mint ([init_boot_bundle_triv]); a constraining
+    application discharges it from its own pinned bundle at "/init".
+
+    THE PATH IS NAMED ONCE.  [init_boot_bytes] is the six bytes of
+    "/init" as the naming function [KexecDefs] indexes by, and
+    [init_boot_path] is the same string as the walk's [pl].  forkret's
+    boot arm calls kexec at exactly these ([ProofForkretParts]'s layout
+    facts are stated at them). *)
+From Stdlib Require Import ZArith List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.base_logic Require Import iprop.
+From iris.proofmode Require Import proofmode.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import RiscvLang RiscvPtsto.    (* [riscvGS], [cstring_bytes] *)
+Require Import DirentEnc.               (* [bview]: the path buffer as a list *)
+(* THE GHOST BINDER LIST'S DEFINING MODULES, each one IMPORTED and not
+   merely required: a class named without its module in scope is a fresh
+   [gFunctors -> Type] variable, and the section's binders then resolve
+   nothing (durable-notes, "Typeclasses and ghost-class bundling"). *)
+Require Import Xv6Cameras.              (* [bioslotG] *)
+Require Import FdSlots.                 (* [fdslotG], [fdstate], [fdt0] *)
+Require Import IrefSlots.               (* [irefslotG] *)
+Require Import ProcAvail.               (* [pavG] *)
+Require Import FileInvDefs.             (* [fileG] and its field instances *)
+Require Import FsAbsDefs.               (* [aview], [anode] *)
+Require Import FsBytesGamma.            (* [fs_gamma_L]: the live Γ *)
+Require Import FsCfg.                   (* [fsc_fs], [fsc_cons] *)
+Require Import ConsoleInv.              (* [cons_reader]: the console's READER
+                                           TOKEN, the boot bundle's input *)
+Require Import PieceFam.                (* [pfam] / [MkPfam] *)
+Require Import ChildTok.                (* [my_pay]: the pay fact the boot bundle is at *)
+Require Import UexecSlot.               (* [uvis] *)
+Require Import UserFd.                  (* [ufdG] *)
+Require Import UexecSG.                 (* [uexecSG] *)
+Require Import UexecRet.                (* [uslot] -- required DIRECTLY: the
+                                           [Typeclasses Opaque] seal does not
+                                           travel through a re-export *)
+Require Import SpecKexec.               (* [exec_au_pre], [exec_au_pre_triv_at] *)
+Require Import Xv6G.
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(*  1.  THE PATH                                                          *)
+(* ===================================================================== *)
+
+(* The path bytes as a naming FUNCTION, which is what [KexecDefs] indexes
+   its [seq]-shaped premise by.  Defined by lookup into [cstring_bytes]
+   rather than as six literals, so it cannot drift from the string. *)
+Definition init_boot_bytes (j : nat) : bv 8 := cstring_bytes "/init"%string !!! j.
+
+(* ...and the same string as a LIST, which is what the walk's [pl] is *)
+Definition init_boot_path : list (bv 8) := DirentEnc.bview 5%nat init_boot_bytes.
+
+(* ===================================================================== *)
+(*  2.  THE BUNDLE                                                        *)
+(* ===================================================================== *)
+
+Section InitBoot.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+            !irefslotG Σ, !pavG Σ, !wchG Σ, !ufdG Σ}.
+  (* NO [`{CID : CpuId}] AND NO [`{XI : CurCtx}], deliberately: nothing in
+     the bundle reads the hart or its context ([SysOpenDefs]'s note on
+     [aopen_commit_at] is the reason -- a context-indexed exec piece makes
+     two proofs at two contexts hold slots that print identically and do
+     not match), and the park package that carries this row is built at
+     the PARKER's context and spent at the RESUMER's. *)
+  Context `{GEN : GenId}.
+  (* NO [ctokG] BINDER OF ITS OWN: [Xv6G.xv6_ctok] is in scope, and a second
+     [Context `{!ctokG Σ}] beside it would win instance resolution here while
+     every file that has only [xv6G] resolves to the field -- two instances
+     that print alike and do not match ([UexecSG]'s note).  The class index
+     is met by the field; the SG binder is NON-generalizing (braces) so that
+     it resolves rather than abstracting a fresh one. *)
+  Context {SG : uexecSG Σ}.
+
+  (* WHAT THE APPLICATION OWES THE KERNEL ABOUT USER EXECUTION, and it is
+     the only thing it owes: kexec's caller-side bundle at "/init", at the
+     first process's working directory [cw] and descriptor view [sts],
+     with the SLOT PIECE at [UexecRet.uslot].  The cursor, the miss
+     family, the observation pair and the refund are the bundle's own
+     choice -- the kernel reads none of them, it only spends the bundle --
+     so they are existential here and pinned by whoever builds one.
+
+     LINEAR.  Its pieces are one-shot ([PieceFam]'s pairs), so the bundle
+     travels the route [FdSlots.fd_frags] travels: userinit hands it to
+     [ParkCap.park_token_park], which puts it in the park package, and
+     forkret's boot arm takes it out and spends it.
+
+     [na = 1] and the single argument being the path again is forkret's
+     call verbatim: [kexec("/init", (char *[]){"/init", 0})]. *)
+  (* AT THE TRIVIAL PAYLOAD.  <init> has no parent, so its exit owes
+     nobody anything: userinit's own choice ([SpecUserinit] states it), and
+     the payload the slot wands hand the exec'd image is therefore
+     [fun _ => True] -- which is exactly what a generic family can pay
+     exit with ([UexecRet.uexec_pay_dep_triv]). *)
+  (* ...AND IT TAKES THE CONSOLE'S READER TOKEN AS AN INPUT (app-echo.md,
+     "SH-LINE RULING", R3).  The token is born with the ring at boot
+     ([ConsoleInv.cons_ghosts_boot]) and is THE KERNEL'S TO HAND, not the
+     application's to mint: [SystemAdequacy]'s [Hinit_boot] asks the
+     application for the bundle out of [app_inv] alone, and its statement
+     does not move.  So the token is a PREMISE OF THE BUNDLE, threaded
+     main -> userinit -> the park package's boot mode -> forkret's boot
+     arm, which applies it here before spending the bundle on
+     kexec("/init").  A constraining application builds the bundle HOLDING
+     the token and can therefore put it in the slot wand's conclusion --
+     [PinnedExec.pinned_exec_bundle]'s linear [Pay] is that slot, and it
+     is why no arity of [SpecKexec.exec_slot_pre] changes.  The generic
+     instance drops it ([init_boot_bundle_triv]). *)
+  (* AT EVERY CHILDREN SET AND PID (lane EXEC-SEAM).  [SpecKexec.
+     exec_slot_pre] now names the caller's two identity readings, and the
+     boot arm names the first process's when it spends the bundle
+     ([ProofForkret.fkr_boot]); the application's constructor reads
+     neither, so the bundle is owed at all of them and the arity of this
+     predicate -- which [App.Hinit_boot] names -- does not move. *)
+  (* ...AND IT CARRIES THE FIRST PROCESS'S ALL-PARKED ROW (lane
+     OFF-HAND-2).  The one kexec <init> ever gets is spent by
+     [ProofForkret.fkr_boot], which holds neither the descriptor bundle nor
+     the block's array and so cannot READ the fact; the bundle's producers
+     can -- every one of them states it at [FdSlots.fdt0]
+     ([FdSlots.fdv_all_parked_fdt0]), because that is the table userinit
+     built.  It is spent by the BUNDLE'S OWN PRODUCERS (lane OFF-HAND-5,
+     D1): the kexec contract stopped carrying a row, so what the fact pays
+     for is the taint arm of whichever builder inhabits this bundle --
+     [SpecKexec.exec_au_pre_triv_at] for the generic application,
+     [PinnedExec.pinned_exec_bundle_boot] for a constraining one. *)
+  Definition init_boot_bundle (cw : Z) (secc : mword 64) (sts : list fdstate) : iProp Σ :=
+    ((cons_reader fsc_cons 0%nat -∗
+     ∃ (P Pmiss : nat -> Z -> iProp Σ)
+       (Fo : pfam Σ (aview -> Z -> anode -> iProp Σ))
+       (R : iProp Σ),
+       ∀ (cs : gset gname) (pidv : mword 32),
+         exec_au_pre (MkPfam uslot R) (fs_gamma_L fsc_fs) fsc_fs cw secc
+           (fun _ => True%I) P Pmiss Fo init_boot_path
+           1%nat (fun _ => 5%nat) (fun _ => init_boot_bytes) sts cs pidv))%I.
+
+  (* THE GENERIC APPLICATION'S: a slot at every key answers both wands and
+     tracks nothing.  [App.xv6_app_adequacy_triv_xv6Σ] reaches the family
+     through [AppInv.app_sup_raw_triv] and [UexecExecMint.uslot_mint]. *)
+  Lemma init_boot_bundle_triv (cw : Z) (secc : mword 64) (sts : list fdstate) :
+    □ (∀ W : uvis, my_pay (uvis_gen W) (fun _ => True)%I -∗ uslot W) -∗
+    init_boot_bundle cw secc sts.
+  Proof using .
+    iIntros "#HS". rewrite /init_boot_bundle.
+    (* THE GENERIC INSTANCE DROPS THE TOKEN: a program that tracks nothing
+       reads the console on the persistent credential, not on the token
+       ([FsAbsInvFire.fsabs_fileread_in]). *)
+    iIntros "_".
+    iExists (fun _ _ => True%I), (fun _ _ => True%I),
+            (pfam_triv (fun _ _ _ => True%I)), True%I.
+    iIntros (cs pidv).
+    iApply (exec_au_pre_triv_at uslot (fs_gamma_L fsc_fs) fsc_fs cw secc
+              init_boot_path 1%nat (fun _ => 5%nat) (fun _ => init_boot_bytes)
+              sts cs pidv).
+    iModIntro. iIntros (W) "Hp".
+    iApply ("HS" $! W with "Hp").
+  Qed.
+
+End InitBoot.

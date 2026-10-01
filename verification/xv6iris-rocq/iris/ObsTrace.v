@@ -1,0 +1,788 @@
+(* ObsTrace.v -- the PURE vocabulary of the observable trace.                *)
+(*                                                                          *)
+(*  The language emits four observation events (RiscvLang.mobs, §3b'):      *)
+(*  ObsUartOut/ObsUartIn on a UART thread's drain/rx arms -- EACH TAGGED    *)
+(*  WITH ITS PORT, since the board has two 16550s -- and ObsPowerOff/       *)
+(*  ObsPowerOn on the power thread.  This file says what a WELL-FORMED      *)
+(*  history of them looks like and proves it a STEP INVARIANT of the        *)
+(*  semantics, with no Iris in it:                                          *)
+(*                                                                          *)
+(*    obs_wf h g  :=  trace_shape h (gpow g)                 -- alternation  *)
+(*                 /\ obs_boots h = start_count g             -- boot count  *)
+(*                 /\ (gpow g -> forall i,                                   *)
+(*                        obs_wire i (open_seg h) = u_wire (duart g i))      *)
+(*                                                            -- WIRE TIE,   *)
+(*                 /\ (gpow g -> forall i,                                   *)
+(*                        obs_ins i (open_seg h) = u_recv (duart g i))       *)
+(*                                                            -- INPUT TIE,  *)
+(*                       per PORT: the board has two 16550s and each event   *)
+(*                       carries the one it happened on, so each tie is one  *)
+(*                       equation per port and a byte can never be credited  *)
+(*                       to the wrong wire -- or to the wrong receiver.      *)
+(*                                                                          *)
+(*  [prim_step_obs_wf] re-establishes it across every arm of [prim_step],   *)
+(*  and [nsteps_obs_wf] lifts that to a whole run.  The Iris side           *)
+(*  (claude-notes/completed/uart-trace.md) carries [obs_wf h g] as a pure    *)
+(*  conjunct of [state_interp] beside [resv_ok], where [h] is the history    *)
+(*  so far: the alternation is what lets a client segment [h] into power     *)
+(*  cycles, and the wire tie is how a client that owns the UART's state      *)
+(*  ([uart_frag u]) learns which bytes of the interleaved current cycle are  *)
+(*  the ones the host actually saw.                                          *)
+(*                                                                          *)
+(*  [obs_wire] and the three wire lemmas were introduced with the events    *)
+(*  (746c265c4) and swept as dead code before anything consumed them         *)
+(*  (c1b3a6670, bdefa96e3); they are restored here, where they are used.     *)
+(*  A LEAF below RiscvPtsto on purpose: nothing rebuilds under it.          *)
+
+From stdpp Require Import gmap finite relations bitvector.definitions.
+From iris.program_logic Require Import language.
+Require Import SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import RiscvModelBytes.
+Require Import RiscvLang.
+
+(* ---------------------------------------------------------------------- *)
+(* 1. The output projection, and the wire lemmas.                          *)
+(*                                                                          *)
+(*    [obs_wire] is a PROOF-SIDE projection only: it is what ties the        *)
+(*    interleaved history to the device's [u_wire], which records outputs   *)
+(*    alone.  Trace PROPERTIES are stated over the interleaved list, never   *)
+(*    over the two directions separately (uart-trace.md, ruling 1).         *)
+(* ---------------------------------------------------------------------- *)
+
+(* the OUTPUT bytes of an observation list.  A direct Fixpoint (not stdpp's
+   [omap]) so [cbn] reduces it on literal lists without unfolding through
+   the typeclass. *)
+Fixpoint obs_wire (i : uart_id) (κ : list mobs) : list (bv 8) :=
+  match κ with
+  | [] => []
+  | ObsUartOut j b :: κ' => if decide (j = i) then b :: obs_wire i κ' else obs_wire i κ'
+  | _ :: κ' => obs_wire i κ'
+  end.
+
+Lemma obs_wire_app (i : uart_id) (κ1 κ2 : list mobs) :
+  obs_wire i (κ1 ++ κ2) = obs_wire i κ1 ++ obs_wire i κ2.
+Proof.
+  induction κ1 as [|e κ1 IH]; [reflexivity|].
+  destruct e; cbn; try (by rewrite IH).
+  case_decide; by rewrite IH.
+Qed.
+
+(* the INPUT bytes of an observation list at port [i] -- the dual of
+   [obs_wire], and the same shape for the same reason.  [ObsUartIn i b] is
+   the rx-accept event itself (a full FIFO refuses silently), so the
+   cumulative [obs_ins i] over an era IS what port [i]'s receiver accepted:
+   [obs_wf]'s input tie below states exactly that. *)
+Fixpoint obs_ins (i : uart_id) (κ : list mobs) : list (bv 8) :=
+  match κ with
+  | [] => []
+  | ObsUartIn j b :: κ' => if decide (j = i) then b :: obs_ins i κ' else obs_ins i κ'
+  | _ :: κ' => obs_ins i κ'
+  end.
+
+Lemma obs_ins_app (i : uart_id) (κ1 κ2 : list mobs) :
+  obs_ins i (κ1 ++ κ2) = obs_ins i κ1 ++ obs_ins i κ2.
+Proof.
+  induction κ1 as [|e κ1 IH]; [reflexivity|].
+  destruct e; cbn; try (by rewrite IH).
+  case_decide; by rewrite IH.
+Qed.
+
+Lemma obs_ins_in (i : uart_id) (b : bv 8) : obs_ins i [ObsUartIn i b] = [b].
+Proof. cbn. by rewrite decide_True. Qed.
+
+Lemma obs_ins_out (i j : uart_id) (b : bv 8) : obs_ins i [ObsUartOut j b] = [].
+Proof. reflexivity. Qed.
+
+(* the receiver never touches SOUT *)
+Lemma uart_recv_wire (u : uart_state) (b : bv 8) :
+  u_wire (uart_recv u b) = u_wire u.
+Proof. reflexivity. Qed.
+
+(* What the drain step puts ON THE WIRE: the popped byte in normal mode,
+   nothing under LOOP (the byte goes back into this UART's own receiver,
+   with SOUT held marking).  This is the pure fact behind the language's
+   UART OUTPUT OBSERVATION (RiscvLang.uart_step): the observation list of a
+   drain step is exactly the wire's growth. *)
+Lemma uart_tx_pop_wire (u : uart_state) (b : bv 8) (u' : uart_state) :
+  uart_tx_pop u = Some (b, u') ->
+  u_wire u' = if uart_loopback u then u_wire u else u_wire u ++ [b].
+Proof.
+  unfold uart_tx_pop. destruct (u_tx u) as [| b0 tx'] eqn:Htx; [discriminate|].
+  destruct (uart_loopback u); intro H; injection H as <- <-.
+  - by rewrite uart_recv_wire.
+  - reflexivity.
+Qed.
+
+(* ... and a byte ARRIVING never touches the wire *)
+Lemma uart_rx_push_wire (u : uart_state) (b : bv 8) (u' : uart_state) :
+  uart_rx_push u b = Some u' -> u_wire u' = u_wire u.
+Proof.
+  unfold uart_rx_push.
+  destruct (length (u_rx u) <? uart_fifo_depth)%nat; [| discriminate].
+  intro H. injection H as <-. by rewrite uart_recv_wire.
+Qed.
+
+(* no MMIO access transmits anything: every [uart_read] branch and every
+   [uart_write] branch carries [u_wire] through untouched (a THR write only
+   QUEUES; the wire event is the device's own later drain) *)
+Lemma uart_read_wire (u : uart_state) (off : Z) (b : bv 8) (u' : uart_state) :
+  uart_read u off = Some (b, u') -> u_wire u' = u_wire u.
+Proof.
+  unfold uart_read. intros H.
+  repeat (case_match; try discriminate); simplify_eq; reflexivity.
+Qed.
+
+Lemma uart_write_wire (u : uart_state) (off : Z) (b : bv 8) (u' : uart_state) :
+  uart_write u off b = Some u' -> u_wire u' = u_wire u.
+Proof.
+  unfold uart_write. intros H.
+  repeat (case_match; try discriminate); simplify_eq; reflexivity.
+Qed.
+
+(* the bus: an MMIO transaction of any width reaches the UART through
+   [uart_read]/[uart_write] and the other two devices through setters that
+   keep [duart] verbatim *)
+(* a device-fabric setter moves ONE port's state, so a fact about every
+   port's wire follows from the fact about the one that moved *)
+Lemma set_duart_wire (d : dev_state) (i j : uart_id) (u : uart_state) :
+  u_wire u = u_wire (duart d i) ->
+  u_wire (duart (set_duart d i u) j) = u_wire (duart d j).
+Proof.
+  intro H. unfold set_duart, uupd. cbn.
+  destruct (decide (j = i)) as [->|]; done.
+Qed.
+
+Lemma set_duart_recv (d : dev_state) (i j : uart_id) (u : uart_state) :
+  u_recv u = u_recv (duart d i) ->
+  u_recv (duart (set_duart d i u) j) = u_recv (duart d j).
+Proof.
+  intro H. unfold set_duart, uupd. cbn.
+  destruct (decide (j = i)) as [->|]; done.
+Qed.
+
+Lemma dev_read_u_wire (d : dev_state) (pa : Arch.pa) (n : N)
+    (w : bv (8 * n)) (d' : dev_state) (j : uart_id) :
+  dev_read d pa n = Some (w, d') ->
+  u_wire (duart d' j) = u_wire (duart d j).
+Proof.
+  unfold dev_read, uart_dev_read. intros H.
+  repeat (case_match; try discriminate); simplify_eq; cbn;
+    first [ reflexivity
+          | by apply set_duart_wire, (uart_read_wire _ _ _ _ ltac:(eassumption)) ].
+Qed.
+
+Lemma dev_write_u_wire (d : dev_state) (pa : Arch.pa) (n : N)
+    (v : bv (8 * n)) (d' : dev_state) (j : uart_id) :
+  dev_write d pa n v = Some d' ->
+  u_wire (duart d' j) = u_wire (duart d j).
+Proof.
+  unfold dev_write, uart_dev_write. intros H.
+  repeat (case_match; try discriminate); simplify_eq; cbn;
+    first [ reflexivity
+          | by apply set_duart_wire, (uart_write_wire _ _ _ _ ltac:(eassumption)) ].
+Qed.
+
+Lemma dev_read_u_recv (d : dev_state) (pa : Arch.pa) (n : N)
+    (w : bv (8 * n)) (d' : dev_state) (j : uart_id) :
+  dev_read d pa n = Some (w, d') ->
+  u_recv (duart d' j) = u_recv (duart d j).
+Proof.
+  unfold dev_read, uart_dev_read. intros H.
+  repeat (case_match; try discriminate); simplify_eq; cbn;
+    first [ reflexivity
+          | by apply set_duart_recv, (uart_read_recv _ _ _ _ ltac:(eassumption)) ].
+Qed.
+
+Lemma dev_write_u_recv (d : dev_state) (pa : Arch.pa) (n : N)
+    (v : bv (8 * n)) (d' : dev_state) (j : uart_id) :
+  dev_write d pa n v = Some d' ->
+  u_recv (duart d' j) = u_recv (duart d j).
+Proof.
+  unfold dev_write, uart_dev_write. intros H.
+  repeat (case_match; try discriminate); simplify_eq; cbn;
+    first [ reflexivity
+          | by apply set_duart_recv, (uart_write_recv _ _ _ _ ltac:(eassumption)) ].
+Qed.
+
+(* THE OBSERVATIONS ARE FAITHFUL: a UART step's output observations are
+   exactly the wire's growth, so the cumulative ObsUartOut trace of any
+   execution IS [u_wire] -- what a console spec talks about, and what
+   [VTest.serial_of] compares against QEMU.  THE INPUT SIDE HAS THE SAME
+   COUNTERPART, and needs one for the same reason: the rx FIFO is consumed,
+   so [DevModel.u_recv] is what remembers the accepted bytes, and
+   [uart_step_recv] below says the [ObsUartIn] trace of any execution IS
+   that list.  Without it nothing relates the number of bytes the console
+   driver has taken out of the FIFO to the number the host typed. *)
+(* STATED AT EVERY PORT, which is what makes it say the thing worth saying:
+   a step of port [i] grows port [i]'s wire by its own events and leaves
+   every OTHER port's wire alone -- so a byte cannot appear on a wire the
+   device that emitted it is not attached to. *)
+Lemma uart_step_wire (i : uart_id) (d : dev_state) (κ : list mobs)
+    (d' : dev_state) (j : uart_id) :
+  uart_step i d κ d' ->
+  u_wire (duart d' j) = u_wire (duart d j) ++ obs_wire j κ.
+Proof.
+  intros H. destruct H as [b u' Htx | b u' Hrx | p' _ _ |].
+  - unfold set_duart, uupd. cbn [duart].
+    case_decide as Hji.
+    + subst j. rewrite (uart_tx_pop_wire _ _ _ Htx).
+      destruct (uart_loopback (duart d i)); cbn [obs_wire].
+      * by rewrite ?app_nil_r.
+      * case_decide as Hc; [by rewrite ?app_nil_r|done].
+    + destruct (uart_loopback (duart d i)); cbn [obs_wire].
+      * by rewrite ?app_nil_r.
+      * case_decide as Hc; [done|]. by rewrite ?app_nil_r.
+  - unfold set_duart, uupd. cbn [duart].
+    case_decide as Hji.
+    + subst j. rewrite (uart_rx_push_wire _ _ _ Hrx).
+      cbn [obs_wire]. by rewrite ?app_nil_r.
+    + cbn [obs_wire]. by rewrite ?app_nil_r.
+  - cbn [duart set_dplic obs_wire]. by rewrite ?app_nil_r.
+  - cbn [obs_wire]. by rewrite ?app_nil_r.
+Qed.
+
+(* ...AND THE SAME ONE PORT AT A TIME ON THE INPUT SIDE.  [uart_step_wire]'s
+   exact mirror: a step of port [i] grows port [i]'s accepted-input list by
+   its own [ObsUartIn] events and leaves every other port's alone.  The rx
+   arm is the only one that grows it -- a drain under LOOP re-enters this
+   UART's own receiver but did NOT come from outside, so [uart_recv] leaves
+   [u_recv] where it was and the arm emits nothing. *)
+Lemma uart_step_recv (i : uart_id) (d : dev_state) (ks : list mobs)
+    (d' : dev_state) (j : uart_id) :
+  uart_step i d ks d' ->
+  u_recv (duart d' j) = u_recv (duart d j) ++ obs_ins j ks.
+Proof.
+  intros H. destruct H as [b u' Htx | b u' Hrx | p' _ _ |].
+  - destruct (uart_loopback (duart d i)); cbn [obs_ins]; rewrite app_nil_r;
+      apply set_duart_recv; exact (uart_tx_pop_recv _ _ _ Htx).
+  - unfold set_duart, uupd. cbn [duart].
+    case_decide as Hji.
+    + subst j. rewrite (uart_rx_push_recv _ _ _ Hrx).
+      by rewrite obs_ins_in.
+    + cbn [obs_ins]. case_decide as Hc; [by symmetry in Hc |].
+      by rewrite app_nil_r.
+  - cbn [duart set_dplic obs_ins]. by rewrite ?app_nil_r.
+  - cbn [obs_ins]. by rewrite ?app_nil_r.
+Qed.
+
+(* a UART step's events are console I/O and nothing else *)
+Definition is_io (e : mobs) : bool :=
+  match e with ObsUartIn _ _ | ObsUartOut _ _ => true | _ => false end.
+
+Lemma uart_step_io (i : uart_id) (d : dev_state) (κ : list mobs) (d' : dev_state) :
+  uart_step i d κ d' -> Forall (fun e => is_io e = true) κ.
+Proof.
+  intros H. destruct H as [b u' _ | b u' _ | p' _ _ |].
+  - destruct (uart_loopback (duart d i)); repeat constructor.
+  - repeat constructor.
+  - constructor.
+  - constructor.
+Qed.
+
+(* A hart node never moves the wire: register effects and RAM accesses do
+   not touch the device fabric, and an MMIO transaction goes through
+   [dev_read]/[dev_write].  The twin of [RiscvLang.mnode_step_v_disk]. *)
+Lemma mnode_step_u_wire oth h img s log tv itv hr r m m' s' log' tv' itv' hr' r' (j : uart_id) :
+  mnode_step oth h img s log tv itv hr r m m' s' log' tv' itv' hr' r' ->
+  u_wire (duart (mdev s') j) = u_wire (duart (mdev s) j).
+Proof.
+  rewrite /mnode_step. destruct m as [y|T oc k].
+  { by intros (tick & _ & -> & _). }
+  destruct oc; simpl;
+    try (by intros (_ & -> & _)); try (by intros []).
+  - (* MemRead *)
+    destruct (dev_addr _).
+    + intros (w & d' & Hdr & _ & -> & _). cbn.
+      exact (dev_read_u_wire _ _ _ _ _ _ Hdr).
+    + by intros [(_ & tvn & w & _ & _ & _ & _ & -> & _)
+                |[(_ & _ & tvn & w & _ & _ & _ & _ & _ & -> & _)
+                 |(_ & [(_ & _ & -> & _) | (_ & w & _ & _ & -> & _)])]].
+  - (* MemWrite *)
+    destruct (dev_addr _).
+    + intros (d' & Hdw & _ & -> & _). cbn.
+      exact (dev_write_u_wire _ _ _ _ _ _ Hdw).
+    + by intros [(_ & _ & -> & _) | (_ & _ & -> & _)].
+  - (* Choose *) by intros (ch & _ & -> & _).
+Qed.
+
+(* ...and the twin on the input side, for the same reason. *)
+Lemma mnode_step_u_recv oth h img s log tv itv hr r m m' s' log' tv' itv' hr' r' (j : uart_id) :
+  mnode_step oth h img s log tv itv hr r m m' s' log' tv' itv' hr' r' ->
+  u_recv (duart (mdev s') j) = u_recv (duart (mdev s) j).
+Proof.
+  rewrite /mnode_step. destruct m as [y|T oc k].
+  { by intros (tick & _ & -> & _). }
+  destruct oc; simpl;
+    try (by intros (_ & -> & _)); try (by intros []).
+  - (* MemRead *)
+    destruct (dev_addr _).
+    + intros (w & d' & Hdr & _ & -> & _). cbn.
+      exact (dev_read_u_recv _ _ _ _ _ _ Hdr).
+    + by intros [(_ & tvn & w & _ & _ & _ & _ & -> & _)
+                |[(_ & _ & tvn & w & _ & _ & _ & _ & _ & -> & _)
+                 |(_ & [(_ & _ & -> & _) | (_ & w & _ & _ & -> & _)])]].
+  - (* MemWrite *)
+    destruct (dev_addr _).
+    + intros (d' & Hdw & _ & -> & _). cbn.
+      exact (dev_write_u_recv _ _ _ _ _ _ Hdw).
+    + by intros [(_ & _ & -> & _) | (_ & _ & -> & _)].
+  - (* Choose *) by intros (ch & _ & -> & _).
+Qed.
+
+(* a disk step never touches the UART: every arm rebuilds the fabric with
+   [set_dvirtio]/[set_dplic], which keep [duart] verbatim *)
+Lemma disk_step_duart (d : dev_state) (m : gmap Arch.pa (bv 8))
+    (d' : dev_state) (m' : gmap Arch.pa (bv 8)) :
+  disk_step d m d' m' -> duart d' = duart d.
+Proof. intros H. destruct H; reflexivity. Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 2. The shape of a history.                                               *)
+(*                                                                          *)
+(*    A machine starts POWERED OFF (the top-level theorems' [gpow g =        *)
+(*    false]).  From there the only legal histories alternate PowerOn,       *)
+(*    console I/O, PowerOff, PowerOn, ...: [obs_step] is the automaton,      *)
+(*    [None] its error state, and [trace_shape h on] says the history        *)
+(*    parses and leaves the power at [on].  Snoc-oriented, since the         *)
+(*    machine extends the history at the right.                              *)
+(* ---------------------------------------------------------------------- *)
+
+Definition obs_step (s : option bool) (e : mobs) : option bool :=
+  match s, e with
+  | Some false, ObsPowerOn => Some true
+  | Some true, ObsPowerOff => Some false
+  | Some true, ObsUartIn _ _ => Some true
+  | Some true, ObsUartOut _ _ => Some true
+  | _, _ => None
+  end.
+
+(* THE ARRIVAL A HISTORY ENDS WITH.  A byte the environment pushed into the
+   UART is tagged at the history it arrived at, and every contract that
+   relays such a byte -- the receive column, uartgetc's post, consoleintr's
+   premise -- has to say that the history and the byte belong together.  One
+   name for that tie, so the six of them spell it identically.  (Coq's
+   [List.last] takes a default and stdpp's is shadowed by it here, which is
+   the other reason this is a definition rather than an equation.) *)
+Definition obs_ends_in (i : uart_id) (h : list mobs) (b : bv 8) : Prop :=
+  exists h0, h = (h0 ++ [ObsUartIn i b])%list.
+
+Lemma obs_ends_in_snoc (i : uart_id) (h : list mobs) (b : bv 8) :
+  obs_ends_in i (h ++ [ObsUartIn i b])%list b.
+Proof. by exists h. Qed.
+
+(* ...and a history names AT MOST ONE byte, which is what lets a reader
+   JOIN two clauses stated over the same [h]: the console receipt's
+   unconditional per-byte ledger (the byte is in the caller's buffer) and
+   its conditional window (the byte is the stored sequence's [cur + j]th)
+   each quantify the byte for themselves, and this is why they agree. *)
+Lemma obs_ends_in_inj (i i' : uart_id) (h : list mobs) (b b' : bv 8) :
+  obs_ends_in i h b -> obs_ends_in i' h b' -> i = i' /\ b = b'.
+Proof.
+  intros [h0 ->] [h1 He].
+  apply (f_equal (@last mobs)) in He.
+  rewrite !last_snoc in He. by injection He as -> ->.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(*  THE ORDER OF TWO HISTORIES  (app-echo.md, lane CONS-CURSOR, C1)        *)
+(*                                                                        *)
+(*  Two histories a proof holds at once are always two SNAPSHOTS OF ONE    *)
+(*  RUN, so the only order that can hold between them is the prefix one,   *)
+(*  and "strictly earlier" is that plus a length.  [hist_ext h h'] is      *)
+(*  "[h'] is [h] with at least one more event on the end"; it is what the  *)
+(*  UART's receive column says of two adjacent queued bytes and what the   *)
+(*  console ring says of two adjacent stored ones.  STATED AS PREFIX PLUS  *)
+(*  LENGTH, not as [h <> h'], because every consumer wants the length      *)
+(*  anyway (it is how two bounds against one authority are ordered) and    *)
+(*  the two forms are equivalent on lists.                                *)
+(*                                                                        *)
+(*  THE [option] FORMS ARE THE EMPTY CASE, not a convenience: the receive  *)
+(*  token's anchor is [None] until the first byte is popped, and the       *)
+(*  console's high-water mark is [None] until the first byte is stored, so *)
+(*  every clause that compares against one has to read [None] as “no       *)
+(*  constraint”.                                                          *)
+(* ---------------------------------------------------------------------- *)
+
+Definition hist_ext (h h' : list mobs) : Prop :=
+  h `prefix_of` h' /\ (length h < length h')%nat.
+
+(* "[a] is at or before [b]", with [None] the bottom *)
+Definition ohist_le (a b : option (list mobs)) : Prop :=
+  match a with
+  | None => True
+  | Some g => match b with None => False | Some g' => g `prefix_of` g' end
+  end.
+
+(* "[a] is strictly before the history [h]" *)
+Definition ohist_ext (a : option (list mobs)) (h : list mobs) : Prop :=
+  match a with None => True | Some g => hist_ext g h end.
+
+Lemma hist_ext_trans (h1 h2 h3 : list mobs) :
+  hist_ext h1 h2 -> hist_ext h2 h3 -> hist_ext h1 h3.
+Proof.
+  intros [Hp1 Hl1] [Hp2 Hl2]. split; [by etrans | lia].
+Qed.
+
+(* a prefix that is not longer, followed by a real extension *)
+Lemma hist_ext_of_prefix (h1 h2 h3 : list mobs) :
+  h1 `prefix_of` h2 -> hist_ext h2 h3 -> hist_ext h1 h3.
+Proof.
+  intros Hp [Hp2 Hl2]. split; [by etrans |].
+  apply prefix_length in Hp. lia.
+Qed.
+
+Lemma hist_ext_snoc (h : list mobs) (e : mobs) : hist_ext h (h ++ [e]).
+Proof.
+  split; [by exists [e] |]. rewrite length_app /=. lia.
+Qed.
+
+Lemma ohist_ext_of_le (a : option (list mobs)) (h h' : list mobs) :
+  ohist_le a (Some h) -> hist_ext h h' -> ohist_ext a h'.
+Proof.
+  destruct a as [g|]; [| done]. cbn. intros Hp Hx.
+  exact (hist_ext_of_prefix g h h' Hp Hx).
+Qed.
+
+(* "at or before" composed with "strictly before": the ring's high-water
+   mark sits at or before the popper's ANCHOR, and the byte just popped is
+   strictly after that anchor, so the mark is strictly before the byte.
+   That composition is what licenses consoleintr's store to extend the
+   ring's chain (app-echo.md, lane CONS-CURSOR, C2). *)
+Lemma ohist_ext_le_ext (a b : option (list mobs)) (h : list mobs) :
+  ohist_le a b -> ohist_ext b h -> ohist_ext a h.
+Proof.
+  destruct a as [x|]; [| done].
+  destruct b as [y|]; [| done]. cbn.
+  intros Hp Hx. exact (hist_ext_of_prefix x y h Hp Hx).
+Qed.
+
+(* "strictly before" implies "at or before" *)
+Lemma ohist_le_of_ext (a : option (list mobs)) (h : list mobs) :
+  ohist_ext a h -> ohist_le a (Some h).
+Proof. destruct a as [g|]; [| done]. cbn. by intros [Hp _]. Qed.
+
+Lemma ohist_le_Some (h : list mobs) : ohist_le (Some h) (Some h).
+Proof. cbn. reflexivity. Qed.
+
+Lemma ohist_le_none (b : option (list mobs)) : ohist_le None b.
+Proof. exact I. Qed.
+
+Lemma ohist_le_trans (a b c : option (list mobs)) :
+  ohist_le a b -> ohist_le b c -> ohist_le a c.
+Proof.
+  destruct a as [x|]; [| done]. destruct b as [y|]; [| done].
+  destruct c as [z|]; [| done]. cbn. apply transitivity.
+Qed.
+
+Lemma ohist_le_ext (a : option (list mobs)) (h h' : list mobs) :
+  ohist_ext a h -> hist_ext h h' -> ohist_le a (Some h').
+Proof.
+  destruct a as [g|]; [| done]. cbn. intros Hx Hy.
+  destruct (hist_ext_trans g h h' Hx Hy) as [Hp _]. exact Hp.
+Qed.
+
+Definition trace_shape (h : list mobs) (on : bool) : Prop :=
+  foldl obs_step (Some false) h = Some on.
+
+Lemma trace_shape_nil : trace_shape [] false.
+Proof. reflexivity. Qed.
+
+Lemma trace_shape_snoc (h : list mobs) (e : mobs) (on on' : bool) :
+  trace_shape h on -> obs_step (Some on) e = Some on' ->
+  trace_shape (h ++ [e]) on'.
+Proof. rewrite /trace_shape foldl_app => -> /=. done. Qed.
+
+Lemma trace_shape_io (h κ : list mobs) :
+  trace_shape h true -> Forall (fun e => is_io e = true) κ ->
+  trace_shape (h ++ κ) true.
+Proof.
+  intros Hh Hκ. revert h Hh.
+  induction Hκ as [|e κ He _ IH]; intros h Hh; [by rewrite app_nil_r|].
+  rewrite cons_middle app_assoc. apply IH.
+  eapply trace_shape_snoc; [exact Hh|]. by destruct e.
+Qed.
+
+(* the boot count: how many times the power came on *)
+Fixpoint obs_boots (h : list mobs) : nat :=
+  match h with
+  | [] => 0
+  | ObsPowerOn :: h' => S (obs_boots h')
+  | _ :: h' => obs_boots h'
+  end.
+
+Lemma obs_boots_app (h1 h2 : list mobs) :
+  obs_boots (h1 ++ h2) = (obs_boots h1 + obs_boots h2)%nat.
+Proof.
+  induction h1 as [|e h1 IH]; [reflexivity|].
+  destruct e; cbn; rewrite IH; lia.
+Qed.
+
+Lemma obs_boots_io (κ : list mobs) :
+  Forall (fun e => is_io e = true) κ -> obs_boots κ = 0%nat.
+Proof. induction 1 as [|e κ He _ IH]; [reflexivity|]. by destruct e. Qed.
+
+(* the CURRENT power cycle's I/O: the events since the last power event.
+   A power event resets it, so with the power off it is empty. *)
+Definition seg_step (seg : list mobs) (e : mobs) : list mobs :=
+  match e with
+  | ObsPowerOn | ObsPowerOff => []
+  | _ => seg ++ [e]
+  end.
+
+Definition open_seg (h : list mobs) : list mobs := foldl seg_step [] h.
+
+Lemma open_seg_app (h κ : list mobs) :
+  open_seg (h ++ κ) = foldl seg_step (open_seg h) κ.
+Proof. by rewrite /open_seg foldl_app. Qed.
+
+Lemma foldl_seg_io (seg κ : list mobs) :
+  Forall (fun e => is_io e = true) κ ->
+  foldl seg_step seg κ = seg ++ κ.
+Proof.
+  intros Hκ. revert seg.
+  induction Hκ as [|e κ He _ IH]; intros seg; [by rewrite app_nil_r|].
+  cbn. destruct e; try discriminate He; cbn; rewrite IH; by rewrite -app_assoc.
+Qed.
+
+Lemma open_seg_io (h κ : list mobs) :
+  Forall (fun e => is_io e = true) κ ->
+  open_seg (h ++ κ) = open_seg h ++ κ.
+Proof. intros Hκ. rewrite open_seg_app. by apply foldl_seg_io. Qed.
+
+Lemma open_seg_power (h : list mobs) (e : mobs) :
+  is_io e = false -> open_seg (h ++ [e]) = [].
+Proof. intros He. rewrite open_seg_app. by destruct e. Qed.
+
+(* THE INPUT NUMBER OF A HISTORY, with [None] read as "before the first".
+   [ins_len i (Some g)] is how many bytes port [i] had accepted by the time
+   the history was [g] -- so a byte whose arrival history is [g] is input
+   number [ins_len i (Some g)], and a column anchored at [g] has seen that
+   many.  The [option] form is the empty case, exactly as [ohist_le]'s is:
+   before the first byte there is no history and the count is zero. *)
+Definition ins_len (i : uart_id) (o : option (list mobs)) : nat :=
+  match o with Some g => length (obs_ins i (open_seg g)) | None => 0%nat end.
+
+(* THE SAME-CYCLE BRIDGE.  A history's OPEN SEGMENT is monotone along a
+   prefix ONLY within one power cycle, and the boot count is what says the
+   cycle did not change: a suffix with no PowerOn in it cannot contain a
+   PowerOff either, because the machine is ON at the end and only a PowerOn
+   turns it back on.  (The same three lemmas live in [EchoOutPure] for the
+   application's own use; these are the copies the KERNEL needs, which sits
+   below that file.) *)
+Lemma obs_foldl_step_none (h : list mobs) :
+  foldl obs_step None h = None.
+Proof. induction h as [| e h IH]; [done |]. by cbn. Qed.
+
+Lemma obs_no_power_of_boots (h : list mobs) (st : bool) :
+  obs_boots h = 0%nat ->
+  foldl obs_step (Some st) h = Some true ->
+  st = true /\ Forall (fun e => is_io e = true) h.
+Proof.
+  revert st. induction h as [| e h IH]; intros st Hb Hf.
+  - cbn in Hf. injection Hf as ->. split; [reflexivity | constructor].
+  - destruct e as [i b | i b | |]; cbn in Hb.
+    + cbn in Hf. destruct st.
+      * destruct (IH true Hb Hf) as [_ HF].
+        split; [reflexivity | by constructor].
+      * rewrite obs_foldl_step_none in Hf. discriminate.
+    + cbn in Hf. destruct st.
+      * destruct (IH true Hb Hf) as [_ HF].
+        split; [reflexivity | by constructor].
+      * rewrite obs_foldl_step_none in Hf. discriminate.
+    + lia.
+    + cbn in Hf. destruct st.
+      * destruct (IH false Hb Hf) as [Habs _]. discriminate.
+      * rewrite obs_foldl_step_none in Hf. discriminate.
+Qed.
+
+Lemma open_seg_prefix_of_boots (h1 h2 : list mobs) :
+  h1 `prefix_of` h2 -> obs_boots h1 = obs_boots h2 ->
+  trace_shape h2 true -> open_seg h1 `prefix_of` open_seg h2.
+Proof.
+  intros [k ->] Hb Hsh.
+  assert (Hk : obs_boots k = 0%nat)
+    by (rewrite obs_boots_app in Hb; lia).
+  rewrite /trace_shape foldl_app in Hsh.
+  destruct (foldl obs_step (Some false) h1) as [st |] eqn:Hst; last first.
+  { rewrite obs_foldl_step_none in Hsh. discriminate. }
+  destruct (obs_no_power_of_boots k st Hk Hsh) as [_ HF].
+  rewrite (open_seg_io h1 k HF). by eexists.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 3. THE STEP INVARIANT.  [start_count g] (RiscvPtsto) is spelled out      *)
+(*    here so that this file stays below the Iris layer.                    *)
+(* ---------------------------------------------------------------------- *)
+
+Definition obs_wf (h : list mobs) (g : gstate) : Prop :=
+  trace_shape h g.(gpow)
+  /\ obs_boots h = (g.(ggen) + (if g.(gpow) then 1 else 0))%nat
+  /\ (g.(gpow) = true ->
+      forall i, obs_wire i (open_seg h) = u_wire (duart g.(gdev) i))
+  (* THE INPUT TIE, the wire tie's dual: the era's [ObsUartIn] events at
+     port [i], in order, ARE what port [i]'s receiver accepted.  It is what
+     lets a client that owns the UART's state count the host's keystrokes --
+     the receive FIFO is consumed, so the count exists nowhere else. *)
+  /\ (g.(gpow) = true ->
+      forall i, obs_ins i (open_seg h) = u_recv (duart g.(gdev) i)).
+
+(* the powered-off, never-booted machine every top-level theorem starts at *)
+Lemma obs_wf_init (g : gstate) :
+  g.(gpow) = false -> g.(ggen) = 0%nat -> obs_wf [] g.
+Proof.
+  intros Hpw Hgen. split_and!.
+  - rewrite Hpw. exact trace_shape_nil.
+  - by rewrite Hpw Hgen.
+  - by rewrite Hpw.
+  - by rewrite Hpw.
+Qed.
+
+Lemma prim_step_obs_wf e g κ e' g' efs (h : list mobs) :
+  prim_step e g κ e' g' efs -> obs_wf h g -> obs_wf (h ++ κ) g'.
+Proof.
+  intros Hstep (Hsh & Hbt & Hwire & Hrecv).
+  destruct Hstep as
+    [ (gen & cpu & m & -> & -> & _ & [ (_ & Hn) | (_ & _ & ->) ])
+    | [ (gen & iu & -> & _ & _ & [ ([Hpw Hgen] & d' & Hu & ->) | (_ & -> & ->) ])
+    | [ (gen & -> & _ & -> & _ & [ (_ & d' & W & log' & Hd & _ & _ & ->) | (_ & ->) ])
+    | [ (gen & -> & _ & -> & _ & [ (_ & gr' & _ & ->) | (_ & ->) ])
+    | (-> & _ & [ (Hpw & -> & _ & ->) | (Hpw & -> & _ & Hboot) ]) ] ] ] ];
+    try (rewrite app_nil_r; by split_and!).
+  - (* a hart node: silent, and it never moves the wire *)
+    rewrite app_nil_r. destruct Hn as (m' & s' & log' & tv' & itv' & hr' & r' & Hn & _ & ->). cbn.
+    split_and!; [exact Hsh|exact Hbt| |].
+    + intros Hpw i. rewrite (Hwire Hpw i). symmetry.
+      exact (mnode_step_u_wire _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ Hn).
+    + intros Hpw i. rewrite (Hrecv Hpw i). symmetry.
+      exact (mnode_step_u_recv _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ Hn).
+  - (* the UART: its events extend the open cycle, and by exactly what
+       reached the wire *)
+    pose proof (uart_step_io _ _ _ _ Hu) as Hio. cbn.
+    rewrite Hpw in Hsh Hbt Hwire Hrecv. cbn in Hbt.
+    split_and!.
+    + rewrite Hpw. by apply trace_shape_io.
+    + rewrite Hpw obs_boots_app (obs_boots_io _ Hio). cbn. lia.
+    + intros _ i. rewrite (open_seg_io _ _ Hio) obs_wire_app (Hwire eq_refl i).
+      symmetry. exact (uart_step_wire _ _ _ _ _ Hu).
+    + intros _ i. rewrite (open_seg_io _ _ Hio) obs_ins_app (Hrecv eq_refl i).
+      symmetry. exact (uart_step_recv _ _ _ _ _ Hu).
+  - (* the disk: silent, and it never touches the UART *)
+    rewrite app_nil_r. cbn. split_and!; [exact Hsh|exact Hbt| |].
+    + intros Hpw i. rewrite (Hwire Hpw i). by rewrite (disk_step_duart _ _ _ _ Hd).
+    + intros Hpw i. rewrite (Hrecv Hpw i). by rewrite (disk_step_duart _ _ _ _ Hd).
+  - (* PowerOff *)
+    cbn. rewrite Hpw in Hsh Hbt. cbn in Hbt. split_and!.
+    + eapply trace_shape_snoc; [exact Hsh|reflexivity].
+    + rewrite obs_boots_app. cbn. lia.
+    + discriminate.
+    + discriminate.
+  - (* PowerOn: the next cycle opens empty, over a reset UART *)
+    destruct Hboot as (Hgen & _ & Hbf).
+    destruct Hbf as (Hpw' & _ & _ & _ & Huart & _).
+    rewrite Hpw in Hsh Hbt. cbn in Hbt. rewrite /obs_wf Hpw' Hgen. split_and!.
+    + eapply trace_shape_snoc; [exact Hsh|reflexivity].
+    + rewrite obs_boots_app. cbn. lia.
+    + intros _ i. rewrite (open_seg_power _ ObsPowerOn eq_refl) Huart.
+      reflexivity.
+    + intros _ i. rewrite (open_seg_power _ ObsPowerOn eq_refl) Huart.
+      reflexivity.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 4. THE WHOLE RUN, with no Iris: a machine that starts powered off emits *)
+(*    a well-formed history, whatever the schedule.  What the adequacy      *)
+(*    theorem adds is the per-cycle CONTENT, which only the logic can       *)
+(*    supply; the shape is the semantics' own.                             *)
+(* ---------------------------------------------------------------------- *)
+
+Lemma step_obs_wf (ρ1 ρ2 : cfg riscv_lang) (κ : list mobs) (h : list mobs) :
+  step ρ1 κ ρ2 -> obs_wf h ρ1.2 -> obs_wf (h ++ κ) ρ2.2.
+Proof.
+  intros [e1 σ1 e2 σ2 efs t1 t2 -> -> Hstep] Hwf. cbn.
+  exact (prim_step_obs_wf _ _ _ _ _ _ _ Hstep Hwf).
+Qed.
+
+Lemma nsteps_obs_wf (n : nat) (ρ1 ρ2 : cfg riscv_lang) (κs : list mobs)
+    (h : list mobs) :
+  nsteps n ρ1 κs ρ2 -> obs_wf h ρ1.2 -> obs_wf (h ++ κs) ρ2.2.
+Proof.
+  intros Hn. revert h.
+  induction Hn as [ρ|n ρ1 ρ2 ρ3 κ κs Hstep _ IH]; intros h Hwf.
+  - by rewrite app_nil_r.
+  - rewrite app_assoc. apply IH. exact (step_obs_wf _ _ _ _ Hstep Hwf).
+Qed.
+
+Theorem run_obs_wf (n : nat) (t t2 : list (expr riscv_lang)) (g g2 : gstate)
+    (κs : list mobs) :
+  g.(gpow) = false -> g.(ggen) = 0%nat ->
+  nsteps (Λ := riscv_lang) n (t, g) κs (t2, g2) ->
+  obs_wf κs g2.
+Proof.
+  intros Hpw Hgen Hn.
+  exact (nsteps_obs_wf _ _ _ _ [] Hn (obs_wf_init _ Hpw Hgen)).
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 5. THE PER-CYCLE VIEW.  A trace property is stated over the WHOLE       *)
+(*    interleaved history (uart-trace.md, ruling 1); this is the derived    *)
+(*    reading a client uses when its property happens to be per power      *)
+(*    cycle: [cycles_of h] is the console I/O of every cycle so far, in     *)
+(*    order, the current (open) one last.  Kept as a fold in REVERSE (most  *)
+(*    recent cycle first, so extending the open cycle is a [cons] case) and *)
+(*    reversed for reading.                                                 *)
+(* ---------------------------------------------------------------------- *)
+
+Definition cyc_step (cs : list (list mobs)) (e : mobs) : list (list mobs) :=
+  match e with
+  | ObsPowerOn => [] :: cs
+  | ObsPowerOff => cs
+  | _ => match cs with [] => [[e]] | c :: cs' => (c ++ [e]) :: cs' end
+  end.
+
+Definition cycles_rev (h : list mobs) : list (list mobs) := foldl cyc_step [] h.
+Definition cycles_of (h : list mobs) : list (list mobs) := rev (cycles_rev h).
+
+Lemma cycles_rev_app (h κ : list mobs) :
+  cycles_rev (h ++ κ) = foldl cyc_step (cycles_rev h) κ.
+Proof. by rewrite /cycles_rev foldl_app. Qed.
+
+(* while the power is on, the most recent cycle IS the open segment *)
+Lemma trace_shape_cycles (h : list mobs) :
+  trace_shape h true -> exists cs, cycles_rev h = open_seg h :: cs.
+Proof.
+  rewrite /trace_shape /cycles_rev /open_seg.
+  induction h as [|e h IH] using rev_ind; [discriminate|].
+  rewrite !foldl_app. intros Hsh.
+  destruct (foldl obs_step (Some false) h) as [on|] eqn:Hs;
+    [|discriminate Hsh].
+  destruct on.
+  - destruct (IH eq_refl) as (cs & Hcs). rewrite Hcs.
+    destruct e; cbn in Hsh |- *; try discriminate Hsh; by eexists.
+  - destruct e; cbn in Hsh |- *; try discriminate Hsh. by eexists.
+Qed.
+
+Lemma cycles_of_on (h : list mobs) :
+  cycles_of (h ++ [ObsPowerOn]) = cycles_of h ++ [[]].
+Proof. by rewrite /cycles_of cycles_rev_app /=. Qed.
+
+Lemma cycles_of_off (h : list mobs) :
+  cycles_of (h ++ [ObsPowerOff]) = cycles_of h.
+Proof. by rewrite /cycles_of cycles_rev_app. Qed.
+
+(* a console event extends the open cycle, and only it *)
+Lemma cycles_of_io (h κ : list mobs) :
+  trace_shape h true -> Forall (fun e => is_io e = true) κ ->
+  exists cs, cycles_of h = cs ++ [open_seg h] /\
+             cycles_of (h ++ κ) = cs ++ [open_seg h ++ κ].
+Proof.
+  intros Hsh Hκ. destruct (trace_shape_cycles _ Hsh) as (cs & Hcs).
+  exists (rev cs). rewrite /cycles_of cycles_rev_app Hcs. split.
+  { done. }
+  assert (Hf : forall c κ', Forall (fun e => is_io e = true) κ' ->
+                foldl cyc_step (c :: cs) κ' = (c ++ κ') :: cs).
+  { intros c κ' Hκ'. revert c.
+    induction Hκ' as [|e κ' He _ IH]; intros c; [by rewrite app_nil_r|].
+    destruct e; try discriminate He; cbn; rewrite IH; by rewrite -app_assoc. }
+  rewrite (Hf _ _ Hκ). done.
+Qed.

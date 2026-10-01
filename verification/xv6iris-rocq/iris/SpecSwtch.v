@@ -1,0 +1,157 @@
+(* SpecSwtch.v -- the public interface of Swtch, stated independently of its
+   proof.  Requires only the definitional layer (SwtchCtx.v) -- never a
+   whole-function proof file -- so every function proof can be checked in
+   parallel.
+
+   swtch(old,new) with the coroutine-chain protocol: consume the ▷-guarded
+   [valid_context P An newc] (▷ because a scheduler can only ever RE-store a
+   parked context under ▷ -- its own swtch delivered it that way) plus the
+   chain payload [P cpu_id Ao newc oldc tp p]; the machine ends up
+   running new's saved WP.  The target's admissibility index [An] must admit
+   THIS hart (the pure [adm An cpu_id] premise), and the caller's
+   continuation is what the OLD record is built from, so it carries the index
+   [Ao] that record is deposited at -- and is quantified over the hart [h]
+   that record may later be resumed on.  The interface is
+   FULL-BUNDLE on both sides: the caller hands its whole [sie_cap_gpr m0 av]
+   and [cpu_own 1 eb p emp] -- both PINNED at [b = false]: [cpu_own]'s own
+   [1] level unconditionally holds the ghost eighth at '0' (the [S _] arm of
+   [IntrDefs.intr_count]), which forces any co-held [sie_cap]/[sie_arm]
+   fragment to agree at [false] by ghost_var_frac agreement (exactly [Swconf]'s own
+   reasoning in SwtchCtx.v) -- and its continuation (the content of
+   [valid_context P Ao oldc]) receives, on a later resumption at hart [h],
+   [sie_cap_gpr@h m av false p] at a fresh file [m] with its
+   own saved image and its own [av], plus [cpu_own@h 1 eb' p emp false] at its
+   own [p] and the resumer's [eb'], and the chain hand-off
+   [▷ valid_context P A' cret ∗ P h A' oldc cret tp' p]
+   (tp' = the resumer's x4, how the resumed code re-ties its per-CPU cells
+   to its own tp -- read via [rget], never the raw map, since tp is pinned to
+   the hart and not carried by [m]/[m0]).
+
+   swtch itself never wraps its continuation in [wp_next]: the hart-crossing
+   here is entirely the [valid_context]/[ctx_adm] admissibility protocol
+   (SwtchCtx.v), not an ordinary trapped step. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import invariants ghost_var.
+Require Import SailStdpp.Base SailStdpp.Operators_mwords SailStdpp.Values SailStdpp.MachineWord.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes KernelText.
+Require Import RegFile HartTp.
+Require Import RiscvExtras.
+Require Import IntrDefs CpuOwn.
+Require Import SwtchCtx.
+From Kernel Require KernelSyms.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Import Defs.
+
+
+Definition wp_swtch_sconf_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (P : CPU -d> ctx_adm -d> mword 64 -d> mword 64 -d>
+         mword 64 -d> mword 64 -d> bool -d> CtxId -d> iPropO Σ)
+    (An Ao : ctx_adm)
+    (oldc newc : mword 64) (m0 : regfile) (old_vs : list (mword 64))
+    (av : nat) (eb : bool) (p : mword 64)
+    (* IS THE CALLER COMING BACK?  At [true] this is the coroutine crossing:
+       the caller's continuation below becomes its [valid_context] record and
+       a later resumption runs it.  At [false] the caller is LEAVING FOR
+       GOOD -- kexit's park, where the C swtch's return is the dead
+       [panic("zombie exit")] tail -- so there is no continuation to give and
+       no record to build, and the resumed party is handed the old context's
+       raw CELLS instead ([SwtchCtx.valid_context_pre]'s [else] arm).  swtch
+       itself learns nothing about why: the flag is pinned by the chain
+       payload, which is where process states live
+       ([SchedCtx.p_sched] pins it at [needs_ctx st]). *)
+    (back : bool) :=
+  length old_vs = 14%nat ->
+  m0 !!! Regidx (mword_of_int 10 : mword 5) = oldc ->
+  m0 !!! Regidx (mword_of_int 11 : mword 5) = newc ->
+  (* THE ADMISSIBILITY OBLIGATION: the target record must admit resumption
+     HERE -- on this hart, against this hart's (now canonical) SIE ghost.  A
+     migratable record ([An = None]) discharges it by [adm_none]; a record
+     pinned to a cpu context ([An = Some cpu_id]) by [adm_pin].
+     [Ao] is the index the caller's OWN record is built at from the
+     continuation below, so the continuation's [⌜adm Ao h⌝] is exactly what
+     that record promises. *)
+  (* A6.128: THE PAYLOAD IS A FUNCTION OF THE CONTEXT, and the crossing MOVES
+     it -- from the caller's identity to the target's, on this hart, by the
+     derived same-hart move [TsoCtx.ctx_move] with both running tokens in
+     hand.  So what [P] owes is the one transport class, [TsoCtx.CtxMorph].
+     This is the store-forwarding hand-off of [p->state]/[c->proc]/the held
+     lock. *)
+  (forall h A c c' tp p' b, CtxMorph (λ ξ, P h A c c' tp p' b ξ)) ->
+  adm An cpu_id ->
+  (* ...and the CALLER's own record admits resumption here too (A6.127 §6):
+     a PINNED caller (the scheduler) parks its RUNNING token into its
+     record, and that token is indexed by this hart. *)
+  adm Ao cpu_id ->
+  kernel_text -∗
+  (* THE FULL AMBIENT BUNDLES: the suspender hands its whole [sie_cap_gpr]
+     (stack + avail included -- they park in ITS [valid_context] record,
+     keyed by the saved sp) and its [cpu_own] at level 1 (xv6's
+     noff==1-at-swtch invariant; slot [emp] -- the context cells travel as
+     [ctx_cells]), both pinned at [b = false] (see the header).  On a later
+     resumption its continuation receives the same shapes back AT THE
+     RESUMING HART [h]: its own [av] (sp is callee-saved, the stack
+     re-attaches), a fresh file with its saved image, [cpu_own] at the SAME
+     [p] (the record parks it; the protocol's c->proc pre-set makes the
+     resumer's bundle match) and the RESUMER's [eb'] -- swtch stores nothing
+     to struct cpu, so the same-eb contract is realized one level up by
+     sched's own epilogue intena store + ghost retune. *)
+  sie_cap_gpr KT1 m0 av false p -∗
+  (* THE HELD SET IS PINNED AT THE PROC LOCK, both directions.  swtch is
+     reachable only from [sched] and the scheduler, and xv6's rule for it is
+     "hold p->lock across the switch" -- [sched]'s own
+     [if (mycpu()->noff != 1) panic("sched locks")] is the C-level statement
+     of it.  So the set is a CONSTANT here, exactly as the level [1] is, and
+     the resumer gets the same constant back.  Quantifying it instead (as an
+     [lks'] the resumer invents) is what left the seam unprovable: a
+     migratable record's resumption is a different critical section, so
+     nothing would tie the two sets together. *)
+  cpu_own 1 eb p false {["proc"]} -∗
+  pc_is (mword_of_int KernelSyms.swtch) -∗
+  ctx_cells oldc old_vs -∗
+  (* THE TARGET RECORD AND ITS TOKEN (A6.127 §6): the record at its own
+     identity [XIt], and beside it what the resumer holds of the token --
+     the link at the resumer's OWN context for a migratable record (the
+     p->lock acquire's morph put it there), the running token for a pinned
+     one ([SwtchCtx.resume_tok]). *)
+  (∃ XIt : CtxId, resume_tok An XIt ∗ ▷ valid_context P An newc p XIt) -∗
+  (* the payload's [A'] slot is always the RESUMER's record index, and the
+     resumer of this crossing is the caller itself -- so it is [Ao]. *)
+  P cpu_id Ao newc oldc (rget m0 (mword_of_int 4 : mword 5)) p back cur_ctx -∗
+  (* THE CALLER'S CONTINUATION -- its record's contents -- and only at
+     [back = true].  At [false] there is nothing to prove about a
+     resumption that cannot happen, which is exactly the point: it is what
+     lets a dying thread give its whole stack away before the crossing
+     rather than park it in a record nobody will ever run. *)
+  (if back then
+     ( ∀ (h : CPU) (m : regfile) (eb' : bool),
+         ⌜adm Ao h⌝ -∗
+         ⌜callee_img m = callee_img m0⌝ -∗
+         sie_cap_gpr KT1 (CID := h) m av false p -∗
+         cpu_own (CID := h) 1 eb' p false {["proc"]} -∗
+         pc_is (CID := h) (ret_pc (m !!! Regidx (mword_of_int 1 : mword 5))) -∗
+         ctx_cells oldc (callee_img m0) -∗
+         (∃ (A' : ctx_adm) (cret : mword 64) (back' : bool),
+            (if back'
+             then ∃ XIo : CtxId, park_tok A' XIo ∗ ▷ valid_context P A' cret p XIo
+             else own_ctx cret) ∗
+            P h A' oldc cret (rget (CID := h) m (mword_of_int 4 : mword 5)) p back' cur_ctx) -∗
+         mWP (LoopE gen_id h : expr riscv_lang) )
+   else emp) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type SWTCH.
+  Parameter wp_swtch_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (P : CPU -d> ctx_adm -d> mword 64 -d> mword 64 -d>
+           mword 64 -d> mword 64 -d> bool -d> CtxId -d> iPropO Σ)
+      (An Ao : ctx_adm)
+      (oldc newc : mword 64) (m0 : regfile) (old_vs : list (mword 64))
+      (av : nat) (eb : bool) (p : mword 64) (back : bool),
+      wp_swtch_sconf_body P An Ao oldc newc m0 old_vs av eb p back.
+End SWTCH.

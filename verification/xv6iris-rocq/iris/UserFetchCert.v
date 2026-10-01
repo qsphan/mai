@@ -1,0 +1,1489 @@
+(* ====================================================================== *)
+(* UserFetchCert.v -- THE U-MODE INSTRUCTION FETCH, PURE.                  *)
+(*                                                                        *)
+(* Package P3's capstone (claude-notes/projects/user-tier-port section     *)
+(* 4.2): [UserFetchPt.user_pt_fetch_instr] with its                        *)
+(* [reg_interp]/[gen_heap_interp] premises replaced by                     *)
+(* [UserBytes.u_mem_wf] projections, a [goodmb] conjunct added, and the    *)
+(* post-state said out loud -- at the reference state                      *)
+(* [UserClassifyAsm.u_state rs mm = MState rs mm dev0_state], in the same  *)
+(* style as [base_exec_total_u] / [rvc_exec_total_u].                       *)
+(*                                                                        *)
+(* Under whole-cycle stepping the composer consumed the two interpretation *)
+(* authorities only to LEARN what memory held; under per-node stepping the *)
+(* hart HOLDS those bytes, so the same facts are pure and the composer is  *)
+(* a [Prop].  What the resources used to carry has to be said explicitly:  *)
+(* the file the fetch LANDS on (a filling walk writes the TLB), the tree   *)
+(* it lands on (the Svadu write-back), and that the bytes moved only the   *)
+(* way [user_pt_inv_bytes]'s closing wand allows ([u_mem_step]).            *)
+(*                                                                        *)
+(* Layout: section 1 the 4-byte fetch READ, certified; section 2 the fetch *)
+(* composer's two shells; section 3 the [u_mem_wf] projections the walk    *)
+(* and the read need; section 4 the byte-level ADUE absorption; section 5  *)
+(* what the write-back does NOT touch and the fetched word; section 6 the  *)
+(* [translateAddr] probes at the fetch, certified; section 7               *)
+(* [u_fetch_pure] itself.                                                  *)
+(*                                                                        *)
+(* ONLY THE 4-ALIGNED FETCH IS HERE.  The 2-aligned split fetch (a         *)
+(* compressed instruction at an odd halfword, and the 2+2 straddle that    *)
+(* translates TWICE) has its exec facts in [UserFetch]                     *)
+(* ([exec_fetch_rvc_2] / [exec_fetch_base_2] / the two fault arms) and its  *)
+(* composer in [UserFetchPt.user_pt_fetch_instr_2], but NO [goodmb] twin   *)
+(* of either exists yet: section 2 certifies [fetch_bytes] and [fetch]     *)
+(* at width 4 only.  A [u_fetch_pure_2] needs those two twins first;       *)
+(* everything else it wants (the walk certificate, the [u_mem_wf]          *)
+(* projections, the landing algebra) is width-independent and is already   *)
+(* here -- it would run the section-7 script TWICE, threading the second   *)
+(* translation's [u_mem_step] through [u_mem_step_trans].                   *)
+(* ====================================================================== *)
+From Stdlib Require Import ZArith Bool Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import RiscvModelBytes.
+Require Import RiscvLang RiscvPtsto RiscvExec RiscvTryStep RiscvFetchExec RiscvExtras.
+Require Import WpDecodeBridge HartMemRun HartMemAsm PtBytes.
+Require Import CommonWalk PtAdBits Pt4kWalk PtreeType KptPt PtTree PtTreeAdue KptTree.
+Require Import ExecCommon UserTranslate UptTree UserPtTree UserBits UserFetch.
+Require Import UserBytes PtWalkCert.
+(* [SmodeCore.ram_fetch_pmp] -- the RAM window's PMP grant -- is the one
+   thing section 7 needs from the S-mode core. *)
+Require Import SmodeCore.
+(* the tier's PURE pair convention: [u_state], [u_exec_pins], [Du_r]/[Du_w].
+   [UserClassifyAsm] is Iris-free; nothing below is an [iProp]. *)
+Require Import UserFrame UserClassifyAsm.
+Local Open Scope Z_scope.
+Import Defs.
+
+(* ===================================================================== *)
+(* 1. THE FETCH READ IS NOT CERTIFIED HERE ANY MORE.                       *)
+(*                                                                        *)
+(* claude-notes/design/icache.md: an instruction fetch reads through a    *)
+(* NON-coherent icache, so the walker ([HartMemRun.hmrun]/[goodmb])       *)
+(* refuses [AK_ifetch] reads and no [goodmb] certificate of a [fetch]     *)
+(* that reaches its read can exist.  The safety tier drives [fetch] node  *)
+(* by node instead ([SmodeCorePt] PART G, [UserActiveClass] §6a'), with   *)
+(* the WALK still certified below ([u_walk_fetch_pure]) and the fetched   *)
+(* word EXISTENTIAL at the memory node.  The fault shells                  *)
+(* ([goodmb_fetch_bytes_ok] / [goodmb_fetch_ok_4]) stay: they take the    *)
+(* read's certificate as a PREMISE and serve the fault arms unchanged.    *)
+(* ===================================================================== *)
+
+(* ===================================================================== *)
+(* 2. THE FETCH SHELLS ([UserFetch.exec_fetch_bytes_ok] /                 *)
+(*    [exec_fetch_ok_4]'s twins).                                         *)
+(*                                                                        *)
+(* Both are pure plumbing over the two calls that matter -- the           *)
+(* translation and the instruction read -- so both take those as exec     *)
+(* fact PLUS certificate and add only [Dr PC] and the [Ziccif] probe.      *)
+(* ===================================================================== *)
+
+Lemma goodmb_currentlyEnabled_Ziccif (Dr Dw : register -> bool) (s : mstate)
+    (mm : pamap) :
+  goodmb Dr Dw (currentlyEnabled Ext_Ziccif) s mm = true.
+Proof.
+  unfold currentlyEnabled. destruct (Defs.Zwf_guarded _).
+  vm_compute. reflexivity.
+Qed.
+
+Lemma goodmb_fetch_bytes_ok (Dr Dw : register -> bool) (width : Z)
+    (fs gs pa : mword 64) (w : mword (8 * width)) (s s' : mstate) (mm : pamap) :
+  exec (translateAddr (Virtaddr gs) (InstructionFetch tt)) s
+    = Some (Ok (Physaddr pa, PBMT_PMA, init_ext_ptw), s') ->
+  goodmb Dr Dw (translateAddr (Virtaddr gs) (InstructionFetch tt)) s mm = true ->
+  exec (mem_read (InstructionFetch tt) PBMT_PMA (Physaddr pa) width false false false) s'
+    = Some (Ok w, s') ->
+  goodmb Dr Dw (mem_read (InstructionFetch tt) PBMT_PMA (Physaddr pa) width
+           false false false) s' mm = true ->
+  goodmb Dr Dw (fetch_bytes fs gs width) s mm = true.
+Proof.
+  intros Htr Htrg Hmr Hmrg.
+  unfold fetch_bytes. apply goodmb_cer.
+  change (ext_fetch_check_pc fs gs) with (@None unit). cbv iota beta.
+  match goal with |- context[Defs.bind (Defs.bind0 ?a ?b) _] =>
+    assert (Htrs : execR (Defs.bind0 a b) s
+                   = Some (inr (Ok (Physaddr pa, PBMT_PMA, init_ext_ptw)), s'));
+    [ | assert (Htrsg : goodmb Dr Dw (Defs.bind0 a b) s mm = true) ] end.
+  { rewrite (execR_bind0_Some _ _ _ _ (execR_returnR_fwd tt s)).
+    rewrite execR_liftR. rewrite Htr. cbn match. reflexivity. }
+  { erewrite gm_bind0R; [ | apply goodmb_returnm | apply execR_returnR_fwd ].
+    apply goodmb_liftR. exact Htrg. }
+  erewrite (gm_bindR Dr Dw _ _ s s' mm _ Htrsg Htrs). cbv iota beta.
+  erewrite gm_bindR; [ | apply goodmb_returnm | apply execR_returnR_fwd ].
+  cbv iota beta.
+  erewrite gm_bindR;
+    [ | apply goodmb_liftR; exact Hmrg
+      | rewrite execR_liftR; rewrite Hmr; cbn match; reflexivity ].
+  cbv iota beta. apply goodmb_returnm.
+Qed.
+
+Section FetchOk4Cert.
+  Context (Dr Dw : register -> bool).
+  Context (s s' : mstate) (mm : pamap) (pc pa : mword 64) (w : mword 32).
+  Hypothesis HDpc : Dr PC = true.
+  Hypothesis HpcPC : register_lookup PC s.(sregs) = pc.
+  Hypothesis Hvalign : is_aligned_vaddr (Virtaddr pc) 4 = true.
+  Hypothesis Htr : exec (translateAddr (Virtaddr pc) (InstructionFetch tt)) s
+                   = Some (Ok (Physaddr pa, PBMT_PMA, init_ext_ptw), s').
+  Hypothesis Htrg : goodmb Dr Dw (translateAddr (Virtaddr pc) (InstructionFetch tt))
+                      s mm = true.
+  Hypothesis Hmr : exec (mem_read (InstructionFetch tt) PBMT_PMA (Physaddr pa) 4
+                           false false false) s' = Some (Ok w, s').
+  Hypothesis Hmrg : goodmb Dr Dw (mem_read (InstructionFetch tt) PBMT_PMA
+                      (Physaddr pa) 4 false false false) s' mm = true.
+
+  Let HrdPC : exec (Defs.read_reg PC) s = Some (pc, s).
+  Proof. rewrite (exec_read_reg PC s). rewrite HpcPC. reflexivity. Qed.
+
+  Let HrdPCg : goodmb Dr Dw (Defs.read_reg PC : M _) s mm = true.
+  Proof. rewrite goodmb_read_reg. exact HDpc. Qed.
+
+  Lemma goodmb_fetch_ok_4 : goodmb Dr Dw (fetch tt) s mm = true.
+  Proof using Dr Dw s s' mm pc pa w HDpc HpcPC Hvalign Htr Htrg Hmr Hmrg.
+    destruct (align4_low_bits pc Hvalign) as [Hbit0 Hbit1].
+    unfold fetch. apply goodmb_cer.
+    change (get_config_rvfi tt) with false. cbv iota beta.
+    gmm_lift HrdPCg HrdPC.
+    gmm_lift HrdPCg HrdPC.
+    change (ext_fetch_check_pc pc pc) with (@None unit). cbv iota beta.
+    match goal with |- context[Defs.bind ?A ?K] =>
+      assert (Halg : goodmb Dr Dw A s mm = true);
+      [ | assert (Hale : execR A s = Some (inr false, s)) ] end.
+    { erewrite gm_bind0R; [ | apply goodmb_returnm | apply execR_returnR_fwd ].
+      unfold Defs.or_boolM.
+      erewrite gm_liftR_nest; [ | exact HrdPCg | exact HrdPC ].
+      rewrite Hbit0. rewrite bindR_ret. cbv iota beta.
+      unfold Defs.and_boolM.
+      erewrite gm_liftR_nest; [ | exact HrdPCg | exact HrdPC ].
+      rewrite Hbit1. rewrite bindR_ret. cbv iota beta. reflexivity. }
+    { rewrite (execR_bind0_Some _ _ _ _ (execR_returnR_fwd tt s)).
+      unfold Defs.or_boolM.
+      rewrite (execR_bind_Some _ _ _ false s).
+      2:{ rewrite (execR_liftR_seq _ _ _ _ _ HrdPC). rewrite Hbit0.
+          apply execR_returnR_fwd. }
+      cbv iota beta.
+      unfold Defs.and_boolM.
+      rewrite (execR_bind_Some _ _ _ false s).
+      2:{ rewrite (execR_liftR_seq _ _ _ _ _ HrdPC). rewrite Hbit1.
+          apply execR_returnR_fwd. }
+      cbv iota beta. reflexivity. }
+    erewrite (gm_bindR Dr Dw _ _ s s mm false Halg Hale). cbv iota beta.
+    match goal with |- context[Defs.bind ?A ?K] =>
+      assert (Hzg : goodmb Dr Dw A s mm = true);
+      [ | assert (Hze : execR A s = Some (inr true, s)) ] end.
+    { unfold Defs.and_boolM.
+      erewrite gm_liftR_nest; [ | exact HrdPCg | exact HrdPC ].
+      rewrite Hvalign. rewrite bindR_ret. cbv iota beta.
+      apply goodmb_liftR. apply goodmb_currentlyEnabled_Ziccif. }
+    { unfold Defs.and_boolM.
+      rewrite (execR_bind_Some _ _ _ true s).
+      2:{ rewrite (execR_liftR_seq _ _ _ _ _ HrdPC). rewrite Hvalign.
+          apply execR_returnR_fwd. }
+      cbv iota beta.
+      rewrite execR_liftR. rewrite exec_currentlyEnabled_Ziccif.
+      cbn match. reflexivity. }
+    erewrite (gm_bindR Dr Dw _ _ s s mm true Hzg Hze). cbv iota beta.
+    gmm_lift HrdPCg HrdPC.
+    gmm_lift HrdPCg HrdPC.
+    erewrite gm_liftR_seq;
+      [ | exact (goodmb_fetch_bytes_ok Dr Dw 4 pc pc pa w s s' mm
+                   Htr Htrg Hmr Hmrg)
+        | exact (exec_fetch_bytes_ok 4 pc pc pa w s s' Htr Hmr) ].
+    cbv iota beta.
+    destruct (isRVC (subrange_vec_dec (autocast (T := mword) w : mword 32) 15 0));
+      reflexivity.
+  Qed.
+
+End FetchOk4Cert.
+
+(* ===================================================================== *)
+(* 3. THE [u_mem_wf] PROJECTIONS THE WALK ASKS FOR.                       *)
+(*                                                                        *)
+(* [PtWalkCert.goodmb_ptree_translateAddr] and its exec twin want, per     *)
+(* slot, a [pt_slot_mem] and a [bytes_owned].  Both are projections of     *)
+(* [UserBytes.u_mem_wf] once the slot is known to be ONE OF THE TREE'S --  *)
+(* which is what [ptree_maps] says, and what this section turns into the   *)
+(* [pt_maps 2 t] membership [u_mem_wf_read] / [u_mem_wf_owned] consume.    *)
+(* ===================================================================== *)
+
+Lemma mword9_uint_range (x : mword 9) : (0 <= uint x < 512)%Z.
+Proof.
+  pose proof (bv_unsigned_in_range _ x) as Hr.
+  unfold uint, MachineWord.MachineWord.word_to_N.
+  rewrite Z2N.id; [| exact (proj1 Hr)].
+  change (bv_modulus (MachineWord.MachineWord.Z_idx 9)) with 512%Z in Hr.
+  exact Hr.
+Qed.
+
+Lemma mword9_uint_id (x : mword 9) : (mword_of_int (uint x) : mword 9) = x.
+Proof.
+  pose proof (bv_unsigned_in_range _ x) as Hr.
+  unfold uint, MachineWord.MachineWord.word_to_N,
+         SailStdpp.Values.mword_of_int, MachineWord.MachineWord.Z_to_word.
+  rewrite Z2N.id; [| exact (proj1 Hr)].
+  apply Z_to_bv_bv_unsigned.
+Qed.
+
+(* a node's OWN slot, as a byte map of that node's page *)
+Lemma pt_page_maps_slot (t : ptree) (i : mword 9) :
+  word_bytes (u_pte_addr (pt_base t) i) (pt_ents t i) ∈ pt_page_maps t.
+Proof.
+  pose proof (pt_page_map_mem t (uint i) (mword9_uint_range i)) as Hm.
+  rewrite mword9_uint_id in Hm. exact Hm.
+Qed.
+
+(* the three slots a successful walk of [vpn] reads, as members of the
+   whole tree's byte-map list *)
+Lemma ptree_maps_slot2 (t : ptree) (vpn : mword 27) (p2 p1 p0 : mword 64) :
+  ptree_maps t vpn p2 p1 p0 ->
+  word_bytes (u_pte_addr (pt_base t) (vpn_idx 2 vpn)) p2 ∈ pt_maps 2 t.
+Proof.
+  intros (c1 & c0 & _ & _ & He2 & _). rewrite <- He2.
+  apply pt_maps_page. apply pt_page_maps_slot.
+Qed.
+
+Lemma ptree_maps_slot1 (t : ptree) (vpn : mword 27) (p2 p1 p0 : mword 64) :
+  ptree_maps t vpn p2 p1 p0 ->
+  word_bytes (pt_addr1 p2 vpn) p1 ∈ pt_maps 2 t.
+Proof.
+  intros (c1 & c0 & Hk1 & Hk0 & He2 & He1 & He0 & Hb1 & Hb0 & _).
+  unfold pt_addr1. rewrite Hb1. rewrite <- He1.
+  apply (pt_maps_kid 1 t c1 (uint (vpn_idx 2 vpn)));
+    [ apply mword9_uint_range
+    | rewrite mword9_uint_id; exact Hk1
+    | apply pt_maps_page; apply pt_page_maps_slot ].
+Qed.
+
+Lemma ptree_maps_slot0 (t : ptree) (vpn : mword 27) (p2 p1 p0 : mword 64) :
+  ptree_maps t vpn p2 p1 p0 ->
+  word_bytes (pt_addr0 p1 vpn) p0 ∈ pt_maps 2 t.
+Proof.
+  intros (c1 & c0 & Hk1 & Hk0 & He2 & He1 & He0 & Hb1 & Hb0 & _).
+  unfold pt_addr0. rewrite Hb0. rewrite <- He0.
+  apply (pt_maps_kid 1 t c1 (uint (vpn_idx 2 vpn)));
+    [ apply mword9_uint_range | rewrite mword9_uint_id; exact Hk1 |].
+  apply (pt_maps_kid 0 c1 c0 (uint (vpn_idx 1 vpn)));
+    [ apply mword9_uint_range | rewrite mword9_uint_id; exact Hk0 |].
+  rewrite pt_maps_O. apply pt_page_maps_slot.
+Qed.
+
+(* ...and a member of that list, at a slot ADDRESS (so its alignment is
+   the slot geometry's), is a [pt_slot_mem] of the reference state *)
+Lemma u_slot_mem_at (P : uptd) (t : ptree) (mm : pamap) (rs : regstate)
+    (b : mword 44) (i : mword 9) (q : mword 64) :
+  u_mem_ok P t mm ->
+  word_bytes (u_pte_addr b i) q ∈ pt_maps 2 t ->
+  pt_slot_mem (MState rs mm dev0_state) (u_pte_addr b i) q.
+Proof.
+  intros Hwf Hin.
+  pose proof (u_mem_ok_sub P t mm _ q Hwf Hin) as Hsub.
+  assert (Hlk : forall j : nat, (N.of_nat j < 8)%N ->
+            mm !! pa_add (u_pte_addr b i) j = Some (nth_byte q j)).
+  { intros j Hj. apply (lookup_weaken (word_bytes (u_pte_addr b i) q) mm);
+      [ apply word_bytes_lookup; lia | exact Hsub ]. }
+  assert (Hram : forall j : nat, (N.of_nat j < 8)%N ->
+            addr_is_ram (pa_add (u_pte_addr b i) j)).
+  { intros j Hj. destruct Hwf as (md & _ & _ & Hmmeq & Hr & _).
+    apply Hr. apply elem_of_dom. exists (nth_byte q j). exact (Hlk j Hj). }
+  split_and!.
+  - exact Hlk.
+  - rewrite <- (pa_add_0 (u_pte_addr b i)). apply Hram. lia.
+  - apply Hram. lia.
+  - exact (pte_addr_at_aligned8 b i).
+Qed.
+
+Lemma u_slot_owned (P : uptd) (t : ptree) (mm : pamap) (a : Arch.pa) (q : mword 64) :
+  u_mem_ok P t mm -> word_bytes a q ∈ pt_maps 2 t -> bytes_owned mm a 8 = true.
+Proof. intros Hwf Hin. exact (u_mem_ok_owned P t mm a q Hwf Hin). Qed.
+
+(* ===================================================================== *)
+(* 4. THE ADUE ABSORPTION AT THE BYTE LEVEL.                              *)
+(*                                                                        *)
+(* [UserBytes.u_mem_step]'s third conjunct asks for                        *)
+(* [mm' = ptree_bytes 2 t' ∪ md'], and on the Svadu write-back arm [mm']  *)
+(* is [write_bytes mm <the leaf slot> 8 q].  Nothing in [UserBytes] says   *)
+(* that writing the slot IS setting the leaf in the tree; this section is  *)
+(* that, and it is map algebra rather than page-table reasoning.           *)
+(* (FOLD BACK into [UserBytes.v] beside [u_mem_step].)                     *)
+(* ===================================================================== *)
+
+(* A WRITE IS A LEFT-BIASED UNION WITH THE WORD.  [write_bytes] folds the
+   same eight inserts [word_bytes] lists, so the two agree. *)
+Lemma foldr_ins_union (a : Arch.pa) {wd : N} (v : bv wd) (js : list nat)
+    (m : pamap) :
+  foldr (fun j acc => <[pa_add a j := nth_byte v j]> acc) m js
+  = (list_to_map ((fun j : nat => (pa_add a j, nth_byte v j)) <$> js) : pamap) ∪ m.
+Proof.
+  induction js as [| j js IH]; cbn [foldr fmap list_fmap].
+  - change (list_to_map [] : pamap) with (∅ : pamap).
+    first [ by rewrite map_empty_union
+          | by rewrite (left_id_L (∅ : pamap) union)
+          | by rewrite left_id_L
+          | symmetry; apply map_empty_union ].
+  - rewrite IH.
+    first [ apply insert_union_l | symmetry; apply insert_union_l ].
+Qed.
+
+Lemma write_bytes_word (m : pamap) (a : Arch.pa) (v : bv 64) :
+  write_bytes m a 8 v = word_bytes a v ∪ m.
+Proof. unfold write_bytes, word_bytes. apply foldr_ins_union. Qed.
+
+Lemma write_bytes_union_l (A B : pamap) (a : Arch.pa) (v : bv 64) :
+  write_bytes (A ∪ B) a 8 v = write_bytes A a 8 v ∪ B.
+Proof.
+  rewrite !write_bytes_word.
+  first [ (rewrite assoc_L; reflexivity)
+        | (rewrite <- assoc_L; reflexivity)
+        | (symmetry; rewrite assoc_L; reflexivity)
+        | (symmetry; rewrite <- assoc_L; reflexivity)
+        | apply map_union_assoc ].
+Qed.
+
+(* [maps_disj] passes to either half of an append *)
+Lemma maps_disj_app_l (l1 l2 : list pamap) : maps_disj (l1 ++ l2) -> maps_disj l1.
+Proof.
+  induction l1 as [| m l1 IH]; intros Hd; [done |].
+  destruct Hd as [Hhd Htl]. split; [| by apply IH].
+  intros m' Hm'. apply Hhd. rewrite elem_of_app. by left.
+Qed.
+
+Lemma maps_disj_app_r (l1 l2 : list pamap) : maps_disj (l1 ++ l2) -> maps_disj l2.
+Proof.
+  induction l1 as [| m l1 IH]; intros Hd; [done |].
+  destruct Hd as [_ Htl]. by apply IH.
+Qed.
+
+Lemma maps_disj_app_cross (l1 l2 : list pamap) :
+  maps_disj (l1 ++ l2) ->
+  forall m1 m2, m1 ∈ l1 -> m2 ∈ l2 -> m1 ##ₘ m2.
+Proof.
+  induction l1 as [| m l1 IH]; intros Hd m1 m2 H1 H2;
+    [ by apply elem_of_nil in H1 |].
+  destruct Hd as [Hhd Htl].
+  apply elem_of_cons in H1 as [-> | H1].
+  - apply Hhd. rewrite elem_of_app. by right.
+  - exact (IH Htl m1 m2 H1 H2).
+Qed.
+
+(* ...and the union of an append splits *)
+Lemma union_list_app (l1 l2 : list pamap) : ⋃ (l1 ++ l2) = (⋃ l1) ∪ (⋃ l2).
+Proof.
+  induction l1 as [| m l1 IH]; cbn [app].
+  - rewrite union_list_nil.
+    first [ by rewrite map_empty_union
+          | by rewrite (left_id_L (∅ : pamap) union)
+          | symmetry; apply map_empty_union ].
+  - rewrite !union_list_cons. rewrite IH.
+    first [ apply map_union_assoc | symmetry; apply map_union_assoc
+          | (rewrite assoc_L; reflexivity)
+          | (rewrite <- assoc_L; reflexivity) ].
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 4a. ONE ELEMENT OF A DISJOINT LIST, REPLACED BY A SAME-DOMAIN MAP.       *)
+(* This is the shape every level of the tree surgery has, and the only      *)
+(* thing that has to be proved about unions.                                *)
+(* ---------------------------------------------------------------------- *)
+Definition maps_upd_at (X Y : pamap) (l l' : list pamap) : Prop :=
+  exists l1 l2, l = (l1 ++ X :: l2)%list /\ l' = (l1 ++ Y :: l2)%list.
+
+(* a left-biased union absorbs a same-domain map underneath it.  Stated over
+   [is_Some] and NOT over [dom]: naming [gset Arch.pa] in this file
+   re-elaborates the key type's [Countable] instance, which is the section-8
+   trap; [is_Some] mentions no instance at all. *)
+Lemma map_union_absorb_dom (X Y Z : pamap) :
+  (forall a, is_Some (X !! a) -> is_Some (Y !! a)) -> Y ∪ (X ∪ Z) = Y ∪ Z.
+Proof.
+  intros Hd. apply map_eq. intros x.
+  destruct (Y !! x) as [b|] eqn:HY.
+  - rewrite (lookup_union_Some_l Y (X ∪ Z) x b HY).
+    rewrite (lookup_union_Some_l Y Z x b HY). reflexivity.
+  - assert (HX : X !! x = None).
+    { destruct (X !! x) as [c|] eqn:HXc; [| reflexivity ].
+      exfalso. destruct (Hd x (mk_is_Some _ _ HXc)) as [bb Hbb]. congruence. }
+    rewrite (lookup_union_r Y (X ∪ Z) x HY).
+    rewrite (lookup_union_r Y Z x HY).
+    rewrite (lookup_union_r X Z x HX). reflexivity.
+Qed.
+
+Lemma union_list_upd_at (X Y : pamap) (l l' : list pamap) :
+  maps_disj l -> maps_upd_at X Y l l' ->
+  (forall a, is_Some (X !! a) -> is_Some (Y !! a)) ->
+  (forall a, is_Some (Y !! a) -> is_Some (X !! a)) ->
+  ⋃ l' = Y ∪ ⋃ l.
+Proof.
+  intros Hd (l1 & l2 & -> & ->) Hdom Hdom'.
+  assert (HX1 : X ##ₘ ⋃ l1).
+  { apply symmetry, map_disjoint_union_list_l, Forall_forall.
+    intros m Hm. apply list_elem_of_In in Hm.
+    revert Hd. clear -Hm. revert Hm. induction l1 as [| m0 l1 IH]; intros Hm Hd;
+      [ by apply elem_of_nil in Hm |].
+    destruct Hd as [Hhd Htl]. apply elem_of_cons in Hm as [-> | Hm].
+    - apply Hhd. rewrite elem_of_app. right. apply elem_of_cons. by left.
+    - exact (IH Hm Htl). }
+  assert (HY1 : Y ##ₘ ⋃ l1).
+  { apply map_disjoint_spec. intros i x y Hy Hu.
+    destruct (Hdom' i (mk_is_Some _ _ Hy)) as [z Hz].
+    exact (proj1 (map_disjoint_spec X (⋃ l1)) HX1 i z y Hz Hu). }
+  rewrite !union_list_app. rewrite !union_list_cons.
+  rewrite (map_union_assoc (⋃ l1) Y (⋃ l2)).
+  rewrite (map_union_comm (⋃ l1) Y (symmetry HY1)).
+  rewrite <- (map_union_assoc Y (⋃ l1) (⋃ l2)).
+  rewrite (map_union_assoc (⋃ l1) X (⋃ l2)).
+  rewrite (map_union_comm (⋃ l1) X (symmetry HX1)).
+  rewrite <- (map_union_assoc X (⋃ l1) (⋃ l2)).
+  by rewrite (map_union_absorb_dom X Y (⋃ l1 ∪ ⋃ l2) Hdom).
+Qed.
+
+Lemma maps_upd_at_app_l (X Y : pamap) (k l l' : list pamap) :
+  maps_upd_at X Y l l' -> maps_upd_at X Y (k ++ l) (k ++ l').
+Proof.
+  intros (l1 & l2 & -> & ->). exists (k ++ l1)%list, l2.
+  by rewrite <- !app_assoc.
+Qed.
+
+Lemma maps_upd_at_app_r (X Y : pamap) (k l l' : list pamap) :
+  maps_upd_at X Y l l' -> maps_upd_at X Y (l ++ k) (l' ++ k).
+Proof.
+  intros (l1 & l2 & -> & ->). exists l1, (l2 ++ k)%list.
+  by rewrite <- !app_assoc.
+Qed.
+
+(* the two ways a one-index change reaches a list of maps: through an
+   [fmap] (a node's own 512 slots) and through a [concat] of [fmap]
+   (a node's 512 children) *)
+Lemma fmap_agree_off {A} (K : list A) (f g : A -> pamap) :
+  (forall i, i ∈ K -> g i = f i) -> (g <$> K) = (f <$> K).
+Proof.
+  induction K as [| a K IH]; intros Hfg; [reflexivity |].
+  cbn [fmap list_fmap]. rewrite (Hfg a (list_elem_of_here a K)).
+  rewrite IH; [ reflexivity |].
+  intros i Hi. apply Hfg. by apply list_elem_of_further.
+Qed.
+
+Lemma fmap_agree_off_l {A} (K : list A) (h h' : A -> list pamap) :
+  (forall i, i ∈ K -> h' i = h i) -> (h' <$> K) = (h <$> K).
+Proof.
+  induction K as [| a K IH]; intros Hfg; [reflexivity |].
+  cbn [fmap list_fmap]. rewrite (Hfg a (list_elem_of_here a K)).
+  rewrite IH; [ reflexivity |].
+  intros i Hi. apply Hfg. by apply list_elem_of_further.
+Qed.
+
+Lemma nodup_split {A} `{EqDecision A} (L L1 L2 : list A) (i0 : A) :
+  base.NoDup L -> L = (L1 ++ i0 :: L2)%list ->
+  (forall i, i ∈ L1 -> i <> i0) /\ (forall i, i ∈ L2 -> i <> i0).
+Proof.
+  intros Hnd ->.
+  apply stdpp.list_relations.list.NoDup_app in Hnd as (H1 & Hcross & H2).
+  apply (proj1 (stdpp.list_relations.list.NoDup_cons i0 L2)) in H2 as [Hni H2].
+  split.
+  - intros i Hi Heq. rewrite Heq in Hi.
+    exact (Hcross i0 Hi (list_elem_of_here _ _)).
+  - intros i Hi Heq. rewrite Heq in Hi. exact (Hni Hi).
+Qed.
+
+Lemma fmap_upd_at {A} `{EqDecision A} (L : list A) (f g : A -> pamap) (i0 : A) :
+  base.NoDup L -> i0 ∈ L ->
+  (forall i, i ∈ L -> i <> i0 -> g i = f i) ->
+  maps_upd_at (f i0) (g i0) (f <$> L) (g <$> L).
+Proof.
+  intros Hnd Hin Hfg.
+  apply list_elem_of_split in Hin as (L1 & L2 & ->).
+  destruct (nodup_split (L1 ++ i0 :: L2)%list L1 L2 i0 Hnd eq_refl) as [Hn1 Hn2].
+  exists (f <$> L1), (f <$> L2).
+  rewrite !fmap_app. cbn [fmap list_fmap]. split; [reflexivity |].
+  rewrite (fmap_agree_off L1 f g
+             (fun i Hi => Hfg i ltac:(rewrite elem_of_app; by left) (Hn1 i Hi))).
+  by rewrite (fmap_agree_off L2 f g
+                (fun i Hi => Hfg i
+                   ltac:(rewrite elem_of_app; right; by apply list_elem_of_further)
+                   (Hn2 i Hi))).
+Qed.
+
+Lemma concat_upd_at {A} `{EqDecision A} (L : list A) (h h' : A -> list pamap)
+    (i0 : A) (X Y : pamap) :
+  base.NoDup L -> i0 ∈ L ->
+  (forall i, i ∈ L -> i <> i0 -> h' i = h i) ->
+  maps_upd_at X Y (h i0) (h' i0) ->
+  maps_upd_at X Y (concat (h <$> L)) (concat (h' <$> L)).
+Proof.
+  intros Hnd Hin Hfg Hupd.
+  apply list_elem_of_split in Hin as (L1 & L2 & ->).
+  destruct (nodup_split (L1 ++ i0 :: L2)%list L1 L2 i0 Hnd eq_refl) as [Hn1 Hn2].
+  rewrite !fmap_app. cbn [fmap list_fmap]. rewrite !concat_app.
+  cbn [concat].
+  rewrite (fmap_agree_off_l L1 h h'
+             (fun i Hi => Hfg i ltac:(rewrite elem_of_app; by left) (Hn1 i Hi))).
+  rewrite (fmap_agree_off_l L2 h h'
+             (fun i Hi => Hfg i
+                ltac:(rewrite elem_of_app; right; by apply list_elem_of_further)
+                (Hn2 i Hi))).
+  apply maps_upd_at_app_l. by apply maps_upd_at_app_r.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 4b. THE TREE SURGERY.  [ptree_set_leaf] is [pt_upd_kid] twice and        *)
+(* [pt_upd_ent] once, and each of the three replaces exactly one element of *)
+(* the byte-map list.                                                       *)
+(* ---------------------------------------------------------------------- *)
+Lemma uint_mword9 (j : Z) : (0 <= j < 512)%Z -> uint (mword_of_int j : mword 9) = j.
+Proof.
+  intro Hj.
+  pose proof (bv_unsigned_in_range _ (mword_of_int j : mword 9)) as Hr.
+  unfold uint, MachineWord.MachineWord.word_to_N.
+  rewrite Z2N.id; [| exact (proj1 Hr)].
+  unfold SailStdpp.Values.mword_of_int, MachineWord.MachineWord.Z_to_word.
+  rewrite Z_to_bv_small; [reflexivity |].
+  change (bv_modulus (MachineWord.MachineWord.Z_idx 9)) with 512%Z. exact Hj.
+Qed.
+
+Lemma mword9_of_int_ne (j : Z) (i : mword 9) :
+  (0 <= j < 512)%Z -> j <> uint i -> (mword_of_int j : mword 9) <> i.
+Proof.
+  intros Hj Hne Heq. apply Hne.
+  rewrite <- (uint_mword9 j Hj). by rewrite Heq.
+Qed.
+
+Lemma seqZ_512_nodup : base.NoDup (seqZ 0 512).
+Proof. apply NoDup_seqZ. Qed.
+
+Lemma seqZ_512_mem (i : mword 9) : uint i ∈ seqZ 0 512.
+Proof. apply elem_of_seqZ. pose proof (mword9_uint_range i). lia. Qed.
+
+
+(* the projections of an updated node, as small equations -- NEVER let a
+   [cbn] near a goal that mentions [pt_page_maps]: its body carries
+   [seqZ 0 512] and a whitelisted [cbn] still fires the iota that computes
+   the 512-element list *)
+Lemma pt_base_upd_ent (t : ptree) (i : mword 9) (q : mword 64) :
+  pt_base (pt_upd_ent t i q) = pt_base t.
+Proof. reflexivity. Qed.
+
+Lemma pt_ents_upd_ent_same (t : ptree) (i : mword 9) (q : mword 64) :
+  pt_ents (pt_upd_ent t i q) i = q.
+Proof.
+  unfold pt_upd_ent. cbn [pt_ents].
+  destruct (decide (i = i)) as [_ | Hc]; [ reflexivity | congruence ].
+Qed.
+
+Lemma pt_ents_upd_ent_ne (t : ptree) (i i' : mword 9) (q : mword 64) :
+  i' <> i -> pt_ents (pt_upd_ent t i q) i' = pt_ents t i'.
+Proof.
+  intros Hne. unfold pt_upd_ent. cbn [pt_ents].
+  destruct (decide (i' = i)) as [Hc | _]; [ congruence | reflexivity ].
+Qed.
+
+Lemma pt_kids_upd_kid_same (t : ptree) (i : mword 9) (c : option ptree) :
+  pt_kids (pt_upd_kid t i c) i = c.
+Proof.
+  unfold pt_upd_kid. cbn [pt_kids].
+  destruct (decide (i = i)) as [_ | Hc]; [ reflexivity | congruence ].
+Qed.
+
+Lemma pt_kids_upd_kid_ne (t : ptree) (i i' : mword 9) (c : option ptree) :
+  i' <> i -> pt_kids (pt_upd_kid t i c) i' = pt_kids t i'.
+Proof.
+  intros Hne. unfold pt_upd_kid. cbn [pt_kids].
+  destruct (decide (i' = i)) as [Hc | _]; [ congruence | reflexivity ].
+Qed.
+
+Lemma moi_ne (j k : Z) : (0 <= j < 512)%Z -> (0 <= k < 512)%Z -> k <> j ->
+  (mword_of_int k : mword 9) <> mword_of_int j.
+Proof.
+  intros Hj Hk Hne Hc. apply Hne.
+  rewrite <- (uint_mword9 k Hk). rewrite Hc. by apply uint_mword9.
+Qed.
+
+(* A NODE'S OWN PAGE, with one slot word replaced.  Indexed by the Z the
+   [seqZ] carries -- [mword_of_int (uint i)] is only PROPOSITIONALLY [i], so
+   a statement at [i] would not match the list the [fmap] builds.  And BOTH
+   endpoints are spelled as the [fmap]'s OWN function applied to the index,
+   so [apply] never has to decide [decide (x = x)] by conversion -- which on
+   a symbolic [mword 9] does not come back. *)
+Lemma pt_page_maps_upd_ent (t : ptree) (j : Z) (q : mword 64) :
+  (0 <= j < 512)%Z ->
+  maps_upd_at
+    (word_bytes (u_pte_addr (pt_base t) (mword_of_int j))
+                (pt_ents t (mword_of_int j)))
+    (word_bytes (u_pte_addr (pt_base (pt_upd_ent t (mword_of_int j) q))
+                            (mword_of_int j))
+                (pt_ents (pt_upd_ent t (mword_of_int j) q) (mword_of_int j)))
+    (pt_page_maps t) (pt_page_maps (pt_upd_ent t (mword_of_int j) q)).
+Proof.
+  intros Hj. unfold pt_page_maps.
+  apply (fmap_upd_at (seqZ 0 512)
+           (fun i0 : Z => word_bytes (u_pte_addr (pt_base t) (mword_of_int i0))
+                            (pt_ents t (mword_of_int i0)))
+           (fun i0 : Z =>
+              word_bytes (u_pte_addr (pt_base (pt_upd_ent t (mword_of_int j) q))
+                                     (mword_of_int i0))
+                (pt_ents (pt_upd_ent t (mword_of_int j) q) (mword_of_int i0)))
+           j).
+  - apply seqZ_512_nodup.
+  - apply elem_of_seqZ. lia.
+  - intros k Hk Hne. cbn beta. apply elem_of_seqZ in Hk.
+    rewrite pt_base_upd_ent.
+    rewrite (pt_ents_upd_ent_ne t (mword_of_int j) (mword_of_int k) q
+               (moi_ne j k Hj ltac:(lia) Hne)).
+    reflexivity.
+Qed.
+
+Lemma pt_maps_upd_ent (lvl : nat) (t : ptree) (j : Z) (q : mword 64) :
+  (0 <= j < 512)%Z ->
+  maps_upd_at
+    (word_bytes (u_pte_addr (pt_base t) (mword_of_int j))
+                (pt_ents t (mword_of_int j)))
+    (word_bytes (u_pte_addr (pt_base (pt_upd_ent t (mword_of_int j) q))
+                            (mword_of_int j))
+                (pt_ents (pt_upd_ent t (mword_of_int j) q) (mword_of_int j)))
+    (pt_maps lvl t) (pt_maps lvl (pt_upd_ent t (mword_of_int j) q)).
+Proof.
+  intros Hj. destruct lvl as [| lvl].
+  - rewrite !pt_maps_O. by apply pt_page_maps_upd_ent.
+  - rewrite !pt_maps_S.
+    apply maps_upd_at_app_r. by apply pt_page_maps_upd_ent.
+Qed.
+
+Lemma pt_maps_upd_kid (lvl : nat) (t c c' : ptree) (j : Z) (X Y : pamap) :
+  (0 <= j < 512)%Z ->
+  pt_kids t (mword_of_int j) = Some c ->
+  maps_upd_at X Y (pt_maps lvl c) (pt_maps lvl c') ->
+  maps_upd_at X Y (pt_maps (S lvl) t)
+    (pt_maps (S lvl) (pt_upd_kid t (mword_of_int j) (Some c'))).
+Proof.
+  intros Hj Hk Hupd. rewrite !pt_maps_S.
+  apply maps_upd_at_app_l.
+  apply (concat_upd_at (seqZ 0 512)
+           (fun i0 : Z => match pt_kids t (mword_of_int i0) with
+                          | Some c0 => pt_maps lvl c0 | None => [] end)
+           (fun i0 : Z =>
+              match pt_kids (pt_upd_kid t (mword_of_int j) (Some c'))
+                            (mword_of_int i0) with
+              | Some c0 => pt_maps lvl c0 | None => [] end)
+           j).
+  - apply seqZ_512_nodup.
+  - apply elem_of_seqZ. lia.
+  - intros k Hk2 Hne. cbn beta. apply elem_of_seqZ in Hk2.
+    rewrite (pt_kids_upd_kid_ne t (mword_of_int j) (mword_of_int k) (Some c')
+               (moi_ne j k Hj ltac:(lia) Hne)).
+    reflexivity.
+  - cbn beta. rewrite pt_kids_upd_kid_same. by rewrite Hk.
+Qed.
+
+(* the two byte maps of one slot have the same keys, whatever the words *)
+Lemma word_bytes_is_Some (a : Arch.pa) (w w' : bv 64) (x : Arch.pa) :
+  is_Some (word_bytes a w !! x) -> is_Some (word_bytes a w' !! x).
+Proof.
+  intros [b Hb].
+  destruct (word_bytes_dom_elim a w x ltac:(apply elem_of_dom; by exists b))
+    as (j & Hj & ->).
+  exists (nth_byte w' j). by apply word_bytes_lookup.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 4c. THE ABSORPTION.  Writing the leaf slot IS setting the leaf.          *)
+(* ---------------------------------------------------------------------- *)
+Lemma ptree_bytes_set_leaf (t : ptree) (vpn : mword 27) (p2 p1 p0 q : mword 64) :
+  maps_disj (pt_maps 2 t) ->
+  ptree_maps t vpn p2 p1 p0 ->
+  ptree_bytes 2 (ptree_set_leaf t vpn q)
+  = write_bytes (ptree_bytes 2 t) (pt_addr0 p1 vpn) 8 q.
+Proof.
+  intros Hdisj (c1 & c0 & Hk1 & Hk0 & He2 & He1 & He0 & Hb1 & Hb0 & _).
+  (* the three indices, as the [Z]s the slot lists carry *)
+  pose proof (mword9_uint_range (vpn_idx 2 vpn)) as Hr2.
+  pose proof (mword9_uint_range (vpn_idx 1 vpn)) as Hr1.
+  pose proof (mword9_uint_range (vpn_idx 0 vpn)) as Hr0.
+  (* the leaf page, updated *)
+  pose proof (pt_maps_upd_ent 0 c0 (uint (vpn_idx 0 vpn)) q Hr0) as H0.
+  rewrite mword9_uint_id in H0.
+  (* ...through the mid node, then through the root *)
+  pose proof (pt_maps_upd_kid 0 c1 c0 (pt_upd_ent c0 (vpn_idx 0 vpn) q)
+                (uint (vpn_idx 1 vpn)) _ _ Hr1
+                ltac:(rewrite mword9_uint_id; exact Hk0) H0) as H1.
+  rewrite mword9_uint_id in H1.
+  pose proof (pt_maps_upd_kid 1 t c1
+                (pt_upd_kid c1 (vpn_idx 1 vpn)
+                   (Some (pt_upd_ent c0 (vpn_idx 0 vpn) q)))
+                (uint (vpn_idx 2 vpn)) _ _ Hr2
+                ltac:(rewrite mword9_uint_id; exact Hk1) H1) as H2.
+  rewrite mword9_uint_id in H2.
+  (* the tree the model lands on IS that update *)
+  assert (Hsl : ptree_set_leaf t vpn q
+                = pt_upd_kid t (vpn_idx 2 vpn)
+                    (Some (pt_upd_kid c1 (vpn_idx 1 vpn)
+                             (Some (pt_upd_ent c0 (vpn_idx 0 vpn) q))))).
+  { unfold ptree_set_leaf. rewrite Hk1. by rewrite Hk0. }
+  rewrite Hsl.
+  (* the endpoints, in the caller's spelling *)
+  rewrite pt_base_upd_ent in H2. rewrite pt_ents_upd_ent_same in H2.
+  unfold ptree_bytes.
+  rewrite (union_list_upd_at _ _ (pt_maps 2 t) _ Hdisj H2
+             (fun x Hx => word_bytes_is_Some _ _ q x Hx)
+             (fun x Hx => word_bytes_is_Some _ q _ x Hx)).
+  rewrite write_bytes_word.
+  unfold pt_addr0. by rewrite Hb0.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 4d. ...AND SO THE WRITE-BACK IS A [u_mem_step].                          *)
+(* ---------------------------------------------------------------------- *)
+Lemma pt_same_shape_upd_ent (lvl : nat) (t : ptree) (i : mword 9) (q : mword 64) :
+  pt_same_shape lvl t (pt_upd_ent t i q).
+Proof.
+  destruct lvl as [| lvl]; split; [ reflexivity | done | reflexivity |].
+  intros k. cbn [pt_kids pt_upd_ent].
+  destruct (pt_kids t k) as [c|]; [ apply pt_same_shape_refl | done ].
+Qed.
+
+Lemma pt_same_shape_upd_kid (lvl : nat) (t c c' : ptree) (i : mword 9) :
+  pt_kids t i = Some c -> pt_same_shape lvl c c' ->
+  pt_same_shape (S lvl) t (pt_upd_kid t i (Some c')).
+Proof.
+  intros Hk Hs. split; [ reflexivity |].
+  intros k. destruct (decide (k = i)) as [-> | Hne].
+  - rewrite pt_kids_upd_kid_same. rewrite Hk. exact Hs.
+  - rewrite (pt_kids_upd_kid_ne t i k (Some c') Hne).
+    destruct (pt_kids t k) as [c0|]; [ apply pt_same_shape_refl | done ].
+Qed.
+
+Lemma pt_same_shape_set_leaf (t : ptree) (vpn : mword 27) (p2 p1 p0 q : mword 64) :
+  ptree_maps t vpn p2 p1 p0 -> pt_same_shape 2 t (ptree_set_leaf t vpn q).
+Proof.
+  intros (c1 & c0 & Hk1 & Hk0 & _).
+  assert (Hsl : ptree_set_leaf t vpn q
+                = pt_upd_kid t (vpn_idx 2 vpn)
+                    (Some (pt_upd_kid c1 (vpn_idx 1 vpn)
+                             (Some (pt_upd_ent c0 (vpn_idx 0 vpn) q))))).
+  { unfold ptree_set_leaf. rewrite Hk1. by rewrite Hk0. }
+  rewrite Hsl.
+  apply (pt_same_shape_upd_kid 1 t c1 _ (vpn_idx 2 vpn) Hk1).
+  apply (pt_same_shape_upd_kid 0 c1 c0 _ (vpn_idx 1 vpn) Hk0).
+  apply pt_same_shape_upd_ent.
+Qed.
+
+Lemma u_mem_step_writeback (P : uptd) (t : ptree) (mm : pamap)
+    (vpn : mword 27) (p2 p1 p0 q : mword 64) :
+  u_mem_wf P t mm ->
+  ptree_maps t vpn p2 p1 p0 ->
+  upt_tree_spec (ud_root P) (ud_tfp P) (ud_um P) (ptree_set_leaf t vpn q) ->
+  u_mem_step P t (ptree_set_leaf t vpn q) mm
+    (write_bytes mm (pt_addr0 p1 vpn) 8 q).
+Proof.
+  intros Hwf Hmaps Hspec'.
+  pose proof (pt_same_shape_set_leaf t vpn p2 p1 p0 q Hmaps) as Hshape.
+  destruct Hwf as (md & Hdisj & Hdj & Hmm & Hdm & Hram & Hrest).
+  (* the slot's OLD bytes live in the tree half, hence are disjoint from the
+     data half; the NEW ones have the same keys, so they are too *)
+  assert (Hwdj : word_bytes (pt_addr0 p1 vpn) q ##ₘ md).
+  { apply map_disjoint_spec. intros x b1 b2 H1 H2.
+    destruct (word_bytes_is_Some (pt_addr0 p1 vpn) q p0 x (mk_is_Some _ _ H1))
+      as [b0 Hb0].
+    pose proof (maps_disj_subseteq (pt_maps 2 t)
+                  (word_bytes (pt_addr0 p1 vpn) p0) Hdisj
+                  (ptree_maps_slot0 t vpn p2 p1 p0 Hmaps)) as Hsubt.
+    pose proof (lookup_weaken _ _ x b0 Hb0 Hsubt) as Hbt.
+    exact (proj1 (map_disjoint_spec (ptree_bytes 2 t) md) Hdj x b0 b2 Hbt H2). }
+  assert (Heq : ptree_bytes 2 (ptree_set_leaf t vpn q)
+                = word_bytes (pt_addr0 p1 vpn) q ∪ ptree_bytes 2 t).
+  { rewrite (ptree_bytes_set_leaf t vpn p2 p1 p0 q Hdisj Hmaps).
+    apply write_bytes_word. }
+  split_and!; [ exact Hshape | exact Hspec' |].
+  exists md. split_and!.
+  - rewrite Heq. apply map_disjoint_union_l. by split.
+  - rewrite Hmm. rewrite write_bytes_union_l. rewrite write_bytes_word.
+    rewrite Heq. reflexivity.
+  - exact Hdm.
+Qed.
+
+(* THE SAME WRITE-BACK AT THE WEAKER PREDICATE.  [u_mem_step_writeback]
+   concludes the STRONG [u_mem_step], whose data clause is exactly what
+   [u_mem_wf] supplies and [u_mem_ok] does not -- so the composer chain,
+   which holds only [u_mem_ok], cannot go through it and cannot repair it
+   with [u_mem_step_ok_of] either (that lemma wants the [u_mem_wf] the
+   chain no longer has).  The domain equality [u_mem_step_ok] asks for
+   instead comes from the SHAPE alone, which is why this twin is the same
+   proof minus one conjunct rather than a weaker theorem. *)
+(* THIS FILE'S [dom] DOES NOT REWRITE, and the failure is the keyed-matching
+   one: [rewrite !dom_union_L] reports "found no subterm matching
+   dom (?m1 ∪ ?m2)" on a goal that visibly contains one, and giving the
+   union's arguments explicitly only moves the failure to the RHS's
+   [dom A].  (The identical script in [UserBytes.union_list_dom_shape]
+   works; this file's ambient instances are not the ones the lemma is
+   keyed on.)  So every step below goes through UNIFICATION -- an [apply]
+   or an [exact] against a statement whose set type is ascribed here --
+   and nothing is rewritten. *)
+Lemma dom_union_shape (A B M : pamap) :
+  (dom A : gset Arch.pa) = dom B ->
+  (dom (A ∪ M) : gset Arch.pa) = dom (B ∪ M).
+Proof.
+  intros H.
+  assert (Hmem : forall a : Arch.pa,
+            a ∈ (dom A : gset Arch.pa) <-> a ∈ (dom B : gset Arch.pa))
+    by (apply set_eq; exact H).
+  assert (Hab : forall a : Arch.pa, is_Some (A !! a) <-> is_Some (B !! a)).
+  { intros a. split; intros Hx.
+    - assert (H1 : a ∈ (dom A : gset Arch.pa)) by (apply elem_of_dom; exact Hx).
+      assert (H2 : a ∈ (dom B : gset Arch.pa)) by (apply (proj1 (Hmem a)); exact H1).
+      apply elem_of_dom in H2. exact H2.
+    - assert (H1 : a ∈ (dom B : gset Arch.pa)) by (apply elem_of_dom; exact Hx).
+      assert (H2 : a ∈ (dom A : gset Arch.pa)) by (apply (proj2 (Hmem a)); exact H1).
+      apply elem_of_dom in H2. exact H2. }
+  assert (Hu : forall (X : pamap) (a : Arch.pa),
+            is_Some ((X ∪ M) !! a) <-> is_Some (X !! a) \/ is_Some (M !! a)).
+  { intros X a. split.
+    - intros [c Hc]. destruct (X !! a) as [b|] eqn:Hb.
+      + left. exists b. reflexivity.
+      + right. exists c. exact (eq_trans (eq_sym (lookup_union_r X M a Hb)) Hc).
+    - intros [[b Hb] | [c Hc]].
+      + exists b. exact (lookup_union_Some_l X M a b Hb).
+      + destruct (X !! a) as [b|] eqn:Hb.
+        * exists b. exact (lookup_union_Some_l X M a b Hb).
+        * exists c. exact (eq_trans (lookup_union_r X M a Hb) Hc). }
+  apply set_eq. intros a. split; intros Ha;
+    apply elem_of_dom; apply elem_of_dom in Ha;
+    apply Hu; apply Hu in Ha;
+    (destruct Ha as [Hx | Hx];
+     [ left; first [ apply (proj1 (Hab a)); exact Hx
+                   | apply (proj2 (Hab a)); exact Hx ]
+     | right; exact Hx ]).
+Qed.
+
+Lemma u_mem_step_ok_writeback (P : uptd) (t : ptree) (mm : pamap)
+    (vpn : mword 27) (p2 p1 p0 q : mword 64) :
+  u_mem_ok P t mm ->
+  ptree_maps t vpn p2 p1 p0 ->
+  upt_tree_spec (ud_root P) (ud_tfp P) (ud_um P) (ptree_set_leaf t vpn q) ->
+  u_mem_step_ok P t (ptree_set_leaf t vpn q) mm
+    (write_bytes mm (pt_addr0 p1 vpn) 8 q).
+Proof.
+  intros Hok Hmaps Hspec'.
+  pose proof (pt_same_shape_set_leaf t vpn p2 p1 p0 q Hmaps) as Hshape.
+  destruct Hok as (md & Hdisj & Hdj & Hmm & Hram & Hwfm & Hspec).
+  assert (Hwdj : word_bytes (pt_addr0 p1 vpn) q ##ₘ md).
+  { apply map_disjoint_spec. intros x b1 b2 H1 H2.
+    destruct (word_bytes_is_Some (pt_addr0 p1 vpn) q p0 x (mk_is_Some _ _ H1))
+      as [b0 Hb0].
+    pose proof (maps_disj_subseteq (pt_maps 2 t)
+                  (word_bytes (pt_addr0 p1 vpn) p0) Hdisj
+                  (ptree_maps_slot0 t vpn p2 p1 p0 Hmaps)) as Hsubt.
+    pose proof (lookup_weaken _ _ x b0 Hb0 Hsubt) as Hbt.
+    exact (proj1 (map_disjoint_spec (ptree_bytes 2 t) md) Hdj x b0 b2 Hbt H2). }
+  assert (Heq : ptree_bytes 2 (ptree_set_leaf t vpn q)
+                = word_bytes (pt_addr0 p1 vpn) q ∪ ptree_bytes 2 t).
+  { rewrite (ptree_bytes_set_leaf t vpn p2 p1 p0 q Hdisj Hmaps).
+    apply write_bytes_word. }
+  assert (Hdj2 : ptree_bytes 2 (ptree_set_leaf t vpn q) ##ₘ md).
+  { rewrite Heq. apply map_disjoint_union_l. by split. }
+  assert (Hmm2 : write_bytes mm (pt_addr0 p1 vpn) 8 q
+                 = ptree_bytes 2 (ptree_set_leaf t vpn q) ∪ md).
+  { rewrite Hmm. rewrite write_bytes_union_l. rewrite write_bytes_word.
+    rewrite Heq. reflexivity. }
+  split_and!.
+  - exact Hshape.
+  - exact Hspec'.
+  (* the domain equality by UNIFICATION against [dom_union_shape], not by
+     [rewrite !dom_union_L] on the goal: after the two map rewrites the
+     goal's [dom] is only convertible to the one [dom_union_L] is keyed on
+     and the rewrite reports "found no subterm". *)
+  - rewrite Hmm2. rewrite Hmm.
+    exact (dom_union_shape _ _ md
+             (eq_sym (ptree_bytes_dom_shape 2 t (ptree_set_leaf t vpn q) Hshape))).
+  - exists md. split; [ exact Hdj2 | exact Hmm2 ].
+Qed.
+
+(* ===================================================================== *)
+(* 5. WHAT THE WRITE-BACK DOES *NOT* TOUCH, and the fetched word.         *)
+(* ===================================================================== *)
+
+(* the DATA half is untouched by a page-table write: that is the whole      *)
+(* content of the [ptree_bytes ##ₘ md] conjunct of [u_mem_wf], and it is    *)
+(* what lets the instruction read be justified at the POST-translate state. *)
+Lemma u_writeback_data (P : uptd) (t : ptree) (mm : pamap) (vpn : mword 27)
+    (p2 p1 p0 q : mword 64) (x : Arch.pa) :
+  u_mem_wf P t mm -> ptree_maps t vpn p2 p1 p0 -> u_data_pa P x ->
+  write_bytes mm (pt_addr0 p1 vpn) 8 q !! x = mm !! x.
+Proof.
+  intros Hwf Hmaps Hx.
+  pose proof Hwf as Hwf0.
+  destruct Hwf as (md & Hdisj & Hdj & Hmm & Hdm & _).
+  rewrite write_bytes_word.
+  destruct (word_bytes (pt_addr0 p1 vpn) q !! x) as [b|] eqn:Hw;
+    [| by rewrite (lookup_union_r _ mm x Hw) ].
+  exfalso.
+  destruct (word_bytes_is_Some (pt_addr0 p1 vpn) q p0 x (mk_is_Some _ _ Hw))
+    as [b0 Hb0].
+  pose proof (maps_disj_subseteq (pt_maps 2 t)
+                (word_bytes (pt_addr0 p1 vpn) p0) Hdisj
+                (ptree_maps_slot0 t vpn p2 p1 p0 Hmaps)) as Hsubt.
+  pose proof (lookup_weaken _ _ x b0 Hb0 Hsubt) as Hbt.
+  destruct (proj1 (Hdm x) Hx) as [bd Hbd].
+  exact (proj1 (map_disjoint_spec (ptree_bytes 2 t) md) Hdj x b0 bd Hbt Hbd).
+Qed.
+
+(* THE WINDOW IS OWNED, at any width the page divides.  Factored out of
+   [u_fetch_bytes] because the 2-ALIGNED split fetch reads HALFWORDS: the
+   coverage argument is width-generic (it is [udata_cov] under
+   [UserBytes.u_walk_pa_window_wf]) and only the byte-list assembly at the
+   end is not. *)
+Lemma u_fetch_win_in (P : uptd) (t : ptree) (mm : pamap) (k : Z)
+    (w va : mword 64) :
+  0 < k -> (k | 4096) ->
+  u_mem_wf P t mm ->
+  ud_um P !! svpn_of va = Some w ->
+  is_aligned_vaddr (Virtaddr va) k = true ->
+  forall j : nat, (j < Z.to_nat k)%nat ->
+    is_Some (mm !! pa_add (u_walk_pa w va) j).
+Proof.
+  intros Hk Hdvd Hwf Hl Hal j Hj.
+  pose proof Hwf as (md & Hdisj & Hdj & Hmm & Hdm & Hram & _ & Hwfm & _).
+  assert (Hd : u_data_pa P (pa_add (u_walk_pa w va) j)).
+  { rewrite (u_walk_pa_window_wf k w va j Hk Hdvd Hal Hj).
+    exact (u_data_pa_cov P (svpn_of va) w (add_vec_int va (Z.of_nat j)) Hwfm Hl). }
+  destruct (proj1 (Hdm _) Hd) as [bd Hbd].
+  exists bd. rewrite Hmm.
+  destruct (ptree_bytes 2 t !! pa_add (u_walk_pa w va) j) as [c|] eqn:Ht.
+  - exfalso.
+    exact (proj1 (map_disjoint_spec (ptree_bytes 2 t) md) Hdj _ c bd Ht Hbd).
+  - by rewrite (lookup_union_r _ md _ Ht).
+Qed.
+
+(* A WINDOW TRAVELS ALONG A DOMAIN EQUALITY.  [u_mem_step_ok] carries
+   [dom mm' = dom mm], so a caller that pays the window premise at the PRE
+   map has it at every map the walk can land on -- which is what lets the
+   composers take their window premise at [mm] alone even though the read
+   happens at the post-walk map. *)
+Lemma u_win_dom (mm mm' : pamap) (pa : Arch.pa) (n : nat) :
+  (dom mm' : gset Arch.pa) = dom mm ->
+  (forall j : nat, (j < n)%nat -> is_Some (mm !! pa_add pa j)) ->
+  forall j : nat, (j < n)%nat -> is_Some (mm' !! pa_add pa j).
+Proof.
+  intros Hdom Hin j Hj.
+  assert (Hmem : forall a : Arch.pa,
+            a ∈ (dom mm' : gset Arch.pa) <-> a ∈ (dom mm : gset Arch.pa))
+    by (apply set_eq; exact Hdom).
+  assert (H1 : pa_add pa j ∈ (dom mm : gset Arch.pa))
+    by (apply elem_of_dom; exact (Hin j Hj)).
+  assert (H2 : pa_add pa j ∈ (dom mm' : gset Arch.pa))
+    by (apply (proj2 (Hmem _)); exact H1).
+  apply elem_of_dom in H2. exact H2.
+Qed.
+
+(* the TWO instruction bytes of a halfword fetch are in the owned map *)
+Lemma nth_byte_assemble2 (bs : list (bv 8)) (j : nat) :
+  length bs = 2%nat -> (j < 2)%nat ->
+  nth_byte (Z_to_bv 16 (assemble_bytes bs) : mword 16) j = bs !!! j.
+Proof. intros Hlen Hj. apply nth_byte_assemble_len; lia. Qed.
+
+(* THE BYTE ASSEMBLY TAKES THE WINDOW, NOT THE MAP PREDICATE.  Coverage is
+   the one thing [u_mem_ok] does not say, so it becomes the caller's
+   premise -- produced by [u_fetch_win_in] in the safety tier, and by its
+   own image in a tier that owns only part of its address space. *)
+Lemma u_fetch_bytes_2 (mm : pamap) (w va : mword 64) :
+  (forall j : nat, (j < 2)%nat ->
+     is_Some (mm !! pa_add (u_walk_pa w va) j)) ->
+  exists ih : mword 16,
+    forall j : nat, (N.of_nat j < 2)%N ->
+      mm !! pa_add (u_walk_pa w va) j = Some (nth_byte ih j).
+Proof.
+  intros Hin.
+  destruct (Hin 0%nat ltac:(lia)) as [b0 Hb0].
+  destruct (Hin 1%nat ltac:(lia)) as [b1 Hb1].
+  exists (Z_to_bv 16 (assemble_bytes [b0; b1]) : mword 16).
+  intros j HjN.
+  assert (Hj : (j < 2)%nat) by lia.
+  rewrite (nth_byte_assemble2 [b0; b1] j eq_refl Hj).
+  destruct j as [ | [ | ] ]; try lia;
+    cbn [lookup_total list_lookup_total];
+    [ exact Hb0 | exact Hb1 ].
+Qed.
+
+(* the four instruction bytes are in the owned map, with SOME value *)
+Lemma u_fetch_bytes (mm : pamap) (w va : mword 64) :
+  (forall j : nat, (j < 4)%nat ->
+     is_Some (mm !! pa_add (u_walk_pa w va) j)) ->
+  exists iw : mword 32,
+    forall j : nat, (N.of_nat j < 4)%N ->
+      mm !! pa_add (u_walk_pa w va) j = Some (nth_byte iw j).
+Proof.
+  intros Hin.
+  destruct (Hin 0%nat ltac:(lia)) as [b0 Hb0].
+  destruct (Hin 1%nat ltac:(lia)) as [b1 Hb1].
+  destruct (Hin 2%nat ltac:(lia)) as [b2 Hb2].
+  destruct (Hin 3%nat ltac:(lia)) as [b3 Hb3].
+  exists (Z_to_bv 32 (assemble_bytes [b0; b1; b2; b3]) : mword 32).
+  intros j HjN.
+  assert (Hj : (j < 4)%nat) by lia.
+  rewrite (nth_byte_assemble4 [b0; b1; b2; b3] j eq_refl Hj).
+  destruct j as [ | [ | [ | [ | ] ] ] ]; try lia;
+    cbn [lookup_total list_lookup_total];
+    [ exact Hb0 | exact Hb1 | exact Hb2 | exact Hb3 ].
+Qed.
+
+(* ===================================================================== *)
+(* 6. THE THREE [translateAddr] INGREDIENTS AT THE FETCH, certified.       *)
+(* ===================================================================== *)
+
+Lemma goodb_read_reg_D (Db : register -> bool) {E} (r : register) (s : mstate) :
+  Db r = true -> goodb Db (Defs.read_reg r : Defs.monad E _) s = true.
+Proof. intros HD. unfold Defs.read_reg. cbn [goodb]. by rewrite HD. Qed.
+
+Lemma goodb_effectivePrivilege_fetch (Db : register -> bool) (m : mword 64)
+    (p : Privilege) (s : mstate) :
+  goodb Db (effectivePrivilege (InstructionFetch tt) m p) s = true.
+Proof.
+  unfold effectivePrivilege.
+  replace (generic_neq (InstructionFetch tt) (InstructionFetch tt)) with false
+    by (vm_compute; reflexivity).
+  reflexivity.
+Qed.
+
+Lemma goodb_is_shadow_stack_fetch (Db : register -> bool) (s : mstate) :
+  goodb Db (is_shadow_stack_access (InstructionFetch tt)) s = true.
+Proof. unfold is_shadow_stack_access. cbn match. reflexivity. Qed.
+
+Lemma goodb_architecture_Supervisor (Db : register -> bool) (s : mstate) :
+  Db mstatus = true ->
+  _get_Mstatus_SXL (register_lookup mstatus s.(sregs)) = 'b"10" ->
+  goodb Db (architecture Supervisor) s = true.
+Proof.
+  intros HD HSXL. unfold architecture. cbn match.
+  match goal with |- goodb _ (Defs.bind ?L _) _ = true =>
+    assert (Hin : exec L s
+                  = Some (_get_Mstatus_SXL (register_lookup mstatus s.(sregs)), s));
+    [ | assert (Hing : goodb Db L s = true) ] end.
+  { rewrite (exec_bind_Some _ _ _ _ _ (exec_read_reg mstatus s)). apply exec_returnM. }
+  { rewrite (goodb_bind Db _ _ s _ (goodb_read_reg_D Db mstatus s HD)
+               (exec_read_reg mstatus s)). reflexivity. }
+  rewrite (goodb_bind Db _ _ s _ Hing Hin).
+  unfold architecture_bits_backwards. rewrite HSXL.
+  replace (eq_vec ('b"10") ('b"01")) with false by (vm_compute; reflexivity).
+  cbn match.
+  replace (eq_vec ('b"10") ('b"10")) with true by (vm_compute; reflexivity).
+  cbn match. reflexivity.
+Qed.
+
+Lemma goodb_translationMode_U (Db : register -> bool) (satp0 : mword 64) (s : mstate) :
+  Db mstatus = true -> Db satp = true ->
+  _get_Mstatus_SXL (register_lookup mstatus s.(sregs)) = 'b"10" ->
+  register_lookup satp s.(sregs) = satp0 ->
+  _get_Satp64_Mode (Mk_Satp64 satp0) = ('b"1000" : mword 4) ->
+  goodb Db (translationMode User) s = true.
+Proof.
+  intros HDms HDsatp HSXL Hsatp Hmode.
+  unfold translationMode.
+  change (generic_eq User Machine) with false. cbn match.
+  rewrite (goodb_bind Db _ _ s RV64
+             (goodb_architecture_Supervisor Db s HDms HSXL)
+             (exec_architecture_Supervisor s HSXL)).
+  assert (Hae : exec (Defs.assert_exp' (Z.geb xlen 64) "sys/vmem.sail:254.25-254.26") s
+                = Some (eq_refl, s)).
+  { replace (Z.geb xlen 64) with true by (vm_compute; reflexivity).
+    unfold Defs.assert_exp'. cbn match. apply exec_returnm. }
+  assert (Haeg : goodb Db (Defs.assert_exp' (Z.geb xlen 64)
+                             "sys/vmem.sail:254.25-254.26" : M _) s = true).
+  { unfold Defs.assert_exp'.
+    replace (Z.geb xlen 64) with true by (vm_compute; reflexivity).
+    cbn match. reflexivity. }
+  match goal with |- goodb _ (Defs.bind ?L _) _ = true =>
+    assert (Hmb : exec L s = Some (_get_Satp64_Mode (Mk_Satp64 satp0), s));
+    [ | assert (Hmbg : goodb Db L s = true) ] end.
+  { rewrite (exec_bind_Some _ _ _ _ _ Hae).
+    rewrite (exec_bind_Some _ _ _ _ _ (exec_read_reg satp s)).
+    rewrite Hsatp. apply exec_returnm. }
+  { rewrite (goodb_bind Db _ _ s _ Haeg Hae).
+    rewrite (goodb_bind Db _ _ s _ (goodb_read_reg_D Db satp s HDsatp)
+               (exec_read_reg satp s)). reflexivity. }
+  rewrite (goodb_bind Db _ _ s _ Hmbg Hmb).
+  rewrite Hmode.
+  replace (satpMode_of_bits RV64 ('b"1000" : mword 4)) with (Some Sv39)
+    by (vm_compute; reflexivity).
+  cbn match. reflexivity.
+Qed.
+
+(* THE LEAF'S PERMISSION CHECK, certified at an ABSTRACT leaf word.
+   [check_PTE_permission] is not register-free in general: on the
+   R=0,W=1,X=0 encoding it reads [menvcfg] and then ASSERTS on
+   menvcfg.SSE, which no abstract state decides, and its leading
+   [assert_exp (W -> (R || !X))] is an error node on W=1,R=0,X=1.  At a
+   leaf the fetch is PERMITTED on, [pte_check_ok] rules both out -- read
+   at [dstateM] (menvcfg = 0) each would make [exec] answer something
+   other than [PTE_Check_Success] -- and what is left reads nothing, so
+   the certificate holds at EVERY footprint.  That is the shape
+   [PtWalkCert.goodmb_ptree_translateAddr]'s [Hgchk] premise wants.
+   (Its natural home is beside [uleaf_ok] in [UserPtTree.v].) *)
+Lemma goodb_check_PTE_permission_fetch (w' : mword 64) (mxr do_sum : bool)
+    (Db : register -> bool) (s : mstate) :
+  pte_check_ok (InstructionFetch tt) User mxr do_sum w' ->
+  goodb Db (check_PTE_permission (InstructionFetch tt) User mxr do_sum
+              (Mk_PTE_Flags (subrange_vec_dec w' 7 0)) (ext_bits_of_PTE w') tt) s = true.
+Proof.
+  unfold pte_check_ok. intro Hchk.
+  pose proof (Hchk dstateM) as Hc0.
+  destruct (mword1_cases (_get_PTE_Flags_U (Mk_PTE_Flags (subrange_vec_dec w' 7 0)))) as [HU|HU];
+  destruct (mword1_cases (_get_PTE_Flags_R (Mk_PTE_Flags (subrange_vec_dec w' 7 0)))) as [HR|HR];
+  destruct (mword1_cases (_get_PTE_Flags_W (Mk_PTE_Flags (subrange_vec_dec w' 7 0)))) as [HW|HW];
+  destruct (mword1_cases (_get_PTE_Flags_X (Mk_PTE_Flags (subrange_vec_dec w' 7 0)))) as [HX|HX];
+  unfold check_PTE_permission in Hc0 |- *;
+  rewrite ?HU, ?HR, ?HW, ?HX in Hc0 |- *;
+  first [ solve [ vm_compute; reflexivity ]
+        | solve [ vm_compute in Hc0; discriminate Hc0 ] ].
+Qed.
+
+(* ===================================================================== *)
+(* 7. [u_fetch_pure] -- THE PURE FETCH COMPOSER.                          *)
+(*                                                                        *)
+(* [UserFetchPt.user_pt_fetch_instr] with its [reg_interp] /               *)
+(* [gen_heap_interp] / [utlb_inv_pt] / [udata_own] premises replaced by    *)
+(* [UserClassifyAsm.u_exec_pins] + [UserBytes.u_mem_wf], a [goodmb]        *)
+(* conjunct added, and the post-state said out loud.  Stated at the        *)
+(* tier's reference state [u_state rsf mm] (section 9 of the worklist), so *)
+(* the successor state is LITERALLY [u_state rsf' mm'] -- which is what    *)
+(* [base_exec_total_u] / [rvc_exec_total_u] are stated over, so the caller *)
+(* feeds this straight into them with no state algebra in between.         *)
+(*                                                                        *)
+(* THE FIVE CONJUNCTS, and who consumes each:                              *)
+(*   - the [exec] fact, with [UserFetch.exec_fetch_ok_4]'s own             *)
+(*     if-isRVC shape: [HartRunFull.run_fetch_base] / [run_fetch_rvc].     *)
+(*   - the certificate at [Du_r]/[Du_w] and at the map the hart holds:     *)
+(*     [HartMemRun.swp_hmrun_of_exec], for the fetch node.                 *)
+(*   - the landing FILE ([rsf] itself, or ONE [tlb] write): every other    *)
+(*     ambient pin -- [post_fetch_cfg], [u_hw_pins], [u_cfg_pins],         *)
+(*     [u_pt_pins] -- transports across it by [irrelevant_register_set],   *)
+(*     which is what lets the caller rebuild [u_exec_pins P t' rsf'].      *)
+(*   - [tlb_ok_pt] at the NEW tree: [u_exec_pins]' fourth conjunct.        *)
+(*   - [u_mem_step]: [UserBytes.u_mem_step_wf] gives [u_mem_wf P t' mm'],  *)
+(*     and [UserClassifyAsm.u_landing_map] turns                            *)
+(*     [swp_hmrun_of_exec]'s existential post map into [mm'].              *)
+(*                                                                        *)
+(* The three [translateAddr] outcomes are handled ONCE, in [Hland]: a TLB  *)
+(* hit changes nothing, a fill writes [tlb] and keeps the tree, and the    *)
+(* Svadu write-back does both and moves the tree by [ptree_set_leaf]       *)
+(* ([u_mem_step_writeback] + [UptTree.upt_tree_spec_set_leaf] +            *)
+(* [PtTree.tlb_ok_pt_fill_self] / [tlb_ok_pt_set_leaf]).  Nothing after    *)
+(* [Hland] looks at which arm ran.                                         *)
+(* ===================================================================== *)
+
+(* ---------------------------------------------------------------------- *)
+(* 7a. THE FETCH WALK, ONCE -- factored out because the 2-ALIGNED split     *)
+(* fetch runs it TWICE (at [va], and at [va+2] when the low halfword is     *)
+(* not compressed, possibly onto another page).                            *)
+(*                                                                        *)
+(* The landing is stated as [u_tlb_only], NOT as the one-walk disjunction   *)
+(* "[rsf] or ONE [register_set tlb]": that shape does not compose, because  *)
+(* collapsing two nested [register_set tlb]s needs functional              *)
+(* extensionality (see [UserClassifyAsm.u_tlb_only]).  The one-walk caller  *)
+(* below still gets the disjunction, from [Hland] directly.                 *)
+(*                                                                        *)
+(* The three cfg pins are taken SEPARATELY rather than as                   *)
+(* [post_fetch_cfg]: at the second halfword the pc is still [va], so        *)
+(* [post_fetch_cfg _ (va+2) _] is not available, while the three registers  *)
+(* it would supply are unchanged.                                          *)
+(* ---------------------------------------------------------------------- *)
+Lemma u_walk_fetch_pure (P : uptd) (t : ptree) (mm : pamap) (rsf : regstate)
+    (w va : mword 64) :
+  ud_um P !! svpn_of va = Some w ->
+  uleaf_ok (InstructionFetch tt) w ->
+  neq_vec (bits_of_virtaddr (Virtaddr va))
+    (sign_extend' 64 (subrange_vec_dec (bits_of_virtaddr (Virtaddr va))
+                        (Z.sub 39 1) 0)) = false ->
+  register_lookup cur_privilege rsf = User ->
+  _get_Mstatus_SXL (register_lookup mstatus rsf) = 'b"10" ->
+  register_lookup menvcfg rsf = MENVCFG_S ->
+  u_exec_pins P t rsf ->
+  u_mem_ok P t mm ->
+  exists (rsf' : regstate) (mm' : pamap) (t' : ptree),
+    exec (translateAddr (Virtaddr va) (InstructionFetch tt)) (u_state rsf mm)
+      = Some (Ok (Physaddr (u_walk_pa w va), PBMT_PMA, init_ext_ptw),
+              u_state rsf' mm') /\
+    goodmb Du_r Du_w (translateAddr (Virtaddr va) (InstructionFetch tt))
+      (u_state rsf mm) mm = true /\
+    (rsf' = rsf \/ exists tv, rsf' = register_set tlb tv rsf) /\
+    tlb_ok_pt (mword_of_int 0) t' (register_lookup tlb rsf') /\
+    u_mem_step_ok P t t' mm mm'.
+Proof.
+  intros Hl Hleaf Hcanon Lcp Lsxl Lmenv Hpins Hwf.
+  destruct Hpins as (Hhw & Hcfgp & Hpt & Htlbok).
+  destruct Hhw as (Hmisa & Hmseccfg & Hsenv & Hhtif & Hall & Help).
+  destruct Hpt as ((usatp & Hsatpok & Hsatp) & HA & Hord & HXp & HWp & HRp & Hcovp).
+  destruct Hsatpok as (Hmode & Hasid & Hppn & Hpmaw_of).
+  pose proof Hwf as (md & Hdisj & Hdj & Hmm & Hram & Hwfm & Hspec).
+  pose proof Hspec as (Hbase & _).
+  destruct (upt_spec_maps (ud_root P) (ud_tfp P) (ud_um P) t (svpn_of va) w
+              Hspec (or_intror (or_intror Hl)))
+    as (p2 & p1 & a0 & d0 & Hmaps).
+  pose proof Hmaps as (c1 & c0 & _ & _ & _ & _ & _ & _ & _ &
+                       Hv2 & Hn2 & Hv1 & Hn1 & Hv0 & Hl0 & Hnap & Hpb0).
+  (* the leaf's per-variant classification *)
+  assert (Hvar : forall a d : mword 1,
+            pte_valid (pte_set_ad w a d) /\ pte_leaf (pte_set_ad w a d) /\
+            pte_no_napot (pte_set_ad w a d) /\ pte_pbmt0 (pte_set_ad w a d))
+    by exact (upt_variant (ud_tfp P) (ud_um P) (svpn_of va) w Hwfm
+                (or_intror (or_intror Hl))).
+  (* the three slots, as reads and as ownership *)
+  assert (Hsm2 : pt_slot_mem (u_state rsf mm) (pt_addr2 t (svpn_of va)) p2)
+    by exact (u_slot_mem_at P t mm rsf (pt_base t) (vpn_idx 2 (svpn_of va)) p2 Hwf
+                (ptree_maps_slot2 t (svpn_of va) p2 p1 _ Hmaps)).
+  assert (Hsm1 : pt_slot_mem (u_state rsf mm) (pt_addr1 p2 (svpn_of va)) p1)
+    by exact (u_slot_mem_at P t mm rsf (u_next_base p2) (vpn_idx 1 (svpn_of va)) p1 Hwf
+                (ptree_maps_slot1 t (svpn_of va) p2 p1 _ Hmaps)).
+  assert (Hsm0 : pt_slot_mem (u_state rsf mm) (pt_addr0 p1 (svpn_of va))
+                   (pte_set_ad w a0 d0))
+    by exact (u_slot_mem_at P t mm rsf (u_next_base p1) (vpn_idx 0 (svpn_of va)) _ Hwf
+                (ptree_maps_slot0 t (svpn_of va) p2 p1 _ Hmaps)).
+  assert (Hown2 : bytes_owned mm (pt_addr2 t (svpn_of va)) 8 = true)
+    by exact (u_slot_owned P t mm _ p2 Hwf (ptree_maps_slot2 t (svpn_of va) p2 p1 _ Hmaps)).
+  assert (Hown1 : bytes_owned mm (pt_addr1 p2 (svpn_of va)) 8 = true)
+    by exact (u_slot_owned P t mm _ p1 Hwf (ptree_maps_slot1 t (svpn_of va) p2 p1 _ Hmaps)).
+  assert (Hown0 : bytes_owned mm (pt_addr0 p1 (svpn_of va)) 8 = true)
+    by exact (u_slot_owned P t mm _ _ Hwf (ptree_maps_slot0 t (svpn_of va) p2 p1 _ Hmaps)).
+  (* the three read-only probes of [translateAddr]'s front matter *)
+  assert (Htm : exec (translationMode User) (u_state rsf mm)
+                = Some (Sv39, u_state rsf mm))
+    by exact (exec_translationMode_U_sv39 usatp (u_state rsf mm) Lsxl Hsatp Hmode).
+  assert (Htmg : goodb Du_r (translationMode User) (u_state rsf mm) = true)
+    by exact (goodb_translationMode_U Du_r usatp (u_state rsf mm)
+                ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+                Lsxl Hsatp Hmode).
+  assert (Heff : exec (effectivePrivilege (InstructionFetch tt)
+                        (register_lookup mstatus (u_state rsf mm).(sregs)) User)
+                   (u_state rsf mm) = Some (User, u_state rsf mm))
+    by exact (exec_effectivePrivilege_fetch _ User (u_state rsf mm)).
+  assert (Hssx : exec (is_shadow_stack_access (InstructionFetch tt)) (u_state rsf mm)
+                 = Some (false, u_state rsf mm))
+    by exact (exec_is_shadow_stack_fetch (u_state rsf mm)).
+  (* the PMA grants *)
+  assert (Hpmar : pma_allows_pte_read
+                    (register_lookup pma_regions (u_state rsf mm).(sregs)))
+    by exact (pma_allows_all_pte_read _ Hall).
+  assert (Hpmaw : pma_allows_pte_write
+                    (register_lookup pma_regions (u_state rsf mm).(sregs)))
+    by exact (Hpmaw_of _ Hall).
+  (* the leaf's permission check and the three validity tests, certified *)
+  assert (Hgchk : forall (a d : mword 1) (mxr do_sum : bool)
+                    (Db : register -> bool) (s0 : mstate),
+            goodb Db (check_PTE_permission (InstructionFetch tt) User mxr do_sum
+                        (Mk_PTE_Flags (subrange_vec_dec (pte_set_ad w a d) 7 0))
+                        (ext_bits_of_PTE (pte_set_ad w a d)) tt) s0 = true).
+  { intros a d mxr do_sum Db s0.
+    exact (goodb_check_PTE_permission_fetch (pte_set_ad w a d) mxr do_sum Db s0
+             (Hleaf a d mxr do_sum)). }
+  assert (Hg2 : forall (Db : register -> bool) (s0 : mstate),
+            goodb Db (pte_is_invalid (Mk_PTE_Flags (subrange_vec_dec p2 7 0))
+                        (ext_bits_of_PTE p2)) s0 = true)
+    by (intros Db s0; exact (goodb_pte_is_invalid_valid p2 Db s0 Hv2)).
+  assert (Hg1 : forall (Db : register -> bool) (s0 : mstate),
+            goodb Db (pte_is_invalid (Mk_PTE_Flags (subrange_vec_dec p1 7 0))
+                        (ext_bits_of_PTE p1)) s0 = true)
+    by (intros Db s0; exact (goodb_pte_is_invalid_valid p1 Db s0 Hv1)).
+  assert (Hg0 : forall (a d : mword 1) (Db : register -> bool) (s0 : mstate),
+            goodb Db (pte_is_invalid
+                        (Mk_PTE_Flags (subrange_vec_dec (pte_set_ad w a d) 7 0))
+                        (ext_bits_of_PTE (pte_set_ad w a d))) s0 = true)
+    by (intros a d Db s0;
+        exact (goodb_pte_is_invalid_valid _ Db s0 (proj1 (Hvar a d)))).
+  (* THE TRANSLATION, exec side and certificate side *)
+  destruct (KptTree.ptree_translateAddr_cases (InstructionFetch tt) User
+              (ud_root P) va w (u_walk_pa w va) usatp t (register_lookup tlb rsf)
+              p2 p1 a0 d0 (u_state rsf mm)
+              Hleaf Hcanon eq_refl (fun a d => proj2 (proj2 (proj2 (Hvar a d))))
+              Hbase Hmaps Htlbok Hsm2 Hsm1 Hsm0
+              Hmisa Lmenv Hhtif Lcp Htm Heff Hssx Hsatp Hppn Hasid eq_refl
+              HA Hord HRp HWp Hcovp Hpmar Hpmaw)
+    as (sf & Htr & Harms).
+  assert (Htrg : goodmb Du_r Du_w
+                   (translateAddr (Virtaddr va) (InstructionFetch tt))
+                   (u_state rsf mm) mm = true).
+  { apply (goodmb_ptree_translateAddr Du_r Du_w (InstructionFetch tt) User
+             ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+             ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+             ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+             ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+             ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+             ltac:(vm_compute; reflexivity)
+             (ud_root P) t va w (u_walk_pa w va) usatp (register_lookup tlb rsf)
+             p2 p1 a0 d0 (u_state rsf mm) mm
+             Hleaf Hgchk Hcanon eq_refl
+             (fun a d => proj2 (proj2 (proj2 (Hvar a d))))
+             Hbase Hmaps Htlbok Hg2 Hg1 Hg0 Hsm2 Hsm1 Hsm0 Hown2 Hown1 Hown0
+             Hmisa Lmenv Hhtif Lcp Htm Htmg Heff
+             (goodb_effectivePrivilege_fetch Du_r
+                (register_lookup mstatus (u_state rsf mm).(sregs)) User (u_state rsf mm))
+             Hssx (goodb_is_shadow_stack_fetch Du_r (u_state rsf mm))
+             Hsatp Hppn Hasid eq_refl HA Hord HRp HWp Hcovp Hpmar Hpmaw). }
+  (* WHERE THE TRANSLATION LANDED: the three arms, each with its tree, its
+     file and its [u_mem_step].  Nothing after this point looks at which. *)
+  assert (Hland : exists (rsf' : regstate) (mm' : pamap) (t' : ptree),
+            sf = u_state rsf' mm' /\
+            (rsf' = rsf \/ exists tv, rsf' = register_set tlb tv rsf) /\
+            tlb_ok_pt (mword_of_int 0) t' (register_lookup tlb rsf') /\
+            u_mem_step_ok P t t' mm mm').
+  { destruct Harms as [-> | [-> | (a1 & d1 & ->)]].
+    - exists rsf, mm, t. split_and!;
+        [ reflexivity | left; reflexivity | exact Htlbok
+        | exact (u_mem_step_ok_refl P t mm Hwf) ].
+    - eexists _, mm, t. split_and!.
+      + reflexivity.
+      + right. eexists. reflexivity.
+      + rewrite register_lookup_set.
+        exact (tlb_ok_pt_fill_self (mword_of_int 0) t (register_lookup tlb rsf)
+                 (svpn_of va) p2 p1 _ Hmaps Htlbok).
+      + exact (u_mem_step_ok_refl P t mm Hwf).
+    - assert (Habs : pte_set_ad (pte_set_ad w a0 d0) a1 d1 = pte_set_ad w a1 d1)
+        by exact (pte_set_ad_absorb w a0 d0 a1 d1).
+      assert (Hv' : pte_valid (pte_set_ad (pte_set_ad w a0 d0) a1 d1))
+        by (rewrite Habs; exact (proj1 (Hvar a1 d1))).
+      assert (Hl' : pte_leaf (pte_set_ad (pte_set_ad w a0 d0) a1 d1))
+        by (rewrite Habs; exact (proj1 (proj2 (Hvar a1 d1)))).
+      assert (Hn' : pte_no_napot (pte_set_ad (pte_set_ad w a0 d0) a1 d1))
+        by (rewrite Habs; exact (proj1 (proj2 (proj2 (Hvar a1 d1))))).
+      assert (Hp' : pte_pbmt0 (pte_set_ad (pte_set_ad w a0 d0) a1 d1))
+        by (rewrite Habs; exact (proj2 (proj2 (proj2 (Hvar a1 d1))))).
+      assert (Hspec' : upt_tree_spec (ud_root P) (ud_tfp P) (ud_um P)
+                (ptree_set_leaf t (svpn_of va)
+                   (pte_set_ad (pte_set_ad w a0 d0) a1 d1))).
+      { rewrite Habs.
+        exact (upt_tree_spec_set_leaf (ud_root P) (ud_tfp P) (ud_um P) t
+                 (svpn_of va) w p2 p1 a0 d0 a1 d1 Hwfm Hspec
+                 (or_intror (or_intror Hl)) Hmaps). }
+      eexists _, _,
+        (ptree_set_leaf t (svpn_of va) (pte_set_ad (pte_set_ad w a0 d0) a1 d1)).
+      split_and!.
+      + reflexivity.
+      + right. eexists. reflexivity.
+      + rewrite register_lookup_set.
+        exact (tlb_ok_pt_fill_self (mword_of_int 0)
+                 (ptree_set_leaf t (svpn_of va)
+                    (pte_set_ad (pte_set_ad w a0 d0) a1 d1))
+                 (register_lookup tlb rsf) (svpn_of va) p2 p1 _
+                 (ptree_set_leaf_maps_self t (svpn_of va) p2 p1
+                    (pte_set_ad w a0 d0) _ Hmaps Hv' Hl' Hn' Hp')
+                 (tlb_ok_pt_set_leaf (mword_of_int 0) t (register_lookup tlb rsf)
+                    (svpn_of va) p2 p1 (pte_set_ad w a0 d0) a1 d1
+                    Hmaps Hv' Hl' Hn' Hp' Htlbok)).
+      + exact (u_mem_step_ok_writeback P t mm (svpn_of va) p2 p1
+                 (pte_set_ad w a0 d0) _ Hwf Hmaps Hspec'). }
+  destruct Hland as (rsf' & mm' & t' & Hsf & Hfile & Htlbok' & Hstep).
+  exists rsf', mm', t'. split_and!;
+    [ rewrite <- Hsf; exact Htr | exact Htrg | exact Hfile | exact Htlbok'
+    | exact Hstep ].
+Qed.
+
+
+(* ---------------------------------------------------------------------- *)
+(* 7b. THE PHYSICAL GRANT FOR THE INSTRUCTION READ, width-generic.          *)
+(*                                                                        *)
+(* Everything [exec_mem_read_fetch_k_U] / [goodmb_mem_read_fetch_k_U] want *)
+(* EXCEPT the byte values, which the caller gets from [u_fetch_bytes_k].    *)
+(* Used three times: once at width 4 by [u_fetch_pure], and twice at width  *)
+(* 2 by the split fetch (the low halfword at [va], the high one at [va+2]). *)
+(*                                                                        *)
+(* The whole bundle is stated at the POST-walk file [rsf'] and transported  *)
+(* from [rsf] by [u_tlb_only]: a filling walk writes [tlb] and nothing the  *)
+(* read consults.  The [bytes_owned] conjunct alone is at the PRE map [mm], *)
+(* because that is the map the certificate is carried over.                 *)
+(* ---------------------------------------------------------------------- *)
+Lemma u_fetch_read_ok (P : uptd) (t t' : ptree) (mm mm' : pamap)
+    (rsf rsf' : regstate) (k : Z) (w va : mword 64) :
+  0 < k -> (k | 4096) -> k <= 16 ->
+  uint (to_bits 64 k) = k ->
+  is_aligned_vaddr (Virtaddr va) k = true ->
+  ud_um P !! svpn_of va = Some w ->
+  register_lookup cur_privilege rsf = User ->
+  u_exec_pins P t rsf ->
+  u_mem_ok P t mm ->
+  u_mem_ok P t' mm' ->
+  (forall j : nat, (j < Z.to_nat k)%nat ->
+     is_Some (mm !! pa_add (u_walk_pa w va) j)) ->
+  (forall j : nat, (j < Z.to_nat k)%nat ->
+     is_Some (mm' !! pa_add (u_walk_pa w va) j)) ->
+  u_tlb_only rsf rsf' ->
+  exists region : PMA_Region,
+    pmpAddrMatchType_encdec_backwards
+      (_get_Pmpcfg_ent_A (vec_access_dec (register_lookup pmpcfg_n rsf') 0)) = TOR /\
+    zopz0zKzJ_u (zeros' 64)
+      (vec_access_dec (register_lookup pmpaddr_n rsf') 0) = false /\
+    pmpRangeMatch (Z.mul (uint (zeros' 64 : mword 64)) 4)
+      (Z.mul (uint (vec_access_dec (register_lookup pmpaddr_n rsf') 0)) 4)
+      (uint (u_walk_pa w va)) (uint (to_bits 64 k)) = PMP_Match /\
+    eq_vec (_get_Pmpcfg_ent_X
+      (vec_access_dec (register_lookup pmpcfg_n rsf') 0)) ('b"1") = true /\
+    matching_pma_region (register_lookup pma_regions rsf')
+      (Physaddr (u_walk_pa w va)) k = Some region /\
+    is_aligned_paddr (Physaddr (u_walk_pa w va)) k = true /\
+    (override_PMA (PMA_Region_attributes region) PBMT_PMA).(PMA_executable) = true /\
+    exec (within_clint (Physaddr (u_walk_pa w va)) k) (u_state rsf' mm')
+      = Some (false, u_state rsf' mm') /\
+    exec (within_sig (Physaddr (u_walk_pa w va)) k) (u_state rsf' mm')
+      = Some (false, u_state rsf' mm') /\
+    register_lookup htif_tohost_base rsf' = None /\
+    dev_addr (u_walk_pa w va) = false /\
+    bytes_owned mm (u_walk_pa w va) (Z.to_N k) = true /\
+    register_lookup cur_privilege rsf' = User.
+Proof.
+  intros Hk Hdvd Hk16 Huintk Hal Hl Lcp Hpins Hwf Hwf' Hwin Hwin' Tr.
+  pose proof Hpins as (Hhw & _ & Hpt & _).
+  pose proof Hhw as (Hmisa & Hmseccfg & Hsenv & Hhtif & Hall & Help).
+  pose proof Hpt as ((usatp & Hsatpok & Hsatp) & HA & Hord & HXp & HWp & HRp & Hcovp).
+  (* the window is owned at the PRE map, and is RAM at the POST map *)
+  assert (Hown : bytes_owned mm (u_walk_pa w va) (Z.to_N k) = true).
+  { apply bytes_owned_of_dom. intros j Hj. apply elem_of_dom.
+    exact (Hwin j ltac:(lia)). }
+  assert (Hramj : forall j : nat, (j < Z.to_nat k)%nat ->
+            addr_is_ram (pa_add (u_walk_pa w va) j)).
+  { intros j Hj. pose proof Hwf' as (mdx & _ & _ & Hmmx & Hr & _).
+    apply Hr. apply elem_of_dom. exact (Hwin' j Hj). }
+  assert (Hram0 : addr_is_ram (u_walk_pa w va))
+    by (rewrite <- (pa_add_0 (u_walk_pa w va)); apply Hramj; lia).
+  assert (Hramk : addr_is_ram (pa_add (u_walk_pa w va) (Z.to_nat k - 1)))
+    by (apply Hramj; lia).
+  (* the ambient pins survive the TLB write *)
+  assert (HA' : pmpAddrMatchType_encdec_backwards
+      (_get_Pmpcfg_ent_A (vec_access_dec (register_lookup pmpcfg_n rsf') 0)) = TOR)
+    by (rewrite (Tr pmpcfg_n ltac:(vm_compute; reflexivity)); exact HA).
+  assert (Hord' : zopz0zKzJ_u (zeros' 64)
+      (vec_access_dec (register_lookup pmpaddr_n rsf') 0) = false)
+    by (rewrite (Tr pmpaddr_n ltac:(vm_compute; reflexivity)); exact Hord).
+  assert (HX' : eq_vec (_get_Pmpcfg_ent_X
+      (vec_access_dec (register_lookup pmpcfg_n rsf') 0)) ('b"1") = true)
+    by (rewrite (Tr pmpcfg_n ltac:(vm_compute; reflexivity)); exact HXp).
+  assert (Hcovp' : (ram_base + ram_size
+      <= uint (vec_access_dec (register_lookup pmpaddr_n rsf') 0) * 4)%Z)
+    by (rewrite (Tr pmpaddr_n ltac:(vm_compute; reflexivity)); exact Hcovp).
+  assert (Hall' : pma_allows_all (register_lookup pma_regions rsf'))
+    by (rewrite (Tr pma_regions ltac:(vm_compute; reflexivity)); exact Hall).
+  assert (Hhtif' : register_lookup htif_tohost_base rsf' = None)
+    by (rewrite (Tr htif_tohost_base ltac:(vm_compute; reflexivity)); exact Hhtif).
+  assert (Lcp' : register_lookup cur_privilege rsf' = User)
+    by (rewrite (Tr cur_privilege ltac:(vm_compute; reflexivity)); exact Lcp).
+  (* [Z.of_nat (Z.to_nat k - 1)] is the access's LAST byte offset.  Named,
+     not an inline [ltac:(lia)]: nat subtraction is truncated, so lia needs
+     [1 <= Z.to_nat k] spelled out and otherwise reports the useless
+     "Cannot find witness". *)
+  assert (Hk1 : (1 <= Z.to_nat k)%nat) by lia.
+  assert (Hkk : Z.of_nat (Z.to_nat k - 1) = k - 1).
+  { rewrite Nat2Z.inj_sub by exact Hk1. rewrite Z2Nat.id by lia. reflexivity. }
+  destruct (pma_all_ram Hall' (u_walk_pa w va) k
+              (pma_access_ram_at _ _ (Z.to_nat k - 1) Hkk Hram0 Hramk
+                 (pma_width_le k 16 Hk Hk16 eq_refl)))
+    as (region & Hpmam & Hexecp & _).
+  exists region. split_and!.
+  - exact HA'.
+  - exact Hord'.
+  - exact (ram_fetch_pmp (u_walk_pa w va) _ k (Z.to_nat k - 1) Hk Hk16
+             Huintk ltac:(lia) Hram0 Hramk Hcovp').
+  - exact HX'.
+  - exact Hpmam.
+  - exact (pa_aligned_div _ va k Hk Hdvd Hal).
+  - exact Hexecp.
+  - exact (within_clint_false (u_walk_pa w va) k (u_state rsf' mm')
+             (addr_is_ram_not_in_clint _ Hram0) ltac:(lia)).
+  - exact (within_sig_false (u_walk_pa w va) k (u_state rsf' mm')
+             (addr_is_ram_not_in_sig _ Hram0) ltac:(lia)).
+  - exact Hhtif'.
+  - exact (addr_is_ram_not_dev _ Hram0).
+  - exact Hown.
+  - exact Lcp'.
+Qed.

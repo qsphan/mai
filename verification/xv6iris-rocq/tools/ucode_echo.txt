@@ -1,0 +1,30 @@
+# ucode_echo.txt -- the pc set of iris/UCodeEcho.v, for tools/gen_ucode.py.
+#
+# This file is the pc set; tools/ucode_manifest.json is the row that binds it
+# to iris/UCodeEcho.v, and `make gen-ucode` rewrites that file from it.
+#
+# It began as the hand-written EXAMPLE the generator was written against --
+# every [udec_*] and [ui_echo_*] statement the two produced was
+# character-for-character the same -- and the generator has owned the output
+# since.
+
+note echo's five reachable functions.  main and start diverge; strlen and
+note the two syscall stubs return.  The three stubs after them (read,
+note close, open) echo never calls: they are here so that echo's program
+note instance ([UkEchoTree.echo_prog]) names all five stub addresses the
+note tree's holes are stated at, and a handler record built at any
+note program with the five stubs has an instance at echo's.
+
+func main
+func start
+func strlen
+func exit
+func write
+func read
+func close
+func open
+
+# one level down from main's diverging [jal ra,<exit>] at 0x78
+omit 0x338 exit's [c.jr ra] -- the ecall at 0x334 never returns
+
+skipdefault library function or other syscall stub that echo never calls

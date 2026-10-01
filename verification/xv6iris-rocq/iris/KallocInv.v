@@ -1,0 +1,715 @@
+(* KallocInv.v -- the LOGICAL specification layer for xv6's page allocator
+   (kalloc/kfree), built on the CSL spin-lock of WpLock.v.
+
+   Design (mirrors xv6's [kernel/kalloc.c]):
+     struct run { struct run *next; };
+     struct { struct spinlock lock; struct run *freelist; } kmem;
+
+   The free list is a singly-linked chain THROUGH the free pages themselves:
+   each free page's first 8 bytes hold the [next] pointer, and the whole 4KB is
+   owned by the allocator.  The allocator's protected resource [kmem_res fl]
+   owns the global head pointer (at address [fl] = &kmem.freelist) plus every
+   page in the chain.  It becomes the resource [R] of a spin-lock over
+   &kmem.lock, giving
+   [is_kmem γ lk fl := is_lock γ lk "kmem" (λ ξ, kmem_res (XIk := ξ) fl)].
+
+   THE CONTEXT AXIS (tso-port M1/M3).  Every points-to below is the flipped
+   [↦ₘ]/[↦₈] -- context-indexed at the ambient [XIk] the section binds -- so
+   the BODIES are the SC bodies verbatim; the context appears exactly twice:
+   the section binder, and the λ at [is_kmem] (a lock payload must NAME its
+   context -- the recipe's rule 1 -- because the resource changes hands
+   between threads of control).  The [CtxMorph] instances after the section
+   are the transport obligation that hand-off carries.
+
+   THE PAGE-COUNT GHOST.  On top of the chain, the protected resource carries
+   an authoritative count of the free pages, [kmem_avail_auth γk (length
+   pages)], mirrored by a caller-side resource [kalloc_avail γk on] with
+   [on : option nat] covering the allocator's two epochs in ONE spec:
+
+     kalloc_avail γk (Some n)  -- boot mode: an EXCLUSIVE token asserting the
+        free list holds exactly [n] pages.  It is a one-shot "pending" token
+        [kalloc_pending] plus half of a ghost_var_frac whose other half sits inside
+        the lock invariant.  While anyone holds it, NO other thread can call
+        kalloc/kfree at all (a [None]-mode call needs the sealed witness below,
+        which cannot coexist with pending) -- formalizing "no concurrency
+        during early boot".  With [Some (S k)], kalloc CANNOT return null.
+     kalloc_avail γk None      -- steady state: the one-shot has fired; a
+        PERSISTENT witness [kalloc_sealed] with no count.  The lock invariant
+        drops its ghost_var_frac half at the next lock acquisition (the auth is a
+        disjunction), the exact count is forgotten forever, and kalloc may
+        fail.  [kalloc_avail_seal] converts [Some n ==∗ None]; there is no way
+        back.
+
+   Specs (caller-facing, plain sequential Hoare triples -- NOT logically atomic):
+     {{ is_kmem γ γk lk fl ∗ kalloc_avail γk on }}
+         kalloc()  {{ r, kalloc_post γk on r }}
+        kalloc_post γk on r :=
+            (r = null ∗ avail_zero on ∗ kalloc_avail γk on)
+          ∨ (page_valid r ∗ page_filled r kalloc_junk ∗ kalloc_avail γk (avail_dec on))
+     {{ is_kmem γ γk lk fl ∗ kfree_pre p ∗ kalloc_avail γk on }}
+         kfree(p)  {{ kalloc_avail γk (avail_inc on) }}
+        kfree_pre p := page_valid p ∗ page_own p      (* §0.26′, A6.87 *)
+   i.e. kalloc hands back full ownership of a fresh 4KB page (or null -- but
+   only when the count is unknown or exactly 0), decrementing the count; kfree
+   absorbs the page and increments it.  Boot code threads [Some n]; after
+   sealing, everyone threads the trivially-available persistent [None].
+
+   This file proves the separation-logic CORE of those triples -- the ghost
+   count lemmas ([kmem_avail_dec]/[kmem_avail_inc]/[kalloc_avail_zero]) and how
+   the invariant reassembles ([kmem_res_close]/[kmem_res_push]).  The
+   instruction-level proofs (ProofKalloc/ProofKfree) open [is_kmem] around
+   kalloc/kfree's loads/stores and discharge the triples using these lemmas. *)
+From Stdlib Require Import ZArith.
+From stdpp Require Import bitvector.definitions.
+From iris.algebra Require Import excl agree csum.
+From iris.algebra.lib Require Import mono_list.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import own ghost_var.
+From iris.program_logic Require Import weakestpre.
+From iris.program_logic Require Import language.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import RiscvModelBytes RiscvPtsto WpLock.
+Require Import TsoCtx.   (* the lock payload's context axis; [<{ }>] *)
+Require Export PageGeom.  (* the pure page geometry: page_valid / page_base / nullp *)
+Local Open Scope Z_scope.
+Require Export Xv6Cameras.  (* the cameras this file states its theory over *)
+Require Export KallocEv.    (* the ledger's events; the led-form posts mention [kev_of]/[pool_empty] *)
+Import Defs.
+
+
+(* pure bookkeeping on the caller-side count [on : option nat]:
+   [None] = count unknown (sealed);  [Some n] = exactly n pages free. *)
+Definition avail_dec (on : option nat) : option nat :=
+  match on with Some n => Some (Nat.pred n) | None => None end.
+Definition avail_inc (on : option nat) : option nat :=
+  match on with Some n => Some (S n) | None => None end.
+Definition avail_zero (on : option nat) : Prop :=
+  match on with Some n => n = 0%nat | None => True end.
+
+(* iterated predecessor: the counter after [k] successful kallocs.  Defined
+   THROUGH [avail_dec] so each step is one [Nat.iter] unfold (walk/mappages
+   per-step accounting); [avail_sub_Some] gives the closed form (kvmmake
+   budget arithmetic). *)
+Definition avail_sub (on : option nat) (k : nat) : option nat :=
+  Nat.iter k avail_dec on.
+
+Lemma avail_sub_0 (on : option nat) : avail_sub on 0%nat = on.
+Proof. reflexivity. Qed.
+Lemma avail_sub_S (on : option nat) (k : nat) :
+  avail_sub on (S k) = avail_dec (avail_sub on k).
+Proof. reflexivity. Qed.
+Lemma avail_sub_None (k : nat) : avail_sub None k = None.
+Proof. induction k as [|k IH]; [reflexivity | rewrite avail_sub_S IH; reflexivity]. Qed.
+Lemma avail_sub_Some (n k : nat) : avail_sub (Some n) k = Some (n - k)%nat.
+Proof.
+  induction k as [|k IH]; [rewrite avail_sub_0; f_equal; lia |].
+  rewrite avail_sub_S IH. unfold avail_dec. f_equal. lia.
+Qed.
+
+(* composing two consumption runs: [a] then [b] more kallocs = [a+b] kallocs.
+   The walk chain uses this to fold per-iteration node growth additively
+   (mappages' loop accumulator) without any nat subtraction. *)
+Lemma avail_sub_add (on : option nat) (a b : nat) :
+  avail_sub on (a + b)%nat = avail_sub (avail_sub on a) b.
+Proof.
+  induction b as [|b IH].
+  - rewrite Nat.add_0_r. reflexivity.
+  - rewrite Nat.add_succ_r. rewrite !avail_sub_S. rewrite IH. reflexivity.
+Qed.
+
+Section Kalloc.
+  Context `{!riscvGS Σ, !lockG Σ, !kallocG Σ}.
+  (* the context axis: everything below is stated at this ambient context;
+     the flipped ↦-notations bind to it invisibly.  [is_kmem] (after the
+     section) is the one place that quantifies over it. *)
+  Context `{XIk : CurCtx}.
+
+  (* ================================================================== *)
+  (* A6.87 OWNER RULING: [byte_any] IS THE VISIBILITY-FREE BYTE.          *)
+  (*                                                                    *)
+  (* A6.85 introduced a SECOND page tier for kfree and kept [byte_any] at *)
+  (* the registered one.  The ruling drops the second name: the           *)
+  (* justification-free physical fact IS what "some byte is here" means,  *)
+  (* and the valued form had no remaining customer.                       *)
+  (*                                                                    *)
+  (* WHAT LICENSES THE COLLAPSE is the audit A6.85 §(3) ran: NO kalloc     *)
+  (* CLIENT READS A FRESH PAGE BEFORE WRITING IT.  xv6's kalloc memsets    *)
+  (* the page it returns, so the only reader of allocator storage is the   *)
+  (* allocator, and every client's first touch is a write.  Once no client *)
+  (* can read an unwritten byte, [∃ x, a ↦ x] and “the future half of the  *)
+  (* ownership of a” have exactly the same set of customers -- and         *)
+  (* preserving the stronger one was a distinction without a difference.   *)
+  (* (If a client is ever found reading first, that is a KERNEL BUG to be  *)
+  (* reported, not a reason to restore the valued body.)                   *)
+  (*                                                                    *)
+  (* DETERMINACY IS REGAINED BY WRITING, and that is now the standard      *)
+  (* story rather than a special path: the store leaf takes a [byte_any]   *)
+  (* and hands back a registered byte ([WpSconfMem.wp_sb_free_s_sconf]),   *)
+  (* so a client that wants named contents gets them from its own memset   *)
+  (* -- which is where [kalloc_post] hands them out ([page_filled]).       *)
+  (* ================================================================== *)
+  Definition byte_any (a : Arch.pa) : iProp Σ :=
+    TsoCtx.mem_free a (DfracOwn 1).
+  (* an 8-byte little-endian word, now expressed via the word points-to
+     abstraction (so it also carries the doubleword-alignment of [a]). *)
+  Definition word_at (a : mword 64) (w : mword 64) : iProp Σ :=
+    (a ↦₈ w)%I.
+  Definition page_head8 (p : mword 64) : iProp Σ :=
+    ([∗ list] j ∈ seq 0 8, byte_any (pa_add p j))%I.
+  Definition page_rest (p : mword 64) : iProp Σ :=
+    ([∗ list] j ∈ seq 8 4088, byte_any (pa_add p j))%I.
+  Definition page_own (p : mword 64) : iProp Σ :=
+    ([∗ list] j ∈ seq 0 4096, byte_any (pa_add p j))%I.
+  Definition run_page (p next : mword 64) : iProp Σ :=
+    (word_at p next ∗ page_rest p)%I.
+
+  (* Seal the big-op leaves so [iFrame]/typeclass search treat each as an atom
+     rather than recursing into its ~4096 per-byte conjuncts.  GLOBAL since
+     the M1 flip: the [CtxMorph] instances live outside this section (they
+     quantify over the context it fixes), and an unsealed [page_rest] there
+     sent [iFrame] crawling through the 4088 conjuncts -- the same class of
+     degeneracy as the ProofKfree/157GB lesson, caught by [coqc -time]. *)
+  Global Typeclasses Opaque byte_any word_at page_head8 page_rest page_own run_page.
+
+  (* the page a memset (or any full-page write) hands back: the same
+     4096 cells, REGISTERED and NAMED at the byte the write stored.  This
+     is what [kalloc_post] carries -- xv6's kalloc memsets with 5 before
+     returning -- and it is strictly more informative than [page_own],
+     which it downgrades to for free. *)
+  (* the byte xv6's kalloc fills a returned page with -- `memset(r, 5, PGSIZE)`,
+     "fill with junk".  A6.87: naming it is what lets [kalloc_post] be the
+     VALUED run, which is strictly more informative than [page_own] and is
+     what keeps [allocproc]'s trapframe honest: the first process's
+     [userret] restores GPRs from slots only this memset ever wrote. *)
+  Definition kalloc_junk : bv 8 := nth_byte (mword_of_int 5 : mword 64) 0.
+
+  Definition page_filled (p : mword 64) (c : bv 8) : iProp Σ :=
+    ([∗ list] j ∈ seq 0 4096, (pa_add p j) ↦ₘ c)%I.
+
+  Global Typeclasses Opaque page_filled.
+
+  Lemma page_own_of_filled p c : page_filled p c ⊢ page_own p.
+  Proof using .
+    rewrite /page_filled /page_own. apply big_sepL_mono.
+    intros k j _. rewrite /byte_any. iIntros "H".
+    by iApply TsoCtx.ctx_pointsto_free.
+  Qed.
+
+  (* ...and the same for a caller holding the bytes named by a FUNCTION
+     (a copy, a boot carve) rather than by one constant. *)
+  Lemma page_own_of_named p (f : nat -> bv 8) :
+    ([∗ list] j ∈ seq 0 4096, (pa_add p j) ↦ₘ (f j)) ⊢ page_own p.
+  Proof using .
+    rewrite /page_own. apply big_sepL_mono. intros k j _.
+    rewrite /byte_any. iIntros "H".
+    by iApply TsoCtx.ctx_pointsto_free.
+  Qed.
+
+  Lemma page_own_of_named_ex p :
+    ([∗ list] j ∈ seq 0 4096, ∃ b : bv 8, (pa_add p j) ↦ₘ b) ⊢ page_own p.
+  Proof using .
+    rewrite /page_own. apply big_sepL_mono. intros k j _.
+    rewrite /byte_any. iIntros "(%b & H)".
+    by iApply TsoCtx.ctx_pointsto_free.
+  Qed.
+
+  Lemma page_own_split p : page_own p ⊣⊢ page_head8 p ∗ page_rest p.
+  Proof using .
+    rewrite /page_own /page_head8 /page_rest.
+    replace 4096%nat with (8 + 4088)%nat by lia.
+    rewrite seq_app big_sepL_app //.
+  Qed.
+
+  Lemma word_at_head8 p w : word_at p w ⊢ page_head8 p.
+  Proof using .
+    rewrite /word_at /page_head8 ctx_word_pointsto_unfold. iIntros "[_ H]".
+    iApply (big_sepL_mono with "H"). iIntros (k j _) "Hb".
+    rewrite /byte_any. by iApply TsoCtx.ctx_pointsto_free.
+  Qed.
+
+  (* A6.87: THE FORWARD DIRECTION IS OFF THE *WRITE*, NOT OFF THE PAGE.
+     [page_head8_word_at] used to read a word window out of eight anonymous
+     bytes; at the visibility-free tier that is exactly the claim the ruling
+     removes -- eight bytes nobody has written have no value to assemble.
+     What kfree actually has when it needs the [r->next] slot is the result
+     of its OWN memset, so the lemma moves onto the FILLED run and the
+     assembly is the same eight lines with the [∃]-destructs gone. *)
+  Lemma page_filled_split8 p c :
+    page_filled p c ⊣⊢
+    ([∗ list] j ∈ seq 0 8, (pa_add p j) ↦ₘ c) ∗
+    ([∗ list] j ∈ seq 8 4088, (pa_add p j) ↦ₘ c).
+  Proof using .
+    rewrite /page_filled. replace 4096%nat with (8 + 4088)%nat by lia.
+    rewrite seq_app big_sepL_app //.
+  Qed.
+
+  Lemma filled_rest_page_rest p c :
+    ([∗ list] j ∈ seq 8 4088, (pa_add p j) ↦ₘ c) ⊢ page_rest p.
+  Proof using .
+    rewrite /page_rest. apply big_sepL_mono. intros k j _.
+    rewrite /byte_any. iIntros "H". by iApply TsoCtx.ctx_pointsto_free.
+  Qed.
+
+  Lemma filled_head8_word_at p c :
+    page_valid p ->
+    ([∗ list] j ∈ seq 0 8, (pa_add p j) ↦ₘ c) ⊢ ∃ w : mword 64, word_at p w.
+  Proof using .
+    intros Hv.
+    change (seq 0 8) with [0;1;2;3;4;5;6;7]%nat.
+    iIntros "(H0 & H1 & H2 & H3 & H4 & H5 & H6 & H7 & _)".
+    set (bs := [c;c;c;c;c;c;c;c]).
+    set (w := Z_to_bv 64 (assemble_bytes bs) : mword 64).
+    iExists w.
+    rewrite /word_at /ctx_word_pointsto.
+    iSplitR; [iPureIntro; by apply page_valid_aligned8|].
+    assert (E0 : nth_byte w 0%nat = c) by (subst w bs; apply nth_byte_assemble8; [reflexivity | lia]).
+    assert (E1 : nth_byte w 1%nat = c) by (subst w bs; apply nth_byte_assemble8; [reflexivity | lia]).
+    assert (E2 : nth_byte w 2%nat = c) by (subst w bs; apply nth_byte_assemble8; [reflexivity | lia]).
+    assert (E3 : nth_byte w 3%nat = c) by (subst w bs; apply nth_byte_assemble8; [reflexivity | lia]).
+    assert (E4 : nth_byte w 4%nat = c) by (subst w bs; apply nth_byte_assemble8; [reflexivity | lia]).
+    assert (E5 : nth_byte w 5%nat = c) by (subst w bs; apply nth_byte_assemble8; [reflexivity | lia]).
+    assert (E6 : nth_byte w 6%nat = c) by (subst w bs; apply nth_byte_assemble8; [reflexivity | lia]).
+    assert (E7 : nth_byte w 7%nat = c) by (subst w bs; apply nth_byte_assemble8; [reflexivity | lia]).
+    change (seq 0 8) with [0;1;2;3;4;5;6;7]%nat. simpl.
+    rewrite E0 E1 E2 E3 E4 E5 E6 E7. iFrame.
+  Qed.
+
+  Lemma run_page_page_own p next : run_page p next ⊢ page_own p.
+  Proof using .
+    rewrite /run_page page_own_split. iIntros "[Hw $]". by iApply word_at_head8.
+  Qed.
+
+  (* the free list: [pages] chained through each page's [next] field *)
+  Fixpoint freelist_chain (head : mword 64) (pages : list (mword 64)) : iProp Σ :=
+    match pages with
+    | [] => ⌜head = nullp⌝
+    | p :: ps => ⌜head = p⌝ ∗ ⌜page_valid p⌝ ∗
+                 (∃ nxt : mword 64, run_page p nxt ∗ freelist_chain nxt ps)
+    end%I.
+
+  Lemma freelist_chain_cons head p ps :
+    freelist_chain head (p :: ps)
+    = (⌜head = p⌝ ∗ ⌜page_valid p⌝ ∗ (∃ nxt : mword 64, run_page p nxt ∗ freelist_chain nxt ps))%I.
+  Proof using . reflexivity. Qed.
+
+  (* ===== the page-count ghost (see the header) ===== *)
+
+  (* the one-shot seal: [pending] is the exclusive boot-mode token; firing it
+     yields the persistent [sealed] witness.  They cannot coexist.  Both live
+     in the FIRST component of the pair camera at γk.2; the second component
+     carries the ledger's name ([kalloc_ledname] below). *)
+  Definition kalloc_pending (γs : gname) : iProp Σ :=
+    own γs ((Some (Cinl (Excl ())), None) : kalloc_oneshotR).
+  Definition kalloc_sealed (γs : gname) : iProp Σ :=
+    own γs ((Some (Cinr (to_agree ())), None) : kalloc_oneshotR).
+  Global Instance kalloc_sealed_persistent γs : Persistent (kalloc_sealed γs).
+  Proof using . apply _. Qed.
+
+  Lemma kalloc_pending_sealed γs : kalloc_pending γs -∗ kalloc_sealed γs -∗ False.
+  Proof using .
+    iIntros "Hp Hs". iDestruct (own_valid_2 with "Hp Hs") as %[Hv _].
+    by destruct Hv.
+  Qed.
+
+  (* ===== the event ledger (claude-notes/design/ni-kalloc-ledger.md, D4) ===== *)
+
+  (* the ledger's NAME, pinned persistently in the pair's second component *)
+  Definition kalloc_ledname (γk : gname * gname) (γe : gname) : iProp Σ :=
+    own γk.2 ((None, Some (to_agree γe)) : kalloc_oneshotR).
+  Global Instance kalloc_ledname_persistent γk γe : Persistent (kalloc_ledname γk γe).
+  Proof using . rewrite /kalloc_ledname. apply _. Qed.
+
+  Lemma kalloc_ledname_agree γk γe γe' :
+    kalloc_ledname γk γe -∗ kalloc_ledname γk γe' -∗ ⌜γe = γe'⌝.
+  Proof using .
+    iIntros "H1 H2". iDestruct (own_valid_2 with "H1 H2") as %[_ Hv].
+    move: Hv. rewrite /= -Some_op Some_valid. by move=> /to_agree_op_valid_L.
+  Qed.
+
+  (* the ledger itself: the authoritative history and its lower bounds *)
+  Definition led_auth (γe : gname) (h : list kev) : iProp Σ :=
+    own γe (●ML (h : list (leibnizO kev))).
+  Definition led_lb (γe : gname) (h : list kev) : iProp Σ :=
+    own γe (◯ML (h : list (leibnizO kev))).
+
+  Global Instance led_lb_persistent γe h : Persistent (led_lb γe h).
+  Proof using . rewrite /led_lb. apply _. Qed.
+  Global Instance led_lb_timeless γe h : Timeless (led_lb γe h).
+  Proof using . rewrite /led_lb. apply _. Qed.
+  Global Instance led_auth_timeless γe h : Timeless (led_auth γe h).
+  Proof using . rewrite /led_auth. apply _. Qed.
+
+  Lemma led_auth_lb γe h : led_auth γe h -∗ led_auth γe h ∗ led_lb γe h.
+  Proof using .
+    rewrite /led_auth /led_lb. iIntros "Ha".
+    iDestruct (own_mono _ _ (◯ML (h : list (leibnizO kev))) with "Ha")
+      as "#Hb"; [ apply mono_list_included |].
+    iFrame "Ha Hb".
+  Qed.
+
+  Lemma led_lb_prefix γe h h' : led_auth γe h -∗ led_lb γe h' -∗ ⌜h' `prefix_of` h⌝.
+  Proof using .
+    rewrite /led_auth /led_lb. iIntros "Ha Hb".
+    iDestruct (own_valid_2 with "Ha Hb") as %Hv%mono_list_both_valid_L.
+    by iPureIntro.
+  Qed.
+
+  (* two lower bounds of one ledger are comparable *)
+  Lemma led_lb_lb γe h h' :
+    led_lb γe h -∗ led_lb γe h' -∗ ⌜h `prefix_of` h' \/ h' `prefix_of` h⌝.
+  Proof using .
+    rewrite /led_lb. iIntros "Ha Hb".
+    iDestruct (own_valid_2 with "Ha Hb") as %Hv%mono_list_lb_op_valid_L.
+    by iPureIntro.
+  Qed.
+
+  Lemma led_auth_grow γe h e :
+    led_auth γe h ==∗ led_auth γe (h ++ [e]) ∗ led_lb γe (h ++ [e]).
+  Proof using .
+    rewrite /led_auth. iIntros "Ha".
+    iMod (own_update _ _ (●ML ((h ++ [e]) : list (leibnizO kev))) with "Ha") as "Ha".
+    { apply mono_list_update. by exists [e]. }
+    iModIntro. iApply (led_auth_lb with "Ha").
+  Qed.
+
+  (* the receipt a call hands back: the ledger's name and a lower bound
+     ending in the call's own event [e], appended at history [h] *)
+  Definition led_receipt (γk : gname * gname) (h : list kev) (e : kev) : iProp Σ :=
+    (∃ γe, kalloc_ledname γk γe ∗ led_lb γe (h ++ [e]))%I.
+  Global Instance led_receipt_persistent γk h e : Persistent (led_receipt γk h e).
+  Proof using . rewrite /led_receipt. apply _. Qed.
+
+  (* the caller-side count: exclusive exact count (boot) or persistent no-info
+     witness (steady state). *)
+  Definition kalloc_avail (γk : gname * gname) (on : option nat) : iProp Σ :=
+    match on with
+    | Some n => kalloc_pending γk.2 ∗ ghost_var_frac γk.1 (1/2)%Qp n
+    | None   => kalloc_sealed γk.2
+    end%I.
+  Global Instance kalloc_avail_None_persistent γk : Persistent (kalloc_avail γk None).
+  Proof using . apply _. Qed.
+
+  (* the invariant-side authority: while counting, the ghost_var_frac's other half
+     (tied to [length pages]); once the seal has fired, any lock holder may
+     reclose into the count-free [sealed] arm -- and after the first such
+     reclose the count is gone for good.
+     ...and, in BOTH epochs, the event ledger [kmem_ledger]: the ledger's
+     name, the authoritative history [h], and the tie
+     [npages + allocs h = frees h].  The LIST is the count: the tie holds
+     from birth through boot and steady state, so the seal forgets the
+     number but not the list. *)
+  Definition kmem_ledger (γk : gname * gname) (npages : nat) : iProp Σ :=
+    (∃ (γe : gname) (h : list kev),
+        kalloc_ledname γk γe ∗ led_auth γe h ∗ ⌜(npages + allocs h = frees h)%nat⌝)%I.
+  Definition kmem_avail_auth (γk : gname * gname) (npages : nat) : iProp Σ :=
+    ((ghost_var_frac γk.1 (1/2)%Qp npages ∨ kalloc_sealed γk.2) ∗ kmem_ledger γk npages)%I.
+
+  Lemma kalloc_avail_alloc n :
+    ⊢ |==> ∃ γk, kalloc_avail γk (Some n) ∗ kmem_avail_auth γk n.
+  (* the ledger is born at [replicate n (KFree nullp)] so the tie holds at
+     the statement's [n]; honest because the one caller ([FsCfgSnap.v])
+     passes [0], i.e. the empty history. *)
+  Proof using .
+    iMod (ghost_var_alloc n) as (γc) "Hg".
+    iEval (rewrite -Qp.half_half) in "Hg".
+    iDestruct (ghost_var_split with "Hg") as "[H1 H2]".
+    iMod (own_alloc (●ML (replicate n (KFree nullp) : list (leibnizO kev))))
+      as (γe) "Hled"; [apply mono_list_auth_valid|].
+    iMod (own_alloc ((Some (Cinl (Excl ())), Some (to_agree γe)) : kalloc_oneshotR))
+      as (γs) "Hs"; [done|].
+    assert (((Some (Cinl (Excl ())), Some (to_agree γe)) : kalloc_oneshotR) =
+            ((Some (Cinl (Excl ())), None) : kalloc_oneshotR) ⋅ (None, Some (to_agree γe)))
+      as Heq by done.
+    rewrite Heq. iDestruct "Hs" as "[Hp #Hn]".
+    iModIntro. iExists (γc, γs). cbn. iFrame "Hp H1". iSplitL "H2".
+    - iLeft. iFrame "H2".
+    - iExists γe, _. iFrame "Hn Hled". iPureIntro. apply tie_birth.
+  Qed.
+
+  (* boot -> steady state: fire the one-shot, forget the count.  Irreversible;
+     the result is persistent, so it can be handed to every later caller. *)
+  Lemma kalloc_avail_seal γk n :
+    kalloc_avail γk (Some n) ==∗ kalloc_avail γk None.
+  Proof using .
+    iIntros "[Hp _]". iApply (own_update with "Hp").
+    apply prod_update; [| done]. cbn.
+    apply option_update. by apply cmra_update_exclusive.
+  Qed.
+
+  (* boot mode agrees with the invariant's count *)
+  Lemma kalloc_avail_agree γk n npages :
+    kalloc_avail γk (Some n) -∗ kmem_avail_auth γk npages -∗ ⌜n = npages⌝.
+  Proof using .
+    iIntros "[Hp Hv] [[Hv'|Hs] _]".
+    - iApply (ghost_var_agree with "Hv Hv'").
+    - iExFalso. iApply (kalloc_pending_sealed with "Hp Hs").
+  Qed.
+
+  (* an empty free list forces the caller's count (if any) to be 0 *)
+  Lemma kalloc_avail_zero γk on :
+    kalloc_avail γk on -∗ kmem_avail_auth γk 0%nat -∗ ⌜avail_zero on⌝.
+  Proof using .
+    destruct on as [n|]; cbn.
+    - iIntros "Hav Hauth". iApply (kalloc_avail_agree with "Hav Hauth").
+    - auto.
+  Qed.
+
+  (* kalloc's ghost step: pop one page off the count, and append the
+     actor's [KAlloc] to the ledger; the history at the call was nonempty *)
+  Lemma kmem_avail_dec γk on (act : mword 64) npages :
+    kalloc_avail γk on -∗ kmem_avail_auth γk (S npages) ==∗
+    kalloc_avail γk (avail_dec on) ∗ kmem_avail_auth γk npages ∗
+    ∃ h, led_receipt γk h (KAlloc act) ∗ ⌜~ pool_empty h⌝.
+  Proof using .
+    iIntros "Hav [Hauth (%γe & %h & #Hn & Hled & %Htie)]".
+    iMod (led_auth_grow γe h (KAlloc act) with "Hled") as "[Hled #Hlb]".
+    iAssert (|==> kalloc_avail γk (avail_dec on) ∗
+               (ghost_var_frac γk.1 (1/2)%Qp npages ∨ kalloc_sealed γk.2))%I
+      with "[Hav Hauth]" as ">[Hav Hauth]".
+    { destruct on as [n|]; cbn.
+      - iDestruct "Hav" as "[Hp Hv]".
+        iDestruct "Hauth" as "[Hv'|Hs]";
+          [| iExFalso; iApply (kalloc_pending_sealed with "Hp Hs")].
+        iDestruct (ghost_var_agree with "Hv Hv'") as %->.
+        iMod (ghost_var_update_halves npages with "Hv Hv'") as "[Hv Hv']".
+        iModIntro. iFrame "Hp Hv". iLeft. iFrame "Hv'".
+      - iDestruct "Hav" as "#Hs". iModIntro. iSplitR; [iExact "Hs" | iRight; iExact "Hs"]. }
+    iModIntro. iFrame "Hav Hauth". iSplitL "Hled".
+    - iExists γe, _. iFrame "Hn Hled". iPureIntro. by apply tie_alloc.
+    - iExists h. iSplit; [iExists γe; by iFrame "Hn Hlb" |].
+      iPureIntro. by eapply tie_nonempty.
+  Qed.
+
+  (* kalloc's null arm: the count stays at 0; the actor's [KNull] is
+     appended, and the history at the call was empty *)
+  Lemma kmem_avail_null γk on (act : mword 64) :
+    kalloc_avail γk on -∗ kmem_avail_auth γk 0%nat ==∗
+    kalloc_avail γk on ∗ kmem_avail_auth γk 0%nat ∗
+    ∃ h, led_receipt γk h (KNull act) ∗ ⌜pool_empty h⌝.
+  Proof using .
+    iIntros "Hav [Hauth (%γe & %h & #Hn & Hled & %Htie)]".
+    iMod (led_auth_grow γe h (KNull act) with "Hled") as "[Hled #Hlb]".
+    iModIntro. iFrame "Hav Hauth". iSplitL "Hled".
+    - iExists γe, _. iFrame "Hn Hled". iPureIntro. by apply tie_null.
+    - iExists h. iSplit; [iExists γe; by iFrame "Hn Hlb" |].
+      iPureIntro. by apply tie_empty.
+  Qed.
+
+  (* kfree's ghost step: push one page onto the count, and append the
+     actor's [KFree] to the ledger *)
+  Lemma kmem_avail_inc γk on (act : mword 64) npages :
+    kalloc_avail γk on -∗ kmem_avail_auth γk npages ==∗
+    kalloc_avail γk (avail_inc on) ∗ kmem_avail_auth γk (S npages) ∗
+    ∃ h, led_receipt γk h (KFree act).
+  Proof using .
+    iIntros "Hav [Hauth (%γe & %h & #Hn & Hled & %Htie)]".
+    iMod (led_auth_grow γe h (KFree act) with "Hled") as "[Hled #Hlb]".
+    iAssert (|==> kalloc_avail γk (avail_inc on) ∗
+               (ghost_var_frac γk.1 (1/2)%Qp (S npages) ∨ kalloc_sealed γk.2))%I
+      with "[Hav Hauth]" as ">[Hav Hauth]".
+    { destruct on as [n|]; cbn.
+      - iDestruct "Hav" as "[Hp Hv]".
+        iDestruct "Hauth" as "[Hv'|Hs]";
+          [| iExFalso; iApply (kalloc_pending_sealed with "Hp Hs")].
+        iDestruct (ghost_var_agree with "Hv Hv'") as %->.
+        iMod (ghost_var_update_halves (S npages) with "Hv Hv'") as "[Hv Hv']".
+        iModIntro. iFrame "Hp Hv". iLeft. iFrame "Hv'".
+      - iDestruct "Hav" as "#Hs". iModIntro. iSplitR; [iExact "Hs" | iRight; iExact "Hs"]. }
+    iModIntro. iFrame "Hav Hauth". iSplitL "Hled".
+    - iExists γe, _. iFrame "Hn Hled". iPureIntro. by apply tie_free.
+    - iExists h, γe. by iFrame "Hn Hlb".
+  Qed.
+
+  (* the allocator's protected resource: the global freelist head pointer at
+     [fl], ownership of every page currently in the list, and the count
+     authority tied to the list's length. *)
+  Definition kmem_res (γk : gname * gname) (fl : mword 64) : iProp Σ :=
+    (∃ (head : mword 64) (pages : list (mword 64)),
+        word_at fl head ∗ freelist_chain head pages ∗
+        kmem_avail_auth γk (length pages))%I.
+
+  (* [is_kmem], the spinlock over [kmem_res], is defined AFTER the section:
+     it is the one definition that must range over contexts rather than sit
+     at the ambient one. *)
+
+  Lemma kmem_res_close γk fl head pages :
+    word_at fl head ∗ freelist_chain head pages ∗ kmem_avail_auth γk (length pages)
+    ⊢ kmem_res γk fl.
+  Proof using . iIntros "H". iExists head, pages. iExact "H". Qed.
+
+  (* kalloc's logical core: the opened invariant either has an empty list (put
+     it back unchanged, kalloc returns null -- [kalloc_avail_zero] pins the
+     caller's count) or exposes the head page [p] -- its [next] pointer, its
+     4KB, and the tail -- for the caller to take ([kmem_avail_dec] then steps
+     the count down before reclosing with the tail). *)
+
+  (* kfree's logical core: after the function has written [p->next := oldhead]
+     and [fl := p], the pieces refold into the invariant with [p] prepended and
+     the count stepped up. *)
+  Lemma kmem_res_push γk fl p oldhead pages on (act : mword 64) :
+    page_valid p ->
+    kalloc_avail γk on -∗
+    word_at fl p -∗
+    run_page p oldhead -∗
+    freelist_chain oldhead pages -∗
+    kmem_avail_auth γk (length pages) ==∗
+    kalloc_avail γk (avail_inc on) ∗ kmem_res γk fl ∗ ∃ h, led_receipt γk h (KFree act).
+  Proof using .
+    iIntros (Hp) "Hav Hfl Hrun Hchain Hauth".
+    iMod (kmem_avail_inc γk on act (length pages) with "Hav Hauth")
+      as "(Hav & Hauth & #Hrcpt)".
+    iModIntro. iFrame "Hav Hrcpt".
+    iApply (kmem_res_close γk fl p (p :: pages)). iFrame "Hfl".
+    iSplitR "Hauth"; [| iExact "Hauth"].
+    rewrite freelist_chain_cons. iSplit; [done|]. iSplit; [done|].
+    iExists oldhead. iFrame "Hrun Hchain".
+  Qed.
+
+  (* ---- the caller-facing pre/post conditions ---- *)
+  Definition kalloc_post (γk : gname * gname) (on : option nat) (r : mword 64) : iProp Σ :=
+    ((⌜r = nullp⌝ ∗ ⌜avail_zero on⌝ ∗ kalloc_avail γk on)
+     ∨ (⌜page_valid r⌝ ∗ page_filled r kalloc_junk ∗
+          kalloc_avail γk (avail_dec on)))%I.
+  (* §0.26′ / A6.87: SAME TEXT, HONEST MEANING.  [page_own] is the
+     visibility-free page now, so kfree's precondition says what the
+     ruling says it should -- the freer owes the page's FUTURE and no
+     claim about its contents -- in the spelling it always had. *)
+  Definition kfree_pre (p : mword 64) : iProp Σ :=
+    (⌜page_valid p⌝ ∗ page_own p)%I.
+
+  (* the LED-FORM posts (design D5): the landed post plus the call's
+     receipt in the ledger -- the event [kev_of act r] (resp. [KFree act])
+     appended at history [h] -- and, for kalloc, the determinism
+     [r = nullp <-> pool_empty h]: the outcome is a function of the
+     history at the call.  The landed posts are corollaries. *)
+  Definition kalloc_post_led (γk : gname * gname) (on : option nat) (act r : mword 64) : iProp Σ :=
+    (∃ h, led_receipt γk h (kev_of act r) ∗ ⌜r = nullp <-> pool_empty h⌝ ∗ kalloc_post γk on r)%I.
+  Definition kfree_post_led (γk : gname * gname) (on : option nat) (act : mword 64) : iProp Σ :=
+    (∃ h, led_receipt γk h (KFree act) ∗ kalloc_avail γk (avail_inc on))%I.
+
+  Lemma kalloc_post_led_post γk on act r : kalloc_post_led γk on act r -∗ kalloc_post γk on r.
+  Proof using . iIntros "(%h & _ & _ & $)". Qed.
+  Lemma kfree_post_led_avail γk on act : kfree_post_led γk on act -∗ kalloc_avail γk (avail_inc on).
+  Proof using . iIntros "(%h & _ & $)". Qed.
+
+  (* boot-mode corollary: with a positive exact count, kalloc CANNOT fail.
+     A6.87: kept at [page_own], so that no client of it moves -- the ones
+     that want the allocator's junk bytes by name take
+     [kalloc_post_success_filled] instead, and the two differ by one
+     [page_own_of_filled]. *)
+  Lemma kalloc_post_success_filled γk k r :
+    kalloc_post γk (Some (S k)) r -∗
+    ⌜page_valid r⌝ ∗ page_filled r kalloc_junk ∗ kalloc_avail γk (Some k).
+  Proof using .
+    iIntros "[(_ & %Hz & _) | H]"; [discriminate | iExact "H"].
+  Qed.
+
+  Lemma kalloc_post_success γk k r :
+    kalloc_post γk (Some (S k)) r -∗
+    ⌜page_valid r⌝ ∗ page_own r ∗ kalloc_avail γk (Some k).
+  Proof using .
+    iIntros "H".
+    iDestruct (kalloc_post_success_filled with "H") as "($ & Hp & $)".
+    by iApply page_own_of_filled.
+  Qed.
+
+  (* ...and the same downgrade straight on the post, for the clients that
+     pattern-match it themselves. *)
+  Lemma kalloc_post_own γk on r :
+    kalloc_post γk on r -∗
+    (⌜r = nullp⌝ ∗ ⌜avail_zero on⌝ ∗ kalloc_avail γk on)
+    ∨ (⌜page_valid r⌝ ∗ page_own r ∗ kalloc_avail γk (avail_dec on)).
+  Proof using .
+    iIntros "[Hl | (%Hv & Hp & Ha)]"; [by iLeft |].
+    iRight. iSplitR; [done|]. iFrame "Ha". by iApply page_own_of_filled.
+  Qed.
+
+  (* Intended Hoare triples -- the operation is the kernel's kalloc/kfree
+     instruction stream, discharged by the instruction-level proofs
+     (ProofKalloc / ProofKfree), which open [is_kmem] around their atomic
+     loads/stores and apply the transfer lemmas above:
+
+       {{ is_kmem γ γk lk fl ∗ kalloc_avail γk on }}
+           kalloc()  {{ r, kalloc_post γk on r }}
+       {{ is_kmem γ γk lk fl ∗ kfree_pre p ∗ kalloc_avail γk on }}
+           kfree(p)  {{ kalloc_avail γk (avail_inc on) }}                  *)
+End Kalloc.
+
+Section KallocCtx.
+  Context `{!riscvGS Σ, !lockG Σ, !kallocG Σ}.
+  Context `{XI : CurCtx}.
+
+  (* ==================================================================
+     THE PAYLOAD'S CtxMorph INSTANCES (tso-port M3): the transport
+     obligation the acquire/release Parameters carry.  Outside the
+     section because each quantifies over the context the section fixes.
+     Instance search cannot do the higher-order big-op unification, so
+     the structural instances are applied AS TERMS throughout (the
+     recipe's rule 3). *)
+
+  (* A6.87: [byte_any] IS CONTEXT-FREE NOW, and so is [page_rest] over it.
+     The transport obligation the M3 sweep pays per row degenerates to the
+     identity here -- there is nothing indexed to carry.  That is the
+     ruling's collapse showing up one tier down: a byte nobody may read
+     has no context to be registered to. *)
+  Global Instance byte_any_morph (a : Arch.pa) :
+    CtxMorph (λ _ : CtxId, byte_any a).
+  Proof using . iIntros (ξ ξ') "Hd H". iModIntro. iFrame. Qed.
+
+  Global Instance word_at_morph (a w : mword 64) :
+    CtxMorph (λ ξ0 : CtxId, word_at (XIk := ξ0) a w).
+  Proof using .
+    iIntros (ξ ξ') "Hd H". rewrite /word_at.
+    iMod (ctx_morph_word _ _ _ _ ξ ξ' with "Hd H") as "[Hd H]".
+    iModIntro. iFrame "Hd". iExact "H".
+  Qed.
+
+  Global Instance page_rest_morph (p : mword 64) :
+    CtxMorph (λ _ : CtxId, page_rest p).
+  Proof using . iIntros (ξ ξ') "Hd H". iModIntro. iFrame. Qed.
+
+  Global Instance run_page_morph (p next : mword 64) :
+    CtxMorph (λ ξ0 : CtxId, run_page (XIk := ξ0) p next).
+  Proof using .
+    iIntros (ξ ξ') "Hd H". rewrite /run_page.
+    iDestruct "H" as "[Hw Hr]".
+    iMod (word_at_morph p next ξ ξ' with "Hd Hw") as "[Hd Hw]".
+    iMod (page_rest_morph p ξ ξ' with "Hd Hr") as "[Hd Hr]".
+    iModIntro. iFrame.
+  Qed.
+
+  Global Instance freelist_chain_morph (head : mword 64)
+      (pages : list (mword 64)) :
+    CtxMorph (λ ξ0 : CtxId, freelist_chain (XIk := ξ0) head pages).
+  Proof using .
+    revert head. induction pages as [|p ps IH] => head.
+    - iIntros (ξ ξ') "Hd H". iModIntro. iFrame.
+    - iIntros (ξ ξ') "Hd H". simpl.
+      iDestruct "H" as "(%Hh & %Hv & %nxt & Hrun & Hchain)".
+      iMod (run_page_morph p nxt ξ ξ' with "Hd Hrun") as "[Hd Hrun]".
+      iMod (IH nxt ξ ξ' with "Hd Hchain") as "[Hd Hchain]".
+      iModIntro. iFrame "Hd".
+      iSplit; [done|]. iSplit; [done|]. iExists nxt. iFrame.
+  Qed.
+
+  Global Instance kmem_res_morph (γk : gname * gname) (fl : mword 64) :
+    CtxMorph (λ ξ0 : CtxId, kmem_res (XIk := ξ0) γk fl).
+  Proof using .
+    iIntros (ξ ξ') "Hd H". rewrite /kmem_res.
+    iDestruct "H" as (head pages) "(Hw & Hchain & Hauth)".
+    iMod (word_at_morph fl head ξ ξ' with "Hd Hw") as "[Hd Hw]".
+    iMod (freelist_chain_morph head pages ξ ξ' with "Hd Hchain")
+      as "[Hd Hchain]".
+    iModIntro. iFrame "Hd". iExists head, pages. iFrame.
+  Qed.
+
+  (* the whole allocator = a spinlock whose resource is [kmem_res], stated
+     at WHATEVER context the holder runs in -- the λ names the payload's
+     context (recipe rule 1: never the ambient wrapper for a converted
+     payload).  Persistent. *)
+  Definition is_kmem (γ : gname) (γk : gname * gname) (lk fl : mword 64) : iProp Σ :=
+    is_lock γ lk "kmem"%string (λ ξ : CtxId, kmem_res (XIk := ξ) γk fl).
+  Global Instance is_kmem_persistent γ γk lk fl : Persistent (is_kmem γ γk lk fl).
+  Proof using . apply _. Qed.
+End KallocCtx.

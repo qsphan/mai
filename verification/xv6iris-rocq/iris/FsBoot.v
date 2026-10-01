@@ -1,0 +1,531 @@
+(* ====================================================================== *)
+(* FsBoot.v -- THE PER-ERA FS BOOT BUNDLE: the one ghost step that turns   *)
+(* what every boot already mints -- the era's exclusive disk-image byte    *)
+(* fragments over [0, ndisk) -- into exactly the material the FS block     *)
+(* layer's constructors want ([BioInv.bio_init]'s pool bundles, and        *)
+(* [SpecInitlog]'s FsBlocks material).                                     *)
+(*                                                                        *)
+(* This closes the gap recorded as future work since stage 1 of the        *)
+(* fs-log project ("where do bio_init's pool inputs come from?" --         *)
+(* claude-notes/design/fs-log.md).  The boot mint is flat and byte-        *)
+(* granular ([RiscvAdequacy.wp_power_loop]'s PowerOn arm, re-exported by   *)
+(* [BootShared.boot_shared_alloc] as                                        *)
+(*   [disk_bytes γv 0 (disk_read dk 0 ndisk)]);                             *)
+(* everything above the driver talks in 1024-byte BLOCKS.  The whole file  *)
+(* is that change of granularity plus the [fs_alloc] handshake.            *)
+(*                                                                        *)
+(* THREE THINGS A FUTURE READER WOULD OTHERWISE RE-DERIVE.                 *)
+(*                                                                        *)
+(* (1) THE MINT'S LENGTH NEED NOT DIVIDE 1024, AND NOTHING HAS TO KNOW     *)
+(*     THE FS'S DISK SIZE.  [fs_cov_in cov ndisk] says only: every covered *)
+(*     block is positive and its last byte is inside the mint.  The carve  *)
+(*     picks [nb := ndisk / 1024] internally ([fs_cov_blocks], the one     *)
+(*     place any division happens), peels [nb] whole blocks off the front  *)
+(*     of the mint and DROPS the tail -- the logic is affine, so the       *)
+(*     leftover bytes simply vanish.  No premise ties [ndisk] to a block   *)
+(*     count, so [SystemAdequacy.XV6_DISK_BYTES] stays where it is.        *)
+(*                                                                        *)
+(* (2) [0 ∉ cov] IS NOT A SEPARATE PREMISE.  [bio_init] needs it (binit    *)
+(*     leaves all thirty buffers claiming blockno 0), and it FOLLOWS from  *)
+(*     [fs_cov_in]'s [0 < b] clause -- [fs_cov_in_0].  Adding it as a      *)
+(*     premise would be a redundant obligation at every boot client.       *)
+(*                                                                        *)
+(* (3) THE LOG REGION'S CLIENT HALVES COME OUT OF THE *SET* BIG-OP, WHICH  *)
+(*     NEEDS THE SLOTS' PAIRWISE DISTINCTNESS.  [log_region_set] is a      *)
+(*     [list_to_set] of [log_slot_bno logstart <$> seq 0 LOGBLOCKS] plus   *)
+(*     the header, so getting the thirty slot halves back as a [∗ list]    *)
+(*     over [seq 0 LOGBLOCKS] goes through [big_sepS_list_to_set], whose   *)
+(*     [NoDup] side condition is exactly [log_slot_bno]'s injectivity in   *)
+(*     [i] ([log_slot_bno_inj] below).  The header comes out AT A NAMED    *)
+(*     CONTENT ([fs_blocks dk (log_hdr_bno logstart)]) rather than under   *)
+(*     an existential: that is what lets a boot client discharge           *)
+(*     [SpecInitlog]'s clean-image premise [hdr_n bs_hdr = 0] from a       *)
+(*     hypothesis about the mkfs image [dk].  Under an existential the     *)
+(*     premise would be unstatable.                                        *)
+(*                                                                        *)
+(* All the arithmetic lives in [mword]-free lemmas over plain [Z]/[nat]    *)
+(* ([fs_cov_blocks], [disk_read_app], [seqZ_cons_nat]) -- durable-notes'   *)
+(* rule, and here it is what keeps [lia] usable at all.                    *)
+(* ====================================================================== *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import excl auth gmap frac numbers.
+From iris.base_logic.lib Require Import gen_heap invariants own ghost_map.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes.
+Require Import RiscvPtsto.
+Require Import Xv6Cameras.
+Require Import VirtioModel.
+Require Import DiskImg.
+Require Import DiskPtsto.
+Require Import BioInv.
+Require Import FsBlocks.
+Require Import LogInv.
+Require Import FsCrash.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+(* The [set_solver] override.  EXPORT, not Import: this import is         *)
+(* deliberately "dead" -- the file compiles without it, just far slower --  *)
+(* and the nightly dead-import sweep skips [Require Export] lines.         *)
+(* It has to be HERE rather than inherited: [Require Export] only          *)
+(* propagates through an unbroken chain of Exports, and this tree's        *)
+(* intermediate files use [Require Import], so nothing downstream inherits *)
+(* it.  See FastSetSolver.v.                                              *)
+Require Export FastSetSolver.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Local Open Scope Z_scope.
+
+(* ====================================================================== *)
+(* 1. THE PURE VOCABULARY.                                                *)
+(* ====================================================================== *)
+
+(* "the covered block range lies inside the mint": every covered block is a
+   real client block (0 is excluded -- binit's zeroed blockno cells claim
+   it) and its last byte is one of the [ndisk] bytes the boot mint owns. *)
+Definition fs_cov_in (cov : gset Z) (ndisk : nat) : Prop :=
+  forall b : Z, b ∈ cov -> 0 < b /\ 1024 * (b + 1) <= Z.of_nat ndisk.
+
+(* [bio_init]'s "0 is not a client block" premise is already in there *)
+Lemma fs_cov_in_0 (cov : gset Z) (ndisk : nat) :
+  fs_cov_in cov ndisk -> (0 : Z) ∉ cov.
+Proof. intros Hc Hin. destruct (Hc 0 Hin) as [Hlt _]. lia. Qed.
+
+(* the two halves of [log_geom_ok], for a caller that has the bundle and
+   wants one of them.  A boot client proves the whole [log_geom_ok] once --
+   that is the premise [SpecInitlog] states -- and feeds it to both. *)
+Lemma log_geom_cov_ok (cov : gset Z) (logstart : Z) :
+  log_geom_ok cov logstart -> cov_ok cov.
+Proof. by intros [? _]. Qed.
+
+Lemma log_geom_region_sub (cov : gset Z) (logstart : Z) :
+  log_geom_ok cov logstart -> log_region_set logstart ⊆ cov.
+Proof. by intros [_ ?]. Qed.
+
+(* THE ONE DIVISION IN THE FILE.  A block count whose blocks all fit in the
+   mint and which covers every covered block.  Kept [mword]-free and over
+   plain [Z]/[nat] so [lia] works (durable-notes). *)
+Lemma fs_cov_blocks (cov : gset Z) (ndisk : nat) :
+  fs_cov_in cov ndisk ->
+  exists nb : nat,
+    (1024 * nb <= ndisk)%nat /\
+    (forall b : Z, b ∈ cov -> 0 <= b < Z.of_nat nb).
+Proof.
+  intros Hcov.
+  pose (nb := (ndisk / 1024)%nat).
+  pose (r := (ndisk mod 1024)%nat).
+  assert (Hdm : ndisk = (1024 * nb + r)%nat)
+    by (unfold nb, r; apply Nat.div_mod_eq).
+  assert (Hr : (r < 1024)%nat)
+    by (unfold r; apply Nat.mod_upper_bound; lia).
+  clearbody nb r.
+  exists nb. split; [lia|].
+  intros b Hb. destruct (Hcov b Hb) as [Hpos Hub].
+  assert (HZ : Z.of_nat ndisk = 1024 * Z.of_nat nb + Z.of_nat r) by lia.
+  lia.
+Qed.
+
+(* the nat-indexed cons for stdpp's [seqZ], so the carve's induction never
+   has to see [Z.succ]/[Z.pred] *)
+Lemma seqZ_cons_nat (m : Z) (n : nat) :
+  seqZ m (Z.of_nat (S n)) = m :: seqZ (m + 1) (Z.of_nat n).
+Proof.
+  rewrite seqZ_cons; [| lia]. f_equal. f_equal; lia.
+Qed.
+
+(* [log_slot_bno] is injective in the slot index -- the [NoDup] the log
+   region's set-to-list conversion needs *)
+Lemma log_slot_bno_inj (logstart : Z) (i j : nat) :
+  log_slot_bno logstart i = log_slot_bno logstart j -> i = j.
+Proof. rewrite /log_slot_bno. lia. Qed.
+
+(* [base.NoDup] and not [NoDup]: this file imports [Stdlib.Lists.List],
+   whose [NoDup] takes the bare name -- and [big_sepS_list_to_set] (like
+   every stdpp lemma here) wants stdpp's. *)
+Lemma log_slot_list_nodup (logstart : Z) :
+  base.NoDup ((fun i => log_slot_bno logstart i) <$> seq 0 LOGBLOCKS).
+Proof.
+  apply NoDup_fmap_2; [| apply NoDup_seq ].
+  intros i j Hij. exact (log_slot_bno_inj logstart i j Hij).
+Qed.
+
+(* the header is not one of the slots *)
+Lemma log_hdr_not_slot (logstart : Z) :
+  log_hdr_bno logstart ∉
+    ((fun i => log_slot_bno logstart i) <$> seq 0 LOGBLOCKS).
+Proof.
+  intros Hin. apply list_elem_of_fmap in Hin as (i & Hi & _).
+  rewrite /log_hdr_bno /log_slot_bno in Hi. lia.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* The initial content map and the all-false dirty map.                     *)
+(*                                                                          *)
+(* [map_imap] over [gset_to_gmap] rather than a [list_to_map] of            *)
+(* [elements cov]: the lookup law then needs no [NoDup] bookkeeping, and     *)
+(* the domain law is one [elem_of_dom] unfold.                              *)
+(* ---------------------------------------------------------------------- *)
+
+Definition fs_C0 (dk : Z -> bv 8) (cov : gset Z) : gmap Z (list (bv 8)) :=
+  map_imap (fun b (_ : unit) => Some (fs_blocks dk b)) (gset_to_gmap () cov).
+
+Definition fs_D0 (dk : Z -> bv 8) (cov : gset Z) : gmap Z bool :=
+  (fun _ => false) <$> fs_C0 dk cov.
+
+Lemma fs_C0_lookup (dk : Z -> bv 8) (cov : gset Z) (b : Z) :
+  b ∈ cov -> fs_C0 dk cov !! b = Some (fs_blocks dk b).
+Proof.
+  intros Hb. rewrite /fs_C0 map_lookup_imap lookup_gset_to_gmap.
+  rewrite option_guard_True; [reflexivity | exact Hb].
+Qed.
+
+Lemma fs_C0_lookup_Some (dk : Z -> bv 8) (cov : gset Z) (b : Z)
+    (bs : list (bv 8)) :
+  fs_C0 dk cov !! b = Some bs -> b ∈ cov /\ bs = fs_blocks dk b.
+Proof.
+  rewrite /fs_C0 map_lookup_imap lookup_gset_to_gmap.
+  destruct (decide (b ∈ cov)) as [Hin|Hout].
+  (* [cbn] with no delta list here is a 7 s trap: it unfolds [fs_blocks]
+     into a [disk_read] of 1024 bytes.  Name the two constants. *)
+  - rewrite option_guard_True; [| exact Hin]. cbn [mbind option_bind].
+    intros Heq. injection Heq as <-. done.
+  - rewrite option_guard_False; [| exact Hout]. cbn [mbind option_bind].
+    discriminate.
+Qed.
+
+Lemma fs_C0_dom (dk : Z -> bv 8) (cov : gset Z) :
+  dom (fs_C0 dk cov) = cov.
+Proof.
+  apply set_eq. intros b. rewrite elem_of_dom. split.
+  - intros [bs Hbs]. exact (proj1 (fs_C0_lookup_Some dk cov b bs Hbs)).
+  - intros Hb. exists (fs_blocks dk b). exact (fs_C0_lookup dk cov b Hb).
+Qed.
+
+(* [fs_C0]'s block lengths, the premise [FsBlocks.fs_alloc]'s byte mint
+   takes: every covered block's content is a whole block. *)
+Lemma fs_C0_lengths (dk : Z -> bv 8) (cov : gset Z) :
+  forall b bs, fs_C0 dk cov !! b = Some bs -> length bs = BSIZE.
+Proof.
+  intros b bs Hb.
+  destruct (fs_C0_lookup_Some dk cov b bs Hb) as [_ ->].
+  exact (fs_blocks_length dk b).
+Qed.
+
+(* THE HOME/LOG-REGION SPLIT, at the level of the content map: restricting
+   [fs_C0] to a set of blocks is [fs_C0] at that set.  Both halves of
+   [FsBlocks.fs_alloc]'s output are named this way, so neither consumer
+   ever sees a [filter]. *)
+Lemma fs_C0_filter_in (dk : Z -> bv 8) (cov S : gset Z) :
+  S ⊆ cov ->
+  base.filter (fun kv : Z * list (bv 8) => kv.1 ∈ S) (fs_C0 dk cov)
+    = fs_C0 dk S.
+Proof.
+  intros Hsub. apply map_eq. intros b.
+  destruct (decide (b ∈ S)) as [Hin | Hout].
+  - rewrite (fs_C0_lookup dk S b Hin).
+    apply map_lookup_filter_Some. split; [| exact Hin].
+    exact (fs_C0_lookup dk cov b (Hsub b Hin)).
+  - assert (Hnone : fs_C0 dk S !! b = None).
+    { apply not_elem_of_dom. rewrite fs_C0_dom. exact Hout. }
+    rewrite Hnone. apply map_lookup_filter_None. right.
+    intros bs _. exact Hout.
+Qed.
+
+Lemma fs_C0_filter_out (dk : Z -> bv 8) (cov S : gset Z) :
+  base.filter (fun kv : Z * list (bv 8) => kv.1 ∉ S) (fs_C0 dk cov)
+    = fs_C0 dk (cov ∖ S).
+Proof.
+  apply map_eq. intros b.
+  destruct (decide (b ∈ cov ∖ S)) as [Hin | Hout].
+  - rewrite (fs_C0_lookup dk (cov ∖ S) b Hin).
+    apply elem_of_difference in Hin as [Hcov Hns].
+    apply map_lookup_filter_Some. split; [| exact Hns].
+    exact (fs_C0_lookup dk cov b Hcov).
+  - assert (Hnone : fs_C0 dk (cov ∖ S) !! b = None).
+    { apply not_elem_of_dom. rewrite fs_C0_dom. exact Hout. }
+    rewrite Hnone. apply map_lookup_filter_None.
+    destruct (decide (b ∈ cov)) as [Hcov | Hcov].
+    + right. intros bs _ Hns. apply Hout.
+      apply elem_of_difference. split; [exact Hcov | exact Hns].
+    + left. apply not_elem_of_dom. rewrite fs_C0_dom. exact Hcov.
+Qed.
+
+Lemma fs_D0_lookup (dk : Z -> bv 8) (cov : gset Z) (b : Z) :
+  b ∈ cov -> fs_D0 dk cov !! b = Some false.
+Proof.
+  intros Hb. rewrite /fs_D0 lookup_fmap (fs_C0_lookup dk cov b Hb) //.
+Qed.
+
+(* ====================================================================== *)
+(* 2. PURE RANGE ALGEBRA over [disk_read].                                *)
+(* ====================================================================== *)
+
+Lemma disk_read_app (dk : Z -> bv 8) (o : Z) (n m : nat) :
+  disk_read dk o (n + m)
+  = (disk_read dk o n ++ disk_read dk (o + Z.of_nat n) m)%list.
+Proof.
+  revert o. induction n as [|n IH]; intros o.
+  - assert (Hz : o + Z.of_nat 0%nat = o) by lia. rewrite Hz. reflexivity.
+  - assert (Hs : (S n + m = S (n + m))%nat) by lia. rewrite Hs.
+    rewrite !disk_read_cons IH.
+    assert (Hz : o + 1 + Z.of_nat n = o + Z.of_nat (S n)) by lia.
+    rewrite Hz. reflexivity.
+Qed.
+
+(* ====================================================================== *)
+(* 3. THE CARVE: the flat byte mint -> per-block disk cells.              *)
+(* ====================================================================== *)
+
+Section FsBoot.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ}.
+
+  (* the append/split law the whole carve rests on *)
+  Lemma disk_bytes_app (γ : disk_names) (o : Z) (bs1 bs2 : list (bv 8)) :
+    disk_bytes γ o ((bs1 ++ bs2)%list)
+      ⊣⊢ disk_bytes γ o bs1 ∗ disk_bytes γ (o + Z.of_nat (length bs1)) bs2.
+  Proof using .
+    revert o. induction bs1 as [|b bs1 IH]; intros o.
+    - assert (Hz : o + Z.of_nat (length (@nil (bv 8))) = o) by (cbn; lia).
+      rewrite Hz. cbn [app].
+      rewrite /disk_bytes /disk_img_bytes big_sepL_nil left_id //.
+    - cbn [app length].
+      rewrite !disk_bytes_cons IH.
+      assert (Hz : o + 1 + Z.of_nat (length bs1)
+                   = o + Z.of_nat (S (length bs1))) by lia.
+      rewrite Hz assoc //.
+  Qed.
+
+  (* one block's worth of the mint IS a [disk_block] *)
+  Lemma disk_bytes_block (γ : disk_names) (dk : Z -> bv 8) (b : Z) :
+    disk_bytes γ (1024 * b) (fs_blocks dk b) -∗ disk_block γ b (fs_blocks dk b).
+  Proof using .
+    iIntros "H". rewrite /disk_block. iSplitR; [| iExact "H"].
+    iPureIntro. rewrite fs_blocks_length //.
+  Qed.
+
+  (* the run: [nb] consecutive blocks starting at [b0] *)
+  Lemma disk_bytes_blocks (γ : disk_names) (dk : Z -> bv 8)
+      (b0 : Z) (nb : nat) :
+    disk_bytes γ (1024 * b0) (disk_read dk (1024 * b0) (1024 * nb)%nat) -∗
+    [∗ list] b ∈ seqZ b0 (Z.of_nat nb), disk_block γ b (fs_blocks dk b).
+  Proof using .
+    revert b0. induction nb as [|nb IH]; intros b0.
+    - iIntros "_". rewrite seqZ_nil; [| lia]. done.
+    - iIntros "H". rewrite seqZ_cons_nat.
+      assert (Hs : (1024 * S nb = 1024 + 1024 * nb)%nat) by lia.
+      rewrite Hs disk_read_app disk_bytes_app.
+      iDestruct "H" as "[Hhd Htl]".
+      iSplitL "Hhd".
+      + iApply (disk_bytes_block γ dk b0).
+        rewrite /fs_blocks /BSIZE.
+        assert (Hz : b0 * Z.of_nat 1024%nat = 1024 * b0) by lia.
+        rewrite Hz. iExact "Hhd".
+      + iApply (IH (b0 + 1)).
+        assert (Hz : 1024 * b0 + Z.of_nat (length (disk_read dk (1024 * b0) 1024))
+                     = 1024 * (b0 + 1)).
+        { rewrite /disk_read length_fmap length_seq. lia. }
+        rewrite Hz. iExact "Htl".
+  Qed.
+
+  (* THE CARVE.  Note the mint's tail (the bytes past the last whole block)
+     is simply dropped -- the logic is affine. *)
+  Lemma fs_boot_carve (γ : disk_names) (dk : Z -> bv 8) (ndisk : nat)
+      (cov : gset Z) :
+    fs_cov_in cov ndisk ->
+    disk_bytes γ 0 (disk_read dk 0 ndisk) -∗
+    [∗ set] b ∈ cov, disk_block γ b (fs_blocks dk b).
+  Proof using .
+    intros Hcov.
+    destruct (fs_cov_blocks cov ndisk Hcov) as (nb & Hle & Hin).
+    assert (Hsub : cov ⊆ list_to_set (seqZ 0 (Z.of_nat nb))).
+    { intros b Hb. apply elem_of_list_to_set, elem_of_seqZ.
+      destruct (Hin b Hb). lia. }
+    assert (Hsplit : ndisk = (1024 * nb + (ndisk - 1024 * nb))%nat) by lia.
+    rewrite {1}Hsplit disk_read_app disk_bytes_app.
+    iIntros "[Hpre _]".
+    iDestruct (disk_bytes_blocks γ dk 0 nb with "Hpre") as "Hl".
+    iApply (big_sepS_subseteq _ _ _ Hsub).
+    rewrite (big_sepS_list_to_set (fun b => disk_block γ b (fs_blocks dk b))
+               (seqZ 0 (Z.of_nat nb)) (NoDup_seqZ 0 (Z.of_nat nb))).
+    iExact "Hl".
+    (* [big_sepS_subseteq]'s [Affine] side condition is SHELVED, not solved:
+       leaving it makes Qed report only "incomplete proof". *)
+    Unshelve. all: intros ?; apply _.
+  Qed.
+
+(* ====================================================================== *)
+(* 4. THE FsBlocks HANDSHAKE.                                             *)
+(* ====================================================================== *)
+
+  (* [fs_alloc]'s per-block bundle arrives as a [∗ map] over [fs_C0]; every
+     consumer wants a [∗ set] over [cov].  One conversion, once. *)
+  Lemma fs_C0_big (Φ : Z -> list (bv 8) -> iProp Σ) (dk : Z -> bv 8)
+      (cov : gset Z) :
+    ([∗ map] b ↦ bs ∈ fs_C0 dk cov, Φ b bs)
+      ⊢ [∗ set] b ∈ cov, Φ b (fs_blocks dk b).
+  Proof using .
+    etrans.
+    { apply (big_sepM_mono _ (fun b (_ : list (bv 8)) => Φ b (fs_blocks dk b))).
+      intros b bs Hb.
+      destruct (fs_C0_lookup_Some dk cov b bs Hb) as [_ ->]. done. }
+    rewrite big_sepM_dom fs_C0_dom //.
+  Qed.
+
+  (* THE GHOST STEP.  The era's byte mint in, the logged-view ghosts out,
+     with the pool bundles [bio_init] wants and the FsBlocks material
+     [initlog] wants.
+
+     [home] IS A PARAMETER (durable-disk 1c-flip): the mint splits its
+     per-block client resource along it -- a home block's owner gets the
+     EXCLUSIVE byte run [fsblock], the log region's blocks keep the parked
+     cache half [fs_chalf] that [LogInv.log_state] parks -- and the byte
+     view's invariant row comes out with them.  The one caller passes
+     [fs_home_set cov logstart]. *)
+  (* [γlk]/[γtp] ARE PARAMETERS, not minted here (durable-disk 2b-A / B3).
+     The two file-system-state ghosts are cameras this file does not know --
+     [FsStateLink.linkUR] and a [ghost_map Z fs_node] -- and the block layer
+     must not name [fs_node].  [FsCfgBoot.fs_cfg_alloc] allocates them from
+     the era's inode map and passes them down; all this lemma does is put
+     them in [γfs] and name them back to the caller. *)
+  (* THE BYTE VIEW IS MINTED AT [Dv], NOT AT THE RAW DISK (durable-disk
+     lane E-except).  [Dv] is the era's COMMITTED view [FsCrash.fr_D] and
+     [X] the set where it differs from the raw disk -- the pending home
+     blocks of a dirty on-disk log header.  The CACHE map stays raw (that
+     is what keeps [BioInv.pool_blk] honest), and the WAL's handle on the
+     difference comes out as [exc_own]. *)
+  Lemma fs_boot_ghosts (γv : disk_names) (dk : Z -> bv 8) (ndisk : nat)
+      (cov home : gset Z) (dev : mword 32) (γlk γtp : gname) (E : coPset)
+      (Dv : Z -> list (bv 8)) (X : gset Z) :
+    fs_cov_in cov ndisk ->
+    home ⊆ cov ->
+    (forall b, b ∈ home -> length (Dv b) = BSIZE) ->
+    X ⊆ home ->
+    (forall b, b ∈ home -> b ∉ X -> Dv b = fs_blocks dk b) ->
+    disk_bytes γv 0 (disk_read dk 0 ndisk) ={E}=∗
+    ∃ γfs : fs_names,
+      ⌜fs_link γfs = γlk⌝ ∗ ⌜fs_top γfs = γtp⌝ ∗
+      ([∗ set] b ∈ cov, pool_blk (fs_view γfs γv dev cov) b) ∗
+      ghost_map_auth_frac (fs_cache γfs) 1 (fs_C0 dk cov) ∗
+      ghost_map_auth_frac (fs_dirty γfs) 1 (fs_D0 dk cov) ∗
+      fs_bytes_inv (fs_bytes γfs) (fs_cache γfs) (fs_exc γfs) home Dv ∗
+      exc_own (fs_exc γfs) X ∗
+      ([∗ set] b ∈ cov, b ↪[fs_dirty γfs]{#(1/2)} false) ∗
+      ([∗ set] b ∈ home, fsblock (fs_bytes γfs) b (Dv b)) ∗
+      ([∗ set] b ∈ cov ∖ home, fs_chalf γfs b (fs_blocks dk b)).
+  Proof using .
+    iIntros (Hcov Hsub HlD HXsub Hagr) "Hm".
+    iDestruct (fs_boot_carve γv dk ndisk cov Hcov with "Hm") as "Hblk".
+    iMod (fs_alloc E γlk γtp (fs_C0 dk cov) home Dv X (fs_C0_lengths dk cov)
+            ltac:(rewrite fs_C0_dom; exact Hsub) HlD HXsub
+            ltac:(intros b bs Hb Hin Hnin;
+                  destruct (fs_C0_lookup_Some dk cov b bs Hb) as [_ ->];
+                  exact (Hagr b Hin Hnin)))
+      as (γfs) "(%Hlk & %Htp & HaL & HaD & #Hinv & Hxo & Hpm & Hfb & Hcl)".
+    rewrite (fs_C0_filter_in dk cov home Hsub) (fs_C0_filter_out dk cov home).
+    iDestruct (fs_C0_big with "Hfb") as "Hfb".
+    iDestruct (fs_C0_big with "Hcl") as "Hcl".
+    iDestruct (fs_C0_big with "Hpm") as "Hpm".
+    (* SCOPE the split.  A bare [rewrite !big_sepS_sep] rewrites the whole
+       [envs_entails] -- hypotheses AND the (existentially quantified)
+       conclusion -- and does not come back. *)
+    iEval (rewrite big_sepS_sep) in "Hpm".
+    iDestruct "Hpm" as "[Hmc Hdty]".
+    iModIntro. iExists γfs.
+    iSplitR; [done |]. iSplitR; [done |].
+    iSplitL "Hblk Hmc".
+    { iDestruct (big_sepS_sep_2 with "Hblk Hmc") as "H".
+      iApply (big_sepS_mono with "H"). intros b Hb.
+      iIntros "[Hd Hc]". rewrite /pool_blk /fs_view. cbn [bv_gd bv_clean].
+      iExists (fs_blocks dk b). iFrame "Hd Hc". }
+    rewrite /fs_D0. iFrame "HaL HaD Hinv Hxo Hdty Hfb Hcl".
+  Qed.
+
+(* ====================================================================== *)
+(* 5. THE FULL BOOT BUNDLE.                                               *)
+(* ====================================================================== *)
+
+  (* a [∗ set] splits along any subset *)
+  Lemma big_sepS_split_sub {A : Type} `{Countable A}
+      (Φ : A -> iProp Σ) (X Y : gset A) :
+    Y ⊆ X ->
+    ([∗ set] x ∈ X, Φ x) ⊢ ([∗ set] x ∈ Y, Φ x) ∗ ([∗ set] x ∈ X ∖ Y, Φ x).
+  Proof using .
+    intros Hsub. rewrite {1}(union_difference_L Y X Hsub).
+    rewrite big_sepS_union; [done | set_solver].
+  Qed.
+
+  (* ...AND THE SAME SPLIT ITERATED, WITH THE REMAINDER KEPT.  [X] is the
+     era's [cov]; [l] indexes a family of PAIRWISE DISJOINT subsets (at the
+     boot stocking: the live inums, [f i] being inode [i]'s own block set);
+     the conclusion hands each member its own [∗ set] and keeps everything
+     [l] did not claim -- which is what the era fupd needs, since the log
+     region, the inode region, the bitmap block and the free pool all live
+     in the remainder.
+
+     ONE induction, on an abstract list, so a caller's big-op is never
+     walked by a framing search: the peel at each step is
+     [big_sepS_split_sub] above and nothing else. *)
+  Lemma big_sepS_carve {A B : Type} `{Countable A} (Φ : A -> iProp Σ)
+      (X : gset A) (l : list B) (f : B -> gset A) :
+    (* [base.NoDup] = stdpp's; the plain name here is Stdlib's
+       [List.NoDup], and the two are different inductives *)
+    base.NoDup l ->
+    (forall i : B, i ∈ l -> f i ⊆ X) ->
+    (forall i j : B, i ∈ l -> j ∈ l -> i <> j -> f i ## f j) ->
+    ([∗ set] b ∈ X, Φ b) -∗
+    ([∗ list] i ∈ l, [∗ set] b ∈ f i, Φ b)
+      ∗ ([∗ set] b ∈ X ∖ ⋃ (f <$> l), Φ b).
+  Proof using .
+    revert X. induction l as [|i l IH]; intros X Hnd Hsub Hdisj.
+    { rewrite fmap_nil union_list_nil difference_empty_L.
+      iIntros "H". iSplitR "H"; [done | iExact "H"]. }
+    assert (Hni : i ∉ l) by exact (NoDup_cons_1_1 i l Hnd).
+    assert (Hndl : base.NoDup l) by exact (NoDup_cons_1_2 i l Hnd).
+    assert (Hle : f i ⊆ X) by (apply Hsub, list_elem_of_here).
+    assert (Hsub' : forall j : B, j ∈ l -> f j ⊆ X ∖ f i).
+    { intros j Hj. apply elem_of_subseteq. intros b Hb.
+      apply elem_of_difference. split.
+      - apply (Hsub j (list_elem_of_further _ _ _ Hj)), Hb.
+      - intros Hbi.
+        assert (Hd : f j ## f i).
+        { apply Hdisj;
+            [by apply list_elem_of_further | apply list_elem_of_here |].
+          intros ->. contradiction. }
+        exact (Hd b Hb Hbi). }
+    assert (Hdisj' : forall j k : B, j ∈ l -> k ∈ l -> j <> k -> f j ## f k)
+      by (intros j k Hj Hk; apply Hdisj; by apply list_elem_of_further).
+    iIntros "H".
+    iDestruct (big_sepS_split_sub Φ X (f i) Hle with "H") as "[Hi Hrest]".
+    iDestruct (IH (X ∖ f i) Hndl Hsub' Hdisj' with "Hrest") as "[Hl Hrem]".
+    rewrite big_sepL_cons fmap_cons union_list_cons
+            -difference_difference_l_L.
+    iSplitR "Hrem"; [| iExact "Hrem"].
+    iSplitL "Hi"; [iExact "Hi" | iExact "Hl"].
+  Qed.
+
+  (* the log region's halves, taken apart into the header and the thirty
+     slots.  The header keeps its NAMED content; the slots go existential
+     (which is all [log_state] records for them). *)
+  Lemma fs_log_region_split (γfs : fs_names) (dk : Z -> bv 8) (logstart : Z) :
+    ([∗ set] b ∈ log_region_set logstart, fs_chalf γfs b (fs_blocks dk b))
+      ⊢ fs_chalf γfs (log_hdr_bno logstart)
+                (fs_blocks dk (log_hdr_bno logstart)) ∗
+        ([∗ list] i ∈ seq 0 LOGBLOCKS,
+           ∃ bs : list (bv 8), fs_chalf γfs (log_slot_bno logstart i) bs).
+  Proof using .
+    rewrite /log_region_set.
+    rewrite big_sepS_union;
+      [| apply disjoint_singleton_r;
+         rewrite elem_of_list_to_set; apply log_hdr_not_slot ].
+    rewrite big_sepS_singleton.
+    rewrite (big_sepS_list_to_set
+               (fun b => fs_chalf γfs b (fs_blocks dk b))
+               ((fun i => log_slot_bno logstart i) <$> seq 0 LOGBLOCKS)
+               (log_slot_list_nodup logstart)).
+    rewrite big_sepL_fmap.
+    iIntros "[Hslots Hhdr]". iFrame "Hhdr".
+    iApply (big_sepL_mono with "Hslots"). intros k i _.
+    iIntros "H". iExists (fs_blocks dk (log_slot_bno logstart i)). iExact "H".
+  Qed.
+
+End FsBoot.

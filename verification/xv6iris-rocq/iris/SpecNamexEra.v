@@ -1,0 +1,312 @@
+(* SpecNamexEra.v -- THE ERA-FRAGMENT TRACE CONTRACT FOR namex: exactly
+   [SpecNamexTr.wp_namex_tr_body] with ONE resource changed at the hop.
+
+   Worklist: claude-notes/projects/fs-syscall-specs.md, lane A item (iii),
+   the user's 2026-08-28 ruling ("OPTION (b): a second walk that lends the
+   era fragment").  The frozen trio ([SpecNameiTr], [SpecNamexTr] and the
+   proofs under them) does not move (R10); this is the PARALLEL contract
+   beside it.
+
+   THE ONE DIFFERENCE, AND THERE IS ONLY ONE.  [SpecNamexTr]'s trace
+   premise is [SpecNameiTr.nx_hops_from P Pmiss pl 0], whose hop lends
+   [DirViewG.dv_half] (RETIRED 2026-08-30 -- read every [dv_half] below as
+   history; this contract is the surviving form).  Here it is
+   [FsAbsEra.ex_hops_from fsc_fs P Pmiss
+   pl 0], whose hop lends [FsAbsEra.elend] -- the era fragment
+   ([FsState.top_frag_q] at gamma-top) beside the two pure facts that make
+   it readable ([fn_is_dir], [dir_entries n = ents]).  Both hops ARE
+   [FsAbs.ax_hop] at a different [F] ([FsAbsEra.ex_hop_is_ax_hop], and
+   [FsAbs]'s header quotes the [reflexivity] receipt for the dv side), so
+   the trace vocabulary is SHARED and not duplicated.  Every other line of
+   this file is [SpecNamexTr.v] byte for byte: same ambient ties, same
+   ledger, same budget, same eb/trap-CSR threading, same name buffer, same
+   two postcondition arms, same [inode_held_at] pin.
+
+   WHY IT IS WORTH A SECOND CONTRACT.  [FsAbsSeam] proved that a
+   [dv_half]-lending hop cannot tell a client anything about the abstract
+   state: [dv_half] lives at [icfg_dview] and the campaign's carrier
+   ([FsAbs.nview]) is a reading of gamma-top, two disjoint ghosts tied only
+   INSIDE the payload the walk is holding.  The era fragment is the same
+   ghost as the carrier, so the hop's caller can read the parent's row off
+   the AUTHORITY at the fire instant ([FsAbsEra.elend_astate]) with no
+   client-held share at all -- which is what [FsAbsCreateFire]'s
+   [dlookup_commit_at] / [acre_commit_at] need and what [nx_hop] cannot
+   give.
+
+   COPY-ADAPT IS THE RULED APPROACH (lane brief, 2026-08-28), and it is
+   TRANSITIONAL BY DESIGN: when the consumers have moved to this contract,
+   the campaign's retirement step deletes the dv-firing original and the
+   [dv_*] column comes off the payloads.  Until then the two contracts
+   stand side by side and the diff IS the review.
+
+   SCOPE: namei side only ([a1 = 0] kills the nameiparent arms at +0xd4
+   and +0x140; that side is [SpecNparEra]).  BOTH STARTS ARE IN SCOPE as
+   of the relative-start walk (lane A-iii): the [pfun 0 = SLASH] premise
+   is GONE, the entry test at +0x22 decides the arm, and the trace premise
+   is [FsAbsStart.ex_start] -- one shot, universally quantified over the
+   start inum, tied to ROOTINO only when the path begins with SLASH.  The
+   absolute contract this file used to state is derivable from it
+   ([FsAbsStart.ex_start_of_pair]), so no consumer weakened.
+
+   WHY THE Q-c GAP WAS NOT A GAP IN THE CWD's READING.  A relative walk
+   starts at [idup(p->cwd)] and the recorded blocker was that
+   [IcacheHeld.inode_held] hides the cwd's inum existentially, so a caller
+   cannot write [P 0 <that inum>].  It never has to: idup's post hands the
+   walk a package whose own witness is the slot's inum, so the PROOF reads
+   it there and fires the caller's one shot at that value.  No new reading
+   of [ProcInv.cwd_ref] exists or is needed.
+
+   THE FIRE POINT (what the proof owes, recorded here so the contract can
+   be read against it).  namex holds the locked directory's payload from
+   ilock's return to its iunlockput, and that payload carries BOTH
+   the (now retired) [dview] contents hold and the era leg
+   [FsState.top_frag ... (era_node dn bm data)] at [DfracOwn 1]
+   ([IcacheEscrow.ic_loaded_flat_body]'s last two conjuncts).  The hop is
+   fired in dirlookup's CONTINUATION, at the instruction boundary where the
+   walk already knows the answer; the walk SPLITS its era leg, lends half
+   through the caller's [={T}=*] and keeps half, so the node the caller
+   returns is pinned to the one it lent ([FsAbsEra.elend_fire_hit]).  The
+   bridge from dirlookup's [dir_first] answer to [ents !! s] is unchanged
+   and uniqueness-free ([FsTree.dv_lookup_found] / [dv_lookup_none]), and
+   the leg is re-joined straight back into the [ic_loaded] the walk re-packs
+   for its iunlockput. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import KernelDataInv.
+Require Import SpecPanic.
+Require Import FdSlots.
+Require Import ProcGeom.
+Require Export SwtchCtx.
+Require Import CpuOwn.
+Require Import SchedCtx.
+Require Import ProcDefs.
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import FsBlocks LogInv.
+Require Import BitmapInv.
+Require Import ByteBuf.
+Require Import DirentEnc.
+Require Import PathElems.
+Require Import InodeInv.
+Require Import InodeRegion.
+Require Import IrefSlots.
+Require Import IcacheHeld.
+Require Import IcacheInv.
+Require Import IcacheEscrow.   (* the payload arms *)
+Require Import KvmSpec.
+Require Import FileInvDefs.
+Require Import SpecDirlink.
+Require Import SpecNamex.      (* K_namex, walk_need / walk_spend, ROOT* *)
+Require Import FsAbsEra.     (* [ex_start]: the DEFERRED start (lane A-iii) *)
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Import Defs.
+Require Import TsoCtx.
+
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(*  1. THE CONTINUATION, NAMED                                           *)
+(* ===================================================================== *)
+
+(* [SpecNamex.namex_postS] with the two arms replaced.  It is named for the
+   same reason that one is (SpecNamex.v:306-320): namex's whole-function
+   proof carries the continuation as a spatial hypothesis for thousands of
+   proofmode steps and restates it inside its loop invariant, and every step
+   re-embeds it in the proof term twice.  TRANSPARENT on purpose -- do NOT
+   seal it; [iApply ("Hcont" $! mf ...)] unifies through a transparent
+   constant and not through an opaque one. *)
+Definition namex_era_post
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+      !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (pj pv nb ret_tgt : mword 64) (pl : list (bv 8))
+    (m : regfile) (K : nat) (b eb : bool) (lks : gset string)
+    (plen : nat) (pfun : nat -> bv 8)
+    (n : nat) (Sb : gset Z)
+    (P : nat -> Z -> iProp Σ) (Pmiss : nat -> Z -> iProp Σ)
+    (pidv : mword 32)
+    (dq dqb dqs dqpv : dfrac) (Upr : ustate) : iProp Σ :=
+  (∀ (mf : regfile) (n' : nat) (Sb' : gset Z)
+     (ok : bool) (nf : nat -> bv 8) (ipv : mword 64) (w : bool),
+      ⌜callee_saved m mf⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      trap_csrs_ext KT1 eb -∗
+      cpu_claim_ext eb pj -∗
+      pc_is ret_tgt -∗
+      (* EVERYTHING LOANED COMES BACK *)
+      sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+      sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+      proc_priv_bare pj pidv Upr -∗
+      inode_held_at (pv_cwd (us_V Upr)) (pv_cwi (us_V Upr)) -∗
+      ([∗ list] i ∈ seq 0 (S plen), pa_add pv i ↦ₘ[KT1]{dqpv} pfun i) -∗
+      ([∗ list] i ∈ seq 0 14, pa_add nb i ↦ₘ[KT1] nf i) -∗
+      bslots 3 -∗
+      ⌜Sb ⊆ Sb'⌝ -∗
+      ⌜w = true -> fsc_bmapstart ∈ Sb'⌝ -∗
+      ⌜((n - (walk_spend w + (if ok then 0%nat else 1%nat)))%nat <= n')%nat
+       /\ (n' <= n)%nat⌝ -∗
+      (* the set form beside the transaction's token: this walk's [ilock]
+         takes the write arm (durable-disk B''-tx), so the token travels
+         with it -- in [log_opS]'s own position, so no stage lemma moved *)
+      log_opSt icfg_log n' Sb' -∗
+      (if ok
+       then (* THE PIN: the register, the package AT ITS INUM, and the
+               cursor having walked the whole path to that same inum.  The
+               caller alone knows what its [P] says about [iL]; the contract
+               promises only the CHAIN -- L hops fired, in order, each at the
+               then-current contents. *)
+            ∃ (iL : Z),
+              ⌜mf !!! Regidx (mword_of_int 10 : mword 5) = ipv⌝ ∗
+              inode_held_at ipv iL ∗
+              P (length (path_elems pl)) iL ∗
+              iref_slots 1
+       else ⌜mf !!! Regidx (mword_of_int 10 : mword 5)
+             = (mword_of_int 0 : mword 64)⌝ ∗
+            iref_slots 2 ∗
+            (* the death index, the receipt, and the UNFIRED suffix; the two
+               disjuncts are [SpecNameiTr]'s, verbatim.  LEFT: hop [k] never
+               fired (the cursor's node was not a directory, or the walk's
+               own nlink guard died there), so [P k d] comes back beside hops
+               [k..].  RIGHT: hop [k] fired and missed. *)
+            (∃ (k : nat) (d : Z), ⌜(k < length (path_elems pl))%nat⌝ ∗
+               ((P k d ∗ ex_hops_from fsc_fs P Pmiss pl k) ∨
+                (Pmiss k d ∗ ex_hops_from fsc_fs P Pmiss pl (S k))))) -∗
+      mWP (Loop : expr riscv_lang))%I.
+
+(* ===================================================================== *)
+(*  2. THE CONTRACT: [SpecNamex.wp_namex_gen_body] + the trace           *)
+(* ===================================================================== *)
+
+Definition wp_namex_era_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+      !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (gs : list gname) (j : nat) (gl : gname)           (* the running process *)
+   (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+ (gf : gname)                          (* kalloc, file table  *)
+    (plen : nat) (pfun : nat -> bv 8)                  (* the path buffer     *)
+    (nfun : nat -> bv 8)                               (* the name buffer, in *)
+    (n : nat) (Sb : gset Z)
+    (P : nat -> Z -> iProp Σ)                          (* the cursor          *)
+    (Pmiss : nat -> Z -> iProp Σ)                      (* the miss receipt    *)
+    (pidv : mword 32) (dq dqb dqs dqpv : dfrac)
+    (m : regfile) (K : nat) (eb : bool)
+    (b : bool) (lks : gset string) (Upr : ustate) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.namex in
+  let pj := proc_addr j in
+  let pv := m !!! Regidx (mword_of_int 10 : mword 5) in   (* a0 = path *)
+  let nb := m !!! Regidx (mword_of_int 12 : mword 5) in   (* a2 = name *)
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  let pl := bview plen pfun in
+  let L := length (path_elems pl) in
+  (K_namex <= K)%nat ->
+  icfg_dev = ROOTDEV ->
+  (0 < icfg_nib)%nat ->
+  log_geom_ok fsc_cov fsc_logst ->
+  0 < fsc_size <= BPB ->
+  0 <= fsc_bmapstart ->
+  fsc_bmapstart ∈ fsc_cov ->
+  ~ (fsc_bmapstart ∈ log_region_set fsc_logst) ->
+  0 <= icfg_ist ->
+  cov_below fsc_cov fsc_size ->
+  ireg_blocks_ok icfg_ist icfg_nib fsc_cov fsc_logst ->
+  bb_cstr pfun plen ->
+  (Z.of_nat plen < 2 ^ 31)%Z ->
+  (* NO ABSOLUTE-PATH PREMISE (the RELATIVE START, lane A-iii): both arms
+     of the [beq] at +0x22 are proven, and which one runs is decided by
+     the buffer, not by a premise.  The start inum travels in the trace
+     premise below. *)
+  (walk_need L <= n)%nat ->
+  (j < NPROC)%nat ->
+  gs !! j = Some gl ->
+  (* a1 = 0: the namei side.  [SpecNamex]'s [npar] boolean is not a
+     parameter here -- it is FIXED false by the ruling, so the flag's
+     reflection premise is the one instance that survives. *)
+  eq_vec (m !!! Regidx (mword_of_int 11 : mword 5)) zero_reg = true ->
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m K b pj -∗
+  cpu_own 0 eb pj b lks -∗
+  trap_csrs_ext KT1 eb -∗
+  cpu_claim_ext eb pj -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  panic_env -∗
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  kalloc_env fsc_kalloc None -∗
+  is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst icfg_nib icfg_dev -∗
+  itable_inv -∗
+  ic_escrows fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst -∗
+  ic_sleeplocks fsc_ic -∗
+  ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  ireg_open -∗
+  procs_inv gs -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+  sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+  bitmap_inv fsc_fs fsc_bmapstart fsc_cov fsc_logst fsc_size -∗
+  proc_priv_bare pj pidv Upr -∗
+  inode_held_at (pv_cwd (us_V Upr)) (pv_cwi (us_V Upr)) -∗
+  ([∗ list] i ∈ seq 0 (S plen), pa_add pv i ↦ₘ[KT1]{dqpv} pfun i) -∗
+  ([∗ list] i ∈ seq 0 14, pa_add nb i ↦ₘ[KT1] nfun i) -∗
+  bslots 3 -∗
+  iref_slots 2 -∗
+  (* the set form beside the transaction's token (durable-disk B''-tx) *)
+  log_opSt icfg_log n Sb -∗
+  (* ---- THE TRACE (ONE resource premise, DEFERRED IN THE START) ----
+     [FsAbsStart.ex_start]: the cursor and the family, at whatever inum
+     the walk begins at -- ROOTINO on the absolute arm, and idup's own
+     package's inum on the relative one, which is where the Q-c gap
+     actually closes (that file's header).  A caller that knows its path
+     is absolute builds this from the landed pair and loses nothing
+     ([FsAbsStart.ex_start_of_pair]). *)
+  ex_start fsc_fs (pv_cwi (us_V Upr)) P Pmiss pl -∗
+  (* THE CROSSING IS THE LITERAL [true], NOT [b] -- namex parks; see
+     [SpecNamex.wp_namex_gen_body]'s note. *)
+  wp_next true pj (fun (CIDc : CpuId) =>
+    namex_era_post (CID := CIDc) pj pv nb ret_tgt pl m K b eb lks
+
+                  plen pfun n Sb P Pmiss pidv dq dqb dqs dqpv Upr) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type NAMEX_ERA.
+  Parameter wp_namex_era :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+             !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (gs : list gname) (j : nat) (gl : gname)
+      (pd pav pu : mword 64)
+ (gf : gname)
+      (plen : nat) (pfun : nat -> bv 8)
+      (nfun : nat -> bv 8)
+      (n : nat) (Sb : gset Z)
+      (P : nat -> Z -> iProp Σ) (Pmiss : nat -> Z -> iProp Σ)
+      (pidv : mword 32) (dq dqb dqs dqpv : dfrac)
+      (m : regfile) (K : nat) (eb : bool)
+      (b : bool) (lks : gset string) (Upr : ustate),
+      wp_namex_era_body gs j gl pd pav pu
+ gf
+ plen pfun nfun n Sb P Pmiss
+                       pidv dq dqb dqs dqpv m K eb b lks Upr.
+End NAMEX_ERA.

@@ -1,0 +1,1404 @@
+#!/usr/bin/env python3
+"""vtest.py -- the QEMU side of a device-semantics test.
+
+Builds a test image, runs it on QEMU, captures what it left in the RESULT
+region and what it did to the disk, and writes both out as a Rocq file that
+vtest-rocq/ checks the model against.  See tools/vtest/README.md and abi.h.
+
+  vtest.py list                 the tests it can see
+  vtest.py build  <name>...     assemble/link only
+  vtest.py run    <name>...     build + run on QEMU, print what came back
+  vtest.py gen    <name>...     build + run + write <Plat>/<Name>{Test,Run}.v
+  vtest.py gen --all
+"""
+import argparse, json, os, re, socket, subprocess, sys, tempfile, time
+
+HERE     = os.path.dirname(os.path.abspath(__file__))
+ROOT     = os.path.abspath(os.path.join(HERE, "..", ".."))
+TESTDIR  = os.path.join(HERE, "tests")
+ROCQDIR  = os.path.join(ROOT, "vtest-rocq")
+BUILDDIR = os.path.join(HERE, "build")
+
+# ---------------------------------------------------------------------------
+# WHERE A vtest-rocq FILE LIVES.  One directory per platform: a capture, the
+# run module built from it and that run's proof are all ABOUT one platform,
+# so they go under that platform's directory.  What is SHARED stays at the
+# top -- the harness (V*.v) and the hand-written interleavings (<Case>Sched.v,
+# which both platforms' run modules Require).  Otherwise the top level is
+# three hundred generated files and the eleven that matter cannot be found.
+#
+# THE PLATFORM IS THE DIRECTORY AND NOT THE NAME.  QEMU/CoreSmokeRun.v, not
+# CoreSmokeQemuRun.v: saying it twice is what made the listing unreadable.
+# So every path helper takes the platform as an ARGUMENT -- it can no longer
+# be recovered from a file name, and nothing should try.
+#
+# Rocq needs only that a Require be qualified where the same name exists on
+# both platforms: [-R . VTest] maps the directories to [VTest.QEMU.*] and
+# [VTest.JH7110.*], and the generated files say [From VTest.QEMU Require
+# Import CoreSmokeRun].  The capture's own DEFINITIONS keep their _hw_
+# infix on the board side, so the two platforms' globals stay distinct even
+# though their files are now both <Case>Test.v.
+# ---------------------------------------------------------------------------
+PLATDIR = {"qemu": "QEMU", "jh7110": "JH7110", "cva6": "CVA6"}
+
+
+def rp(fname, platform=None):
+    """The absolute path of a vtest-rocq file.  [platform] names the
+    directory it belongs to; None is the shared top level."""
+    return os.path.join(ROCQDIR, PLATDIR.get(platform, ""), fname)
+
+
+def rrel(fname, platform=None):
+    """...and the path _CoqProject lists, relative to vtest-rocq/."""
+    d = PLATDIR.get(platform, "")
+    return "%s/%s" % (d, fname) if d else fname
+
+
+def rocq_listdir(platform=None):
+    """The basenames in one vtest-rocq directory ([platform] None = the top)."""
+    d = os.path.join(ROCQDIR, PLATDIR.get(platform, ""))
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def rocq_mkdirs():
+    """vtest-rocq/ and both platform directories."""
+    for d in [ROCQDIR] + [os.path.join(ROCQDIR, x) for x in PLATDIR.values()]:
+        os.makedirs(d, exist_ok=True)
+
+
+CC      = os.environ.get("VTEST_CC", "riscv64-linux-gnu-gcc")
+OBJCOPY = os.environ.get("VTEST_OBJCOPY", "riscv64-linux-gnu-objcopy")
+QEMU    = os.environ.get("VTEST_QEMU", "qemu-system-riscv64")
+
+def abi():
+    """the ABI constants, read from abi.h so there is ONE definition."""
+    d = {}
+    for line in open(os.path.join(HERE, "abi.h")):
+        m = re.match(r"#define\s+(\w+)\s+([^/\s].*?)\s*(?:/\*.*)?$", line)
+        if m:
+            try: d[m.group(1)] = eval(m.group(2), {}, dict(d))
+            except Exception: pass
+    return d
+ABI = abi()
+
+# ---------------------------------------------------------------- build ----
+
+def config(name):
+    """Per-test knobs, read from a `vtest:` directive in the .S itself so the
+    configuration sits next to the test.  e.g.
+
+        /* vtest: repeat=40 drive=cache=none,aio=threads */
+
+    [repeat] > 1 is for a test whose QEMU-side result is NOT deterministic:
+    the model must admit EVERY execution the hardware has, so such a test is
+    captured as a SET of observations rather than one."""
+    src = os.path.join(TESTDIR, name + ".S")
+    cfg = {"repeat": 1, "drives": "cache=writeback", "smp": 1, "serial_in": "",
+           # HOW MANY 16550s THE MACHINE HAS.  QEMU virt instantiates its
+           # second ns16550a (0x1000a000, PLIC source 12 -- abi.h's UART1)
+           # ONLY when a second serial backend is attached, so a case that
+           # touches the second window says `uarts=2` and the runner adds
+           # one.  With `uarts=1` the command line is byte-for-byte what it
+           # always was, which is what keeps every existing capture
+           # reproducible; the second serial node is then absent from the
+           # device tree entirely and those images do not move.
+           "uarts": 1,
+           # ...and the RECEIVE side of the second port.  [serial_in] feeds
+           # port 0; this feeds port 1.  Either one turns THAT port's
+           # backend into a socket the runner can push bytes into; the other
+           # port stays a plain output file.
+           "serial1_in": "",
+           # A SEPARATE REPEAT COUNT FOR THE BOARD, because a board run costs
+           # ~4 s of JTAG round trips where a QEMU run costs milliseconds.
+           # conc_sb wants repeat=700 on QEMU to hunt the rare (0,0); on the
+           # board that is 48 MINUTES to sample a test that performs ONE race
+           # per run, and it silently blew past two sweep timeouts.  The
+           # sensitive instrument for that question is conc_sbx, which does
+           # 200000 races in a single run.  Defaults to `repeat` when unset.
+           "board_repeat": "",
+           # THE PROGRAM WRITES ITS OWN TEXT.  A board repeat reloads the
+           # image only when it changes (board.py); a self-modifying program
+           # must have it reloaded EVERY run or the repeat observes the
+           # previous run's patched code.  QEMU starts afresh each run.
+           "selfmod": 0,
+           # WHICH PLATFORMS THIS CASE IS MEANINGFUL ON.  There is ONE set of
+           # test cases; executing a case on a platform produces a test RUN,
+           # so a case yields zero, one or two runs.  The default is both.
+           #
+           #   platforms=qemu,jh7110,cva6   (the default -- may be omitted)
+           #   platforms=qemu          QEMU only
+           #   platforms=jh7110        board only
+           #   platforms=none          runs nowhere, and the directive says why
+           #
+           # A case is marked down to one platform when it cannot produce a
+           # MEANINGFUL run on the other -- not when it merely fails there.
+           # A failure is a finding and belongs in the table; an exclusion
+           # is a statement that the question cannot be asked.
+           "platforms": "qemu,jh7110,cva6",
+           # THE MODEL-SIDE CONFIGURATION, which is also a property of the
+           # case and so also lives here.  vtest-rocq/VRun.v consumes these.
+           #   budget=N    steps the model is given.  Too small reads as a
+           #               failure (MBudget); too large only costs time, and
+           #               only for a case that does not finish.
+           #   tick=1      step the CLOCK-TICKING branch of the boundary's
+           #               [exists tick : bool].  For a case whose subject is
+           #               elapsed time; see VTest section 3a.
+           #   budget=N    steps the model is given.  Too small reads as a
+           #               failure; too large only costs time, and only for a
+           #               case that does not finish.
+           #   tick=1      step the CLOCK-TICKING branch of the boundary's
+           #               [exists tick : bool].  For a case whose subject is
+           #               elapsed time; see VTest section 3a.
+           "budget": 2000, "tick": 0,
+           #   csched=...  the per-observation INTERLEAVINGS of a multi-hart
+           #               case, semicolons between and run-length encoded
+           #               inside; a trailing `s` marks a stretch STALE.
+           #               [csched_hw] overrides it for the board, whose
+           #               image does not share the instruction counts.
+           "csched": "", "csched_hw": "",
+           #   crounds=N   raise the multi-hart round cap for a case that
+           #               genuinely needs more.  The cap exists so a run
+           #               that never reaches the DONE flag fails in seconds
+           #               instead of minutes; a run that DOES reach it stops
+           #               there and pays nothing for a high number.
+           "crounds": 0,
+           #   ipol=fresh|stale;...   THE FETCH VIEW, for a case whose
+           #               subject is self-modifying code: one per
+           #               observation.  [fresh] reads the fetch at the top
+           #               of the log -- a coherent I-cache; [stale] reads it
+           #               AT the instruction view, which only fence.i
+           #               raises.  Both are executions the model has
+           #               (VIcacheStep, icache.md).  [ipol_hw] is the
+           #               board's.
+           "ipol": "", "ipol_hw": "",
+           #   picks=a,b   one disk completion order per observation, for a
+           #               case that observed several.
+           "picks": "",
+           #   latch=N     how many INSTRUCTIONS the PLIC gateway may keep
+           #               re-forwarding a still-asserted level source for.
+           #               [VSched.settle] is eager, but the RELATION never
+           #               requires the gateway arm, so a run that stops
+           #               taking it is just as much a model execution --
+           #               which is what lets plic_level match QEMU.  0 means
+           #               "the whole run", which every other case wants.
+           "latch": 0}
+    for line in open(src):
+        m = re.search(r"vtest:\s*(.*?)\s*\*/", line)
+        if m:
+            for kv in m.group(1).split():
+                k, _, v = kv.partition("=")
+                cfg[k] = int(v) if k in ("repeat", "smp", "budget", "tick",
+                                     "board_repeat", "selfmod", "uarts",
+                                     "crounds", "latch") else v
+    return cfg
+
+def build(name, defines=(), march="rv64imafd", tag=""):
+    """[defines]/[march]/[tag] are for a BOARD PROFILE (tools/vtest/board.py)
+    and default to exactly what the QEMU suite has always built: no -D, the
+    same -march, and the same output filenames.  A profile passes its own
+    -D list and a [tag] so the two machines' images sit side by side in
+    build/ instead of overwriting each other."""
+    src = os.path.join(TESTDIR, name + ".S")
+    if not os.path.exists(src): sys.exit(f"no such test: {src}")
+    os.makedirs(BUILDDIR, exist_ok=True)
+    elf = os.path.join(BUILDDIR, name + tag + ".elf")
+    binf = os.path.join(BUILDDIR, name + tag + ".bin")
+    subprocess.run([CC, f"-march={march}", "-mabi=lp64d", "-nostdlib",
+                    "-nostartfiles", "-static", f"-I{HERE}",
+                    *[f"-D{d}" for d in defines],
+                    f"-Wl,-Ttext=0x{ABI['TEXT_BASE']:x}",
+                    "-o", elf, os.path.join(HERE, "vtest.S"), src], check=True)
+    # -j .text, never plain -O binary: that pads from address 0 and produces a
+    # 2 GB file for an image linked at 0x80000000.
+    subprocess.run([OBJCOPY, "-O", "binary", "-j", ".text", elf, binf], check=True)
+    return elf, open(binf, "rb").read()
+
+# ------------------------------------------------------------------ qemu ----
+
+class Qmp:
+    def __init__(self, path, deadline):
+        while time.time() < deadline:
+            try:
+                self.s = socket.socket(socket.AF_UNIX); self.s.connect(path); break
+            except OSError: time.sleep(0.01)
+        else: raise RuntimeError("QEMU never opened its QMP socket")
+        self.f = self.s.makefile("rw"); self.f.readline(); self.cmd("qmp_capabilities")
+    def cmd(self, ex, **a):
+        self.f.write(json.dumps({"execute": ex, "arguments": a}) + "\n"); self.f.flush()
+        while True:
+            r = json.loads(self.f.readline())
+            if "event" not in r: return r
+    def hmp(self, line):
+        return self.cmd("human-monitor-command", **{"command-line": line})["return"]
+    def read(self, addr, nbytes):
+        """guest physical memory -> bytes.  `xp` rather than `pmemsave`: the
+        latter mis-parses its filename argument in QEMU 10.2, and `xp` needs
+        no temp file (4 KB in ~2 ms)."""
+        out = b""
+        for off in range(0, nbytes, 4096):
+            n = min(4096, nbytes - off) // 4
+            txt = self.hmp(f"xp/{n}xw 0x{addr + off:x}")
+            for w in re.findall(r"0x([0-9a-f]{8})", txt):
+                out += int(w, 16).to_bytes(4, "little")
+        return out[:nbytes]
+
+def in_bytes(spec):
+    """A `serial_in=`/`serial1_in=` directive value as the bytes to push."""
+    return bytes(int(x, 0) for x in spec.split(",")) if spec else b""
+
+
+def run(name, disk_sectors=128, timeout=15.0, drive_opts="cache=writeback",
+        smp=None, serial_in=None, hart=0, serial1_in=None, uarts=None):
+    # smp and serial_in default to the test's own `vtest:` directive, so a
+    # direct vtest.run("conc_foo") behaves the same as the command line.
+    cfg = config(name)
+    if smp is None: smp = cfg["smp"]
+    if serial_in is None:
+        serial_in = in_bytes(cfg["serial_in"])
+    if serial1_in is None:
+        serial1_in = in_bytes(cfg["serial1_in"])
+    if uarts is None: uarts = int(cfg["uarts"])
+    # A CASE THAT FEEDS PORT 1 HAS TWO PORTS whether or not it said so; the
+    # directive would otherwise be a silent way to push bytes at a UART the
+    # machine does not have.
+    if serial1_in: uarts = max(uarts, 2)
+    # THE HART VARIANT.  hart 0 builds and runs exactly as this suite always
+    # has (no -D, no tag, the test's own smp); anything else needs BOTH a
+    # different image -- the prologue's primary/AP branch and its stack slot
+    # are keyed on PRIMARY_HART -- and enough harts for that one to exist.
+    if hart:
+        smp = max(smp, hart + 1)
+    elf, text = build(name,
+                      defines=() if not hart else ("PRIMARY_HART=%d" % hart,),
+                      tag="" if not hart else "_hart%d" % hart)
+    d = tempfile.mkdtemp(prefix="vtest-")
+    qmp  = os.path.join(d, "qmp")
+    disk = os.path.join(d, "disk.img")
+    ser  = [os.path.join(d, "serial%d.out" % p) for p in range(2)]
+    sock = [os.path.join(d, "serial%d.sock" % p) for p in range(2)]
+    # THE FIRST PORT'S FILENAMES DID NOT MOVE.  They are inside a fresh
+    # mkdtemp, so nothing outside this process can see them -- but keeping
+    # the shape identical is the cheap way to be sure that adding the second
+    # port changed nothing about the first.
+    ser[0], sock[0] = os.path.join(d, "serial.out"), os.path.join(d, "serial.sock")
+    sin = [serial_in, serial1_in]
+    with open(disk, "wb") as fh: fh.write(b"\0" * (512 * disk_sectors))
+    pre = open(disk, "rb").read()
+
+    # THE SERIAL CHANNEL IS CAPTURED, not discarded: it is how a `uart`
+    # test observes what the 16550 actually transmitted.  It is NOT the
+    # channel other tests report through -- printing a result costs ~10
+    # instructions per character and the model executes every one.
+    #
+    # A test that needs a UART to RECEIVE declares `serial_in=` (port 0) or
+    # `serial1_in=` (port 1) and THAT port gets a socket instead of an
+    # output file, so the runner can push bytes in.  Receiving is the only
+    # externally-driven event in the whole suite: on the model side those
+    # same bytes are a SCHEDULE choice, the [SUartRx] arm of VSched, tagged
+    # with the port they arrive at and delivered where the test says.
+    #
+    # ONE BACKEND PER PORT, IN ORDER: QEMU's virt machine instantiates its
+    # Nth ns16550a only when an Nth -serial backend is supplied, so the
+    # number of backends here IS the number of UARTs the guest sees, and a
+    # `uarts=1` case emits exactly the argument list it always did.
+    def backend(p):
+        return (["-chardev", f"socket,id=s{p},path={sock[p]},server=on,wait=off",
+                 "-serial", f"chardev:s{p}"] if sin[p] else
+                ["-serial", f"file:{ser[p]}"])
+    serial_args = [a for p in range(uarts) for a in backend(p)]
+
+    q = subprocess.Popen([QEMU, "-machine", "virt", "-bios", "none",
+        "-kernel", elf, "-display", "none",
+        *serial_args,
+        "-smp", str(smp), "-m", "128M",
+        # without this QEMU is a LEGACY virtio-mmio device (Version = 1)
+        "-global", "virtio-mmio.force-legacy=false",
+        "-drive", f"file={disk},if=none,format=raw,id=x0,{drive_opts}",
+        "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
+        "-qmp", f"unix:{qmp},server,nowait"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.time() + timeout
+    sc, sout = [None, None], [b"", b""]
+    try:
+        m = Qmp(qmp, deadline)
+        for p in range(uarts):
+            if not sin[p]: continue
+            while time.time() < deadline:
+                try:
+                    c = socket.socket(socket.AF_UNIX); c.connect(sock[p])
+                    sc[p] = c; break
+                except OSError: time.sleep(0.01)
+            else: raise RuntimeError("QEMU never opened its serial socket")
+            sc[p].setblocking(False)
+            sc[p].sendall(sin[p])
+        t0, done = time.time(), False
+        while time.time() < deadline:
+            for p in range(2):
+                if sc[p] is None: continue
+                try: sout[p] += sc[p].recv(4096)
+                except BlockingIOError: pass
+                except OSError: pass
+            if int.from_bytes(m.read(ABI["RESULT_BASE"], 4), "little") == ABI["DONE_MAGIC"]:
+                done = True; break
+            time.sleep(0.005)
+        for p in range(2):
+            if sc[p] is None: continue
+            for _ in range(20):
+                try: sout[p] += sc[p].recv(4096)
+                except BlockingIOError: time.sleep(0.005)
+                except OSError: break
+        result = m.read(ABI["RESULT_BASE"], ABI["RESULT_SIZE"])
+        ms = (time.time() - t0) * 1000
+    finally:
+        # ALWAYS reap it: a survivor holds the disk image's write lock and the
+        # next run dies with "Failed to get write lock".
+        try: m.hmp("quit")
+        except Exception: pass
+        try: q.wait(timeout=5)
+        except subprocess.TimeoutExpired: q.kill(); q.wait()
+    post = open(disk, "rb").read()
+    # ONE WIRE PER PORT, and a port the machine does not have contributes an
+    # EMPTY one rather than being absent: the model's claim about the wires
+    # is total over [enum uart_id], so the capture has to be too.
+    def wire(p):
+        if p >= uarts: return b""
+        if sin[p]: return sout[p]
+        return open(ser[p], "rb").read() if os.path.exists(ser[p]) else b""
+    serials = [wire(0), wire(1)]
+    changed = [(i, post[i*512:(i+1)*512]) for i in range(len(pre)//512)
+               if pre[i*512:(i+1)*512] != post[i*512:(i+1)*512]]
+    if not done:
+        sys.exit(f"{name}: guest never set the DONE flag within {timeout}s "
+                 f"(status word = 0x{int.from_bytes(result[4:8],'little'):08x})")
+    return dict(name=name, text=text, result=result, disk=changed, ms=ms,
+                # [serial] is port 0, unchanged, because board.py and every
+                # caller that predates the second port read it
+                serial=serials[0], serials=serials)
+
+# ------------------------------------------------------------------- gen ----
+
+def modname(name):
+    return "".join(p.capitalize() for p in name.split("_"))
+
+
+def regions_of(name):
+    """The declared regions this case needs, read off its source.  Every
+    declared byte is a gmap insert on the model side, so a case declares
+    what it uses and no more."""
+    src = open(os.path.join(TESTDIR, name + ".S")).read()
+    if "PT_BASE" in src:
+        return "pt_regions"
+    if "DMA_BASE" in src:
+        return "dma_regions"
+    return "std_regions"
+
+
+FORCE = [False]      # set from --force in main()
+
+GEN_MARK = "GENERATED by tools/vtest"
+
+
+def merge_observations(run_path, test_path, text, alts, force=False):
+    """Union a fresh capture's observations with the ones already on disk.
+
+    A CAPTURE IS AN ASSET, NOT A CACHE.  A racy case's value is the SET of
+    distinct outcomes the platform has ever shown, and the rare one -- the
+    (0,0) that makes conc_sb a finding at all -- may take many runs to see.
+    Overwriting the file with whatever this run happened to produce silently
+    throws that away, and nothing downstream can tell: the run still builds,
+    still passes, and quietly asserts less than it used to.  So a re-capture
+    ADDS, and re-running a case you are not working on cannot cost you
+    anything.
+
+    KEYED ON THE IMAGE, because that is what makes the union sound.  Old
+    observations describe the program that produced them; if [text] differs
+    the .S changed and every stored observation is about a DIFFERENT program,
+    so they are dropped and the file is replaced.  [force] drops them anyway,
+    for when a capture is known bad (a wedged board, a misconfigured run).
+
+    THE IMAGE IS IN THE TEST FILE AND THE OBSERVATIONS ARE IN THE RUN FILE,
+    which is the whole point of the split: [text] is the experiment and
+    [results] is the measurement.  Both have to be read, and a missing
+    either way means there is nothing to union with.
+
+    Returns (alts, note) with alts in a stable sorted order."""
+    if force or not os.path.exists(run_path) or not os.path.exists(test_path):
+        return sorted(set(map(tuple, alts))), "fresh"
+    m = re.search(r"Definition text : list Z :=\s*\[(.*?)\]\.",
+                  open(test_path).read(), re.S)
+    old_text = [int(x) for x in re.findall(r"-?\d+", m.group(1))] if m else None
+    if old_text != list(text):
+        return sorted(set(map(tuple, alts))), "image changed -- old observations dropped"
+    m = re.search(r"Definition results : list \(list Z\) :=\s*\[(.*?)\]\.",
+                  open(run_path).read(), re.S)
+    old = []
+    if m:
+        old = [tuple(int(x) for x in re.findall(r"-?\d+", b))
+               for b in re.findall(r"\[([^\[\]]*)\]", m.group(1))]
+    merged = sorted(set(old) | set(map(tuple, alts)))
+    added = len(merged) - len(set(old))
+    return merged, ("kept %d, added %d" % (len(set(old)), added) if added
+                    else "kept %d, nothing new" % len(set(old)))
+
+
+def hand_written(fname, platform=None):
+    """True when this file is a HAND-WRITTEN module the generator must leave
+    alone.
+
+    A builder computes [outcome] for the shapes it knows.  Some runs it does
+    not: a race whose interleavings nobody has worked out, or one whose model
+    side is not an evaluation at all.  Rather than emit something wrong, the
+    generator emits NOTHING for those and a hand-written file supplies the
+    run or its proof -- still a [VRun.TEST_RUN] and one of the two pass
+    module types, so the table judges it exactly like any other.
+
+    The marker is the generator's own header, so this cannot drift: a file
+    the generator wrote says so, and anything else is somebody's work."""
+    path = rp(fname, platform)
+    if not os.path.exists(path):
+        return False
+    return GEN_MARK not in open(path).read(400)
+
+
+VERDICTS = ("agree", "stuck")
+
+# how far a stuck proof looks; see [emit_passes]
+STUCK_BUDGET = 500
+
+# HOW MANY ROUNDS A MULTI-HART PROOF GETS, and it is a CAP on the damage
+# rather than a guess at what a case needs.  [VConcStep.cfinish] counts
+# ROUNDS, each of which is one instruction of every hart in the round -- so
+# a case's own `budget`, which is an instruction count from the old harness,
+# buys twice that many instructions here.  A run that reaches the DONE flag
+# stops at once and this costs nothing; a run that does NOT reach it burns
+# the whole budget, and at ~12ms an instruction conc_sb's 20000 was eight
+# MINUTES of compile for a proof that then fails.  1500 rounds is 3000
+# instructions, comfortably past every case that finishes, and a failure
+# now costs seconds.
+CONC_ROUNDS = 1500
+
+
+def verdict_of_file(mod, pl):
+    """Which way a generated proof claims the run passes, read off its
+    MODULE ASCRIPTION -- [TEST_PASSES_AGREE] or [TEST_PASSES_STUCK].
+
+    BOTH ARE PASSES.  They say different things, though: "agree" is that the
+    model exhibits what the platform produced, "stuck" that this test's
+    execution reaches a thread the RELATION cannot step from -- sound (a
+    state the model cannot leave is one no proof can reach) but mentioning
+    the observation nowhere.  The two module types differ in exactly that:
+    the stuck one takes no run at all, because there is no observation in
+    its statement.  Reading the ascription, rather than a comment, means the
+    report cannot drift from what was proved."""
+    p = rp(mod + "Pass.v", pl)
+    if not os.path.exists(p):
+        return None
+    body = open(p).read()
+    if "TEST_PASSES_STUCK" in body:
+        return "stuck"
+    if "TEST_PASSES_AGREE" in body:
+        return "agree"
+    return None
+
+
+def parse_csched(spec):
+    """The per-observation INTERLEAVINGS of a multi-hart case.
+
+    A race has one legal execution per outcome the hardware showed, and the
+    model must have each -- so a case gives ONE SCHEDULE PER OBSERVATION,
+    in the order the capture lists them, and the proof pairs them off.  One
+    schedule applied to every observation is what the first cut did and it
+    is wrong for any case that observed more than one thing.
+
+    Syntax, semicolons between schedules and commas inside one:
+
+        csched=20*0,23*1,33*0;20*0,23*1,11*0s
+
+    [count*hart] is [count] whole instructions of that hart, run-length
+    encoded because an alignment prefix is a hundred instructions long and
+    nobody should read that as a list of bits.  A trailing `s` marks the
+    stretch STALE: its loads read at the LOWEST view the model admits
+    rather than at the top of the log, which is where the other hart's
+    later store is invisible.  That is store buffering's (0,0) and it is
+    the only reason the driver carries the write log at all; everything
+    else reads fresh, which is the strongest read TSO allows.
+
+    Returns a list of Rocq expressions, or [] when the case names no
+    schedule -- which is not the same as naming the empty one: it means
+    "round-robin from the start", the same schedule for every
+    observation."""
+    out = []
+    for sched in spec.split(";"):
+        sched = sched.strip()
+        parts = []
+        for grp in sched.split(","):
+            grp = grp.strip()
+            if not grp:
+                continue
+            n, _, h = grp.partition("*")
+            h = h.strip()
+            stale = h.endswith("s")
+            hart = h[:-1] if stale else h
+            parts.append("replicate %d (%s, %s)"
+                         % (int(n), "true" if hart == "1" else "false",
+                            "true" if stale else "false"))
+        out.append(("(" + " ++ ".join(parts) + ")%list") if parts else "[]")
+    return out
+
+
+def platform_knob(cfg, k, pl):
+    """A model-side knob that can differ PER PLATFORM, because the machines
+    differ: `ipol_cva6=stale` says CVA6's fetch was stale where QEMU's was
+    fresh.  `<k>_hw` is the board's older spelling of `<k>_jh7110`."""
+    for key in ("%s_%s" % (k, pl),) + (("%s_hw" % k,) if pl == "jh7110" else ()):
+        if cfg.get(key):
+            return cfg[key]
+    return cfg[k]
+
+
+def emit_passes(built=None, reset=False):
+    """One proof per RUN, in ONE of the two forms.
+
+    NOT [first [agree | stuck]]: that pays for the agree branch and then the
+    stuck branch on every stuck test, and a run of twenty thousand steps is
+    minutes either way.  Each file does ONE computation, and which one is
+    recorded in its header.
+
+    [built] is the set of "<PLAT>/<Mod>" that DID compile; everything else
+    is re-emitted in the other form.  That is how the build classifies a
+    run -- emit [agree] for everything, build, flip what failed, build
+    again -- and it is passed IN rather than read off the local tree,
+    because the .vo live wherever the build ran, which is not here.
+    [reset] forces every proof back to [agree]."""
+    made, kept = [], []
+    for n in all_tests():
+        mod = modname(n)
+        cfg = config(n)
+        tick = "true" if str(cfg.get("tick", 0)) == "1" else "false"
+        budget = cfg["budget"]
+        # A STUCK PROOF DOES NOT NEED THE CASE'S BUDGET.  [run_no_step_at]
+        # quantifies the step count existentially: the proof needs only
+        # enough steps to REACH the stuck node, and a model that refuses an
+        # undecoded MMIO access does so within a few hundred instructions of
+        # boot.  Running the case's own budget instead would cost exactly
+        # what the agree form costs -- [eval_run_at] has to run the whole
+        # thing before it can answer "not stuck" -- so a slow case would be
+        # just as slow under this form, for nothing.  A test that only gets
+        # stuck later than this stays unproved, which understates.
+        stuck_budget = min(int(budget), STUCK_BUDGET)
+        conc_rounds = (int(cfg["crounds"]) if int(cfg["crounds"])
+                       else min(int(budget), CONC_ROUNDS))
+        lk = int(cfg["latch"]) if int(cfg["latch"]) else int(budget)
+        for pl in PLATFORMS:
+            if pl not in platforms_of(n):
+                continue
+            if not os.path.exists(rp(mod + "Run.v", pl)):
+                continue
+            if hand_written(mod + "Pass.v", pl):
+                kept.append(rrel(mod, pl)); continue
+            was = verdict_of_file(mod, pl)
+            v = "agree" if reset else (was or "agree")
+            if built is not None and was is not None \
+               and rrel(mod, pl) not in built:
+                v = "stuck" if was == "agree" else "agree"
+            conc = int(cfg["smp"]) > 1
+            spec = platform_knob(cfg, "csched", pl)
+            scheds = parse_csched(spec) if spec.strip() else []
+            picks = [q.strip() for q in cfg.get("picks", "").split(",") if q.strip()]
+            ipspec = platform_knob(cfg, "ipol", pl)
+            ipols = [("IStale" if q.strip() == "stale" else "IFresh")
+                     for q in ipspec.split(";") if q.strip()]
+            # ONE if/elif CHAIN, AND NOTHING BETWEEN ITS ARMS.  Twice now a
+            # new knob has been added as a fresh `if` with its own setup
+            # lines in front, which silently ends the chain: the later
+            # single-hart arm then runs too and overwrites [sig], so every
+            # multi-hart case was emitted with the single-hart theorem and
+            # burned its whole budget before failing.  Compute the knobs
+            # ABOVE, and keep the arms adjacent.
+            if v == "agree" and conc and scheds:
+                # ONE BLOCK PER OBSERVATION, paired with its own schedule,
+                # in the order the capture lists them.  Not [repeat]: that
+                # applies one schedule to every observation, which is right
+                # only for a case that observed one thing.
+                blocks = "\n".join(
+                    f"""    destruct Ho as [<-|Ho];
+      [ apply (conc2_shows {tick} {sc} {conc_rounds});
+        vm_compute; repeat split |].""" for sc in scheds)
+                sig = f"""Module {mod}Pass <: TEST_PASSES_AGREE {mod} {mod}Run.
+  Lemma agrees :
+    run_agrees {mod}.hart {mod}.text {mod}.regions
+               {mod}.uart_input {mod}.disk_init {mod}Run.observed.
+  Proof.
+    intros o Ho.
+    cbn [{mod}Run.observed {mod}Run.results fmap list_fmap] in Ho.
+{blocks}
+    destruct Ho.
+  Qed."""
+                imports = ("From VTest Require Import VConcStep.\n"
+                           f"From VTest.{PLATDIR[pl]} Require Import "
+                           f"{mod}Test {mod}Run.")
+                what = ("the model EXHIBITS every observation the platform\n"
+                        "   produced, each under an INTERLEAVING of the two harts\n"
+                        "   named for it -- which is what a race has and what the\n"
+                        "   single-hart theorem cannot state")
+            elif v == "agree" and conc:
+                # THE MULTI-HART FORM.  Run such a case through the
+                # single-hart theorem and the second hart never executes at
+                # all: the DONE flag is never published and the run burns
+                # its budget on a program that cannot finish.
+                sig = f"""Module {mod}Pass <: TEST_PASSES_AGREE {mod} {mod}Run.
+  Lemma agrees :
+    run_agrees {mod}.hart {mod}.text {mod}.regions
+               {mod}.uart_input {mod}.disk_init {mod}Run.observed.
+  Proof.
+    intros o Ho.
+    cbn [{mod}Run.observed {mod}Run.results fmap list_fmap] in Ho.
+    repeat (destruct Ho as [<-|Ho];
+            [ apply (conc2_shows {tick} [] {conc_rounds});
+              vm_compute; repeat split |]).
+    destruct Ho.
+  Qed."""
+                imports = ("From VTest Require Import VConcStep.\n"
+                           f"From VTest.{PLATDIR[pl]} Require Import "
+                           f"{mod}Test {mod}Run.")
+                what = ("the model EXHIBITS every observation the platform\n"
+                        "   produced, under an INTERLEAVING of the two harts --\n"
+                        "   which is what a race has and what the single-hart\n"
+                        "   theorem cannot state")
+            elif v == "agree" and not conc and ipols:
+                # ONE FETCH VIEW PER OBSERVATION.  A self-modifying-code
+                # case races a hart against ITSELF, so what varies between
+                # observations is not an interleaving but WHERE THE FETCH
+                # READS -- the top of the log, or the instruction view.
+                blocks = "\n".join(
+                    f"""    destruct Ho as [<-|Ho];
+      [ apply (icache_shows {q} {tick} {budget});
+        vm_compute; repeat split |].""" for q in ipols)
+                sig = f"""Module {mod}Pass <: TEST_PASSES_AGREE {mod} {mod}Run.
+  Lemma agrees :
+    run_agrees {mod}.hart {mod}.text {mod}.regions
+               {mod}.uart_input {mod}.disk_init {mod}Run.observed.
+  Proof.
+    intros o Ho.
+    cbn [{mod}Run.observed {mod}Run.results fmap list_fmap] in Ho.
+{blocks}
+    destruct Ho.
+  Qed."""
+                imports = ("From VTest Require Import VIcache VIcacheStep.\n"
+                           f"From VTest.{PLATDIR[pl]} Require Import "
+                           f"{mod}Test {mod}Run.")
+                what = ("the model EXHIBITS every observation the platform\n"
+                        "   produced, each under the FETCH VIEW named for it --\n"
+                        "   the top of the log, or the instruction view that\n"
+                        "   only fence.i raises")
+            elif v == "agree" and not conc and len(picks) > 1:
+                # ONE MODEL EXECUTION PER OBSERVATION, and here what varies
+                # is not an interleaving but WHICH IN-FLIGHT REQUEST THE
+                # DISK ANSWERS.  A case that declares several picks observed
+                # several completion orders and the model must have each;
+                # one pick applied to every observation can only ever
+                # exhibit one of them.
+                blocks = "\n".join(
+                    f"""    destruct Ho as [<-|Ho];
+      [ apply (run_shows {tick} {q} {lk} {budget});
+        vm_cast_no_check (eq_refl true) |].""" for q in picks)
+                sig = f"""Module {mod}Pass <: TEST_PASSES_AGREE {mod} {mod}Run.
+  Lemma agrees :
+    run_agrees {mod}.hart {mod}.text {mod}.regions
+               {mod}.uart_input {mod}.disk_init {mod}Run.observed.
+  Proof.
+    intros o Ho.
+    cbn [{mod}Run.observed {mod}Run.results fmap list_fmap] in Ho.
+{blocks}
+    destruct Ho.
+  Qed."""
+                imports = f"From VTest.{PLATDIR[pl]} Require Import {mod}Test {mod}Run."
+                what = ("the model EXHIBITS every observation the platform\n"
+                        "   produced, each under the disk completion order named\n"
+                        "   for it -- which is what a case with several picks has")
+            elif v == "agree":
+                sig = f"""Module {mod}Pass <: TEST_PASSES_AGREE {mod} {mod}Run.
+  Lemma agrees :
+    run_agrees {mod}.hart {mod}.text {mod}.regions
+               {mod}.uart_input {mod}.disk_init {mod}Run.observed.
+  Proof.
+    intros o Ho.
+    cbn [{mod}Run.observed {mod}Run.results fmap list_fmap] in Ho.
+    repeat (destruct Ho as [<-|Ho];
+            [ apply (run_shows {tick} lowest_head {lk} {budget});
+              vm_cast_no_check (eq_refl true) |]).
+    destruct Ho.
+  Qed."""
+                imports = f"From VTest.{PLATDIR[pl]} Require Import {mod}Test {mod}Run."
+                what = ("the model EXHIBITS every observation the platform\n"
+                        "   produced, from this test's own configuration")
+            else:
+                sig = f"""Module {mod}Pass <: TEST_PASSES_STUCK {mod}.
+  Lemma no_step :
+    run_no_step_at {mod}.hart {mod}.text {mod}.regions
+                   {mod}.uart_input {mod}.disk_init.
+  Proof.
+    apply (run_no_step {tick} lowest_head {lk} {stuck_budget}).
+    vm_cast_no_check (eq_refl true).
+  Qed."""
+                imports = f"From VTest.{PLATDIR[pl]} Require Import {mod}Test."
+                what = ("this test's execution reaches a thread the RELATION\n"
+                        "   cannot step from.  A pass, and a real one -- a state the\n"
+                        "   model cannot leave is one no proof can reach -- but it\n"
+                        "   says NOTHING about what the platform observed, which is\n"
+                        "   why this module type takes no run")
+            rocq_mkdirs()
+            open(rp(mod + "Pass.v", pl), "w").write(
+f"""(* {PLATDIR[pl]}/{mod}Pass.v -- GENERATED by tools/vtest.  Do not edit.
+
+   The proof for the run of case [{n}] on platform [{pl}].  What is proved
+   is a statement about [RiscvLang.prim_step]; [VExecStep] is what carries a
+   computation of the interpreter to it.
+
+   THIS RUN PASSES BECAUSE {what}. *)
+From Stdlib Require Import List ZArith.
+From stdpp Require Import base list.
+Import ListNotations.
+From VTest Require Import VTest VRun VExecStep.
+{imports}
+
+{sig}
+End {mod}Pass.
+""")
+            made.append("%s (%s)" % (rrel(mod, pl), v))
+    if kept:
+        print("kept %d hand-written proof(s): %s" % (len(kept), " ".join(kept)))
+    return made
+
+
+# The model side that is not per-case: the harness, the run framework, and
+# VModelFacts -- the universally quantified statements about the model that
+# no capture comparison can express, which is why they outlived the per-case
+# files they came from.
+# The model side that is not per-case.  VRunConc.v and VIcache.v are NOT
+# here: they are written against the old [TEST_RUN] and carry an OFF THE
+# BUILD header saying so.
+HARNESS = ["VSched.v", "VExecStuck.v", "VTest.v", "VTso.v", "VBoot.v", "VConc.v",
+           "VNode.v", "VExecStep.v", "VConcStep.v", "VIcache.v", "VIcacheStep.v",
+           "VRun.v", "VModelFacts.v"]
+
+PROJECT_HEAD = """-R . VTest
+-R ../iris xv6iris
+-R ../model-xv6iris Riscv
+-R ../kernel-rocq Kernel
+-arg -w
+-arg -notation-overridden
+# a quotation in a comment must not swallow a `*)` (tools/comment_quote_check.py)
+-arg -w
+-arg +comment-terminator-in-string
+# two notations sharing a prefix at different levels leave one unparseable
+-arg -w
+-arg +notation-incompatible-prefix
+# a nat literal of 5000+ is meant to be an of_num_uint term, not unary
+-arg -w
+-arg -abstract-large-number
+"""
+
+
+
+def write_project(from_build=False):
+    """Regenerate vtest-rocq/_CoqProject.
+
+    THE PROJECT IS THE GREEN SET, and it is also the RECORD of which runs
+    pass: `make vtest-check` requires everything listed to compile, so a run
+    whose proof does not hold is simply not listed.  There is no second file
+    saying the same thing.
+
+    Which Pass modules to list comes from one of two places:
+
+      * by default, the ones ALREADY listed -- so regenerating after adding
+        a case, or after taking a new capture, is idempotent and cannot
+        silently drop a proof that still holds;
+      * with [from_build], the ones with a .vo on disk, which is what
+        `make vtest-try` leaves behind.  That is how a newly-passing run
+        gets ADDED, and how one that stopped passing gets removed.
+
+    Everything else -- which runs exist at all -- is read off the tree.
+
+    THERE IS NO LEGACY TIER.  Every case is expressed as a run through a
+    VRun builder; what a per-case <Name>.v used to say about a capture, its
+    Run and Pass modules now say uniformly, and what it said about the MODEL
+    ITSELF (the universally quantified lemmas, the ones a capture
+    comparison cannot express) lives in VModelFacts.v."""
+    # EVERY PATH LISTED IS RELATIVE TO vtest-rocq/ and carries its platform
+    # directory; coq_makefile takes the subdirectories as they come.  ORDER:
+    # the shared harness and interleavings first, then each platform's
+    # captures, runs and proofs -- which is also how they are read.
+    top = rocq_listdir()
+    # a file carrying an OFF THE BUILD header is kept in the tree and left
+    # out of the project, which is how this repo parks something unported
+    def on_build(f):
+        p = rp(f)
+        return os.path.exists(p) and "OFF THE BUILD" not in open(p).read(600)
+    shared = ([h for h in HARNESS if on_build(h)]
+              + sorted(f for f in top
+                       if f.endswith("Sched.v") and f != "VSched.v"
+                       and on_build(f)))
+    files, passes = [rrel(f) for f in shared], []
+    for pl in PLATFORMS:
+        here = rocq_listdir(pl)
+        gens = sorted(f for f in here if f.endswith("Test.v"))
+        runs = sorted(f for f in here if f.endswith("Run.v"))
+        if from_build is True or from_build == pl:
+            ok = {f[:-len("Pass.vo")] for f in here if f.endswith("Pass.vo")}
+        else:
+            ok = _passing(pl)
+        mine = sorted(f for f in here
+                      if f.endswith("Pass.v") and f[:-len("Pass.v")] in ok)
+        files += [rrel(f, pl) for f in gens + runs + mine]
+        passes += [rrel(f, pl) for f in mine]
+    open(os.path.join(ROCQDIR, "_CoqProject"), "w").write(
+        PROJECT_HEAD + "\n".join(files) + "\n")
+    # ...and the ATTEMPT project: everything, including the Pass modules the
+    # green set leaves out.  coq_makefile only emits rules for files it is
+    # given, so a proof that is not listed anywhere cannot even be TRIED --
+    # which is how "is this still failing?" would become unanswerable.
+    every = [rrel(f) for f in shared]
+    for pl in PLATFORMS:
+        every += [rrel(f, pl) for f in rocq_listdir(pl) if f.endswith(".v")]
+    open(os.path.join(ROCQDIR, "_CoqProject.all"), "w").write(
+        PROJECT_HEAD + "\n".join(every) + "\n")
+    return files, [], passes
+
+
+def _built_at_all():
+    """Has anything been compiled here?  With no build there are no .vo to
+    read, and the table would call every run a failure; say "unbuilt"
+    instead of lying in either direction."""
+    return any(f.endswith("Pass.vo")
+               for pl in PLATFORMS for f in rocq_listdir(pl))
+
+
+def _passing(platform):
+    """The runs whose proof compiles.
+
+    THE PROJECT IS THE RECORD.  A Pass module is listed in _CoqProject
+    exactly when it holds, and `make vtest-check` -- which CI runs -- fails
+    if anything listed does not compile.  So membership already IS the
+    passing set, and a second file saying the same thing could only drift
+    from it."""
+    p = os.path.join(ROCQDIR, "_CoqProject")
+    if not os.path.exists(p):
+        return set()
+    pfx = PLATDIR[platform] + "/"
+    return {l.strip()[len(pfx):-len("Pass.v")] for l in open(p)
+            if l.strip().endswith("Pass.v") and l.strip().startswith(pfx)}
+
+
+def _run_state(n, pl):
+    """The ONE state of (case, platform).  Four of them, and each says
+    something a reader can act on:
+
+      pass (agrees)  the model exhibits what this platform produced
+      pass (stuck)   this test's execution reaches a thread the relation
+                     cannot step from -- also a pass, but it claims nothing
+                     about the observation
+      no proof       there is a run and no proof of it
+      --             the case does not declare this platform
+
+    THE TWO THAT WENT.  "no builder" meant the capture existed but nothing
+    knew how to make a run module from it, which was an artefact of the old
+    Gen -> Run derivation; a capture is now written as its Test AND its Run
+    together, so it cannot happen, and if it did it would just be no proof.
+    "not captured" meant a case declared a platform it had never run on --
+    which is not a state, it is a case whose `platforms=` is wrong, and it
+    is fixed where it is wrong."""
+    if pl not in platforms_of(n):
+        return "excluded"
+    mod = modname(n)
+    if not os.path.exists(rp(mod + "Run.v", pl)):
+        return "no-proof"
+    # THE .vo IS THE EVIDENCE.  Membership in _CoqProject is only an
+    # ASSERTION that the proof holds -- a Pass.v listed there that does not
+    # actually compile would read as "pass" until a build caught it, i.e.
+    # the table would be reporting its own bookkeeping back.  Only a .vo
+    # says coqc accepted the proof, so CI generates the table AFTER the
+    # build and this reads the artefact.
+    if os.path.exists(rp(mod + "Pass.vo", pl)):
+        return verdict_of_file(mod, pl) or "pass"
+    if not _built_at_all():
+        return "unbuilt" if mod in _passing(pl) else "no-proof"
+    return "no-proof"
+
+
+_MD = {"pass":     "**pass**",
+       "agree":    "**pass** (agrees)",
+       "stuck":    "**pass** (stuck)",
+       "unbuilt":  "*not built*",
+       "no-proof": "no proof",
+       "excluded": "—"}
+_TXT = {"pass": "PASS", "agree": "PASS agrees", "stuck": "PASS stuck",
+        "unbuilt": "not built", "no-proof": "no proof", "excluded": "--"}
+
+
+def print_table(fmt="text"):
+    """THE SINGLE TABLE: every case, its run on each platform, and whether
+    that run has a passing proof.
+
+    Everything is read off the tree -- the case's own directive, whether a
+    run module exists, whether its proof compiles --
+    so it cannot drift."""
+    rows = [(n,) + tuple(_run_state(n, pl) for pl in PLATFORMS)
+            for n in all_tests()]
+    heads = [PLATDIR[pl] for pl in PLATFORMS]
+    if fmt == "md":
+        print("## Device conformance: every case, every run\n")
+        print("| case | " + " | ".join(heads) + " |")
+        print("|---" * (len(heads) + 1) + "|")
+        for r in rows:
+            print("| `%s` | " % r[0] + " | ".join(_MD[v] for v in r[1:]) + " |")
+    else:
+        w = max(len(r[0]) for r in rows)
+        rule = "-" * (w + 16 * len(PLATFORMS))
+        print("%-*s" % (w, "case") + "".join(" | %-13s" % pl for pl in PLATFORMS))
+        print(rule)
+        for r in rows:
+            print("%-*s" % (w, r[0]) + "".join(" | %-13s" % _TXT[v] for v in r[1:]))
+        print(rule)
+    def c(i, v): return sum(1 for r in rows if r[i] == v)
+    if any("unbuilt" in r[1:] for r in rows):
+        print("\nNOTE: nothing is built here, so `not built` means the proof "
+              "is listed in _CoqProject but has not been checked in this "
+              "tree.  CI generates this table AFTER the build, where every "
+              "verdict is a .vo.")
+    # BOTH VERDICTS ARE PASSES; the split says what each one claims.
+    def npass(i): return c(i, "pass") + c(i, "agree") + c(i, "stuck")
+    line = "%d cases.  " % len(rows) + "  ".join(
+        "%s: %d pass (%d agree, %d stuck), %d no proof, %d excluded."
+        % (PLATDIR[pl], npass(i), c(i, "agree"), c(i, "stuck"),
+           c(i, "no-proof"), c(i, "excluded"))
+        for i, pl in enumerate(PLATFORMS, 1))
+    if fmt == "md":
+        print("\n" + line)
+        print("""
+| state | meaning |
+|---|---|
+| **pass** (agrees) | the model EXHIBITS every observation this platform produced, from the test's own configuration |
+| **pass** (stuck) | this test's execution reaches a thread the RELATION cannot step from.  Also a pass, and a real one — a state the model cannot leave is one no proof can reach, so it costs REACH and not soundness — but it says nothing about what the platform observed |
+| no proof | there is a run and no proof of it |
+| — | the case does not declare this platform: the question cannot be asked there (no disk on the board, a program the board traps on) |""")
+    else:
+        print(line)
+
+
+def lit(bs, per=20):
+    """A byte list as Rocq source, wrapped so a 4 KB region is readable in a
+    diff rather than one enormous line."""
+    xs = [str(b) for b in bs]
+    rows = ["; ".join(xs[i:i+per]) for i in range(0, len(xs), per)]
+    return ";\n   ".join(rows)
+
+
+def gen(r, alts=None, hart=0):
+    """alts: every DISTINCT result region observed, sorted, when the test is
+    nondeterministic on the QEMU side.
+
+    [hart] is the HART VARIANT.  0 is the plain capture this suite has always
+    written; anything else is the same source built with PRIMARY_HART=<hart>
+    and run under -smp <hart+1>, captured as <Name>Hart<N>Gen.v with its own
+    <name>_hartN_ definitions.  See "Running a test on a hart that is not 0"
+    in README.md for why that is a different program and not just a different
+    schedule."""
+    rocq_mkdirs()
+    mod, low = modname(r["name"]), r["name"]
+    # A RE-CAPTURE ADDS.  See merge_observations: a racy case's value is the
+    # SET of outcomes ever seen, and overwriting can silently throw away the
+    # rare one that made the case a finding.
+    vmod = mod if hart == 0 else "%sHart%d" % (mod, hart)
+    if alts:
+        alts, _note = merge_observations(rp(vmod + "Run.v", "qemu"),
+                                         rp(vmod + "Test.v", "qemu"),
+                                         r["text"], alts, force=FORCE[0])
+        alts = [list(a) for a in alts]
+        print("  captures: %s" % _note)
+    low  = low if hart == 0 else "%s_hart%d" % (low, hart)
+    disk = ";\n   ".join("(%d, [%s])" % (i, lit(b)) for i, b in r["disk"]) or ""
+    alts = alts or [bytes(r["result"])]
+    sers = [lit(s) for s in r.get("serials", [r["serial"], b""])]
+    results = ";\n     ".join("[%s]" % lit(a) for a in alts)
+    return emit_capture("qemu", vmod, r["name"], hart, lit(r["text"]),
+                        results, sers[0], disk, serial1=sers[1])
+
+
+def emit_capture(platform, vmod, case, hart, text, results, serial, disk,
+                 serial1=""):
+    """Write a capture as the TWO files it is: the TEST (the experiment --
+    the image, the hart, the mapped memory, the input) and the RUN (the
+    measurement -- what came back, on all three channels).
+
+    THERE IS NO THIRD FILE.  A capture used to be written as <Name>Gen.v and
+    then re-presented as a run module, which duplicated the image and left
+    the capture itself required by nothing.  The test and the run ARE the
+    capture, split where the meaning splits.
+
+    A Test and a Run are written for EVERY captured run.  Whether a Pass
+    proof exists for one is a separate question, and the table answers it.
+
+    NOTHING IS WRITTEN FOR A RUN THAT OBSERVED NOTHING.  [run_agrees]
+    quantifies over the observations, so an empty one is vacuously true and
+    its proof asserts nothing -- see TEST_RUN's [observed_ne].  A platform
+    that could not produce a result for this case has no run, and a case
+    with no run has no proof; that is a gap the table should show, not one
+    a green tick should paper over."""
+    PL = PLATDIR[platform]
+    # A HAND-WRITTEN Test or Run SURVIVES REGENERATION.  [emit_passes] has
+    # always honoured [hand_written]; this did not, and that is how
+    # QEMU/PlicLevelRun.v -- hand-written with a device schedule, because no
+    # builder computed what that run needed -- was silently overwritten.
+    for f in (vmod + "Test.v", vmod + "Run.v"):
+        if os.path.exists(rp(f, platform)) and hand_written(f, platform):
+            print("  == %s/%s: HAND-WRITTEN, left alone" % (PL, f))
+            return rp(vmod + "Test.v", platform)
+    if not results.strip() or results.strip() == "[]":
+        for f in (vmod + "Test.v", vmod + "Run.v", vmod + "Pass.v"):
+            if os.path.exists(rp(f, platform)) and not hand_written(f, platform):
+                os.remove(rp(f, platform))
+        print("  !! %s/%s: NO OBSERVATION -- no run written" % (PL, vmod))
+        return None
+    rocq_mkdirs()
+    try:
+        regions, cfg = regions_of(case), config(case)
+        # WHAT THE HOST TYPED, AND AT WHICH PORT.  The model's input is a
+        # list of (port, byte) pairs -- [VRun]'s [uart_input] -- because a
+        # byte arriving is a schedule choice at ONE port, and a run that
+        # delivered it to the other would otherwise satisfy the theorem.
+        # Port 0's bytes first, then port 1's: no case feeds both, and the
+        # day one does it will want to say the interleaving itself.
+        uin = "[" + "; ".join(
+            "(%s, Z_to_bv 8 %s)" % (port, b.strip())
+            for port, spec in (("Uart0", cfg.get("serial_in", "")),
+                               ("Uart1", cfg.get("serial1_in", "")))
+            for b in spec.split(",") if b.strip()) + "]"
+    except Exception:
+        regions, uin = "std_regions", "[]"
+    open(rp(vmod + "Test.v", platform), "w").write(
+f"""(* {PL}/{vmod}Test.v -- GENERATED by tools/vtest.  Do not edit: run
+   `make vtest` to regenerate.
+
+   THE TEST: the image tools/vtest/tests/{case}.S was built to, the hart it
+   ran on, the memory that was mapped, and what it was given.  This is the
+   EXPERIMENT; what came back is in {vmod}Run.v.
+
+   THE HART IS {hart}, and it is not a label: [ColdBoot.cold_regs] is
+   parametric in it and the program reads [mhartid], so a model started on
+   a different one computes a different stack slot and goes stuck. *)
+From Stdlib Require Import List ZArith String.
+From stdpp Require Import base list gmap bitvector.definitions.
+Import ListNotations.
+From VTest Require Import VTest VRun.
+Local Open Scope Z_scope.
+
+Module {vmod} <: TEST.
+  Definition name       := "{case}"%string.
+  Definition platform   := "{platform}"%string.
+  Definition hart       : Z := {hart}.
+  Definition regions    : list region := {regions}.
+  Definition uart_input : list (uart_id * bv 8) := {uin}.
+  Definition disk_init  : list (Z * list Z) := [].
+
+  Definition text : list Z :=
+    [{text}].
+End {vmod}.
+""")
+    open(rp(vmod + "Run.v", platform), "w").write(
+f"""(* {PL}/{vmod}Run.v -- GENERATED by tools/vtest.  Do not edit: run
+   `make vtest` to regenerate.
+
+   THE RUN: what the platform produced, on all three channels -- the whole
+   result region untrimmed, the bytes that left EACH UART, and the disk it
+   ended with.  More than one observation means the hardware itself has
+   more than one legal execution here, and the model must have each.
+
+   ONE WIRE PER PORT, ALWAYS BOTH.  [o_uart] is a list indexed by
+   [enum uart_id], so the claim it feeds is TOTAL over the ports: it says
+   what BOTH wires hold, and a byte the model put on the wrong port is a
+   violation rather than something nobody looked at.  A case with one port
+   -- which is most of them -- has [o_serial1] empty, and that empty list
+   is an observation like any other. *)
+From Stdlib Require Import List ZArith.
+From stdpp Require Import base list gmap bitvector.definitions.
+Import ListNotations.
+From VTest Require Import VTest VRun.
+From VTest.{PL} Require Import {vmod}Test.
+Local Open Scope Z_scope.
+
+Module {vmod}Run <: TEST_RUN {vmod}.
+  Definition o_serial  : list Z := [{serial}].
+  Definition o_serial1 : list Z := [{serial1}].
+  Definition o_sectors : list (Z * list Z) := [{disk}].
+
+  Definition results : list (list Z) :=
+    [{results}].
+
+  Definition observed : list observation :=
+    (fun r => Obs r [o_serial; o_serial1] o_sectors) <$> results.
+
+  (* the run is non-empty; see TEST_RUN's [observed_ne] *)
+  Lemma observed_ne : observed <> [].
+  Proof. vm_compute. discriminate. Qed.
+End {vmod}Run.
+""")
+    return rp(vmod + "Test.v", platform)
+
+
+# --------------------------------------------------------------- reshape ----
+
+def _field(body, pat):
+    """The bracketed literal of one generated definition, verbatim.
+
+    The captures are read back as SOURCE TEXT and written out again
+    unchanged, so a reshape moves the bytes and never re-formats them: a
+    Test module regenerated from its own capture must come out
+    byte-identical, which is the check that a shape change did not silently
+    perturb 200 images."""
+    m = re.search(pat + r"\s*:=\s*\[(.*?)\]\.", body, re.S)
+    return m.group(1) if m else None
+
+
+def reshape_captures():
+    """REWRITE EVERY CHECKED-IN CAPTURE IN THE CURRENT SHAPE, WITHOUT QEMU.
+
+    A capture is data -- the image, what came back on each channel -- and
+    the Test/Run modules are one RENDERING of it.  When the rendering
+    changes (a second UART wire, say) every module in the tree has to follow
+    or the build is half in each shape, and re-running QEMU to get there
+    would be re-MEASURING when nothing was measured: the old numbers are the
+    same numbers.  So this reads each pair back, pulls the data out of it,
+    and re-emits both files through [emit_capture] -- the one place that
+    knows the shape.
+
+    A field the old rendering did not have comes out EMPTY, which is the
+    honest value: a one-port machine's second wire carried nothing.
+
+    Hand-written modules are left alone, as everywhere else."""
+    made, skipped = [], []
+    for pl in PLATFORMS:
+        for f in rocq_listdir(pl):
+            if not f.endswith("Test.v"):
+                continue
+            vmod = f[:-len("Test.v")]
+            rf = rp(vmod + "Run.v", pl)
+            if not os.path.exists(rf):
+                continue
+            if hand_written(f, pl) or hand_written(vmod + "Run.v", pl):
+                skipped.append(rrel(vmod, pl)); continue
+            tb, rb = open(rp(f, pl)).read(), open(rf).read()
+            case = re.search(r'Definition name\s*:=\s*"(.*?)"', tb)
+            hart = re.search(r"Definition hart\s*: Z\s*:=\s*(-?\d+)", tb)
+            text = _field(tb, r"Definition text\s*: list Z")
+            results = _field(rb, r"Definition results\s*: list \(list Z\)")
+            if not (case and hart and text is not None and results is not None):
+                skipped.append(rrel(vmod, pl)); continue
+            ser  = _field(rb, r"Definition o_serial\s*: list Z") or ""
+            ser1 = _field(rb, r"Definition o_serial1\s*: list Z") or ""
+            disk = _field(rb, r"Definition o_sectors\s*: list \(Z \* list Z\)") or ""
+            emit_capture(pl, vmod, case.group(1), int(hart.group(1)),
+                         text, results, ser, disk, serial1=ser1)
+            made.append(rrel(vmod, pl))
+    if skipped:
+        print("left alone: %s" % " ".join(skipped))
+    return made
+
+
+# ------------------------------------------------------------------ main ----
+
+def repeat(name, n, drive_opts, smp=1):
+    """Run a test n times and report the DISTINCT observations.
+
+    The model must admit every execution the hardware has, so a test whose
+    QEMU-side result varies between runs is not one capture but several, and
+    each needs a model schedule that reproduces it.  This is how the suite
+    looks for that -- notably for completion ORDER, which the model fixes to
+    publication order and a real device does not have to."""
+    seen = {}
+    for _ in range(n):
+        r = run(name, drive_opts=drive_opts, smp=smp)
+        key = (bytes(r["result"]), tuple((i, bytes(b)) for i, b in r["disk"]),
+               tuple(bytes(s) for s in r["serials"]))
+        seen.setdefault(key, 0)
+        seen[key] += 1
+    return seen
+
+PLATFORMS = ["qemu", "jh7110", "cva6"]
+
+
+def platforms_of(name):
+    """The platforms this CASE declares itself meaningful on."""
+    v = config(name).get("platforms", "qemu,jh7110,cva6").strip()
+    if v in ("none", ""):
+        return []
+    return [p for p in v.split(",") if p in PLATFORMS]
+
+
+def all_tests():
+    return sorted(f[:-2] for f in os.listdir(TESTDIR) if f.endswith(".S"))
+
+
+def cases_for(platform):
+    """The cases that declare themselves meaningful on [platform]."""
+    return [t for t in all_tests() if platform in platforms_of(t)]
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("cmd", choices=["list", "build", "run", "gen", "runs",
+                                   "table", "passes", "project"])
+    p.add_argument("names", nargs="*")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--repeat", type=int, default=0,
+                   help="run N times and report distinct observations")
+    p.add_argument("--drive-opts", default="cache=writeback",
+                   help="extra -drive options, e.g. aio=threads,cache=none")
+    p.add_argument("--built", metavar="FILE",
+                   help="file listing the <PLAT>/<Mod> whose proof compiled; "
+                        "every other proof is re-emitted in the OTHER "
+                        "verdict.  This is how the build classifies a run: "
+                        "emit agree, build, flip what failed, build again.")
+    p.add_argument("--reset", action="store_true",
+                   help="force every generated proof back to [agree]")
+    p.add_argument("--from-build", action="store_true",
+                   help="take the passing set from the .vo on disk (what "
+                        "`make vtest-try` leaves) rather than from the "
+                        "project's current membership")
+    p.add_argument("--force", action="store_true",
+                   help="REPLACE the stored observations instead of adding "
+                        "to them.  A re-capture normally UNIONS with what is "
+                        "already on disk, so re-running a case cannot lose a "
+                        "rare outcome somebody spent many runs catching; pass "
+                        "this only when the stored capture is known bad.")
+    p.add_argument("--from-build-platform", metavar="PLAT",
+                   help="--from-build for ONE platform only (e.g. cva6): its "
+                        "proofs are taken from the .vo on disk, every other "
+                        "platform keeps its current listing.  For a build "
+                        "that checked one platform's runs and not the rest.")
+    p.add_argument("--check", action="store_true",
+                   help="exit nonzero if anything listed in _CoqProject has "
+                        "no .vo, i.e. did not compile")
+    p.add_argument("--format", choices=["text", "md"], default="text",
+                   help="md emits a GitHub-flavoured markdown table")
+    p.add_argument("--hart", type=int, default=0,
+                   help="run _vtest_body on this hart instead of 0.  Builds a "
+                        "SEPARATE image (PRIMARY_HART=N) and runs it under "
+                        "-smp N+1; the capture is <Name>Hart<N>Gen.v.")
+    a = p.parse_args()
+    FORCE[0] = a.force
+    if a.cmd == "list":
+        print("\n".join(all_tests())); return
+    if a.cmd == "runs":
+        # REBUILD THE RUN MODULES FROM THE CHECKED-IN CAPTURES, and NOT from
+        # QEMU: the numbers are already in the tree, and re-running the
+        # hardware to change the SHAPE of a file would be re-measuring
+        # something nobody re-measured.  [reshape_captures] reads each
+        # Test/Run pair back and writes both out through the one emitter, so
+        # the whole tree is in whatever shape that emitter has today.
+        shaped = reshape_captures()
+        made = emit_passes()
+        print("reshaped %d capture(s) from the tree; wrote %d proof(s)"
+              % (len(shaped), len(made)))
+        return
+    if a.cmd == "table":
+        print_table(a.format)
+        if not a.check:
+            return
+        # THE VERDICT, from the same artefacts the table just read.  Every
+        # file in _CoqProject is asserted to compile -- that is what listing
+        # it means -- so a listed .v with no .vo is a failure, and there is
+        # no second pass over the build log to disagree with the table.
+        proj = os.path.join(ROCQDIR, "_CoqProject")
+        red = [l.strip() for l in open(proj)
+               if l.strip().endswith(".v")
+               and not os.path.exists(os.path.join(ROCQDIR, l.strip() + "o"))]
+        if red:
+            print("\n**%d file(s) in _CoqProject did not compile:** %s"
+                  % (len(red), ", ".join(red)))
+            sys.exit(1)
+        return
+    if a.cmd == "project":
+        files, _, passes = write_project(a.from_build_platform or a.from_build)
+        print("_CoqProject: %d files (%d run proofs)" % (len(files), len(passes)))
+        return
+    if a.cmd == "passes":
+        built = None
+        if a.built:
+            # accept "<PLAT>/<Mod>", "<PLAT>/<Mod>Pass", "<PLAT>/<Mod>Pass.v"
+            # or the .vo -- the caller is usually piping an ls
+            def norm(x):
+                x = x.strip()
+                for suf in (".vo", ".v"):
+                    if x.endswith(suf):
+                        x = x[:-len(suf)]
+                if x.endswith("Pass"):
+                    x = x[:-len("Pass")]
+                return x
+            built = {norm(l) for l in open(a.built) if l.strip()}
+        made = emit_passes(built=built, reset=a.reset)
+        print("wrote %d per-run Pass file(s)" % len(made))
+        for m in made:
+            if "(stuck)" in m:
+                print("  stuck: %s" % m.split(" ")[0])
+        return
+    names = all_tests() if a.all else a.names
+    if not names: sys.exit("name a test, or pass --all")
+    for n in names:
+        if a.cmd == "build":
+            _, t = build(n); print(f"{n}: {len(t)} text bytes")
+        elif a.cmd == "gen":
+            cfg = config(n)
+            reps = a.repeat or cfg["repeat"]
+            # SEVERAL BACKEND CONFIGURATIONS, not just one.  Whether QEMU
+            # reorders two in-flight requests depends on the backend, and no
+            # single configuration reliably shows BOTH orders -- so a test
+            # that is about nondeterminism names the configurations that
+            # between them exhibit its executions, and the capture is their
+            # union.  Without this, `make vtest-gen` is itself flaky.
+            drives = (cfg["drives"] if a.drive_opts == "cache=writeback"
+                      else a.drive_opts).split(";")
+            seen = {}
+            for opts in drives:
+                for _ in range(reps):
+                    rr = run(n, drive_opts=opts, smp=cfg["smp"], hart=a.hart)
+                    seen.setdefault(bytes(rr["result"]), rr)
+            disks = {tuple((i, bytes(b)) for i, b in rr["disk"]) for rr in seen.values()}
+            if len(disks) != 1:
+                sys.exit(f"{n}: the runs disagree on the DISK too ({len(disks)} "
+                         f"variants); <name>_qemu_disk cannot represent that yet")
+            alts = sorted(seen.keys())
+            r = seen[alts[0]]
+            print(f"{n}: {reps}x{len(drives)} runs {drives} -> "
+                  f"{len(alts)} distinct result(s), "
+                  f"sectors changed: {[i for i,_ in r['disk']] or 'none'}")
+            print("  ->", os.path.relpath(gen(r, alts, hart=a.hart), ROOT))
+            # ...and the uniform RUN MODULE, which is what VRun's theorem is
+            # stated over.  <Name>Gen.v above is the raw capture; the run
+            # module is the capture in the form the theorem is about.
+            # [gen] wrote the Test and the Run; the observations it merged
+            # are already in the Run, so nothing re-derives them.  (This is
+            # what the old two-step got wrong: one `gen conc_sb --repeat 1`
+            # left the capture with all four outcomes and the run module
+            # with one, losing the (0,0) that IS finding 24.)
+            print("  ->", os.path.relpath(
+                rp(modname(n) + "Run.v", "qemu"), ROOT))
+        elif a.repeat:
+            seen = repeat(n, a.repeat, a.drive_opts, config(n)["smp"])
+            print(f"{n}: {a.repeat} runs [{a.drive_opts}] -> "
+                  f"{len(seen)} distinct observation(s)")
+            for k, (key, cnt) in enumerate(sorted(seen.items(), key=lambda kv: -kv[1])):
+                res = key[0]
+                words = " ".join(f"{int.from_bytes(res[o:o+4],'little'):#010x}"
+                                 for o in range(4, 68, 4))
+                print(f"  [{k}] x{cnt}  sectors={[i for i,_ in key[1]]}")
+                print(f"        +4..+64: {words}")
+        else:
+            r = run(n, drive_opts=a.drive_opts, smp=config(n)["smp"], hart=a.hart)
+            print(f"{n}: DONE in {r['ms']:.0f} ms, "
+                  f"serial={'/'.join(str(len(s)) for s in r['serials'])}B, status="
+                  f"0x{int.from_bytes(r['result'][4:8],'little'):08x}, "
+                  f"sectors changed: {[i for i,_ in r['disk']] or 'none'}")
+
+
+if __name__ == "__main__":
+    main()

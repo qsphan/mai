@@ -1,0 +1,478 @@
+(* SpecKfork.v -- the public interface of kfork() (kernel/proc.c), stated
+   independently of its proof.
+
+     int kfork(void) {
+       int i, pid;
+       struct proc *np;
+       struct proc *p = myproc();
+
+       if ((np = allocproc()) == 0) { return -1; }
+
+       if (uvmcopy(p->pagetable, np->pagetable, p->sz) < 0) {
+         freeproc(np); release(&np->lock); return -1;
+       }
+       np->sz = p->sz;
+
+       *(np->trapframe) = *(p->trapframe);
+       np->trapframe->a0 = 0;
+
+       for (i = 0; i < NOFILE; i++)
+         if (p->ofile[i]) np->ofile[i] = filedup(p->ofile[i]);
+       np->cwd = idup(p->cwd);
+
+       safestrcpy(np->name, p->name, sizeof(p->name));
+       pid = np->pid;
+       release(&np->lock);
+
+       acquire(&wait_lock); np->parent = p; release(&wait_lock);
+
+       acquire(&np->lock); np->state = RUNNABLE; release(&np->lock);
+
+       return pid;
+     }
+
+   @ KernelSyms.kfork = 0x80001c76, 270 bytes: a 64-byte ra/s0/s1/s4/s5 frame
+   (s2/s3/s4 LAZILY spilled -- see below), the two `if` failure tails, the
+   trapframe word-copy loop (+0x4a..+0x58, four words/iteration), the
+   [filedup] scan over [NOFILE] descriptors, and the two lock crossings
+   ([np->lock] release/reacquire around [wait_lock]'s acquire/write/release).
+
+   THE SHRINK-WRAPPED EPILOGUE.  Three exits share ONE tail (+0xfc,
+   `mv a0,s1; <pop ra/s0/s1/s5>; ret`), but s2/s3/s4 are pushed/popped only
+   on the arms that actually use them (kexit.md's "a lazily-spilled
+   callee-saved register makes [callee_saved] a PREMISE of the epilogue" --
+   the exact same shape here):
+     - allocproc fails (+0x16): jumps straight past the s2/s3/s4 reloads --
+       neither register was ever touched, so the CALLER'S values are still
+       sitting in the physical registers, untouched.
+     - uvmcopy fails (+0x7c): s4 (=np) WAS written, so its slot is reloaded
+       before the jump; s2/s3 were never touched (they are pushed only after
+       uvmcopy SUCCEEDS), so they are not reloaded either.
+     - success: falls through the ordinary `ld s2,32(sp); ld s3,24(sp);
+       ld s4,16(sp)` sequence.
+
+   THERE IS NO PAGE COUNT.  kfork is reached from [sys_fork] and from
+   nowhere else, so it never runs in the allocator's COUNTED regime: the
+   precondition is [kalloc_env_at γa γk None] outright, not a generic
+   [on : option nat].  Two things follow and both simplify the contract.
+
+   First, allocproc is called with no budget, so both of its own [freeproc]
+   failure tails are LIVE code here (claude-notes/projects/
+   proc-struct-resources.md, "S7 -- allocproc in the UNCOUNTED regime").
+
+   Second, and this is what shrinks [kfork_post]: at [None] every arm
+   reports the SAME thing.  [uvmcopy] and [freeproc] are stated only at
+   [kalloc_env_at γa γk None], so the two arms past "found a slot" were always
+   going to report it; and the "no free slot" arm, which used to be able to
+   hand the caller's own [on] back untouched, now hands back [None] too --
+   while [allocproc_post]'s third disjunct degenerates, since
+   [avail_sub None n] is [None] and [avail_zero None] is [True], so its
+   "the allocator ran dry after n pages" witness says nothing.  So
+   [kalloc_env_at γa γk None] is hoisted OUT of the disjunction, beside
+   [proc_priv], and the three arms collapse to TWO: the return value is
+   either -1 or the child's pid, and that is the whole of what the arms
+   still distinguish.
+
+   NOTHING ABOUT THE CHILD COMES BACK, on EITHER of the two arms that reach
+   a stable final state for it.  On the uvmcopy-failure arm, [freeproc]
+   fully reclaims the slot to [proc_dormant _ UNUSED] and its lock is
+   released, so the slot is back in [procs_inv] (persistent) with nothing
+   owed to the caller.  On the success arm the child is parked at RUNNABLE,
+   also inside [procs_inv], and design/proc-struct.md's "USED/RUNNING maps
+   to emp" note is exactly what licenses NOT threading the child's private
+   block back out through kfork's own postcondition -- it was handed
+   entirely to the RUNNABLE park (a Löb argument about `forkret`, assumed
+   here as [SpecForkretPark.FORKRET_PARK] -- see [ProofKfork.v]'s header for
+   why that is a NEW, honest assumption and not a design shortcut).  Either
+   way [kfork_post] says only: the return value, and [kalloc_env] at its
+   final state.
+
+   THE PARENT COMES BACK UNCHANGED, ON EVERY ARM.  kfork only ever READS
+   [p]'s fields (pagetable/sz for uvmcopy, the trapframe contents, each
+   [ofile] slot for [filedup], [cwd] for [idup], [name] for [safestrcpy]) --
+   it writes nothing into the parent's block on any path -- so
+   [proc_priv γf pme pid_p Vp] is taken as a precondition and handed back
+   verbatim, exactly as [SpecUvmcopy.v]'s own "the parent's table comes back
+   verbatim" note already says about the one piece of it uvmcopy itself
+   touches.
+
+   [pme] IS THE PARENT.  Every other whole-function contract in this tree
+   names "the calling process" through [cpu_own]'s own [p] parameter rather
+   than through a separate premise on [myproc()]'s result (myproc's own
+   contract, [SpecMyproc.v], returns exactly THAT [p]), and kfork is no
+   different: [pme] is both [cpu_own]'s process index and the parent [p] the
+   C source calls [myproc()] to get.
+
+   THE CWD REFERENCE IS INSIDE THE TWO [proc_priv] BLOCKS, WHICH IS WHY
+   THIS CONTRACT NO LONGER NAMES AN INODE.  kfork runs
+   [np->cwd = idup(p->cwd)], and [SpecIdup.v] wants a real
+   [IcacheInv.inode_ref] on the entry [p->cwd] names.  That used to be a
+   PREMISE -- together with [pv_cwd Vp = ientry ck] and the four parameters
+   [ck cq cdev cinum] -- because [ProcInv.cwd_ref] was [emp] and the
+   parent's own block could not produce it.  It is real now
+   ([InodeRef.iref_at]), so the parent's block DOES produce it: the slot,
+   the device and the inum are read off [cwd_ref (pv_cwd Vp)] inside
+   [ProofKforkB4], idup's two halves go back into the parent's block and
+   into the CHILD's, and nothing about an inode appears here or in
+   [kfork_post].
+
+   What is left of the icache is only what the LOCK needs:
+   [IcacheEscrow.is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst nib icfg_dev] (which drags
+   the disk and log fabric -- [fsc_fs], [fsc_cov], [fsc_logst], [nib] -- along) and
+   [itable_inv].  No coherence side condition ties the caller's lock to
+   [ProcInv.cwd_ref]'s reference: both are stated over the same canonical
+   [IcacheInv.iref_name] by construction, so there is nothing left to
+   equate; [InodeRef.v]'s header explains why the authority's gname is
+   canonical instead of threaded.
+
+   THE CHILD IS HANDED OVER AS A DEFICIT BLOCK AND COMES BACK WHOLE.
+   allocproc returns [ProcInv.proc_priv_nocwd] -- a process whose [p->cwd]
+   is still 0 holds no reference and does not satisfy [proc_priv] -- and
+   kfork's [sd a0,336(s4)] at +0xac is what closes the construction window,
+   with idup's second half.  That is the whole reason idup returns two.
+
+   AND THE [iref_slot] IS NOT A PREMISE EITHER.  What makes [ip->ref++]
+   safe is one unit of [IrefSlots]' fixed supply, and it comes out of
+   ALLOCPROC with the child's block -- allocproc is the function that took
+   the slot out of [procs_inv], and a dormant process parks
+   [iref_slots (1 + IREFSPARE)] exactly as it parks [fd_slots FDSPARE].
+   The [1] is the child's own cwd unit: while [np->cwd] is 0 the process
+   holds the unit itself, and the [sd a0,336(s4)] is where it stops --
+   spent on the reference [idup] creates, and parked in the itable against
+   it from then on.  That bijection is what makes
+   [IREFSLOTS = NPROC*(1 + IREFSPARE) + NFILE] literally true. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language weakestpre lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SpecUsertrap.  (* [usertrap_res]'s instances: was reaching
+                                 here through UsertrapRes.v's own import *)
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import SpecPrintk.
+Require Import FirstTok.  (* [first_done] -- the child's token's source *)
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import CpuOwn.
+Require Import FdSlots FileInv.
+Require Import ProcInv.
+Require Import ProcGeom.  (* [PIDMAX] -- kernel/param.h *)
+Require Import SchedCtx.
+Require Import KvmSpec.
+Require Import InodeRegion.
+Require Import IrefSlots.
+Require Import IcacheInv.
+Require Import IcacheEscrow.
+Require Import PidLock.
+Require Import WaitInv.
+Require Import SpecProcinit.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import SyscParkEnv ParkCap.   (* [park_world] / [park_token] *)
+Require Import UexecSlot. (* [uvis] -- the slot's key *)
+Require Import UexecRet.  (* [uslot] -- the slot kfork spends at the park.
+                             Required DIRECTLY (durable-notes). *)
+Require Import KforkChild. (* [kfork_child] -- the record it is spent at *)
+Require Import ChildTok.   (* [child_tok] / [my_pay] -- the generation's pieces *)
+Require Import Xv6Cameras.  (* [logG]: [ireg_inv]'s own instance argument *)
+Local Open Scope Z_scope.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+
+
+(* kfork's own frame is 8 slots (addi sp,sp,-64); the deepest callee is
+   allocproc's UNCOUNTED core, [wp_allocproc_core_body] (48) -- deeper than
+   uvmcopy (42), freeproc (44), filedup/idup (14 apiece), acquire/release
+   (10), myproc (10), safestrcpy (2). *)
+Notation K_kfork := (56%nat) (only parsing).
+Require Import CtxIdDefs.
+Definition kfork_post
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+ (γf : gname) (lvl : nat) (eb : bool)
+    (pme : mword 64)
+    (b : bool) (pid_p : mword 32) (Up : ustate) (stsP : list fdstate)
+    (* THE CALLER'S CHILDREN SET, going in.  The row is the caller's own
+       ([WaitInv.ch_frag] at [ProcDefs.pv_chg] of its block, in the map
+       <wait_lock> owns at the canonical [Xv6Cameras.wch_name]), and it
+       rides its trap residue ([UsertrapRes.ut_own]); kfork holds the lock
+       while it writes [np->parent], and that is where it moves the row. *)
+    (csP : gset gname)
+    (* THE CHILD'S EXIT PAYLOAD, chosen by the forking process and set on
+       the child's generation inside this call ([ChildTok.gen_set]): what
+       the child's exit will owe its parent, as a function of the status.
+       kfork is payload-GENERIC -- it never reads [Q] -- and the generic
+       fork bundle picks [fun _ => True]. *)
+    (Q : Z -> iProp Σ)
+    (* WHAT THE FORKING PROCESS LENDS ITS CHILD (lane FORK-REFUND).  The
+       resource the parent hands the child to run WITH, as opposed to what
+       the child's exit owes back ([Q]).  kfork is lend-GENERIC -- it never
+       reads [Rc] -- and does exactly two things with it: it feeds it to the
+       slot premise on the success path, and it hands it BACK on the -1 arm,
+       where no child was created and nothing consumed it.  The generic fork
+       bundle lends [emp]. *)
+    (Rc : iProp Σ)
+    (K : nat) (mr : regfile) (rv : mword 64) (lks : gset string) : iProp Σ :=
+  ( sie_cap_gpr KT1 mr K b pme ∗
+    cpu_own lvl eb pme b lks ∗
+    (* THE PARENT COMES BACK VERBATIM on every arm -- kfork only reads it.
+       Its cwd reference comes back INSIDE it: idup halves the fraction on
+       the success path and does not run at all on the two failure paths,
+       and [ProcInv.cwd_ref] hides the fraction, so the block is stated at
+       the very same [Vp] either way. *)
+    (* ...AT A LATER EVENT COUNT (permit sweep, design
+       ni-strong-instance.md §7): allocproc, uvmcopy and the failure path's
+       freeproc take the PARENT's counter -- the forking process is the
+       actor of every allocation and release made on the child's behalf --
+       so the block comes back at a count at least the one it went in at,
+       and otherwise verbatim. *)
+    (∃ k' : nat, ⌜(pv_ev (us_V Up) <= k')%nat⌝ ∗
+       proc_priv γf pme pid_p (upd_usV Up (upd_ev (us_V Up) k'))) ∗
+    (* ...AND ITS DESCRIPTOR STATES, AT THE VERY LIST THEY WENT IN AT.
+       kfork reads every slot of [p->ofile] and writes none, so this is
+       verbatim like the block beside it -- and naming it is what lets the
+       CHILD's be named at all: the copy loop retypes the child's ghost, one
+       descriptor at a time, at the state the PARENT's list records, so the
+       table the child is parked with IS this one.  That is the whole
+       content of "a forked child inherits its parent's descriptors", and it
+       is stated here because this is the last place both are in hand. *)
+    fd_frags (pv_fdg (us_V Up)) stsP ∗
+    (* THE ALLOCATOR'S STATE IS THE SAME ON EVERY ARM, so it is stated ONCE
+       here rather than per-disjunct.  See the header: with no page count
+       there is nothing left for the arms to disagree about. *)
+    kalloc_env_at fsc_kalloc fsc_kpages None ∗
+    (* ... and what IS left is only the return value.  Nothing about the
+       CHILD appears: on the failure arm freeproc returned it to
+       [procs_inv], on the success arm the RUNNABLE park swallowed it. *)
+    ( (* allocproc found no slot, or uvmcopy failed: the row comes back
+         at the set it went in at, because no child was made *)
+      (* ...AND THE LEND COMES BACK (lane FORK-REFUND): allocproc found no
+         slot, or uvmcopy failed and freeproc undid the slot, so no child
+         ever ran and the resource the parent lent it is still whole. *)
+      (⌜ rv = (mword_of_int (-1) : mword 64) ⌝ ∗
+       ch_frag (pv_chg (us_V Up)) pme csP ∗ Rc)
+    ∨ (* the child's pid, sign-extended exactly as `lw`/`mv a0,s1` leaves it,
+         AND IN [1, PIDMAX] (kernel/param.h) -- allocproc chose it out of the
+         bounded counter <pid_lock> protects and its post says so
+         ([SpecAllocproc.allocproc_post]).  The interval is what makes the
+         value NONZERO, which is the whole point of relaying it: the parent
+         of a fork can always tell itself from its child. *)
+      (* ...AND THE CHILD TOKEN.  allocproc minted the child's generation
+         at its slot and pid ([ChildTok.gen_alloc]); kfork set the payload
+         on it and split it three ways ([gen_set], [gen_split]) -- the
+         PARENT's quarter is this, the KERNEL's stays in the child's
+         private block, and the discarded half is what the child's
+         [my_pay] and the two persistent readings come off.  This is the
+         one thing about a forked child that comes back to its parent, and
+         what a later wait() redeems ([ChildTok.gen_pay]).
+
+         ...AND THE CALLER'S CHILDREN ROW, MOVED.  kfork holds
+         <wait_lock> while it writes [np->parent], and it holds the
+         caller's row off the caller's residue -- authority and row
+         together, which is what [WaitInv.children_own_upd] takes -- so
+         the set the parent gets back has the child's generation in it.
+         THE CHILD'S OWN ROW IS NOT INSTALLED HERE: it came out of the
+         slot's dormant block with allocproc's found arm
+         ([SpecAllocproc.allocproc_post]) and kfork parks it with the
+         child.  That is what makes the
+         resume key's [UexecSlot.uvis_ch] a READING of the map rather than
+         a choice of the trap loop's. *)
+      (* ...AND THE CHILD'S GENERATION IS FRESH (design app-pipe SS4.3x,
+         lane PIPE-GEN).  The row move below is a plain ghost update and
+         says only [csP ∪ {[γ]}], which a generation already in the set
+         satisfies; the invariant knows better, and this is where the
+         knowledge leaves the kernel.  Read off [WaitInv.inv_rows] at the
+         [sd s5,56(s4)] that fills the child's parent cell
+         ([WaitFresh.children_inv_row_fresh] through
+         [ProofKforkB5.kfk_b5]), which is why this contract now takes
+         [pme <> zero_reg]: at a zero row address every tie of the
+         invariant is guarded away and the fact is false.  PURE, so it
+         rides the four statements above the kernel untouched. *)
+      (∃ (pidv : mword 32) (γ : gname),
+         ⌜ rv = (sign_extend' 64 pidv : mword 64) ⌝ ∗
+         ⌜ (1 <= bv_unsigned pidv <= PIDMAX)%Z ⌝ ∗
+         ⌜ γ ∉ csP ⌝ ∗
+         child_tok γ pidv Q ∗
+         ch_frag (pv_chg (us_V Up)) pme (csP ∪ {[γ]})) ) )%I.
+
+Definition wp_kfork_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+ (γp γw γl γf : gname)  (γs : list gname)
+    (m : regfile) (lvl K : nat) (eb : bool) (pme : mword 64)
+    (b : bool) (pid_p : mword 32) (Up : ustate) (stsP : list fdstate)
+    (* the caller's children set, going in -- see [kfork_post] *)
+    (csP : gset gname)
+    (* the child's exit payload -- see [kfork_post] *)
+    (Q : Z -> iProp Σ)
+    (* the parent's lend -- see [kfork_post] *)
+    (Rc : iProp Σ)
+    (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.kfork in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (K_kfork <= K)%nat ->
+  (* propagates to every callee's own nesting-level bound: allocproc's own
+     (lvl+2), and -- once the lock is held -- uvmcopy/freeproc/filedup/idup
+     at (S lvl)+1 = lvl+2 again. *)
+  (Z.of_nat lvl + 2 < 2 ^ 31)%Z ->
+  (* THE CALLER'S ADDRESS IS A PROC SLOT'S, hence not 0 (design app-pipe
+     SS4.3x (ii), lane PIPE-GEN).  kfork is stated at an opaque [pme] and
+     writes [np->parent = p] under <wait_lock> with it; every tie of the
+     wait-lock invariant is guarded on a nonzero address (WaitInv.v's
+     header), so at [pme = 0] the deposit is dropped and the FRESHNESS
+     the post now reports ([kfork_post]'s [γ ∉ csP]) is false.  A premise
+     because this contract is at an opaque address; its caller has the
+     index -- [SpecSysFork] relays it and [ProofSyscall]'s dispatcher
+     discharges it from [pj = proc_addr j] ([ProcGeom.proc_addr_nonzero]).
+     Nothing else in the contract needs it: the two failure arms and every
+     other row are untouched. *)
+  pme <> (zero_reg : mword 64) ->
+  (* THE PARENT HAS A WORKING DIRECTORY.  [ProcInv.cwd_ref] is two-armed on
+     the pointer -- a process between [p->cwd = 0] and its next chdir owns
+     no reference.  xv6's fork runs [np->cwd = idup(p->cwd)] with no null
+     test, and that is still the honest reading of the code -- but it is no
+     longer a PREMISE: [ProcInv.cwd_ref] has no null arm, so the parent's
+     own [proc_priv] carries it ([proc_priv_cwd_nonzero]). *)
+  (* the floor of kfork's cone is wait_lock (8), taken after np->lock is
+     released; allocproc's "proc" (9), the fd scan's "ftable"/"itable" and
+     kalloc/uvmcopy's "kmem" all follow by [LockRank.locks_below_mono]. *)
+  locks_below lks "wait_lock" ->
+  sie_cap_gpr KT1 m K b pme -∗
+  cpu_own lvl eb pme b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  procs_inv γs -∗
+  is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+  is_lock γw wait_lock_addr "wait_lock"%string (wait_res_at) -∗
+  is_ftable γl γf -∗
+  SpecPrintk.printk_env (FsCfg.fsc_printk) (FsCfg.fsc_uart) (FsCfg.fsc_disk) -∗
+  is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst icfg_nib icfg_dev -∗
+  itable_inv -∗
+  (* THE INODE REGION, and it is here for ONE reason: kfork's
+     [np->cwd = idup(p->cwd)].  idup's [ref++] became a ledger move in
+     increment IVe (iclaim-ledger.md §3.19), so [SpecIdup] takes the region
+     handle, and this contract -- like [SpecSysFork] above it -- only passes
+     it through.  Persistent, and every FS-fabric caller already holds it
+     (the dispatch's [sysc_fs_env]), so it costs a caller a frame and
+     nothing else.  kfork reads no dinode and touches no log. *)
+  ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  kalloc_env_at fsc_kalloc fsc_kpages None -∗
+  (* THE PROC TABLE'S SEALED REGIME.  kfork allocates a proc, so it needs
+     [ProcAvail]'s authority to mint the new slot's allocation marker -- and
+     it takes the count-free arm, which is persistent and says nothing, so
+     kfork keeps allocproc's empty-table disjunct and handles it (the
+     [return -1]).  Only [userinit] runs in the counted regime.  *)
+  procs_avail None -∗
+  (* THE WORLD THE CHILD'S PARK NEEDS ([SyscParkEnv.park_world]) -- see
+     [SpecSysFork]; kfork builds the child's trap-loop environment
+     ([UsertrapRes.park_env]) out of it at its first release. *)
+  park_world γs -∗
+  (* ...AND THE PARK ITSELF, as a resource ([ParkCap.park_token]): this is
+     what lets kfork be proved WITHOUT a functor over the park's proof --
+     which would be a module cycle, since that proof runs the trap loop
+     kfork sits inside.  See ParkCap.v. *)
+  park_token γs -∗
+  (* THE CHILD'S SLOT, spent at the park.  A LINEAR premise, and the reason
+     kfork's contract has one: what the child's trap loop will run is a
+     resource of the child, and it is paid by whoever forks.  Nothing
+     persistent in the tree carries one ([SyscParkEnv.park_world] used to),
+     so this premise is what makes the parent responsible for its child.
+     ONE SLOT, AT THE RECORD KFORK STATES.  [KforkChild.kfork_child] is the
+     child's user-visible state as a function of the parent's -- the
+     parent's trapframe with a0 := 0, its address space, its size, its
+     descriptor table, its working directory -- so a caller with a
+     continuation for its child pays for exactly that continuation and for
+     nothing else.  The record the child is actually parked at differs from
+     it only in what the slot does not read ([UexecApply.uslot_key_cong]):
+     allocproc's page-table root and trapframe page, the child's own
+     descriptor pointers, ghost names and name bytes, and the KERNEL words
+     of the trapframe.  So the park re-keys, and it may: kfork holds
+     [FirstTok.first_done] below, so the child can never be resumed through
+     forkret's boot arm and the park it reaches is the STEADY one
+     ([ParkCap.park_token_park_steady]), whose closer resumes at a record
+     with the parked run key ([UexecRet.urun_eq],
+     [KforkChild.urun_eq_kfork_child]). *)
+  (* THE CHILD'S GENERATION IS ∀-BOUND: allocproc mints a fresh one inside
+     this call, so the CALLER cannot name it and undertakes to supply a
+     slot at whichever one comes out; the child's children set is [∅] on
+     the nose ([UexecRet.uexec_fork_child_F]). *)
+  (* ...AND IT IS PAID UNDER THE CHILD'S OWN [my_pay]: the caller's slot
+     may READ the payload its child's exit owes, because a verified child
+     has to prove that exit.  kfork hands it over out of the split it
+     makes ([ChildTok.gen_split]); a generic child ignores it. *)
+  (* ...AND SO IS ITS PID, on exactly the generation's terms: <allocpid>
+     chooses it inside this call, so the CALLER cannot name it either.  IT
+     IS THE PID THE POST RETURNS: kfork parks the child at the number
+     [kfork_post]'s success arm hands back as [pidv], so a parent holding
+     [ChildTok.child_tok γ pidv Q] knows the pid its child's key is at --
+     [ChildTok.gen_pid] reads it off the token -- and a verified parent can
+     therefore say what its child's getpid(2) will answer. *)
+  (* ...AND WHAT THE PARENT LENDS THE CHILD, A LINEAR PREMISE OF ITS OWN
+     (lane FORK-REFUND).  It comes in BESIDE the slot rather than inside
+     it, because kfork has to be able to give it back without building a
+     child: on the two failure exits it drops the wand below and refunds
+     this copy ([kfork_post]'s -1 arm), and on the success path it feeds
+     this copy to the wand.  A caller that lends nothing passes [emp]. *)
+  Rc -∗
+  (* THE CHILD IS NOT <INIT> (lane TRAP-ROWS-4, B1b): <init>'s pid is the
+     literal 1, permanently registered, and the pid scan inside allocproc
+     is what refutes the candidate -- kfork holds [procs_avail None] and
+     that is where the refutation comes from
+     ([SpecAllocproc.allocproc_post]'s uncounted arm). *)
+  (∀ (g' : gname) (pidc : mword 32),
+     ⌜pidc <> (mword_of_int 1 : mword 32)⌝ -∗
+     my_pay g' Q -∗ Rc -∗ uslot (uvis_of (kfork_child Up) stsP g' ∅ pidc)) -∗
+  (* ...AND HOW A KILLER PAYS FOR THE CHILD (lane SELF-KILL, §4b'; the
+     owner's ruling of 2026-09-13).  A [kill(2)] costs the TARGET's exit
+     payload at -1, and the party that calls kill holds none of the
+     target's resources -- so the child's killed row
+     ([SchedCtx.kill_paid]'s live arm) publishes this wand and a TAINTED
+     killer cashes it with [RiscvPtsto.app_taint].  allocproc founds
+     the row, so the FORKING process is the party that must supply the
+     wand: a verified parent proves it on its payload's taint arm, and the
+     generic slot's [Q] is [fun _ => True]. *)
+  □ (app_taint -∗ Q (-1)) -∗
+  (* THE STEADY ARM OF [FirstTok.first_tok], and the ONE thing fork cannot
+     take out of the parent's block: the parent's token may be the EXCLUSIVE
+     boot arm, and the child needs a token of its own.  [first_done] is
+     persistent, so a copy is free -- and it is what
+     [FirstTok.first_tok_of_done] mints the child's token from, at the
+     [sd a0,336(s4)] that closes the child's construction window. *)
+  first_done -∗
+  proc_priv γf pme pid_p Up -∗
+  (* THE PARENT'S DESCRIPTOR STATES.  kfork needs them to say what it copies
+     into the child; it changes none of them and hands them back. *)
+  fd_frags (pv_fdg (us_V Up)) stsP -∗
+  (* ...AND THE CALLER'S CHILDREN ROW.  kfork takes <wait_lock> anyway --
+     it writes [np->parent] under it -- so the caller's row travels in with
+     the block and comes back moved ([kfork_post]'s success arm). *)
+  ch_frag (pv_chg (us_V Up)) pme csP -∗
+  wp_next b pme (fun (CID : CpuId) =>
+    ∀ (mr : regfile),
+      ⌜ callee_saved m mr ⌝ -∗
+      pc_is ret_tgt -∗
+      kfork_post γf lvl eb pme b pid_p Up stsP csP Q Rc K mr
+        (mr !!! Regidx (mword_of_int 10 : mword 5)) lks -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Require Import UserFd.   (* [ufdG] -- the class a minted user slot needs *)
+
+Module Type KFORK.
+  Parameter wp_kfork_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+ (γp γw γl γf : gname) (γs : list gname)
+      (m : regfile) (lvl K : nat) (eb : bool) (pme : mword 64)
+      (b : bool) (pid_p : mword 32) (Up : ustate) (stsP : list fdstate)
+      (csP : gset gname)
+      (Q : Z -> iProp Σ)
+      (Rc : iProp Σ)
+      (lks : gset string),
+      wp_kfork_sconf_body γp γw γl γf γs
+ m lvl K eb pme b pid_p Up stsP csP Q Rc lks.
+End KFORK.

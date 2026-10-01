@@ -1,0 +1,3499 @@
+(* ProofVirtioDiskIntr.v -- virtio_disk_intr() over the SIE-agnostic sconf
+   world.
+
+   virtio_disk_intr @ 0x80005a34 is virtio_disk.c's completion handler:
+
+     acquire(&disk.vdisk_lock);
+     *R(INTERRUPT_ACK) = *R(INTERRUPT_STATUS) & 0x3;
+     __sync_synchronize();
+     while (disk.used_idx != disk.used->idx) {
+       __sync_synchronize();
+       int id = disk.used->ring[disk.used_idx % NUM].id;
+       if (disk.info[id].status != 0) panic("virtio_disk_intr status");
+       struct buf *b = disk.info[id].b;
+       b->disk = 0;
+       wakeup(b);
+       disk.used_idx += 1;
+     }
+     release(&disk.vdisk_lock);
+
+   The frame is the standard 32-byte / ra,s0,s1 shape (byte-identical to
+   sys_uptime's), and the ISR read/ack pair runs on the [dev_inv]-borrowing
+   virtio MMIO leaves of WpVirtioDev.v.
+
+   A functor over ACQUIRE / RELEASE / WAKEUP. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language weakestpre lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map mono_nat.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes.
+Require Import RiscvLang RiscvPtsto RiscvFetchExec.
+Require Import InstrBytes WpMmodeLeafBase.
+Require Import WpGpr RegFile.
+Require Import KptPt.
+Require Import RiscvExtras.
+Require Import StackOwn CalleeSaved KernelText.
+Require Import WpLock.
+Require Import ProcGeom.
+Require Import IntrDefs.
+Require Import HartTp WpNext.
+Require Import CpuOwn SchedCtx FdSlots.
+Require Import VcGen WpSconfAlu WpSconfMem WpSconfCtl WpSconfBtype WpSconfFencePub.
+Require Import MinstretInv.
+Require Import WpSmodeHalf.
+Require Import VirtioQueue DiskPtsto VirtioProto DiskInv DiskAvail.
+Require Import VirtioModel.
+Require Import WpVirtioDev.
+Require Import WpUart.
+Require Import Xv6Cameras.
+Require Import SpecWakeup SpecAcquire SpecRelease.
+Require Import CodeVirtioDiskIntr.
+Require Import SpecVirtioDiskIntr.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Import Defs.
+Require Import TsoCtx.
+Require Import TsoCtxAbsorbLb.
+Require Import SieCapCtx.
+Require Import RiscvExec.
+Require Import TsoMemPa.
+Require Import KMap.
+
+Local Open Scope Z_scope.
+
+(* a whole-function goal over the disk invariant prints enormous; see
+   claude-notes/durable-notes.md ("A FAILING TACTIC ... LOOKS LIKE A HANG") *)
+Set Printing Depth 40.
+
+(* ===================================================================== *)
+(* §0  The virtio-mmio window geometry, per concrete register address.    *)
+(*     (The [vdi_geom] of ProofVirtioDiskInit.v -- that file's copy is    *)
+(*     behind its own module seal, and the predicate is four vm_compute   *)
+(*     facts, so it is re-stated rather than promoted.)                   *)
+(* ===================================================================== *)
+
+Definition vt_geom (a : mword 64) : Prop :=
+  (virtio_base <= uint a < virtio_base + virtio_size)%Z
+  /\ is_aligned_vaddr (Virtaddr a) 4 = true
+  /\ neq_vec (bits_of_virtaddr (Virtaddr a))
+       (sign_extend' 64 (subrange_vec_dec (bits_of_virtaddr (Virtaddr a)) (Z.sub 39 1) 0)) = false
+  /\ kpt_dev_vpn (svpn_of a).
+
+Local Ltac zrange_vm := split; [ apply Z.leb_le | apply Z.ltb_lt ]; vm_compute; reflexivity.
+Local Ltac vgeom := unfold vt_geom; split; [zrange_vm|];
+              split; [vm_compute; reflexivity|];
+              split; [vm_compute; reflexivity|];
+              unfold kpt_dev_vpn; zrange_vm.
+
+(* INTERRUPT_STATUS and INTERRUPT_ACK, the only two registers intr names *)
+Lemma vg_060 : vt_geom (mword_of_int 0x10001060). Proof. vgeom. Qed.
+Lemma vg_064 : vt_geom (mword_of_int 0x10001064). Proof. vgeom. Qed.
+
+
+(* the width-4 load's post value, collapsed to a plain sign-extension *)
+Lemma vt_ldval (w : mword (8*4)) :
+  extend_value false w = sign_extend' 64 w.
+Proof. exact (data2_ext_4 w). Qed.
+
+Section VtLeaves.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Notation ra_idx := (mword_of_int 1 : mword 5).
+  Notation tp_idx := (mword_of_int 4 : mword 5).
+  Notation s0_idx := (mword_of_int 8 : mword 5).
+  Notation s1_idx := (mword_of_int 9 : mword 5).
+  Notation a0_idx := (mword_of_int 10 : mword 5).
+  Notation a4_idx := (mword_of_int 14 : mword 5).
+  Notation a5_idx := (mword_of_int 15 : mword 5).
+
+  (* ---- the two dev_inv-borrowing virtio leaves, at a CONCRETE address ---- *)
+
+  Lemma wp_vt_lw_dev (γu : uart_names) (γd : disk_names)
+      (pc : mword 64) (rvc : bool) (rd rs1 : mword 5) `{!SrcOk rs1} (imm : mword 12)
+      (m : regfile) (n : nat) (a : mword 64) (off : Z) (P : bv 32 -> Prop)
+      (p : mword 64) :
+    add_vec (rget m rs1) (sign_extend' 64 imm) = a ->
+    vt_geom a ->
+    (uint a - virtio_base)%Z = off ->
+    uint rd <> 0 -> rd_ok rd ->
+    (forall v : virtio_state, virtio_isr_ok v ->
+       exists w : bv 32, virtio_read v off = Some w /\ P w) ->
+    sie_cap_gpr KT1 m n false p -∗
+    pc_is pc -∗ instr pc rvc (LOAD (imm, Regidx rs1, Regidx rd, false, 4)) -∗
+    dev_inv γu γd -∗
+    ( ∀ w : bv 32, ⌜ P w ⌝ -∗
+      sie_cap_gpr KT1 (<[Regidx rd := regval_into_reg (sign_extend' 64 (w : mword 32))]> m) n false p -∗
+      pc_is (add_vec_int pc (if rvc then 2 else 4)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hea Hg Hoff Hrd Hrdok Hread. destruct Hg as (Hr & Hal & Hcan & Hdv).
+    (* the class, consumed at [rs1] -- see [IntrDefs.SrcOk].  This wrapper
+       applies a converted leaf at a VARIABLE register and carries no tp fact
+       of its own, so the class has to be stated here; it is implicit, so this
+       lemma's own call sites (which pass concrete registers) do not move.  The
+       [assert] is the wiring check: it names the register the premise reads. *)
+    assert (Hea_all : forall hh : CpuId,
+              add_vec (rget (CID := hh) m rs1) (sign_extend' 64 imm)
+              = add_vec (rget (CID := CID) m rs1) (sign_extend' 64 imm))
+      by (intros hh; by rewrite (src_ok_rget_indep m rs1 hh CID)).
+    assert (Ha8 : sign_extend' 64 (subrange_vec_dec
+                    (add_vec (rget m rs1) (sign_extend' 64 imm)) (xlen - 0 - 1) 0) = a).
+    { rewrite subrange_id. rewrite sign_extend'_id. exact Hea. }
+    iIntros "Hcg Hpc Hinstr #Hdinv Hcont".
+    iApply (wp_lw_virtio_dev_s_sconf (CID:=CID) γu γd pc rvc false rd rs1 imm m n P
+              ltac:(rewrite Ha8; exact Hr)
+              ltac:(rewrite Ha8; exact Hal)
+              ltac:(rewrite Ha8; exact Hcan)
+              ltac:(rewrite Ha8; exact Hdv)
+              Hrd Hrdok
+              ltac:(rewrite Ha8; rewrite Hoff; exact Hread)
+              with "Hcg Hpc Hinstr Hdinv").
+    iApply wp_next_off_intro.
+    iIntros (w) "%HPw Hcg Hpc". iEval (rewrite vt_ldval) in "Hcg".
+    iApply ("Hcont" $! w with "[%] Hcg Hpc"). exact HPw.
+  Qed.
+
+  Lemma wp_vt_sw_dev (γu : uart_names) (γd : disk_names)
+      (pc : mword 64) (rvc : bool) (rs2 rs1 : mword 5) `{!SrcOk rs1} `{!SrcOk rs2} (imm : mword 12)
+      (m : regfile) (n : nat) (a : mword 64) (off : Z) (sw : mword 32)
+      (p : mword 64) :
+    add_vec (rget m rs1) (sign_extend' 64 imm) = a ->
+    vt_geom a ->
+    (uint a - virtio_base)%Z = off ->
+    trunc32 (rget m rs2) = sw ->
+    (forall v : virtio_state, virtio_isr_ok v ->
+       exists v' : virtio_state,
+         virtio_write v off sw = Some v'
+         /\ virtio_isr_ok v'
+         /\ v_cfg v' = v_cfg v /\ v_seen v' = v_seen v
+         /\ v_used_idx v' = v_used_idx v /\ v_disk v' = v_disk v
+         /\ v_cache v' = v_cache v /\ v_taken v' = v_taken v
+         /\ v_inflight v' = v_inflight v) ->
+    sie_cap_gpr KT1 m n false p -∗
+    pc_is pc -∗ instr pc rvc (STORE (imm, Regidx rs2, Regidx rs1, 4)) -∗
+    dev_inv γu γd -∗
+    ( sie_cap_gpr KT1 m n false p -∗
+      pc_is (add_vec_int pc (if rvc then 2 else 4)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hea Hg Hoff Hsw Hwr. destruct Hg as (Hr & Hal & Hcan & Hdv).
+    (* the class, consumed at [rs1 / rs2] -- see [IntrDefs.SrcOk].  This wrapper
+       applies a converted leaf at a VARIABLE register and carries no tp fact
+       of its own, so the class has to be stated here; it is implicit, so this
+       lemma's own call sites (which pass concrete registers) do not move.  The
+       [assert] is the wiring check: it names the register the premise reads. *)
+    assert (Hea_all : forall hh : CpuId,
+              add_vec (rget (CID := hh) m rs1) (sign_extend' 64 imm)
+              = add_vec (rget (CID := CID) m rs1) (sign_extend' 64 imm))
+      by (intros hh; by rewrite (src_ok_rget_indep m rs1 hh CID)).
+    assert (Hsv2_all : forall hh : CpuId, rget (CID := hh) m rs2 = rget (CID := CID) m rs2)
+      by (intros hh; exact (src_ok_rget_indep m rs2 hh CID)).
+    assert (Hsw' : (autocast (T := mword)
+                      (subrange_vec_dec (rget m rs2) (Z.sub (Z.mul 4 8) 1) 0) : mword 32) = sw)
+      by exact Hsw.
+    assert (Ha8 : sign_extend' 64 (subrange_vec_dec
+                    (add_vec (rget m rs1) (sign_extend' 64 imm)) (xlen - 0 - 1) 0) = a).
+    { rewrite subrange_id. rewrite sign_extend'_id. exact Hea. }
+    iIntros "Hcg Hpc Hinstr #Hdinv Hcont".
+    iApply (wp_sw_virtio_dev_s_sconf (CID:=CID) γu γd pc rvc rs2 rs1 imm m n
+              ltac:(rewrite Ha8; exact Hr)
+              ltac:(rewrite Ha8; exact Hal)
+              ltac:(rewrite Ha8; exact Hcan)
+              ltac:(rewrite Ha8; exact Hdv)
+              ltac:(rewrite Ha8; rewrite Hoff; rewrite Hsw'; exact Hwr)
+              with "Hcg Hpc Hinstr Hdinv").
+    iApply wp_next_off_intro. iExact "Hcont".
+  Qed.
+
+  (* ================================================================== *)
+  (* THE ISR ACKNOWLEDGEMENT (KernelSyms.virtio_disk_intr+0x1e .. KernelSyms.virtio_disk_intr+0x30):                     *)
+  (*   *R(INTERRUPT_ACK) = *R(INTERRUPT_STATUS) & 0x3;                   *)
+  (*   __sync_synchronize();                                            *)
+  (* Five instructions, all under [dev_inv] and nothing else -- the      *)
+  (* lock's resource is untouched, so this is a self-contained chunk.    *)
+  (* Only a4 and a5 are clobbered.                                      *)
+  (* ================================================================== *)
+  Lemma wp_vt_isr (γu : uart_names) (γd : disk_names) (M : regfile) (n : nat) (p : mword 64) :
+    sie_cap_gpr KT1 M n false p -∗
+    kernel_text -∗ pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x1e) : mword 64) -∗
+    dev_inv γu γd -∗
+    ( ∀ M' : regfile,
+        ⌜ forall r : mword 5, r <> a4_idx -> r <> a5_idx ->
+            M' !!! Regidx r = M !!! Regidx r ⌝ -∗
+        sie_cap_gpr KT1 M' n false p -∗
+        pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x30) : mword 64) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    iIntros "Hcg #Htext Hpc #Hdinv Hcont".
+    (* ---- +0x1e: lui a5,0x10001 ---- *)
+    iApply (wp_lui_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x1e)) a5_idx
+              (mword_of_int 65537 : mword 20) (mword_of_int 0x10001000 : mword 64) M n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (vti_1e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (B0 := <[Regidx a5_idx := regval_into_reg (mword_of_int 0x10001000 : mword 64)]> M).
+    change (<[Regidx a5_idx := regval_into_reg (mword_of_int 0x10001000 : mword 64)]> M) with B0.
+    assert (Hp22 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x1e) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x22))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp22) in "Hpc".
+    assert (HB0a5 : B0 !!! Regidx a5_idx = (mword_of_int 0x10001000 : mword 64))
+      by (rewrite /B0 upd_eq; reflexivity).
+    (* ---- +0x22: c.lw a5,96(a5) -- *R(INTERRUPT_STATUS) ---- *)
+    assert (Hea60 : add_vec (rget B0 a5_idx) (sign_extend' 64 (mword_of_int 96 : mword 12))
+                    = (mword_of_int 0x10001060 : mword 64)).
+    { rgne. rewrite HB0a5. apply bv_eq; vm_compute; reflexivity. }
+    assert (Hoff60 : (uint (mword_of_int 0x10001060 : mword 64) - virtio_base)%Z
+                     = vio_off_interrupt_status)
+      by (vm_compute; reflexivity).
+    assert (Hrd60 : forall v : virtio_state, virtio_isr_ok v ->
+              exists w : bv 32, virtio_read v vio_off_interrupt_status = Some w /\ True).
+    { intros v _. exists (v_isr v). split; [reflexivity | exact I]. }
+    iApply (wp_vt_lw_dev γu γd (mword_of_int (KernelSyms.virtio_disk_intr + 0x22)) true a5_idx a5_idx
+              (mword_of_int 96 : mword 12) B0 n
+              (mword_of_int 0x10001060 : mword 64) vio_off_interrupt_status (fun _ => True) p
+              Hea60 vg_060 Hoff60
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              Hrd60
+              with "Hcg Hpc [] Hdinv").
+    { iApply (vti_22 with "Htext"). }
+    iIntros (w) "_ Hcg Hpc".
+    set (B1 := <[Regidx a5_idx := regval_into_reg (sign_extend' 64 (w : mword 32))]> B0).
+    change (<[Regidx a5_idx := regval_into_reg (sign_extend' 64 (w : mword 32))]> B0) with B1.
+    assert (Hp24 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x22) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x24))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp24) in "Hpc".
+    (* ---- +0x24: c.andi a5,3 ---- *)
+    iApply (wp_candi_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x24)) a5_idx (mword_of_int 3 : mword 6)
+              B1 n false ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_24 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    iEval (rgne) in "Hcg".
+    set (B2 := <[Regidx a5_idx := regval_into_reg
+        (and_vec (B1 !!! Regidx a5_idx) (sign_extend' 64 (sign_extend' 12 (mword_of_int 3 : mword 6))))]> B1).
+    change (<[Regidx a5_idx := regval_into_reg
+        (and_vec (B1 !!! Regidx a5_idx) (sign_extend' 64 (sign_extend' 12 (mword_of_int 3 : mword 6))))]> B1) with B2.
+    assert (Hp26 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x24) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x26))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp26) in "Hpc".
+    (* ---- +0x26: lui a4,0x10001 ---- *)
+    iApply (wp_lui_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x26)) a4_idx
+              (mword_of_int 65537 : mword 20) (mword_of_int 0x10001000 : mword 64) B2 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (vti_26 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (B3 := <[Regidx a4_idx := regval_into_reg (mword_of_int 0x10001000 : mword 64)]> B2).
+    change (<[Regidx a4_idx := regval_into_reg (mword_of_int 0x10001000 : mword 64)]> B2) with B3.
+    assert (Hp2a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x26) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x2a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp2a) in "Hpc".
+    assert (HB3a4 : B3 !!! Regidx a4_idx = (mword_of_int 0x10001000 : mword 64))
+      by (rewrite /B3 upd_eq; reflexivity).
+    (* ---- +0x2a: c.sw a5,100(a4) -- *R(INTERRUPT_ACK) ---- *)
+    assert (Hea64 : add_vec (rget B3 a4_idx) (sign_extend' 64 (mword_of_int 100 : mword 12))
+                    = (mword_of_int 0x10001064 : mword 64)).
+    { rgne. rewrite HB3a4. apply bv_eq; vm_compute; reflexivity. }
+    assert (Hoff64 : (uint (mword_of_int 0x10001064 : mword 64) - virtio_base)%Z
+                     = vio_off_interrupt_ack)
+      by (vm_compute; reflexivity).
+    assert (Hwr64 : forall v : virtio_state, virtio_isr_ok v ->
+              exists v' : virtio_state,
+                virtio_write v vio_off_interrupt_ack (trunc32 (rget B3 a5_idx)) = Some v'
+                /\ virtio_isr_ok v'
+                /\ v_cfg v' = v_cfg v /\ v_seen v' = v_seen v
+                /\ v_used_idx v' = v_used_idx v /\ v_disk v' = v_disk v
+                /\ v_cache v' = v_cache v /\ v_taken v' = v_taken v
+                /\ v_inflight v' = v_inflight v).
+    { intros v Hv. exact (virtio_ack_write_ok v _ Hv). }
+    iApply (wp_vt_sw_dev γu γd (mword_of_int (KernelSyms.virtio_disk_intr + 0x2a)) true a5_idx a4_idx
+              (mword_of_int 100 : mword 12) B3 n
+              (mword_of_int 0x10001064 : mword 64) vio_off_interrupt_ack
+              (trunc32 (rget B3 a5_idx)) p
+              Hea64 vg_064 Hoff64 eq_refl Hwr64
+              with "Hcg Hpc [] Hdinv").
+    { iApply (vti_2a with "Htext"). }
+    iIntros "Hcg Hpc".
+    assert (Hp2c : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x2a) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x2c))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp2c) in "Hpc".
+    (* ---- +0x2c: fence rw,rw ---- *)
+    iApply (wp_fence_gen_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x2c))
+              (mword_of_int 0) (mword_of_int 15) (mword_of_int 15)
+              (Regidx (mword_of_int 0)) (Regidx (mword_of_int 0)) B3 n false
+              with "Hcg Hpc []").
+    { iApply (vti_2c with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    assert (Hp30 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x2c) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x30))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp30) in "Hpc".
+    (* ---- the frame: only a4/a5 moved ---- *)
+    iApply ("Hcont" $! B3 with "[%] Hcg Hpc").
+    intros r N4 N5.
+    rewrite /B3 upd_ne; [| congruence].
+    rewrite /B2 upd_ne; [| congruence].
+    rewrite /B1 upd_ne; [| congruence].
+    rewrite /B0 upd_ne; [| congruence]. reflexivity.
+  Qed.
+
+End VtLeaves.
+
+(* ===================================================================== *)
+(* §1  The prologue and the acquire call (KernelSyms.virtio_disk_intr+0x00 .. KernelSyms.virtio_disk_intr+0x1e).          *)
+(*                                                                        *)
+(*     A functor over ACQUIRE only: the 32-byte frame (ra/s0/s1) is the   *)
+(*     byte-identical twin of sys_uptime's, then s1 := &disk and          *)
+(*     a0 := &disk.vdisk_lock are each materialized by an auipc/addi      *)
+(*     pair and [acquire] is called.  What comes out is the whole         *)
+(*     critical section's environment: the lock token, [disk_res], the    *)
+(*     raised [cpu_own] and its [trap_csrs_pay], the four frame slots     *)
+(*     (so the epilogue can restore ra/s0/s1), and the register facts     *)
+(*     the body needs (s1 = &disk, sp = the pushed frame, tp = cid, and   *)
+(*     every OTHER callee-saved register still holding its entry value).  *)
+(* ===================================================================== *)
+Module VtPrologue (Acquire : ACQUIRE).
+Section VtPrologue.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Notation ra_idx := (mword_of_int 1 : mword 5).
+  Notation tp_idx := (mword_of_int 4 : mword 5).
+  Notation s0_idx := (mword_of_int 8 : mword 5).
+  Notation s1_idx := (mword_of_int 9 : mword 5).
+  Notation a0_idx := (mword_of_int 10 : mword 5).
+
+  Lemma wp_vt_prologue (γk : gname) (γd : disk_names)
+      (pd pav pu : mword 64) (m : regfile) (av n : nat) (eb : bool)
+      (pme : mword 64) (b : bool) (lks : gset string) :
+    (Z.of_nat n + 1 < 2 ^ 31)%Z ->
+    (22 <= av)%nat ->
+    (* acquire's order premise -- see [wp_virtio_disk_intr_sconf] where it
+       originates *)
+    locks_below lks "virtio_disk" ->
+    sie_cap_gpr KT1 m av b pme -∗
+    cpu_own n eb pme b lks -∗
+    kernel_text -∗ pc_is (mword_of_int KernelSyms.virtio_disk_intr : mword 64) -∗
+    is_lock γk d_lock "virtio_disk"%string (disk_res_at γd pd pav pu) -∗
+    wp_next b pme (fun (CID : CpuId) =>
+      ∀ (MA : regfile) (sp0 : mword 64),
+        ⌜ sp0 = m !!! Regidx csp_rs1
+          /\ MA !!! Regidx csp_rs1 = add_vec sp0
+               (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6)))
+          /\ MA !!! Regidx s1_idx = (disk_base : mword 64)
+          /\ (forall r : mword 5, is_cs_idx r = true ->
+                r <> csp_rs1 -> r <> s0_idx -> r <> s1_idx ->
+                MA !!! Regidx r = m !!! Regidx r) ⌝ -∗
+        sie_cap_gpr KT1 MA (trap_res b + (av - 4))%nat false pme -∗
+        pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x1e) : mword 64) -∗
+        locked γk cpu_id -∗ disk_res γd pd pav pu -∗
+        cpu_own (S n) eb pme false ({["virtio_disk"]} ∪ lks) -∗ arm_pay KT1 n eb pme -∗
+        (* the frame: ra/s0/s1's entry values and the unused fourth slot *)
+        pa_stk sp0 1 ↦₈[KT1] (m !!! Regidx ra_idx) -∗
+        pa_stk sp0 2 ↦₈[KT1] (m !!! Regidx s0_idx) -∗
+        pa_stk sp0 3 ↦₈[KT1] (m !!! Regidx s1_idx) -∗
+        (∃ vg : mword 64, pa_stk sp0 4 ↦₈[KT1] vg) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hn Hav Hfresh.
+    pose (sp0 := (m !!! Regidx csp_rs1 : mword 64)).
+    iIntros "Hcg Hcnt #Htext Hpc #Hlk Hcont".
+    (* ===================== PROLOGUE (32-byte frame) ===================== *)
+    set (spd := add_vec sp0 (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6)))).
+    set (A0 := <[Regidx csp_rs1 := regval_into_reg
+        (add_vec (m !!! Regidx csp_rs1) (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6))))]> m).
+    assert (HcspA0 : A0 !!! Regidx csp_rs1 = spd) by (rewrite /A0 upd_eq; reflexivity).
+    assert (Hspd4 : pa_stk sp0 4 = spd).
+    { rewrite /spd. unfold pa_stk, add_vec_int. apply f_equal. apply bv_eq; vm_compute; reflexivity. }
+    assert (Hspm : m !!! Regidx csp_rs1 = sp0) by reflexivity.
+    assert (Hpush : add_vec (m !!! Regidx csp_rs1) (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6)))
+                    = pa_stk (m !!! Regidx csp_rs1) 4).
+    { unfold pa_stk, add_vec_int. apply f_equal. apply bv_eq; vm_compute; reflexivity. }
+    iApply (wp_caddi_sp_push_s_sconf (mword_of_int KernelSyms.virtio_disk_intr)
+              (mword_of_int 32 : mword 6) m av 4 b ltac:(lia) Hpush
+              with "Hcg Hpc []").
+    { iApply (vti_00 with "Htext"). }
+    iIntros (CID1 Hs1) "Hcg Hframe Hpc".
+    iEval (rewrite Hspm) in "Hframe".
+    change (<[Regidx csp_rs1 := regval_into_reg
+        (add_vec (m !!! Regidx csp_rs1) (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6))))]> m) with A0.
+    assert (Hpc02 : add_vec_int (mword_of_int KernelSyms.virtio_disk_intr : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x02))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc02) in "Hpc".
+    iEval (rewrite (stack_own_slots (KTR := KT1)); cbn [seq]) in "Hframe".
+    iDestruct "Hframe" as "(S1c & S2c & S3c & S4c & _)".
+    iDestruct "S1c" as (vr24) "Hr24".
+    iDestruct "S2c" as (vr16) "Hr16".
+    iDestruct "S3c" as (vr8) "Hr8".
+    iDestruct "S4c" as (vgap) "Hgap".
+    assert (Hb1 : pa_stk sp0 1
+                   = add_vec spd (zero_extend' 64 (concat_vec (mword_of_int 3 : mword 6) ('b"000")))).
+    { rewrite /spd. unfold sp0, pa_stk, add_vec_int. rewrite add_vec_off2.
+      f_equal; try (apply bv_eq; vm_compute; reflexivity). }
+    assert (Hb2 : pa_stk sp0 2
+                   = add_vec spd (zero_extend' 64 (concat_vec (mword_of_int 2 : mword 6) ('b"000")))).
+    { rewrite /spd. unfold sp0, pa_stk, add_vec_int. rewrite add_vec_off2.
+      f_equal; try (apply bv_eq; vm_compute; reflexivity). }
+    assert (Hb3 : pa_stk sp0 3
+                   = add_vec spd (zero_extend' 64 (concat_vec (mword_of_int 1 : mword 6) ('b"000")))).
+    { rewrite /spd. unfold sp0, pa_stk, add_vec_int. rewrite add_vec_off2.
+      f_equal; try (apply bv_eq; vm_compute; reflexivity). }
+    (* +0x02/+0x04/+0x06: c.sdsp ra/s0/s1 *)
+    iApply (wp_csdsp_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x02)) (mword_of_int 3 : mword 6) ra_idx
+              A0 (av - 4)%nat vr24 b
+              with "Hcg Hpc [] [Hr24]").
+    { iApply (vti_02 with "Htext"). }
+    { iEval (rewrite HcspA0 -Hb1). iExact "Hr24". }
+    iIntros (CID2 Hs2) "Hcg Hpc Hr24".
+    assert (Hpc04 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x02) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x04))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc04) in "Hpc".
+    iApply (wp_csdsp_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x04)) (mword_of_int 2 : mword 6) s0_idx
+              A0 (av - 4)%nat vr16 b
+              with "Hcg Hpc [] [Hr16]").
+    { iApply (vti_04 with "Htext"). }
+    { iEval (rewrite HcspA0 -Hb2). iExact "Hr16". }
+    iIntros (CID3 Hs3) "Hcg Hpc Hr16".
+    assert (Hpc06 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x04) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x06))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc06) in "Hpc".
+    iApply (wp_csdsp_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x06)) (mword_of_int 1 : mword 6) s1_idx
+              A0 (av - 4)%nat vr8 b
+              with "Hcg Hpc [] [Hr8]").
+    { iApply (vti_06 with "Htext"). }
+    { iEval (rewrite HcspA0 -Hb3). iExact "Hr8". }
+    iIntros (CID4 Hs4) "Hcg Hpc Hr8".
+    assert (Hpc08 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x06) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x08))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc08) in "Hpc".
+    (* +0x08: c.addi4spn s0,sp,32 *)
+    iApply (wp_caddi4spn_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x08)) (Cregidx (mword_of_int 0))
+              (mword_of_int 8 : mword 8) s0_idx A0 (av - 4)%nat b
+              ltac:(vm_compute; reflexivity) ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_08 with "Htext"). }
+    iIntros (CID5 Hs5) "Hcg Hpc".
+    set (A1 := <[Regidx s0_idx := regval_into_reg
+        (add_vec (A0 !!! Regidx csp_rs1) (sign_extend' 64 (caddi4spn_imm (mword_of_int 8 : mword 8))))]> A0).
+    change (<[Regidx s0_idx := regval_into_reg
+        (add_vec (A0 !!! Regidx csp_rs1) (sign_extend' 64 (caddi4spn_imm (mword_of_int 8 : mword 8))))]> A0) with A1.
+    assert (Hpc0a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x08) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x0a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc0a) in "Hpc".
+    (* ===================== s1 := &disk ===================== *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x0a)) s1_idx (mword_of_int 30 : mword 20)
+              A1 (av - 4)%nat b ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_0a with "Htext"). }
+    iIntros (CID6 Hs6) "Hcg Hpc".
+    set (A2 := <[Regidx s1_idx := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x0a) : mword 64) (auipc_off (mword_of_int 30 : mword 20)))]> A1).
+    change (<[Regidx s1_idx := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x0a) : mword 64) (auipc_off (mword_of_int 30 : mword 20)))]> A1) with A2.
+    assert (Hpc0e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x0a) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x0e))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc0e) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x0e)) s1_idx s1_idx
+              (mword_of_int 0xaee : mword 12) A2 (av - 4)%nat b
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_0e with "Htext"). }
+    iIntros (CID7 Hs7) "Hcg Hpc".
+    iEval (rgne) in "Hcg".
+    set (A3 := <[Regidx s1_idx := regval_into_reg
+        (add_vec (A2 !!! Regidx s1_idx) (sign_extend' 64 (mword_of_int 2798 : mword 12)))]> A2).
+    change (<[Regidx s1_idx := regval_into_reg
+        (add_vec (A2 !!! Regidx s1_idx) (sign_extend' 64 (mword_of_int 2798 : mword 12)))]> A2) with A3.
+    assert (Hpc12 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x0e) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x12))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc12) in "Hpc".
+    assert (HA3s1 : A3 !!! Regidx s1_idx = (disk_base : mword 64)).
+    { rewrite /A3 upd_eq. rewrite /A2 upd_eq.
+      unfold disk_base. apply bv_eq; vm_compute; reflexivity. }
+    (* ===================== a0 := &disk.vdisk_lock ===================== *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x12)) a0_idx (mword_of_int 30 : mword 20)
+              A3 (av - 4)%nat b ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_12 with "Htext"). }
+    iIntros (CID8 Hs8) "Hcg Hpc".
+    set (A4 := <[Regidx a0_idx := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x12) : mword 64) (auipc_off (mword_of_int 30 : mword 20)))]> A3).
+    change (<[Regidx a0_idx := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x12) : mword 64) (auipc_off (mword_of_int 30 : mword 20)))]> A3) with A4.
+    assert (Hpc16 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x12) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x16))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc16) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x16)) a0_idx a0_idx
+              (mword_of_int 0xc0e : mword 12) A4 (av - 4)%nat b
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_16 with "Htext"). }
+    iIntros (CID9 Hs9) "Hcg Hpc".
+    iEval (rgne) in "Hcg".
+    set (A5 := <[Regidx a0_idx := regval_into_reg
+        (add_vec (A4 !!! Regidx a0_idx) (sign_extend' 64 (mword_of_int 3086 : mword 12)))]> A4).
+    change (<[Regidx a0_idx := regval_into_reg
+        (add_vec (A4 !!! Regidx a0_idx) (sign_extend' 64 (mword_of_int 3086 : mword 12)))]> A4) with A5.
+    assert (Hpc1a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x16) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x1a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc1a) in "Hpc".
+    (* ===================== jal acquire ===================== *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x1a)) ra_idx (mword_of_int 2076678 : mword 21)
+              A5 (av - 4)%nat b
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (vti_1a with "Htext"). }
+    iIntros (CID10 Hs10) "Hcg Hpc".
+    set (A6 := <[Regidx ra_idx := regval_into_reg (add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x1a) : mword 64) 4)]> A5).
+    change (<[Regidx ra_idx := regval_into_reg (add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x1a) : mword 64) 4)]> A5) with A6.
+    assert (Hjacq : add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x1a) : mword 64) (sign_extend' 64 (mword_of_int 2076678 : mword 21))
+                    = mword_of_int KernelSyms.acquire)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hjacq) in "Hpc".
+    assert (HA6ra : A6 !!! Regidx ra_idx = add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x1a) : mword 64) 4)
+      by (rewrite /A6 upd_eq; reflexivity).
+    assert (HA6a0 : A6 !!! Regidx a0_idx = (d_lock : mword 64)).
+    { rewrite /A6 upd_ne; [| vm_compute; discriminate].
+      rewrite /A5 upd_eq. rewrite /A4 upd_eq.
+      unfold d_lock, disk_base. apply bv_eq; vm_compute; reflexivity. }
+    assert (HA6csp : A6 !!! Regidx csp_rs1 = spd).
+    { rewrite /A6 upd_ne; [| vm_compute; discriminate].
+      rewrite /A5 upd_ne; [| vm_compute; discriminate].
+      rewrite /A4 upd_ne; [| vm_compute; discriminate].
+      rewrite /A3 upd_ne; [| vm_compute; discriminate].
+      rewrite /A2 upd_ne; [| vm_compute; discriminate].
+      rewrite /A1 upd_ne; [| vm_compute; discriminate]. exact HcspA0. }
+    assert (HA6s1 : A6 !!! Regidx s1_idx = (disk_base : mword 64)).
+    { rewrite /A6 upd_ne; [| vm_compute; discriminate].
+      rewrite /A5 upd_ne; [| vm_compute; discriminate].
+      rewrite /A4 upd_ne; [| vm_compute; discriminate]. exact HA3s1. }
+    iDestruct (cpu_own_transport CID CID10 n eb pme b ltac:(wp_next_chain) with "Hcnt") as "Hcnt".
+    iApply (Acquire.wp_acquire_sconf KT1 γk "virtio_disk"%string (disk_res_at γd pd pav pu) A6
+              n eb pme (av - 4)%nat b lks ltac:(exact Hn) ltac:(lia) Hfresh
+              with "Hcg Hcnt Htext Hpc [Hlk]").
+    all: try lkbelow.
+    { iEval (rewrite HA6a0). iExact "Hlk". }
+    iIntros (CID11 Hs11 ms MA) "%Hms Hcg Hpc %HcsA Htok HR _ Hcnt Hpay".
+    assert (Hpc1e : ret_pc (A6 !!! Regidx ra_idx) = mword_of_int (KernelSyms.virtio_disk_intr + 0x1e))
+      by (rewrite HA6ra; apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc1e) in "Hpc".
+    (* the register facts the body/epilogue need *)
+    assert (HMAcsp : MA !!! Regidx csp_rs1 = spd)
+      by (rewrite (callee_saved_lookup HcsA csp_rs1 ltac:(vm_compute; reflexivity)); exact HA6csp).
+    assert (HMAs1 : MA !!! Regidx s1_idx = (disk_base : mword 64))
+      by (rewrite (callee_saved_lookup HcsA s1_idx ltac:(vm_compute; reflexivity)); exact HA6s1).
+    assert (Hthr : forall r : mword 5, is_cs_idx r = true ->
+                     r <> csp_rs1 -> r <> s0_idx -> r <> s1_idx ->
+                     MA !!! Regidx r = m !!! Regidx r).
+    { intros r Hr Ncsp N8 N9.
+      assert (N1 : r <> ra_idx) by (intro He; rewrite He in Hr; vm_compute in Hr; discriminate).
+      assert (N10 : r <> a0_idx) by (intro He; rewrite He in Hr; vm_compute in Hr; discriminate).
+      rewrite (callee_saved_lookup HcsA r Hr).
+      rewrite /A6 upd_ne; [| congruence].
+      rewrite /A5 upd_ne; [| congruence].
+      rewrite /A4 upd_ne; [| congruence].
+      rewrite /A3 upd_ne; [| congruence].
+      rewrite /A2 upd_ne; [| congruence].
+      rewrite /A1 upd_ne; [| congruence].
+      rewrite /A0 upd_ne; [| congruence]. reflexivity. }
+    (* hand the frame slots back at their ENTRY values *)
+    assert (HraA0 : A0 !!! Regidx ra_idx = m !!! Regidx ra_idx)
+      by (rewrite /A0 upd_ne; [reflexivity | vm_compute; discriminate]).
+    assert (Hs0A0 : A0 !!! Regidx s0_idx = m !!! Regidx s0_idx)
+      by (rewrite /A0 upd_ne; [reflexivity | vm_compute; discriminate]).
+    assert (Hs1A0 : A0 !!! Regidx s1_idx = m !!! Regidx s1_idx)
+      by (rewrite /A0 upd_ne; [reflexivity | vm_compute; discriminate]).
+    iEval (rgne) in "Hr24". iEval (rewrite HcspA0 HraA0 -Hb1) in "Hr24".
+    iEval (rgne) in "Hr16". iEval (rewrite HcspA0 Hs0A0 -Hb2) in "Hr16".
+    iEval (rgne) in "Hr8".  iEval (rewrite HcspA0 Hs1A0 -Hb3) in "Hr8".
+    iSpecialize ("Hcont" $! CID11 with "[%]"); [wp_next_chain|].
+    iApply ("Hcont" $! MA sp0 with "[%] Hcg Hpc Htok HR Hcnt Hpay Hr24 Hr16 Hr8 [Hgap]").
+    { split_and!; [ reflexivity | exact HMAcsp | exact HMAs1 | exact Hthr ]. }
+    { iExists vgap. iEval (rewrite Hspd4 -HcspA0). iExact "Hgap". }
+  Qed.
+
+End VtPrologue.
+End VtPrologue.
+
+(* ===================================================================== *)
+(* §2  The release call and the epilogue (KernelSyms.virtio_disk_intr+0x8a .. KernelSyms.virtio_disk_intr+0x9e).          *)
+(*                                                                        *)
+(*     A functor over RELEASE.  a0 := &disk.vdisk_lock again, release,    *)
+(*     restore ra/s0/s1, pop the frame, return.  The postcondition is     *)
+(*     the whole function's: [callee_saved m MF] and the return pc.       *)
+(* ===================================================================== *)
+Module VtEpilogue (Release : RELEASE).
+Section VtEpilogue.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Notation ra_idx := (mword_of_int 1 : mword 5).
+  Notation tp_idx := (mword_of_int 4 : mword 5).
+  Notation s0_idx := (mword_of_int 8 : mword 5).
+  Notation s1_idx := (mword_of_int 9 : mword 5).
+  Notation a0_idx := (mword_of_int 10 : mword 5).
+
+  Lemma wp_vt_epilogue (γk : gname) (γd : disk_names)
+      (pd pav pu : mword 64) (m MB : regfile) (av n : nat) (eb : bool)
+      (pme : mword 64) (sp0 : mword 64) (b : bool) (lks : gset string) :
+    sp0 = m !!! Regidx csp_rs1 ->
+    MB !!! Regidx csp_rs1
+      = add_vec sp0 (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6))) ->
+    (forall r : mword 5, is_cs_idx r = true ->
+       r <> csp_rs1 -> r <> s0_idx -> r <> s1_idx ->
+       MB !!! Regidx r = m !!! Regidx r) ->
+    (22 <= av)%nat ->
+    (* release's own exit index; the caller derives it from its entry
+       resources ([CpuOwn.cpu_own] / [sie_arm] ghost agreement). *)
+    (match n with O => eb | S _ => false end) = b ->
+    (* matches [wp_vt_prologue]'s order premise: needed to fold release's
+       output set back down to [lks] *)
+    locks_below lks "virtio_disk" ->
+    sie_cap_gpr KT1 MB (trap_res b + (av - 4))%nat false pme -∗
+    kernel_text -∗ pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x8a) : mword 64) -∗
+    is_lock γk d_lock "virtio_disk"%string (disk_res_at γd pd pav pu) -∗
+    locked γk cpu_id -∗ disk_res γd pd pav pu -∗
+    cpu_own (S n) eb pme false ({["virtio_disk"]} ∪ lks) -∗ arm_pay KT1 n eb pme -∗
+    pa_stk sp0 1 ↦₈[KT1] (m !!! Regidx ra_idx) -∗
+    pa_stk sp0 2 ↦₈[KT1] (m !!! Regidx s0_idx) -∗
+    pa_stk sp0 3 ↦₈[KT1] (m !!! Regidx s1_idx) -∗
+    (∃ vg : mword 64, pa_stk sp0 4 ↦₈[KT1] vg) -∗
+    wp_next b pme (fun (CID : CpuId) =>
+      ∀ MF : regfile,
+        ⌜ callee_saved m MF ⌝ -∗
+        sie_cap_gpr KT1 MF av b pme -∗
+        cpu_own n eb pme b lks -∗
+        pc_is (ret_pc (m !!! Regidx ra_idx)) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hsp0 HMBcsp HMBthr Hav Hbeq Hfresh.
+    set (spd := add_vec sp0 (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6)))).
+    iIntros "Hcg #Htext Hpc #Hlk Htok HR Hcnt Hpay Hr24 Hr16 Hr8 Hgap Hcont".
+    iDestruct "Hgap" as (vgap) "Hgap".
+    assert (Hspd4 : pa_stk sp0 4 = spd).
+    { rewrite /spd. unfold pa_stk, add_vec_int. apply f_equal. apply bv_eq; vm_compute; reflexivity. }
+    assert (Hb1 : pa_stk sp0 1
+                   = add_vec spd (zero_extend' 64 (concat_vec (mword_of_int 3 : mword 6) ('b"000")))).
+    { rewrite /spd. unfold pa_stk, add_vec_int. rewrite add_vec_off2.
+      f_equal; try (apply bv_eq; vm_compute; reflexivity). }
+    assert (Hb2 : pa_stk sp0 2
+                   = add_vec spd (zero_extend' 64 (concat_vec (mword_of_int 2 : mword 6) ('b"000")))).
+    { rewrite /spd. unfold pa_stk, add_vec_int. rewrite add_vec_off2.
+      f_equal; try (apply bv_eq; vm_compute; reflexivity). }
+    assert (Hb3 : pa_stk sp0 3
+                   = add_vec spd (zero_extend' 64 (concat_vec (mword_of_int 1 : mword 6) ('b"000")))).
+    { rewrite /spd. unfold pa_stk, add_vec_int. rewrite add_vec_off2.
+      f_equal; try (apply bv_eq; vm_compute; reflexivity). }
+    (* ---- +0x8a/+0x8e: a0 := &disk.vdisk_lock ---- *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x8a)) a0_idx (mword_of_int 30 : mword 20)
+              MB (trap_res b + (av - 4))%nat false ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_8a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (E0 := <[Regidx a0_idx := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x8a) : mword 64) (auipc_off (mword_of_int 30 : mword 20)))]> MB).
+    change (<[Regidx a0_idx := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x8a) : mword 64) (auipc_off (mword_of_int 30 : mword 20)))]> MB) with E0.
+    assert (Hpc8e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x8a) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x8e))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc8e) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x8e)) a0_idx a0_idx
+              (mword_of_int 0xb96 : mword 12) E0 (trap_res b + (av - 4))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_8e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    iEval (rgne) in "Hcg".
+    set (E1 := <[Regidx a0_idx := regval_into_reg
+        (add_vec (E0 !!! Regidx a0_idx) (sign_extend' 64 (mword_of_int 2966 : mword 12)))]> E0).
+    change (<[Regidx a0_idx := regval_into_reg
+        (add_vec (E0 !!! Regidx a0_idx) (sign_extend' 64 (mword_of_int 2966 : mword 12)))]> E0) with E1.
+    assert (Hpc92 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x8e) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x92))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc92) in "Hpc".
+    (* ---- +0x92: jal ra,release ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x92)) ra_idx (mword_of_int 2076694 : mword 21)
+              E1 (trap_res b + (av - 4))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (vti_92 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (E2 := <[Regidx ra_idx := regval_into_reg (add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x92) : mword 64) 4)]> E1).
+    change (<[Regidx ra_idx := regval_into_reg (add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x92) : mword 64) 4)]> E1) with E2.
+    assert (Hjrel : add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x92) : mword 64) (sign_extend' 64 (mword_of_int 2076694 : mword 21))
+                    = mword_of_int KernelSyms.release)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hjrel) in "Hpc".
+    assert (HE2ra : E2 !!! Regidx ra_idx = add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x92) : mword 64) 4)
+      by (rewrite /E2 upd_eq; reflexivity).
+    assert (HE2a0 : E2 !!! Regidx a0_idx = (d_lock : mword 64)).
+    { rewrite /E2 upd_ne; [| vm_compute; discriminate].
+      rewrite /E1 upd_eq. rewrite /E0 upd_eq.
+      unfold d_lock, disk_base. apply bv_eq; vm_compute; reflexivity. }
+    assert (HE2csp : E2 !!! Regidx csp_rs1 = spd).
+    { rewrite /E2 upd_ne; [| vm_compute; discriminate].
+      rewrite /E1 upd_ne; [| vm_compute; discriminate].
+      rewrite /E0 upd_ne; [| vm_compute; discriminate]. exact HMBcsp. }
+    (* the acquire handed this window out at [trap_res b + N]; release wants
+       [trap_res outb + N], and [outb] IS [b] ([cpu_own] forces it, which is
+       what [Hbeq]/[Houtb] records).  Pure re-spelling -- it is what makes
+       the acquire/release pair compose back to [N]. *)
+    iEval (rewrite -Hbeq) in "Hcg".
+    iApply (Release.wp_release_sconf KT1 γk d_lock "virtio_disk"%string (disk_res_at γd pd pav pu) E2
+              n eb pme (av - 4)%nat ({["virtio_disk"]} ∪ lks)
+              ltac:(rewrite HE2a0; apply addv_sext0) ltac:(lia)
+              with "Hcg Htext Hpc [Hlk] [Htok] [HR] Hcnt Hpay").
+    { iExact "Hlk". }
+    { iExact "Htok". }
+    { iExact "HR". }
+    iIntros (CID1 Hs1 MR) "Hcg Hpc %HcsR Hcnt".
+    rewrite Hbeq in Hs1.
+    iEval (rewrite Hbeq) in "Hcg". iEval (rewrite Hbeq) in "Hcnt".
+    (* virtio_disk_intr is BALANCED: what it acquired it released, so the set
+       release hands back collapses to the entry [lks]. *)
+    pose proof (locks_below_not_elem lks "virtio_disk" Hfresh) as Hnotin.
+    assert (Hsetback : ({["virtio_disk"]} ∪ lks) ∖ {["virtio_disk"]} = lks)
+      by (apply locks_add_del_below; lkbelow).
+    iEval (rewrite Hsetback) in "Hcnt".
+    assert (Hpc96 : ret_pc (E2 !!! Regidx ra_idx) = mword_of_int (KernelSyms.virtio_disk_intr + 0x96))
+      by (rewrite HE2ra; apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc96) in "Hpc".
+    assert (HMRcsp : MR !!! Regidx csp_rs1 = spd)
+      by (rewrite (callee_saved_lookup HcsR csp_rs1 ltac:(vm_compute; reflexivity)); exact HE2csp).
+    (* ---- +0x96/+0x98/+0x9a: restore ra/s0/s1 ---- *)
+    iApply (wp_cldsp_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x96)) (mword_of_int 3 : mword 6) ra_idx
+              MR (av - 4)%nat (m !!! Regidx ra_idx) b (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [Hr24]").
+    { iApply (vti_96 with "Htext"). }
+    { iEval (rewrite HMRcsp -Hb1). iExact "Hr24". }
+    iIntros (CID2 Hs2) "Hcg Hpc Hr24".
+    set (E3 := <[Regidx ra_idx := regval_into_reg (m !!! Regidx ra_idx)]> MR).
+    change (<[Regidx ra_idx := regval_into_reg (m !!! Regidx ra_idx)]> MR) with E3.
+    assert (Hpc98 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x96) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x98))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc98) in "Hpc".
+    assert (HE3csp : E3 !!! Regidx csp_rs1 = spd)
+      by (rewrite /E3 upd_ne; [exact HMRcsp | vm_compute; discriminate]).
+    iApply (wp_cldsp_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x98)) (mword_of_int 2 : mword 6) s0_idx
+              E3 (av - 4)%nat (m !!! Regidx s0_idx) b (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [Hr16]").
+    { iApply (vti_98 with "Htext"). }
+    { iEval (rewrite HE3csp -Hb2). iExact "Hr16". }
+    iIntros (CID3 Hs3) "Hcg Hpc Hr16".
+    set (E4 := <[Regidx s0_idx := regval_into_reg (m !!! Regidx s0_idx)]> E3).
+    change (<[Regidx s0_idx := regval_into_reg (m !!! Regidx s0_idx)]> E3) with E4.
+    assert (Hpc9a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x98) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x9a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc9a) in "Hpc".
+    assert (HE4csp : E4 !!! Regidx csp_rs1 = spd)
+      by (rewrite /E4 upd_ne; [exact HE3csp | vm_compute; discriminate]).
+    iApply (wp_cldsp_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x9a)) (mword_of_int 1 : mword 6) s1_idx
+              E4 (av - 4)%nat (m !!! Regidx s1_idx) b (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [Hr8]").
+    { iApply (vti_9a with "Htext"). }
+    { iEval (rewrite HE4csp -Hb3). iExact "Hr8". }
+    iIntros (CID4 Hs4) "Hcg Hpc Hr8".
+    set (E5 := <[Regidx s1_idx := regval_into_reg (m !!! Regidx s1_idx)]> E4).
+    change (<[Regidx s1_idx := regval_into_reg (m !!! Regidx s1_idx)]> E4) with E5.
+    assert (Hpc9c : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x9a) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x9c))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc9c) in "Hpc".
+    (* ---- +0x9c: c.addi16sp sp,32 -- the frame pop ---- *)
+    assert (HE5csp : E5 !!! Regidx csp_rs1 = spd)
+      by (rewrite /E5 upd_ne; [exact HE4csp | vm_compute; discriminate]).
+    set (E6 := <[Regidx csp_rs1 := regval_into_reg
+        (add_vec (E5 !!! Regidx csp_rs1) (sign_extend' 64 (caddi16sp_imm (mword_of_int 2 : mword 6))))]> E5).
+    assert (Hsp0up : add_vec spd (sign_extend' 64 (caddi16sp_imm (mword_of_int 2 : mword 6))) = sp0).
+    { rewrite /spd add_vec_assoc.
+      assert (HAB : add_vec (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6)))
+                            (sign_extend' 64 (caddi16sp_imm (mword_of_int 2 : mword 6))) = mword_of_int 0)
+        by (apply bv_eq; vm_compute; reflexivity).
+      rewrite HAB. apply avi0. }
+    assert (Hwv : add_vec (E5 !!! Regidx csp_rs1) (sign_extend' 64 (caddi16sp_imm (mword_of_int 2 : mword 6))) = sp0).
+    { rewrite HE5csp. exact Hsp0up. }
+    assert (HE6sp : E6 !!! Regidx csp_rs1 = sp0).
+    { rewrite /E6 upd_eq. exact Hwv. }
+    assert (Hpop : E5 !!! Regidx csp_rs1
+                   = pa_stk (add_vec (E5 !!! Regidx csp_rs1) (sign_extend' 64 (caddi16sp_imm (mword_of_int 2 : mword 6)))) 4).
+    { rewrite Hwv HE5csp. symmetry. exact Hspd4. }
+    iAssert (stack_own (KTR := KT1) sp0 4) with "[Hr24 Hr16 Hr8 Hgap]" as "Hframe4".
+    { rewrite (stack_own_slots (KTR := KT1)). cbn [seq].
+      iSplitL "Hr24". { iExists _. iEval (rewrite Hb1 -HE3csp). iExact "Hr24". }
+      iSplitL "Hr16". { iExists _. iEval (rewrite Hb2 -HE4csp). iExact "Hr16". }
+      iSplitL "Hr8".  { iExists _. iEval (rewrite Hb3 -HE5csp). iExact "Hr8". }
+      iSplitL "Hgap". { iExists _. iExact "Hgap". }
+      done. }
+    iEval (rewrite -Hwv) in "Hframe4".
+    iApply (wp_caddi16sp_pop_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x9c)) (mword_of_int 2 : mword 6)
+              E5 (av - 4)%nat 4 b Hpop with "Hcg Hpc [] Hframe4").
+    { iApply (vti_9c with "Htext"). }
+    iIntros (CID5 Hs5) "Hcg Hpc".
+    assert (Hnk : ((av - 4) + 4)%nat = av) by lia.
+    iEval (rewrite Hnk) in "Hcg".
+    change (<[Regidx csp_rs1 := regval_into_reg
+        (add_vec (E5 !!! Regidx csp_rs1) (sign_extend' 64 (caddi16sp_imm (mword_of_int 2 : mword 6))))]> E5) with E6.
+    assert (Hpc9e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x9c) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x9e))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc9e) in "Hpc".
+    (* ---- +0x9e: c.ret ---- *)
+    assert (HE6ra : E6 !!! Regidx ra_idx = m !!! Regidx ra_idx).
+    { rewrite /E6 upd_ne; [| vm_compute; discriminate].
+      rewrite /E5 upd_ne; [| vm_compute; discriminate].
+      rewrite /E4 upd_ne; [| vm_compute; discriminate].
+      rewrite /E3. apply upd_eq. }
+    iApply (wp_cret_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x9e)) ra_idx E6 av b
+              ltac:(vm_compute; discriminate) with "Hcg Hpc []").
+    { iApply (vti_9e with "Htext"). }
+    iIntros (CID6 Hs6) "Hcg Hpc".
+    iEval (rgne) in "Hpc". iEval (rewrite HE6ra) in "Hpc".
+    (* ---- the callee-saved postcondition ---- *)
+    assert (HE6s0 : E6 !!! Regidx s0_idx = m !!! Regidx s0_idx).
+    { rewrite /E6 upd_ne; [| vm_compute; discriminate].
+      rewrite /E5 upd_ne; [| vm_compute; discriminate].
+      rewrite /E4. apply upd_eq. }
+    assert (HE6s1 : E6 !!! Regidx s1_idx = m !!! Regidx s1_idx).
+    { rewrite /E6 upd_ne; [| vm_compute; discriminate].
+      rewrite /E5. apply upd_eq. }
+    assert (HE6csp : E6 !!! Regidx csp_rs1 = m !!! Regidx csp_rs1)
+      by (rewrite HE6sp Hsp0; reflexivity).
+    assert (Hthr : forall r : mword 5, is_cs_idx r = true ->
+                     r <> csp_rs1 -> r <> s0_idx -> r <> s1_idx ->
+                     E6 !!! Regidx r = m !!! Regidx r).
+    { intros r Hr Ncsp N8 N9.
+      assert (N1 : r <> ra_idx) by (intro He; rewrite He in Hr; vm_compute in Hr; discriminate).
+      assert (N10 : r <> a0_idx) by (intro He; rewrite He in Hr; vm_compute in Hr; discriminate).
+      rewrite /E6 upd_ne; [| congruence].
+      rewrite /E5 upd_ne; [| congruence].
+      rewrite /E4 upd_ne; [| congruence].
+      rewrite /E3 upd_ne; [| congruence].
+      rewrite (callee_saved_lookup HcsR r Hr).
+      rewrite /E2 upd_ne; [| congruence].
+      rewrite /E1 upd_ne; [| congruence].
+      rewrite /E0 upd_ne; [| congruence].
+      exact (HMBthr r Hr Ncsp N8 N9). }
+    iDestruct (cpu_own_transport CID1 CID6 n eb pme b ltac:(wp_next_chain) with "Hcnt") as "Hcnt".
+    iSpecialize ("Hcont" $! CID6 with "[%]"); [wp_next_chain|].
+    iApply ("Hcont" $! E6 with "[%] Hcg Hcnt Hpc").
+    unfold callee_saved.
+    split; [exact HE6csp|].
+    split; [exact HE6s0|].
+    split; [exact HE6s1|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    split; [apply Hthr; vm_compute; first [reflexivity | discriminate]|].
+    apply Hthr; vm_compute; first [reflexivity | discriminate].
+  Qed.
+
+End VtEpilogue.
+End VtEpilogue.
+
+(* ===================================================================== *)
+(* §3  Seams for the LOOP region (+0x30 .. +0x86).                        *)
+(*                                                                        *)
+(*  (a) [disk_res_at] -- [DiskInv.disk_res] with its four existentials    *)
+(*      NAMED.  The loop carries the destructured form across iterations  *)
+(*      (its [nr] moves), so the invariant cannot be the packed           *)
+(*      [disk_res].  Kept HERE, not in DiskInv.v, because virtio_disk_rw  *)
+(*      owns that file; if rw ends up wanting the same split, promote it  *)
+(*      there.                                                            *)
+(*                                                                        *)
+(*  (b) the queue pages' word-alignment, which is what turns the          *)
+(*      protocol's byte-granular [phys_word2]/[phys_word4] back into the  *)
+(*      [↦₂]/[↦₄] the memory leaves consume ([DiskInv.phys_to_word2] /    *)
+(*      [phys_to_word4] take it as a premise).  It is a consequence of    *)
+(*      [virtio_pages_aligned] alone, stated mword-free so [lia] works    *)
+(*      (durable-notes' zify gotcha).                                     *)
+(*                                                                        *)
+(*  (c) the width-1/4/8 [wordw_pointsto] the atomic-update leaves speak,  *)
+(*      as the [↦ₘ]/[↦₄]/[↦₈] the accessors hand out.                     *)
+(* ===================================================================== *)
+(* RESTATEMENTS of [DiskInv]'s family (it moved there: the queue pages'
+   geometry, cloned by three files).  Local names kept, so no call site
+   below changed. *)
+
+Lemma vt_wrap_off (x k : Z) :
+  0 <= x -> x < 18446744073709551616 -> x mod 4096 = 0 ->
+  0 <= k -> k < 4096 ->
+  (x + k) mod 18446744073709551616 = x + k.
+Proof. exact (pa_wrap_in_page x k). Qed.
+
+Lemma vt_rem_off (x k d : Z) :
+  0 <= x -> x < 18446744073709551616 -> x mod 4096 = 0 ->
+  0 <= k -> k < 4096 -> 0 < d -> 4096 mod d = 0 -> k mod d = 0 ->
+  Z.rem ((x + k) mod 18446744073709551616) d = 0.
+Proof. exact (pa_rem_in_page x k d). Qed.
+
+(* an offset [k] into a 4096-aligned page is [d]-aligned whenever [d] divides
+   4096 and [k]: exactly the premise [phys_to_word2]/[phys_to_word4] want. *)
+Lemma vt_aligned_off (p : Arch.pa) (k : nat) (d : Z) :
+  bv_unsigned (p : SailStdpp.Values.mword 64) `mod` 4096 = 0 ->
+  (Z.of_nat k < 4096)%Z -> (0 < d)%Z -> (4096 mod d = 0)%Z ->
+  (Z.of_nat k mod d = 0)%Z ->
+  is_aligned_paddr (Physaddr (pa_add p k)) d = true.
+Proof. exact (pa_add_aligned_in_page p k d). Qed.
+
+Section VtLoopSeam.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ}.
+  Context `{XI : CurCtx}.
+  Context `{CID : CpuId}.   (* [hart_view_lb]: the loop receipt is this hart's *)
+
+  (* the T-leg's [disk_nr] is our [disk_read_at]: same ghost, same body *)
+  Lemma vt_nr_eq (γ : disk_names) (n : nat) : disk_read_at γ n ⊣⊢ disk_nr γ n.
+  Proof using . reflexivity. Qed.
+
+  (* [DiskInv.disk_res]'s body with the four existentials named. *)
+  Definition disk_res_at (γ : disk_names) (pd pav pu : SailStdpp.Values.mword 64)
+      (np nr : nat) (cm : gmap nat dclaim) (fr : nat -> bool) : iProp Σ :=
+    ((* every row of the claim map is below the published count, names its
+        own position and links its slot to its buffer: the handler reads the
+        claim at the record it is looking at off THIS map, and that is how it
+        knows the head is below 8 and the status byte is [info[h].status] *)
+     ⌜forall p dc, cm !! p = Some dc ->
+        (p < np)%nat /\ dc_pos dc = p /\ slot_buf_link (dc_slot dc) (dc_buf dc)⌝ ∗
+     disk_pub γ np ∗
+     disk_done_lb γ nr ∗
+     (* the READ WATERMARK's half: the deposit at [b->disk = 0] spends it and
+        hands it back advanced, which is what drains the ring in order *)
+     disk_read_at γ nr ∗
+     (* A6.126 §6: the reader's floors -- the index word's two stamps and the
+        reader floor [F], each a floor of the running context *)
+     (∃ t0 t1 F : nat,
+        disk_fl γ t0 t1 ∗ disk_flr γ F ∗
+        lk_floor cur_ctx t0 ∗ lk_floor cur_ctx t1 ∗ TsoCtx.ctx_floor cur_ctx F) ∗
+     (* nothing half-published while the lock is not held mid-publish *)
+     disk_stage γ None ∗
+     (* THE CLAIM MAP'S AUTHORITY: the handler's carrier between its
+        openings of the device invariant.  It holds the lock for the whole
+        loop, so the map is stable in its hands; each accessor agrees the
+        receipt's fragment with it and speaks about the claim it read here. *)
+     ghost_map_auth_frac (dn_claim γ) 1 cm ∗
+     (* the claim ROWS (DiskInv.v, the row design): the handler reads
+        [info[id].b] off the row at the record's position and clears
+        [b->disk] through its cell, then flips the row to its Right arm *)
+     ([∗ map] p ↦ dc ∈ cm, claim_cells γ nr p dc) ∗
+     d_used_idx ↦₂ wrap16 nr ∗
+     free_bundles γ pd fr ∗
+     ring_hcells cur_ctx pav ∗
+     avail_half pav np)%I.
+
+  Lemma disk_res_at_elim (γ : disk_names) (pd pav pu : SailStdpp.Values.mword 64) :
+    disk_res γ pd pav pu -∗
+    ∃ (np nr : nat) (cm : gmap nat dclaim) (fr : nat -> bool),
+      disk_res_at γ pd pav pu np nr cm fr.
+  Proof using .
+    iIntros "H". rewrite /disk_res.
+    iDestruct "H" as (np nr cm fr) "H".
+    iExists np, nr, cm, fr. rewrite /disk_res_at /free_bundles. iExact "H".
+  Qed.
+
+  Lemma disk_res_at_intro (γ : disk_names) (pd pav pu : SailStdpp.Values.mword 64)
+      (np nr : nat) (cm : gmap nat dclaim) (fr : nat -> bool) :
+    disk_res_at γ pd pav pu np nr cm fr -∗ disk_res γ pd pav pu.
+  Proof using .
+    iIntros "H". rewrite /disk_res.
+    iEval (rewrite /disk_res_at /free_bundles) in "H".
+    iExists np, nr, cm, fr. iExact "H".
+  Qed.
+
+  (* THE loop invariant's ghost content, at the loop head +0x3e: the
+     destructured lock resource plus the observation that carried the thread
+     into the body -- the device is provably PAST the driver's [nr], which
+     is what entitles the handler to the completion record at [nr]
+     ([VirtioProto.virtio_proto_record_at] wants [disk_done_lb (S nr)]). *)
+  Definition vt_loop_state (γ : disk_names) (pd pav pu : SailStdpp.Values.mword 64)
+    : iProp Σ :=
+    (∃ (np nr : nat) (cm : gmap nat dclaim) (fr : nat -> bool) (c : nat),
+       ⌜(nr < c)%nat /\ (c <= np)%nat⌝ ∗ disk_done_lb γ c ∗
+       (* A6.126 §6: the read that entered the loop (or its last iteration)
+          settled on an index past [nr] at a view [V0] that has every
+          completion below it -- in particular the record at [nr] -- in it *)
+       (∃ V0 : nat, hart_rview_lb_at cpu_id V0 ∗
+          [∗ list] u ∈ seq 0 c, ∃ q : nat, disk_done_pos γ u q ∗ ⌜(q <= V0)%nat⌝) ∗
+       disk_res_at γ pd pav pu np nr cm fr)%I.
+
+  Lemma vt_loop_state_close (γ : disk_names) (pd pav pu : SailStdpp.Values.mword 64) :
+    vt_loop_state γ pd pav pu -∗ disk_res γ pd pav pu.
+  Proof using .
+    iIntros "H". iDestruct "H" as (np nr cm fr c) "(_ & _ & _ & H)".
+    iApply (disk_res_at_intro with "H").
+  Qed.
+
+  (* the completed-count lower bound weakens *)
+  Lemma vt_done_lb_le (γ : disk_names) (n c : nat) :
+    (n <= c)%nat -> disk_done_lb γ c -∗ disk_done_lb γ n.
+  Proof using . intro H. rewrite /disk_done_lb. iApply (mono_nat_lb_own_le n H). Qed.
+
+  (* the atomic-update leaves' window at the three widths the loop body
+     touches through the device invariant ([WpSconfMem.wordw1_byte] is the
+     byte instance; the other two are the definitions side by side) *)
+  Lemma vt_byte_wordw (a : Arch.pa) (b : bv 8) :
+    wordw_pointsto (KTR := KT0) 1 a (DfracOwn 1) b ⊣⊢ a ↦ₘ b.
+  Proof using .
+    rewrite (wordw1_byte (KTR := KT0)). reflexivity.
+  Qed.
+
+  Lemma vt_word4_wordw (a : Arch.pa) (w : SailStdpp.Values.mword 32) :
+    a ↦₄ w ⊣⊢ wordw_pointsto (KTR := KT0) 4 a (DfracOwn 1) w.
+  Proof using .
+    rewrite /wordw_pointsto /TsoCtx.ctx_word4_pointsto.
+    by change (Z.to_nat 4) with 4%nat.
+  Qed.
+
+  Lemma vt_word8_wordw (a : Arch.pa) (w : SailStdpp.Values.mword 64) :
+    a ↦₈ w ⊣⊢ wordw_pointsto (KTR := KT0) 8 a (DfracOwn 1) w.
+  Proof using . rewrite (wordw8_ctx (KTR2 := KT0)). reflexivity. Qed.
+
+  (* the width-1 unsigned load's extension, as [wp_load_s_sconf_au] wants
+     it ([WpSconfMem]'s own copy is local to that file) *)
+  Lemma vt_ext1 (v : SailStdpp.Values.mword 8) :
+    extend_value true v = zero_extend' 64 v.
+  Proof using . unfold extend_value. reflexivity. Qed.
+
+End VtLoopSeam.
+
+(* ===================================================================== *)
+(* §4  The two dev_inv-OPENING RAM leaves of the loop.                    *)
+(*                                                                        *)
+(*     The used ring lives in the DMA lease, so its bytes are reachable   *)
+(*     only through [VirtioProto]'s accessors, which run inside the       *)
+(*     device invariant.  Both loads are therefore ATOMIC-UPDATE leaves   *)
+(*     ([WpSconfMem.wp_load_s_sconf_au], the [WpSconfLock] pattern) that  *)
+(*     open [dev_inv] across the one memory step, and both have to cross  *)
+(*     the tier boundary twice: the accessor hands out [phys_word2] /     *)
+(*     [phys_word4] (byte-granular, PHYSICAL) and the leaf consumes       *)
+(*     [wordw_pointsto] (aligned, VA tier), so [DiskInv.phys_to_word*] /  *)
+(*     [word*_to_phys] bracket the access.  The alignment premise comes   *)
+(*     from [virtio_pages_aligned] via [vt_aligned_off]; the static/      *)
+(*     canonical premises from [disk_geom_static]/[_canonical]; and the   *)
+(*     claims bundle off the threaded [sie_cap_gpr]                       *)
+(*     ([IntrDefs.sie_cap_gpr_kmap_claims]).                              *)
+(*                                                                        *)
+(*     [disk_cfg_agree] is what makes the accessor's address the one the  *)
+(*     CODE computes: it pins [v_cfg v = virtio_init_cfg pd pav pu], so   *)
+(*     [used_idx_pa (v_cfg v)] IS [pa_add pu 2].                          *)
+(* ===================================================================== *)
+
+(* the byte offset of used-ring element [p] inside the used page: the
+   accessors' [used_elem_pa] with the config's [vc_used] peeled off. *)
+Definition vt_uoff (p : nat) : nat :=
+  Z.to_nat (vq_used_ring_off + vq_used_elem_size * (Z.of_nat p `mod` 8)).
+
+Lemma vt_uoff_z (p : nat) :
+  Z.of_nat (vt_uoff p) = (4 + 8 * (Z.of_nat p `mod` 8))%Z.
+Proof.
+  unfold vt_uoff, vq_used_ring_off, vq_used_elem_size.
+  rewrite Z2Nat.id; [reflexivity|].
+  pose proof (Z.mod_pos_bound (Z.of_nat p) 8 ltac:(lia)). lia.
+Qed.
+
+Lemma vt_uoff_le (p : nat) : (vt_uoff p <= 60)%nat.
+Proof.
+  pose proof (vt_uoff_z p) as Hz.
+  pose proof (Z.mod_pos_bound (Z.of_nat p) 8 ltac:(lia)). lia.
+Qed.
+
+Lemma vt_uoff_lt (p : nat) : (vt_uoff p < 4096)%nat.
+Proof. pose proof (vt_uoff_le p). lia. Qed.
+
+Lemma vt_uoff_lt_z (p : nat) : (Z.of_nat (vt_uoff p) < 4096)%Z.
+Proof. pose proof (vt_uoff_lt p). lia. Qed.
+
+Lemma vt_uoff_add_lt (p j : nat) : (j < 4)%nat -> (vt_uoff p + j < 4096)%nat.
+Proof. intro Hj. pose proof (vt_uoff_le p). lia. Qed.
+
+Lemma vt_two_add_lt (j : nat) : (j < 2)%nat -> (2 + j < 4096)%nat.
+Proof. intro Hj. lia. Qed.
+
+Lemma vt_zero_lt_4096 : (0 < 4096)%nat.
+Proof. lia. Qed.
+
+Lemma vt_uoff_mod4 (p : nat) : (Z.of_nat (vt_uoff p) mod 4 = 0)%Z.
+Proof.
+  rewrite vt_uoff_z.
+  replace (4 + 8 * (Z.of_nat p `mod` 8))%Z with ((1 + 2 * (Z.of_nat p `mod` 8)) * 4)%Z by lia.
+  apply Z.mod_mul. lia.
+Qed.
+
+Section VtDevRam.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  (* the used-ring INDEX read: [lhu a5,2(a5)] at +0x36 and [lhu a4,2(a4)]
+     at +0x82.  Drives [virtio_proto_used_idx_acc]; the value is the
+     device's completed count, and what survives is the pair of bounds
+     [nr <= nc <= np] plus the persistent lower bound at [nc] -- which is
+     what entitles the handler to the completion record at [nr]
+     ([virtio_proto_record_at]). *)
+  (* ================================================================= *)
+  (* A6.126 §6: THE HANDLER'S RACY READS.  The used index and the used     *)
+  (* element are the DEVICE's cells: the handler owns none of them, and    *)
+  (* reads them through the racy-read leaves against the lease's stamped   *)
+  (* cells.  The claims those leaves want are built from the cells' own    *)
+  (* RAM facts.                                                            *)
+  (* ================================================================= *)
+  Lemma vt_claim_of_ram (width : Z) (a : Arch.pa) :
+    is_aligned_paddr (Physaddr a) width = true ->
+    kmap_static (svpn_of a) KP_rw ->
+    (uint (a : SailStdpp.Values.mword 64) < 274877906944)%Z ->
+    addr_is_ram a ->
+    kmap_static_claims -∗ wordw_claim (KTR := KT0) width a.
+  Proof using .
+    iIntros (Hal Hs Hc Hram) "#Hkm".
+    iDestruct (kmap_static_claims_at _ KP_rw Hs with "Hkm") as "#Hk0".
+    pose proof (pa_of_id a Hc) as Hid.
+    rewrite /wordw_claim /mem_claim. iSplitR; [iPureIntro; exact Hal|].
+    iExists (kpt_leaf_ppn (svpn_of a)). iFrame "Hk0". iPureIntro.
+    split; [exact Hc|]. split; [rewrite Hid; exact Hram|].
+    exact (ktier_pin_of_id _ _ _ Hid).
+  Qed.
+
+  (* the index word's RAM fact, off either form of the release window *)
+  Lemma vt_used_idx_ram (c : virtio_cfg) (nc lo : nat) (tf : nat -> nat)
+      (hist : list (nat * (nat -> bv 8))) :
+    ((⌜hist = []⌝ ∗ TsoCtx.rel_pre_cells (used_idx_pa c) 2 tf (nth_byte (wrap16 0)))
+     ∨ TsoCtx.rel_cells (used_idx_pa c) 2 (DfracOwn 1) disk_agent lo tf
+         (nth_byte (wrap16 0)) (nth_byte (wrap16 nc)) hist) -∗
+    ⌜addr_is_ram (pa_add (used_idx_pa c) 0)⌝.
+  Proof using .
+    iIntros "[[_ Hpre] | Hrel]".
+    - rewrite /TsoCtx.rel_pre_cells. iDestruct "Hpre" as "(Hc & _)".
+      iDestruct (phys_ledger_at_ledger with "Hc") as "Hc".
+      iApply (phys_ledger_ram with "Hc").
+    - rewrite /TsoCtx.rel_cells. iDestruct "Hrel" as "((%t & Hc) & _)".
+      iDestruct (phys_ledger_rpay_forget with "Hc") as "Hc".
+      rewrite /phys_pointsto. iDestruct "Hc" as "[_ %Hr]". by iPureIntro.
+  Qed.
+
+  (* a byte is its own byte 0 *)
+  Lemma vt_nth_byte0 (b : bv 8) : nth_byte b 0 = b.
+  Proof using .
+    unfold nth_byte. apply bv_eq. rewrite bv_extract_unsigned.
+    replace (Z.of_N (8 * N.of_nat 0)) with 0%Z by reflexivity.
+    rewrite Z.shiftr_0_r. apply bv_wrap_bv_unsigned.
+  Qed.
+
+  (* the bytes of a read pin the word *)
+  Lemma vt_word1_of_bytes (v w : SailStdpp.Values.mword 8) :
+    (forall j, (j < 1)%nat -> nth_byte v j = nth_byte w j) -> v = w.
+  Proof using .
+    intro H. apply (bv_eq_of_bytes (n := 1)). intros j Hj. apply H. lia.
+  Qed.
+  Lemma vt_word2_of_bytes (v w : SailStdpp.Values.mword 16) :
+    (forall j, (j < 2)%nat -> nth_byte v j = nth_byte w j) -> v = w.
+  Proof using .
+    intro H. apply (bv_eq_of_bytes (n := 2)). intros j Hj. apply H. lia.
+  Qed.
+  Lemma vt_word4_of_bytes (v w : SailStdpp.Values.mword 32) :
+    (forall j, (j < 4)%nat -> nth_byte v j = nth_byte w j) -> v = w.
+  Proof using .
+    intro H. apply (bv_eq_of_bytes (n := 4)). intros j Hj. apply H. lia.
+  Qed.
+
+  (* WHAT THE HANDLER LEARNS from [used->idx]: the index it read, as a
+     count between the reclaimed and the completed, with every completion
+     below it in the view the read settled at -- persistent, so the leaf's
+     [□]-obligation can hand it over *)
+  Definition vt_idx_q (γd : disk_names) (np nr : nat)
+      (v : SailStdpp.Values.mword 16) (V0 : nat) : iProp Σ :=
+    (∃ k : nat, ⌜v = wrap16 k⌝ ∗ ⌜(nr <= k)%nat /\ (k <= np)%nat⌝ ∗
+       disk_done_lb γd k ∗
+       [∗ list] p ∈ seq 0 k, ∃ q : nat, disk_done_pos γd p q ∗ ⌜(q <= V0)%nat⌝)%I.
+  Global Instance vt_idx_q_persistent γd np nr v V0 : Persistent (vt_idx_q γd np nr v V0).
+  Proof using . rewrite /vt_idx_q. apply _. Qed.
+
+  (* the window the AU hands the leaf, WITH its own close-wand: the leaf's
+     [Res] comes back under fresh existentials, so the way back into the
+     invariant travels inside it *)
+  Definition vt_idx_res (γd : disk_names) (pu : mword 64) (np nr F t0 t1 : nat)
+      (W : virtio_cfg -> nat -> nat -> list (nat * (nat -> bv 8)) -> iProp Σ) : iProp Σ :=
+    (lk_floor cur_ctx t0 ∗ lk_floor cur_ctx t1 ∗ TsoCtx.ctx_floor cur_ctx F ∗
+     ∃ (c : virtio_cfg) (nc lo : nat) (hist : list (nat * (nat -> bv 8))),
+       ⌜used_idx_pa c = pa_add pu 2%nat⌝ ∗
+       ⌜(nr <= nc)%nat /\ (nc <= np)%nat⌝ ∗ ⌜hist_ok hist nc⌝ ∗
+       ⌜forall p q g, hist !! p = Some (q, g) -> (p < nr)%nat -> (q <= F)%nat⌝ ∗
+       disk_done_lb γd nc ∗
+       ([∗ list] p ↦ qg ∈ hist, disk_done_pos γd p qg.1) ∗
+       ((⌜hist = []⌝ ∗ TsoCtx.rel_pre_cells (used_idx_pa c) 2 (tf2 t0 t1) (nth_byte (wrap16 0)))
+        ∨ TsoCtx.rel_cells (used_idx_pa c) 2 (DfracOwn 1) disk_agent lo (tf2 t0 t1)
+            (nth_byte (wrap16 0)) (nth_byte (wrap16 nc)) hist) ∗
+       W c nc lo hist)%I.
+
+  (* the read obligation of [wp_load_s_sconf_au_reli] for the index word:
+     [VirtioProto.used_rel_read_ok] at this hart, with the three floors of
+     the lock payload cashed at the running context *)
+  Local Lemma vt_used_idx_read_ok (ea pu : mword 64) (γd : disk_names)
+      (np nr F t0 t1 : nat)
+      (W : virtio_cfg -> nat -> nat -> list (nat * (nat -> bv 8)) -> iProp Σ)
+      {P : CpuId -> Prop} :
+    ea = (pa_add pu 2%nat : mword 64) ->
+    forall (CIDw : CpuId) (img : TsoMemPa.bytemap) (sigma : mstate) (log : list pwmsg)
+           (V : agent -> nat) (ppn : mword 44),
+      (uint ea < 274877906944)%Z ->
+      (bv_unsigned (subrange_vec_dec ea 11 0) + 2 <= 4096)%Z ->
+      ktier_pin KT0 ppn ea ->
+      P CIDw ->
+      kmap_at (svpn_of ea) ppn KP_rw -∗
+      gen_heap_interp (hG := riscv_memGS) sigma.(mem) -∗
+      tso_interp_of riscv_eraGS img sigma.(mem) log V -∗
+      TsoCtx.own_context (CID := CIDw) CtxIdDefs.cur_ctx -∗
+      vt_idx_res γd pu np nr F t0 t1 W -∗
+      ⌜forall tvr : nat, (V (hart_agent (@cpu_id CIDw)) <= tvr)%nat ->
+         exists v : mword 16,
+           tso_read_bytes img log (hart_agent (@cpu_id CIDw)) tvr
+             (pa_of ppn ea) (Z.to_N 2) v⌝ ∗
+      □ (∀ (tvr : nat) (v : mword 16),
+           ⌜(V (hart_agent (@cpu_id CIDw)) <= tvr)%nat⌝ -∗
+           ⌜tso_read_bytes img log (hart_agent (@cpu_id CIDw)) tvr
+              (pa_of ppn ea) (Z.to_N 2) v⌝ -∗
+           vt_idx_q γd np nr v tvr).
+  Proof using .
+    intros -> CIDw img sigma log V ppn Hcan Hoff Hid _.
+    rewrite (ktier_pin_id ppn _ Hid).
+    iIntros "#Hk Hgh Htso Hctx (#Hf0 & #Hf1 & #HfF & HR)".
+    iDestruct "HR" as (c nc lo hist)
+      "(%Hidx & %Hbnd & %Hho & %HF & #Hlbnc & #Hfrag & Hcells & _)".
+    iDestruct (tso_interp_of_pin with "Htso") as %Hpin.
+    rewrite (tso_interp_of_at_gs riscv_eraGS img sigma.(mem) log V
+               sigma.(sregs) sigma.(mdev) Hpin).
+    (* the three floors, cashed at this hart and joined *)
+    iDestruct (lk_floor_vis (CID := CIDw) with "Hctx Hf0") as "[Hctx (%K0 & #HK0 & #Hv0)]".
+    iDestruct (lk_floor_vis (CID := CIDw) with "Hctx Hf1") as "[Hctx (%K1 & #HK1 & #Hv1)]".
+    iDestruct (TsoCtx.own_context_floor_view (CID := CIDw) with "Hctx HfF")
+      as "[Hctx (%K2 & #HK2 & %HFK2)]".
+    iDestruct (view_lb_max with "HK0 HK1") as "#HK01".
+    iDestruct (view_lb_max with "HK01 HK2") as "#HK".
+    iAssert (TsoCtx.rel_floor_vis (hart_agent (@cpu_id CIDw))
+               (Nat.max (Nat.max K0 K1) K2) 2 (tf2 t0 t1)) as "#Hfv".
+    { rewrite /TsoCtx.rel_floor_vis. iEval (cbn [seq]).
+      rewrite !big_sepL_cons big_sepL_nil. cbn [tf2].
+      iSplitR; [iApply (TsoCtx.ledger_vis_mono _ K0 with "Hv0"); lia |].
+      iSplitR; [iApply (TsoCtx.ledger_vis_mono _ K1 with "Hv1"); lia | done]. }
+    iDestruct (used_rel_read_ok (CID := CIDw)
+                 (gs_of img sigma.(mem) log V sigma.(sregs) sigma.(mdev))
+                 c nc lo nr F (Nat.max (Nat.max K0 K1) K2) (tf2 t0 t1) hist
+                 Hho HF (proj1 Hbnd) ltac:(lia) with "Hgh Htso HK Hfv Hcells") as %Hrd.
+    cbn in Hrd. rewrite Hidx in Hrd.
+    assert (H2N : Z.to_N 2 = 2%N) by reflexivity.
+    iSplitR.
+    { iPureIntro. intros tvr Htvr. destruct (Hrd tvr Htvr) as (k & _ & _ & Hb & _).
+      exists (wrap16 k). intros j Hj. rewrite H2N in Hj. apply Hb. lia. }
+    iModIntro. iIntros (tvr v) "%Htvr %Hread".
+    destruct (Hrd tvr Htvr) as (k & Hnrk & Hknc & Hb & Hpos).
+    assert (Hv : v = wrap16 k).
+    { apply vt_word2_of_bytes. intros j Hj.
+      pose proof (Hread j ltac:(rewrite H2N; lia)) as Hr. pose proof (Hb j Hj) as Hb'.
+      pose proof (eq_trans (eq_sym Hr) Hb') as He. injection He as He. apply bv_eq. exact He. }
+    subst v. rewrite /vt_idx_q. iExists k.
+    iSplitR; [done|]. iSplitR; [iPureIntro; lia|].
+    iSplitR. { rewrite /disk_done_lb. iApply (mono_nat_lb_own_le k with "Hlbnc"). lia. }
+    iApply big_sepL_intro. iIntros "!>" (i p Hip). apply lookup_seq in Hip as [-> Hp].
+    destruct (Hpos (0 + i)%nat Hp) as (q & g0 & Hq & Hqtv).
+    iExists q. iSplitR; [| iPureIntro; exact Hqtv].
+    iDestruct (big_sepL_lookup _ hist (0 + i)%nat (q, g0) Hq with "Hfrag") as "Hp". iExact "Hp".
+  Qed.
+
+  (* +0x36 lhu a5,2(a5) -- disk.used->idx, THE RELEASE READ (A6.126 §6).
+     The word is the device's; what the handler learns is [vt_idx_q]: the
+     index it read is [wrap16 k] with [nr ≤ k ≤ np] and, at the read's
+     view [V0], every completion below [k] -- their positions as
+     persistent fragments -- so each record it goes on to look at is one
+     whose stamped cells it can read exactly. *)
+  Lemma wp_vt_lhu_used_idx (γu : uart_names) (γd : disk_names) (pd pav pu : mword 64)
+      (pc : mword 64) (rd rs1 : mword 5) `{!SrcOk rs1} (imm : mword 12)
+      (m : regfile) (n : nat) (np nr F t0 t1 : nat) (p : mword 64) :
+    add_vec (rget m rs1) (sign_extend' 64 imm) = (pa_add pu 2%nat : mword 64) ->
+    uint rd <> 0 -> rd_ok rd ->
+    sie_cap_gpr KT1 m n false p -∗ pc_is pc -∗
+    instr pc false (LOAD (imm, Regidx rs1, Regidx rd, true, 2)) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    disk_pub γd np -∗ disk_read_at γd nr -∗ disk_flr γd F -∗ disk_fl γd t0 t1 -∗
+    lk_floor cur_ctx t0 -∗ lk_floor cur_ctx t1 -∗ TsoCtx.ctx_floor cur_ctx F -∗
+    ( ∀ (k V0 : nat),
+        ⌜(nr <= k)%nat /\ (k <= np)%nat⌝ -∗
+        disk_done_lb γd k -∗
+        hart_rview_lb_at cpu_id V0 -∗
+        ([∗ list] p ∈ seq 0 k, ∃ q : nat, disk_done_pos γd p q ∗ ⌜(q <= V0)%nat⌝) -∗
+        disk_pub γd np -∗ disk_read_at γd nr -∗ disk_flr γd F -∗ disk_fl γd t0 t1 -∗
+        sie_cap_gpr KT1 (<[Regidx rd := regval_into_reg (zero_extend' 64 (wrap16 k : SailStdpp.Values.mword 16))]> m) n false p -∗
+        pc_is (add_vec_int pc 4) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hea Hrd Hrdok.
+    assert (Hea_all : forall hh : CpuId,
+              add_vec (rget (CID := hh) m rs1) (sign_extend' 64 imm)
+              = add_vec (rget (CID := CID) m rs1) (sign_extend' 64 imm))
+      by (intros hh; by rewrite (src_ok_rget_indep m rs1 hh CID)).
+    iIntros "Hcg Hpc Hinstr #Hdinv #Hgeom Hpub Hnr Hflr Hfl #Hf0 #Hf1 #HfF Hcont".
+    iEval (rewrite vt_nr_eq) in "Hnr".
+    iDestruct (sie_cap_gpr_kmap_claims with "Hcg") as "[#Hkm Hcg]".
+    iDestruct (disk_geom_static with "Hgeom") as %(_ & _ & Hstu).
+    iDestruct (disk_geom_canonical with "Hgeom") as %(_ & _ & Hcanu).
+    iDestruct (disk_geom_aligned with "Hgeom") as %Hal0.
+    iDestruct (disk_geom_cfg with "Hgeom") as "#Hcfg0".
+    destruct Hal0 as (_ & _ & Halu).
+    assert (Halign : is_aligned_paddr (Physaddr (pa_add pu 2%nat)) 2 = true).
+    { apply (vt_aligned_off pu 2%nat 2 Halu);
+        [ reflexivity | reflexivity | reflexivity | reflexivity ]. }
+    assert (Hst2 : forall j, (j < 2)%nat ->
+              kmap_static (svpn_of (pa_add (pa_add pu 2%nat) j)) KP_rw).
+    { intros j Hj. rewrite pa_add_add. exact (Hstu (2 + j)%nat (vt_two_add_lt j Hj)). }
+    assert (Hcan2 : forall j, (j < 2)%nat ->
+              (uint (pa_add (pa_add pu 2%nat) j : SailStdpp.Values.mword 64) < 274877906944)%Z).
+    { intros j Hj. rewrite pa_add_add. exact (Hcanu (2 + j)%nat (vt_two_add_lt j Hj)). }
+    (* the claim, off the window's own RAM fact (one peek) *)
+    iApply fupd_wp.
+    iDestruct (dev_inv_disk with "Hdinv") as "#Hvinv0".
+    iInv "Hvinv0" as ">Hdbodyp" "Hdclosep".
+    iDestruct "Hdbodyp" as (vstp) "(Hvfp & Hprotop & %Hvokp)".
+    iDestruct (virtio_proto_used_idx_open γd vstp np nr F t0 t1 with "Hprotop Hpub Hnr Hflr Hfl")
+      as (ncp lop histp) "(_ & #Hcfgvp & _ & _ & _ & _ & _ & _ & _ & Hcellsp & Hbackp)".
+    iDestruct (disk_cfg_agree with "Hcfgvp Hcfg0") as %Hceqp.
+    assert (Haddrp : used_idx_pa (v_cfg vstp) = pa_add pu 2%nat)
+      by (rewrite Hceqp; reflexivity).
+    iDestruct (vt_used_idx_ram with "Hcellsp") as %Hram.
+    rewrite Haddrp pa_add_zero in Hram.
+    iDestruct (vt_claim_of_ram 2 (pa_add pu 2%nat) Halign
+                 ltac:(pose proof (Hst2 0%nat ltac:(lia)) as H; rewrite pa_add_zero in H; exact H)
+                 ltac:(pose proof (Hcan2 0%nat ltac:(lia)) as H; rewrite pa_add_zero in H; exact H)
+                 Hram with "Hkm") as "#Hcl".
+    iDestruct ("Hbackp" with "Hcellsp") as "(Hprotop & Hpub & Hnr & Hflr & Hfl)".
+    iMod ("Hdclosep" with "[Hvfp Hprotop]") as "_".
+    { iNext. iExists vstp. iFrame. iPureIntro. exact Hvokp. }
+    iModIntro.
+    iApply (wp_load_s_sconf_au_reli (CID:=CID) (kt := KT1) (ktd := KT0) 2 false true pc rd rs1 imm m n
+              (fun w => zero_extend' 64 w)
+              (⊤ ∖ ↑minstretN ∖ ↑diskN) false
+              (vt_idx_q γd np nr)
+              (vt_idx_res γd pu np nr F t0 t1
+                 (fun c nc lo hist =>
+                    (((⌜hist = []⌝ ∗ TsoCtx.rel_pre_cells (used_idx_pa c) 2 (tf2 t0 t1) (nth_byte (wrap16 0)))
+                      ∨ TsoCtx.rel_cells (used_idx_pa c) 2 (DfracOwn 1) disk_agent lo (tf2 t0 t1)
+                          (nth_byte (wrap16 0)) (nth_byte (wrap16 nc)) hist) -∗
+                     |={⊤ ∖ ↑minstretN ∖ ↑diskN, ⊤ ∖ ↑minstretN}=>
+                       disk_pub γd np ∗ disk_nr γd nr ∗ disk_flr γd F ∗ disk_fl γd t0 t1)%I))
+              (disk_pub γd np ∗ disk_nr γd nr ∗ disk_flr γd F ∗ disk_fl γd t0 t1)%I
+              ltac:(lia) ltac:(lia) ltac:(unfold vmem_width; lia) ltac:(exists 2048; reflexivity) ltac:(vm_compute; reflexivity)
+              exec_read_ram_plain_2 data2_ext_2_unsigned Hrd Hrdok
+              ltac:(solve_ndisj)
+              (vt_used_idx_read_ok (add_vec (rget m rs1) (sign_extend' 64 imm)) pu γd np nr F t0 t1 _ Hea)
+              with "Hcg Hpc Hinstr [] [Hpub Hnr Hflr Hfl] [Hcont]").
+    { rewrite Hea. iExact "Hcl". }
+    { (* ---- the atomic update: open dev_inv, run the window opener ---- *)
+      iDestruct (dev_inv_disk with "Hdinv") as "#Hvinv".
+      iInv "Hvinv" as ">Hdbody" "Hdclose".
+      iDestruct "Hdbody" as (vst) "(Hvf & Hproto & %Hvok)".
+      iDestruct (virtio_proto_used_idx_open γd vst np nr F t0 t1 with "Hproto Hpub Hnr Hflr Hfl")
+        as (nc lo hist) "(%Hbnd & #Hcfgv & %Halv & #Hlbc & %Hho & %Htf & %Hlo & %HF & #Hfrag & Hcells & Hback)".
+      iDestruct (disk_cfg_agree with "Hcfgv Hcfg0") as %Hceq.
+      assert (Haddr : used_idx_pa (v_cfg vst) = pa_add pu 2%nat)
+        by (rewrite Hceq; reflexivity).
+      iModIntro.
+      iSplitL "Hcells Hback Hvf Hdclose".
+      { rewrite /vt_idx_res. iFrame "Hf0 Hf1 HfF".
+        iExists (v_cfg vst), nc, lo, hist. iFrame "Hcells Hlbc Hfrag".
+        iSplitR; [iPureIntro; exact Haddr|].
+        iSplitR; [iPureIntro; exact Hbnd|].
+        iSplitR; [iPureIntro; exact Hho|].
+        iSplitR; [iPureIntro; exact HF|].
+        iIntros "Hcells".
+        iDestruct ("Hback" with "Hcells") as "(Hproto & Hpub & Hnr & Hflr & Hfl)".
+        iMod ("Hdclose" with "[Hvf Hproto]") as "_".
+        { iNext. iExists vst. iFrame. iPureIntro. exact Hvok. }
+        iModIntro. iFrame "Hpub Hnr Hflr Hfl". }
+      iIntros "(_ & _ & _ & HR)". rewrite /vt_idx_res.
+      iDestruct "HR" as (c' nc' lo' hist') "(_ & _ & _ & _ & _ & _ & Hcells & Hclose)".
+      iApply ("Hclose" with "Hcells"). }
+    iIntros (w). iApply wp_next_off_intro.
+    iIntros "Hcg Hpc HQ (Hpub & Hnr & Hflr & Hfl)".
+    iDestruct "HQ" as (V0) "[#Hvlb HQi]". rewrite /vt_idx_q.
+    iDestruct "HQi" as (k) "(-> & %Hb & #Hlbk & #Hfr)".
+    iEval (rewrite -vt_nr_eq) in "Hnr".
+    iApply ("Hcont" $! k V0 with "[%] Hlbk Hvlb Hfr Hpub Hnr Hflr Hfl Hcg Hpc"). exact Hb.
+  Qed.
+
+  (* the used-ring ELEMENT read: [c.lw a5,4(a5)] at +0x4e, at the watermark
+     [u].  Two accessors, both read-only, keyed by the record rather than by
+     a receipt (the handler holds none): [virtio_proto_record_at] names the
+     POSITION [p] the record at [u] is about and agrees the claim [dc] at
+     [p] with the handler's own map (the lock's [dn_claim] authority), and
+     [virtio_proto_used_peek_at] hands out the element's bytes for that
+     claim -- so the loaded id IS the head of [dc_slot dc].  Nothing is
+     spent: the watermark comes back at [u]; the deposit at [b->disk = 0]
+     (chunk C) is what advances it.
+
+     The address claim is taken off the element's own points-to in one
+     read-only pre-opening (per node the access translates before it reads,
+     so the claim rides BESIDE the atomic update), and the peek runs again
+     inside the update for the value.  [disk_cfg_agree] against
+     [disk_geom]'s copy pins [v_cfg v] and makes [used_elem_pa (v_cfg v) u]
+     the very address the code computes off [disk.used]. *)
+  (* the read obligation for a stamped 4-byte device cell: read at a view
+     past the completion's position, the four stamped cells ARE the word *)
+  Local Lemma vt_used_elem_read_ok (ea : mword 64) (q0 V0 : nat) (head : bv 32)
+      (pp : mword 64) (W : iProp Σ) :
+    forall (CIDw : CpuId) (img : TsoMemPa.bytemap) (sigma : mstate) (log : list pwmsg)
+           (V : agent -> nat) (ppn : mword 44),
+      (uint ea < 274877906944)%Z ->
+      (bv_unsigned (subrange_vec_dec ea 11 0) + 4 <= 4096)%Z ->
+      ktier_pin KT0 ppn ea ->
+      (false = false \/ pp = zero_reg -> (CIDw : CPU) = (CID : CPU)) ->
+      kmap_at (svpn_of ea) ppn KP_rw -∗
+      gen_heap_interp (hG := riscv_memGS) sigma.(mem) -∗
+      tso_interp_of riscv_eraGS img sigma.(mem) log V -∗
+      TsoCtx.own_context (CID := CIDw) CtxIdDefs.cur_ctx -∗
+      (TsoCtx.hart_view_lb (CID := CID) V0 ∗ ⌜(q0 <= V0)%nat⌝ ∗
+       ([∗ list] j ∈ seq 0 4,
+          ledger_le (pa_add ea j) (nth_byte head j) q0) ∗ W) -∗
+      ⌜forall tvr : nat, (V (hart_agent (@cpu_id CIDw)) <= tvr)%nat ->
+         (exists v : mword 32,
+            tso_read_bytes img log (hart_agent (@cpu_id CIDw)) tvr
+              (pa_of ppn ea) (Z.to_N 4) v)
+         /\ (forall v : mword 32,
+               tso_read_bytes img log (hart_agent (@cpu_id CIDw)) tvr
+                 (pa_of ppn ea) (Z.to_N 4) v -> v = head)⌝.
+  Proof using .
+    intros CIDw img sigma log V ppn Hcan Hoff Hid Hcid.
+    pose proof (Hcid (or_introl eq_refl)) as Hceq.
+    rewrite (ktier_pin_id ppn _ Hid).
+    iIntros "#Hk Hgh Htso Hctx (#HV0 & %Hq0V & Hcells & _)".
+    iDestruct (tso_interp_of_pin with "Htso") as %Hpin.
+    rewrite (tso_interp_of_at_gs riscv_eraGS img sigma.(mem) log V
+               sigma.(sregs) sigma.(mdev) Hpin).
+    iEval (rewrite TsoCtx.hart_view_lb_unseal /TsoCtx.hart_view_lb_def) in "HV0".
+    assert (Hagent : hart_agent (@cpu_id CID) = hart_agent (@cpu_id CIDw))
+      by (unfold hart_agent; rewrite Hceq; reflexivity).
+    iEval (rewrite Hagent) in "HV0".
+    iAssert (⌜forall j, (j < 4)%nat -> forall tvr : nat,
+               ((gs_of img sigma.(mem) log V sigma.(sregs) sigma.(mdev)).(gtv) (@cpu_id CIDw) <= tvr)%nat ->
+               tso_read img log (hart_agent (@cpu_id CIDw)) tvr (pa_add ea j)
+               = Some (nth_byte head j)⌝)%I as %Hrd.
+    { rewrite bi.pure_forall. iIntros (j). rewrite bi.pure_impl. iIntros (Hj).
+      iDestruct (big_sepL_lookup _ (seq 0 4) j j with "Hcells") as (t) "[%Ht Hc]".
+      { rewrite lookup_seq_lt; [reflexivity | lia]. }
+      iDestruct (TsoCtx.ledger_read_at_vis_ok (CID := CIDw)
+                   (gs_of img sigma.(mem) log V sigma.(sregs) sigma.(mdev))
+                   (pa_add ea j) (DfracOwn 1) (nth_byte head j) t V0
+                   with "Hgh Htso HV0 [] Hc") as %H.
+      { iApply TsoCtx.ledger_vis_below. lia. }
+      iPureIntro. exact H. }
+    cbn in Hrd.
+    assert (H4N : Z.to_N 4 = 4%N) by reflexivity.
+    iPureIntro. intros tvr Htvr. split.
+    - exists head. intros j Hj. rewrite H4N in Hj. apply Hrd; [lia | exact Htvr].
+    - intros v Hv. apply vt_word4_of_bytes. intros j Hj.
+      pose proof (Hv j ltac:(rewrite H4N; lia)) as Hr. pose proof (Hrd j Hj tvr Htvr) as Hb.
+      pose proof (eq_trans (eq_sym Hr) Hb) as He. injection He as He.
+      apply bv_eq. exact He.
+  Qed.
+
+  (* the same for a stamped BYTE (the status cell, chunk B) *)
+  Local Lemma vt_byte_read_ok (ea : mword 64) (q0 V0 : nat) (b : bv 8)
+      (pp : mword 64) (W : iProp Σ) :
+    forall (CIDw : CpuId) (img : TsoMemPa.bytemap) (sigma : mstate) (log : list pwmsg)
+           (V : agent -> nat) (ppn : mword 44),
+      (uint ea < 274877906944)%Z ->
+      (bv_unsigned (subrange_vec_dec ea 11 0) + 1 <= 4096)%Z ->
+      ktier_pin KT0 ppn ea ->
+      (false = false \/ pp = zero_reg -> (CIDw : CPU) = (CID : CPU)) ->
+      kmap_at (svpn_of ea) ppn KP_rw -∗
+      gen_heap_interp (hG := riscv_memGS) sigma.(mem) -∗
+      tso_interp_of riscv_eraGS img sigma.(mem) log V -∗
+      TsoCtx.own_context (CID := CIDw) CtxIdDefs.cur_ctx -∗
+      (TsoCtx.hart_view_lb (CID := CID) V0 ∗ ⌜(q0 <= V0)%nat⌝ ∗
+       ledger_le ea b q0 ∗ W) -∗
+      ⌜forall tvr : nat, (V (hart_agent (@cpu_id CIDw)) <= tvr)%nat ->
+         (exists v : mword 8,
+            tso_read_bytes img log (hart_agent (@cpu_id CIDw)) tvr
+              (pa_of ppn ea) (Z.to_N 1) v)
+         /\ (forall v : mword 8,
+               tso_read_bytes img log (hart_agent (@cpu_id CIDw)) tvr
+                 (pa_of ppn ea) (Z.to_N 1) v -> v = b)⌝.
+  Proof using .
+    intros CIDw img sigma log V ppn Hcan Hoff Hid Hcid.
+    pose proof (Hcid (or_introl eq_refl)) as Hceq.
+    rewrite (ktier_pin_id ppn _ Hid).
+    iIntros "#Hk Hgh Htso Hctx (#HV0 & %Hq0V & (%t & %Ht & Hc) & _)".
+    iDestruct (tso_interp_of_pin with "Htso") as %Hpin.
+    rewrite (tso_interp_of_at_gs riscv_eraGS img sigma.(mem) log V
+               sigma.(sregs) sigma.(mdev) Hpin).
+    iEval (rewrite TsoCtx.hart_view_lb_unseal /TsoCtx.hart_view_lb_def) in "HV0".
+    assert (Hagent : hart_agent (@cpu_id CID) = hart_agent (@cpu_id CIDw))
+      by (unfold hart_agent; rewrite Hceq; reflexivity).
+    iEval (rewrite Hagent) in "HV0".
+    iDestruct (TsoCtx.ledger_read_at_vis_ok (CID := CIDw)
+                 (gs_of img sigma.(mem) log V sigma.(sregs) sigma.(mdev))
+                 ea (DfracOwn 1) b t V0
+                 with "Hgh Htso HV0 [] Hc") as %Hrd.
+    { iApply TsoCtx.ledger_vis_below. lia. }
+    assert (H1N : Z.to_N 1 = 1%N) by reflexivity.
+    iPureIntro. intros tvr Htvr. split.
+    - exists b. intros j Hj. rewrite H1N in Hj.
+      assert (j = 0%nat) as -> by lia. rewrite pa_add_zero.
+      transitivity (Some b); [exact (Hrd tvr Htvr) | f_equal; symmetry; apply vt_nth_byte0].
+    - intros v Hv. apply vt_word1_of_bytes. intros j Hj.
+      assert (j = 0%nat) as -> by lia.
+      pose proof (Hv 0%nat ltac:(rewrite H1N; lia)) as Hr.
+      rewrite pa_add_zero in Hr.
+      pose proof (Hrd tvr Htvr) as Hb.
+      pose proof (eq_trans (eq_sym Hr) Hb) as He. injection He as He.
+      rewrite He. symmetry. apply vt_nth_byte0.
+  Qed.
+
+  (* +0x4e lw a5,4(a5) -- disk.used->ring[nr % 8].id, the head of the
+     completed chain at record [u].  A6.126 §6 on the pop model: the element
+     is the DEVICE's cell, stamped at the completion's log position [q]
+     ([VirtioProto.virtio_proto_used_peek_at]); the handler reads it exactly
+     because its view [V0] (the index read's) has [q] in it.  The read is a
+     PEEK: the record's row stays where it is, and what the handler learns is
+     which claim [p] the record at [u] names. *)
+  Lemma wp_vt_lw_used_elem (γu : uart_names) (γd : disk_names) (pd pav pu : mword 64)
+      (pc : mword 64) (rd rs1 : mword 5) `{!SrcOk rs1} (imm : mword 12)
+      (m : regfile) (n : nat) (np u : nat) (cm : gmap nat dclaim)
+      (pp : mword 64) (V0 : nat) :
+    add_vec (rget m rs1) (sign_extend' 64 imm)
+      = (pa_add pu (vt_uoff u) : SailStdpp.Values.mword 64) ->
+    uint rd <> 0 -> rd_ok rd ->
+    sie_cap_gpr KT1 m n false pp -∗ pc_is pc -∗
+    instr pc true (LOAD (imm, Regidx rs1, Regidx rd, false, 4)) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    disk_pub γd np -∗ disk_done_lb γd (S u) -∗ disk_read_at γd u -∗
+    ghost_map_auth_frac (dn_claim γd) 1 cm -∗
+    TsoCtx.hart_view_lb V0 -∗
+    (∃ q0 : nat, disk_done_pos γd u q0 ∗ ⌜(q0 <= V0)%nat⌝) -∗
+    ( ∀ (p : nat) (dc : dclaim),
+      ⌜ cm !! p = Some dc ⌝ -∗
+      ⌜ slot_pin_ok (virtio_init_cfg pd pav pu) p (dc_slot dc) (dc_pin dc) ⌝ -∗
+      disk_ord γd p u -∗
+      sie_cap_gpr KT1 (<[Regidx rd := regval_into_reg
+          (sign_extend' 64 (Z_to_bv 32 (bv_unsigned (vr_head (vs_req (dc_slot dc))))
+                            : SailStdpp.Values.mword 32))]> m) n false pp -∗
+      pc_is (add_vec_int pc 2) -∗
+      disk_pub γd np -∗ disk_read_at γd u -∗ ghost_map_auth_frac (dn_claim γd) 1 cm -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hea Hrd Hrdok.
+    assert (Hea_all : forall hh : CpuId,
+              add_vec (rget (CID := hh) m rs1) (sign_extend' 64 imm)
+              = add_vec (rget (CID := CID) m rs1) (sign_extend' 64 imm))
+      by (intros hh; by rewrite (src_ok_rget_indep m rs1 hh CID)).
+    iIntros "Hcg Hpc Hinstr #Hdinv #Hgeom Hpub #Hlb Hrd Hauth #HV0 #Hq0 Hcont".
+    iDestruct "Hq0" as (q0) "[#Hpos0 %Hq0V]".
+    iDestruct (sie_cap_gpr_kmap_claims with "Hcg") as "[#Hkm Hcg]".
+    iDestruct (disk_geom_static with "Hgeom") as %(_ & _ & Hstu).
+    iDestruct (disk_geom_canonical with "Hgeom") as %(_ & _ & Hcanu).
+    iDestruct (disk_geom_aligned with "Hgeom") as %Hal0.
+    iDestruct (disk_geom_cfg with "Hgeom") as "#Hcfg0".
+    destruct Hal0 as (_ & _ & Halu).
+    assert (Halign : is_aligned_paddr (Physaddr (pa_add pu (vt_uoff u))) 4 = true).
+    { apply (vt_aligned_off pu (vt_uoff u) 4 Halu);
+        [ exact (vt_uoff_lt_z u) | reflexivity | reflexivity | exact (vt_uoff_mod4 u) ]. }
+    assert (Hst4 : forall j, (j < 4)%nat ->
+              kmap_static (svpn_of (pa_add (pa_add pu (vt_uoff u)) j)) KP_rw).
+    { intros j Hj. rewrite pa_add_add.
+      exact (Hstu (vt_uoff u + j)%nat (vt_uoff_add_lt u j Hj)). }
+    assert (Hcan4 : forall j, (j < 4)%nat ->
+              (uint (pa_add (pa_add pu (vt_uoff u)) j : SailStdpp.Values.mword 64) < 274877906944)%Z).
+    { intros j Hj. rewrite pa_add_add.
+      exact (Hcanu (vt_uoff u + j)%nat (vt_uoff_add_lt u j Hj)). }
+    (* THE RECORD, AND THE ADDRESS CLAIM off the element's own RAM fact, in
+       one read-only opening.  The leaf wants the claim BESIDE the atomic
+       update (per node the access translates several nodes before the memory
+       node where the update is opened). *)
+    iApply fupd_wp.
+    iDestruct (dev_inv_disk with "Hdinv") as "#Hvinv".
+    iInv "Hvinv" as ">Hdbodyp" "Hdclosep".
+    iDestruct "Hdbodyp" as (vstp) "(Hvfp & Hprotop & %Hvokp)".
+    iDestruct (virtio_proto_record_at γd vstp np u cm with "Hprotop Hpub Hlb Hrd Hauth")
+      as "(Hrec & Hprotop & Hpub & _ & Hrd & Hauth)".
+    iDestruct "Hrec" as (p dc) "(%Hcm & %Hpos & #Hord)".
+    iDestruct (virtio_proto_used_peek_at γd vstp np p u cm dc Hcm
+                 with "Hprotop Hpub Hord Hrd Hauth")
+      as "(_ & #Hcfgvp & %Hspop & (%qp & #Hposp & Hw4p & Hbackp))".
+    iDestruct (disk_cfg_agree with "Hcfgvp Hcfg0") as %Hceqp.
+    assert (Haddrp : (pa_add pu (vt_uoff u) : Arch.pa) = used_elem_pa (v_cfg vstp) u)
+      by (rewrite Hceqp; reflexivity).
+    assert (Hspo : slot_pin_ok (virtio_init_cfg pd pav pu) p (dc_slot dc) (dc_pin dc))
+      by (rewrite -Hceqp; exact Hspop).
+    iAssert (⌜addr_is_ram (pa_add (used_elem_pa (v_cfg vstp) u) 0)⌝)%I as %Hram.
+    { iDestruct "Hw4p" as "(Hc & _)".
+      iDestruct (ledger_le_ledger with "Hc") as "Hc".
+      iApply (phys_ledger_ram with "Hc"). }
+    rewrite -Haddrp pa_add_zero in Hram.
+    iDestruct (vt_claim_of_ram 4 (pa_add pu (vt_uoff u)) Halign
+                 ltac:(pose proof (Hst4 0%nat ltac:(lia)) as H; rewrite pa_add_zero in H; exact H)
+                 ltac:(pose proof (Hcan4 0%nat ltac:(lia)) as H; rewrite pa_add_zero in H; exact H)
+                 Hram with "Hkm") as "#Hclaim0".
+    iDestruct ("Hbackp" with "Hw4p") as "(Hprotop & Hpub & Hrd & Hauth)".
+    iMod ("Hdclosep" with "[Hvfp Hprotop]") as "_".
+    { iNext. iExists vstp. iFrame. iPureIntro. exact Hvokp. }
+    iModIntro.
+    set (head := (Z_to_bv 32 (bv_unsigned (vr_head (vs_req (dc_slot dc)))) : SailStdpp.Values.mword 32)).
+    iApply (wp_load_s_sconf_au_rel (CID:=CID) (kt := KT1) (ktd := KT0) 4 true false pc rd rs1 imm m n
+              (fun w => sign_extend' 64 w)
+              (⊤ ∖ ↑minstretN ∖ ↑diskN) false
+              (fun w _ => w = head)
+              (TsoCtx.hart_view_lb (CID := CID) V0 ∗ ⌜(q0 <= V0)%nat⌝ ∗
+               ([∗ list] j ∈ seq 0 4,
+                  ledger_le (pa_add (pa_add pu (vt_uoff u)) j) (nth_byte head j) q0) ∗
+               (([∗ list] j ∈ seq 0 4,
+                   ledger_le (pa_add (pa_add pu (vt_uoff u)) j) (nth_byte head j) q0) -∗
+                |={⊤ ∖ ↑minstretN ∖ ↑diskN, ⊤ ∖ ↑minstretN}=>
+                  disk_pub γd np ∗ disk_read_at γd u ∗ ghost_map_auth_frac (dn_claim γd) 1 cm))%I
+              (disk_pub γd np ∗ disk_read_at γd u ∗ ghost_map_auth_frac (dn_claim γd) 1 cm)%I
+              ltac:(lia) ltac:(lia) ltac:(unfold vmem_width; lia) ltac:(exists 1024; reflexivity) ltac:(vm_compute; reflexivity)
+              exec_read_ram_plain_4 data2_ext_4 Hrd Hrdok
+              ltac:(solve_ndisj)
+              ltac:(rewrite Hea; exact (vt_used_elem_read_ok (pa_add pu (vt_uoff u)) q0 V0 head pp _))
+              with "Hcg Hpc Hinstr [] [Hpub Hrd Hauth] [Hcont]").
+    { rewrite Hea. iExact "Hclaim0". }
+    { (* ---- the atomic update: the stamped peek ---- *)
+      iInv "Hvinv" as ">Hdbody" "Hdclose".
+      iDestruct "Hdbody" as (vst) "(Hvf & Hproto & %Hvok)".
+      iDestruct (virtio_proto_used_peek_at γd vst np p u cm dc Hcm
+                   with "Hproto Hpub Hord Hrd Hauth")
+        as "(_ & #Hcfgv & _ & (%q & #Hposq & Hw4 & Hback))".
+      iDestruct (disk_done_pos_agree with "Hpos0 Hposq") as %<-.
+      iDestruct (disk_cfg_agree with "Hcfgv Hcfg0") as %Hceq.
+      assert (Haddr : (pa_add pu (vt_uoff u) : Arch.pa) = used_elem_pa (v_cfg vst) u).
+      { rewrite Hceq. reflexivity. }
+      iModIntro.
+      iSplitL "Hw4 Hback Hvf Hdclose".
+      { iFrame "HV0". iSplitR; [iPureIntro; exact Hq0V|].
+        rewrite Haddr. iFrame "Hw4".
+        iIntros "Hcells".
+        iDestruct ("Hback" with "Hcells") as "(Hproto & Hpub & Hrd & Hauth)".
+        iMod ("Hdclose" with "[Hvf Hproto]") as "_".
+        { iNext. iExists vst. iFrame. iPureIntro. exact Hvok. }
+        iModIntro. iFrame "Hpub Hrd Hauth". }
+      iIntros "(_ & _ & Hcells & Hclose)". iApply ("Hclose" with "Hcells"). }
+    iIntros (w). iApply wp_next_off_intro.
+    iIntros "Hcg Hpc HQ (Hpub & Hrd & Hauth)".
+    iDestruct "HQ" as (V1) "[_ %Hw]". subst w.
+    iApply ("Hcont" $! p dc with "[%] [%] Hord Hcg Hpc Hpub Hrd Hauth");
+      [ exact Hcm | exact Hspo ].
+  Qed.
+
+  (* the two 12-bit displacements the loop head uses, as plain 64-bit words *)
+  Lemma vt_sext_2  : sign_extend' 64 (mword_of_int 2 : mword 12) = (mword_of_int 2 : mword 64).
+  Proof using . apply bv_eq; vm_compute; reflexivity. Qed.
+  Lemma vt_sext_16 : sign_extend' 64 (mword_of_int 16 : mword 12) = (mword_of_int 16 : mword 64).
+  Proof using . apply bv_eq; vm_compute; reflexivity. Qed.
+  Lemma vt_sext_32 : sign_extend' 64 (mword_of_int 32 : mword 12) = (mword_of_int 32 : mword 64).
+  Proof using . apply bv_eq; vm_compute; reflexivity. Qed.
+
+  Lemma vt_zext16_unsigned (x : SailStdpp.Values.mword 16) :
+    bv_unsigned (zero_extend' 64 x : SailStdpp.Values.mword 64) = bv_unsigned x.
+  Proof using .
+    cbv [zero_extend' Operators_mwords.zero_extend Operators_mwords.extz_vec
+         MachineWord.MachineWord.zero_extend].
+    rewrite bv_zero_extend_unsigned. reflexivity.
+    first [ lia | vm_compute; discriminate | done ].
+  Qed.
+
+  (* the loop test compares two ZERO-EXTENDED 16-bit counters, so a
+     disequality of the counters is a disequality of the registers.  (Only
+     this direction is ever needed: on EQUAL registers the loop simply
+     exits, which is sound at any pair of counters -- a missed completion is
+     a liveness loss the spec promises nothing about.) *)
+  Lemma vt_zext16_inj (a b : SailStdpp.Values.mword 16) :
+    (zero_extend' 64 a : SailStdpp.Values.mword 64) = zero_extend' 64 b -> a = b.
+  Proof using .
+    intro He. apply bv_eq.
+    rewrite <- (vt_zext16_unsigned a), <- (vt_zext16_unsigned b), He. reflexivity.
+  Qed.
+
+  (* ================================================================== *)
+  (* (a) THE LOOP-ENTRY TEST (KernelSyms.virtio_disk_intr+0x30 .. KernelSyms.virtio_disk_intr+0x3a):                     *)
+  (*       while (disk.used_idx != disk.used->idx)                       *)
+  (*     Reads [disk.used] (the persistent geometry cell), the driver's  *)
+  (*     [disk.used_idx] (a plain owned halfword out of [disk_res]) and  *)
+  (*     the device's [used->idx] (the dev_inv-opening leaf), then       *)
+  (*     branches.  The two arms are offered as an ADDITIVE conjunction  *)
+  (*     so both see the same resources; the ENTER arm additionally      *)
+  (*     learns [nr < nc], which is what entitles the body to the        *)
+  (*     completion record at [nr]:  [nr <= nc] comes from the accessor  *)
+  (*     and [nc <> nr] from the branch, by plain congruence on [wrap16]. *)
+  (* ================================================================== *)
+  Lemma wp_vt_entry_test (γu : uart_names) (γd : disk_names) (pd pav pu : mword 64) (M : regfile) (n : nat)
+      (np nr F t0 t1 : nat) (p : mword 64) :
+    (M !!! Regidx (mword_of_int 9 : mword 5) : mword 64) = (disk_base : mword 64) ->
+    sie_cap_gpr KT1 M n false p -∗
+    kernel_text -∗ pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x30) : mword 64) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    disk_pub γd np -∗ d_used_idx ↦₂ wrap16 nr -∗
+    disk_read_at γd nr -∗ disk_flr γd F -∗ disk_fl γd t0 t1 -∗
+    lk_floor cur_ctx t0 -∗ lk_floor cur_ctx t1 -∗ TsoCtx.ctx_floor cur_ctx F -∗
+    ( ( ∀ M' : regfile,
+          ⌜ forall r : mword 5, r <> mword_of_int 14 -> r <> mword_of_int 15 ->
+              M' !!! Regidx r = M !!! Regidx r ⌝ -∗
+          sie_cap_gpr KT1 M' n false p -∗
+          pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x8a) : mword 64) -∗
+          disk_pub γd np -∗ d_used_idx ↦₂ wrap16 nr -∗
+          disk_read_at γd nr -∗ disk_flr γd F -∗ disk_fl γd t0 t1 -∗
+          mWP (Loop : expr riscv_lang))
+      ∧ ( ∀ (M' : regfile) (nc V0 : nat),
+          ⌜ forall r : mword 5, r <> mword_of_int 14 -> r <> mword_of_int 15 ->
+              M' !!! Regidx r = M !!! Regidx r ⌝ -∗
+          ⌜ (nr < nc)%nat /\ (nc <= np)%nat ⌝ -∗
+          disk_done_lb γd nc -∗
+          hart_rview_lb_at cpu_id V0 -∗
+          ([∗ list] p ∈ seq 0 nc, ∃ q : nat, disk_done_pos γd p q ∗ ⌜(q <= V0)%nat⌝) -∗
+          sie_cap_gpr KT1 M' n false p -∗
+          pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x3e) : mword 64) -∗
+          disk_pub γd np -∗ d_used_idx ↦₂ wrap16 nr -∗
+          disk_read_at γd nr -∗ disk_flr γd F -∗ disk_fl γd t0 t1 -∗
+          mWP (Loop : expr riscv_lang)) ) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HMs1.
+    iIntros "Hcg #Htext Hpc #Hdinv #Hgeom Hpub Hidx Hnr Hflr Hfl #Hf0 #Hf1 #HfF Hcont".
+    iDestruct (disk_geom_used_ptr with "Hgeom") as "#Hup".
+    iDestruct "Hgeom" as "#Hgeomc".
+    (* ---- +0x30: c.ld a5,16(s1) -- a5 := disk.used ---- *)
+    assert (Hup : add_vec (rget M (mword_of_int 9 : mword 5))
+                    (sign_extend' 64 (mword_of_int 16 : mword 12)) = (d_used_ptr : mword 64)).
+    { rgne. rewrite HMs1 vt_sext_16. reflexivity. }
+    iApply (wp_cld_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_intr + 0x30)) (mword_of_int 15 : mword 5)
+              (mword_of_int 9 : mword 5) (mword_of_int 16 : mword 12) M n pu false
+              (dqm := DfracDiscarded)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] []").
+    { iApply (vti_30 with "Htext"). }
+    { iEval (rewrite Hup). iExact "Hup". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc _".
+    set (C0 := <[Regidx (mword_of_int 15 : mword 5) := regval_into_reg pu]> M).
+    change (<[Regidx (mword_of_int 15 : mword 5) := regval_into_reg pu]> M) with C0.
+    assert (Hp32 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x30) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x32))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp32) in "Hpc".
+    assert (HC0s1 : C0 !!! Regidx (mword_of_int 9 : mword 5) = (disk_base : mword 64))
+      by (rewrite /C0 upd_ne; [exact HMs1 | vm_compute; discriminate]).
+    (* ---- +0x32: lhu a4,32(s1) -- a4 := disk.used_idx ---- *)
+    assert (Huidx : add_vec (rget C0 (mword_of_int 9 : mword 5))
+                      (sign_extend' 64 (mword_of_int 32 : mword 12)) = (d_used_idx : mword 64)).
+    { rgne. rewrite HC0s1 vt_sext_32. reflexivity. }
+    iApply (wp_lhu_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_intr + 0x32)) (mword_of_int 14 : mword 5)
+              (mword_of_int 9 : mword 5) (mword_of_int 32 : mword 12) C0 n (wrap16 nr) false
+              (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [Hidx]").
+    { iApply (vti_32 with "Htext"). }
+    { iEval (rewrite Huidx). iExact "Hidx". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc Hidx". iEval (rewrite Huidx) in "Hidx".
+    set (C1 := <[Regidx (mword_of_int 14 : mword 5) :=
+        regval_into_reg (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))]> C0).
+    change (<[Regidx (mword_of_int 14 : mword 5) :=
+        regval_into_reg (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))]> C0) with C1.
+    assert (Hp36 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x32) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x36))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp36) in "Hpc".
+    assert (HC1a5 : C1 !!! Regidx (mword_of_int 15 : mword 5) = pu).
+    { rewrite /C1 upd_ne; [| vm_compute; discriminate]. rewrite /C0. apply upd_eq. }
+    (* ---- +0x36: lhu a5,2(a5) -- a5 := disk.used->idx ---- *)
+    assert (Hued : add_vec (rget C1 (mword_of_int 15 : mword 5))
+                     (sign_extend' 64 (mword_of_int 2 : mword 12))
+                   = (pa_add pu 2%nat : SailStdpp.Values.mword 64)).
+    { rgne. rewrite HC1a5 vt_sext_2. reflexivity. }
+    iApply (wp_vt_lhu_used_idx γu γd pd pav pu (mword_of_int (KernelSyms.virtio_disk_intr + 0x36))
+              (mword_of_int 15 : mword 5) (mword_of_int 15 : mword 5)
+              (mword_of_int 2 : mword 12) C1 n np nr F t0 t1 p Hued
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] Hdinv Hgeomc Hpub Hnr Hflr Hfl Hf0 Hf1 HfF").
+    { iApply (vti_36 with "Htext"). }
+    iIntros (nc V0) "%Hbnd #Hlbc #HV0 #Hfr Hpub Hnr Hflr Hfl Hcg Hpc".
+    set (C2 := <[Regidx (mword_of_int 15 : mword 5) :=
+        regval_into_reg (zero_extend' 64 (wrap16 nc : SailStdpp.Values.mword 16))]> C1).
+    change (<[Regidx (mword_of_int 15 : mword 5) :=
+        regval_into_reg (zero_extend' 64 (wrap16 nc : SailStdpp.Values.mword 16))]> C1) with C2.
+    assert (Hp3a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x36) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x3a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp3a) in "Hpc".
+    assert (HC2a4 : C2 !!! Regidx (mword_of_int 14 : mword 5)
+                    = zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16)).
+    { rewrite /C2 upd_ne; [| vm_compute; discriminate]. rewrite /C1. apply upd_eq. }
+    assert (HC2a5 : C2 !!! Regidx (mword_of_int 15 : mword 5)
+                    = zero_extend' 64 (wrap16 nc : SailStdpp.Values.mword 16))
+      by (rewrite /C2; apply upd_eq).
+    assert (HC2thr : forall r : mword 5, r <> mword_of_int 14 -> r <> mword_of_int 15 ->
+                       C2 !!! Regidx r = M !!! Regidx r).
+    { intros r N4 N5.
+      rewrite /C2 upd_ne; [| congruence].
+      rewrite /C1 upd_ne; [| congruence].
+      rewrite /C0 upd_ne; [| congruence]. reflexivity. }
+    (* ---- +0x3a: beq a4,a5 -- the loop test ---- *)
+    destruct (decide ((wrap16 nc : SailStdpp.Values.mword 16) = wrap16 nr)) as [Heq|Hne].
+    - (* the wraps agree: EXIT (sound at any counters -- see vt_zext16_inj) *)
+      iDestruct "Hcont" as "[Hexit _]".
+      assert (Hcmp : eq_vec (rget C2 (mword_of_int 14 : mword 5))
+                            (rget C2 (mword_of_int 15 : mword 5)) = true).
+      { rgne. rgne. rewrite HC2a4 HC2a5 Heq. apply eq_vec_true_iff. reflexivity. }
+      iApply (wp_beq_taken_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x3a))
+                (mword_of_int 80 : mword 13) (mword_of_int 15 : mword 5)
+                (mword_of_int 14 : mword 5) C2 n false
+                ltac:(vm_compute; discriminate) ltac:(vm_compute; discriminate)
+                Hcmp
+                ltac:(vm_compute; reflexivity)
+                with "Hcg Hpc []").
+      { iApply (vti_3a with "Htext"). }
+      iNext. iApply wp_next_off_intro. iIntros "Hcg Hpc".
+      assert (Hp8a : add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x3a) : mword 64)
+                       (sign_extend' 64 (mword_of_int 80 : mword 13)) = mword_of_int (KernelSyms.virtio_disk_intr + 0x8a))
+        by (apply bv_eq; vm_compute; reflexivity).
+      iEval (rewrite Hp8a) in "Hpc".
+      iApply ("Hexit" $! C2 with "[%] Hcg Hpc Hpub Hidx Hnr Hflr Hfl"). exact HC2thr.
+    - (* the wraps differ: ENTER, with nr < nc *)
+      iDestruct "Hcont" as "[_ Henter]".
+      assert (Hnrnc : (nr < nc)%nat).
+      { destruct Hbnd as [Hle _].
+        destruct (decide (nr = nc)) as [->|Hne2]; [ exfalso; apply Hne; reflexivity |].
+        lia. }
+      assert (Hcmp : eq_vec (rget C2 (mword_of_int 14 : mword 5))
+                            (rget C2 (mword_of_int 15 : mword 5)) = false).
+      { rgne. rgne. rewrite HC2a4 HC2a5.
+        apply not_true_is_false; intro Hc;
+        apply eq_vec_true_iff in Hc;
+        exact (Hne (vt_zext16_inj _ _ (eq_sym Hc))). }
+      iApply (wp_beq_fall_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x3a))
+                (mword_of_int 80 : mword 13) (mword_of_int 15 : mword 5)
+                (mword_of_int 14 : mword 5) C2 n false
+                ltac:(vm_compute; discriminate) ltac:(vm_compute; discriminate)
+                Hcmp
+                with "Hcg Hpc []").
+      { iApply (vti_3a with "Htext"). }
+      iApply wp_next_off_intro. iIntros "Hcg Hpc".
+      assert (Hp3e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x3a) : mword 64) 4
+                     = mword_of_int (KernelSyms.virtio_disk_intr + 0x3e))
+        by (apply bv_eq; vm_compute; reflexivity).
+      iEval (rewrite Hp3e) in "Hpc".
+      iApply ("Henter" $! C2 nc V0 with "[%] [%] Hlbc HV0 Hfr Hcg Hpc Hpub Hidx Hnr Hflr Hfl").
+      { exact HC2thr. }
+      { split; [exact Hnrnc | exact (proj2 Hbnd)]. }
+  Qed.
+
+End VtDevRam.
+
+(* ===================================================================== *)
+(* §5  The loop body's PURE arithmetic.                                   *)
+(*                                                                        *)
+(*     Everything [lia] touches is factored into mword-free helpers (the  *)
+(*     zify hook of durable-notes makes [lia] unreliable next to          *)
+(*     [bv_unsigned]); the mword-level facts are then closed by           *)
+(*     [vm_compute] at a CONCRETE index, via the eight-way [destruct]     *)
+(*     idiom [ProofFreeDesc.fd_shl4] uses.                                *)
+(* ===================================================================== *)
+
+(* ---- plain-Z helpers (no mword anywhere) ---- *)
+
+Lemma vt_mod8_bound_z (nr : nat) : (0 <= Z.of_nat (nr `mod` 8) < 8)%Z.
+Proof. pose proof (Nat.mod_upper_bound nr 8 ltac:(lia)). lia. Qed.
+
+Lemma vt_mod8_z (nr : nat) : (Z.of_nat nr `mod` 8)%Z = Z.of_nat (nr `mod` 8)%nat.
+Proof. rewrite Nat2Z.inj_mod. reflexivity. Qed.
+
+Lemma vt_small_wrap64 (k : Z) : (0 <= k)%Z -> (k < 4096)%Z -> bv_wrap 64 k = k.
+Proof.
+  intros H0 H1. unfold bv_wrap, bv_modulus. change (Z.of_N 64) with 64%Z.
+  apply Z.mod_small. change (2 ^ 64)%Z with 18446744073709551616%Z. lia.
+Qed.
+
+Lemma vt_land7_z (x : Z) : Z.land x 7 = (x `mod` 8)%Z.
+Proof.
+  change 7%Z with (Z.ones 3).
+  rewrite (Z.land_ones x 3 ltac:(lia)). reflexivity.
+Qed.
+
+(* (a mod 2^32) mod 2^16 = a mod 2^16, and its 2^64 twin *)
+Lemma vt_mod_32_16 (a : Z) : ((a `mod` 4294967296) `mod` 65536)%Z = (a `mod` 65536)%Z.
+Proof.
+  rewrite (Z.mod_mod_divide a 4294967296 65536); [reflexivity|].
+  exists 65536%Z. reflexivity.
+Qed.
+
+Lemma vt_mod_64_16 (a : Z) : ((a `mod` 18446744073709551616) `mod` 65536)%Z = (a `mod` 65536)%Z.
+Proof.
+  rewrite (Z.mod_mod_divide a 18446744073709551616 65536); [reflexivity|].
+  exists 281474976710656%Z. reflexivity.
+Qed.
+
+Lemma vt_shift48_z (u : Z) :
+  ((u * 281474976710656) `mod` 18446744073709551616 / 281474976710656)%Z
+  = (u `mod` 65536)%Z.
+Proof.
+  replace 18446744073709551616%Z with (281474976710656 * 65536)%Z by reflexivity.
+  rewrite (Z.mul_comm u 281474976710656).
+  rewrite (Z.mul_mod_distr_l u 65536 281474976710656 ltac:(lia) ltac:(lia)).
+  rewrite Z.mul_comm. apply Z.div_mul. lia.
+Qed.
+
+Lemma vt_uoff_q (nr : nat) : vt_uoff nr = (4 + 8 * (nr `mod` 8))%nat.
+Proof.
+  unfold vt_uoff, vq_used_ring_off, vq_used_elem_size.
+  rewrite vt_mod8_z. lia.
+Qed.
+
+(* ---- mword-level structural helpers ---- *)
+
+
+Lemma vt_and_vec_unsigned (a b : mword 64) :
+  bv_unsigned (and_vec a b) = Z.land (bv_unsigned a) (bv_unsigned b).
+Proof.
+  cbv [and_vec Operators_mwords.word_binop 
+       ].
+  unfold MachineWord.MachineWord.and. apply bv_and_unsigned.
+Qed.
+
+(* [add_vec (X + p) Y] with X, Y closed: reassociate onto the symbolic base *)
+Lemma vt_addv_pa (p : mword 64) (X Y : mword 64) (k : nat) :
+  add_vec X Y = (mword_of_int (Z.of_nat k) : mword 64) ->
+  add_vec (add_vec X p) Y = (pa_add p k : SailStdpp.Values.mword 64).
+Proof.
+  intro H. rewrite (add_vec64_comm X p) add_vec_assoc H.
+  unfold pa_add, add_vec_int. reflexivity.
+Qed.
+
+(* ---- the ring index [disk.used_idx & 7] ---- *)
+
+Lemma vt_ring_idx (nr : nat) :
+  and_vec (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))
+          (sign_extend' 64 (sign_extend' 12 (mword_of_int 7 : mword 6)))
+  = (mword_of_int (Z.of_nat (nr `mod` 8)) : mword 64).
+Proof.
+  apply bv_eq. rewrite vt_and_vec_unsigned vq_moi_unsigned.
+  replace (bv_unsigned (sign_extend' 64 (sign_extend' 12 (mword_of_int 7 : mword 6)) : mword 64))
+    with 7%Z by (vm_compute; reflexivity).
+  rewrite vt_zext16_unsigned vt_land7_z wrap16_mod8 vt_mod8_z.
+  pose proof (vt_mod8_bound_z nr) as Hb.
+  rewrite (vt_small_wrap64 _ (proj1 Hb) ltac:(lia)). reflexivity.
+Qed.
+
+(* ---- shifts ---- *)
+
+Lemma vt_shl3 (q : nat) : (q < 8)%nat ->
+  shift_bits_left (mword_of_int (Z.of_nat q) : mword 64)
+    (subrange_vec_dec (mword_of_int 3 : mword 6) (Z.sub log2_xlen 1) 0)
+  = (mword_of_int (8 * Z.of_nat q) : mword 64).
+Proof. intro H. do 8 (destruct q as [|q]; [apply bv_eq; vm_compute; reflexivity|]). lia. Qed.
+
+Lemma vt_shl4 (h : nat) : (h < 8)%nat ->
+  shift_bits_left (mword_of_int (Z.of_nat h) : mword 64)
+    (subrange_vec_dec (mword_of_int 4 : mword 6) (Z.sub log2_xlen 1) 0)
+  = (mword_of_int (16 * Z.of_nat h) : mword 64).
+Proof. intro H. do 8 (destruct h as [|h]; [apply bv_eq; vm_compute; reflexivity|]). lia. Qed.
+
+Lemma vt_id_word (h : nat) : (h < 8)%nat ->
+  sign_extend' 64 (Z_to_bv 32 (Z.of_nat h) : SailStdpp.Values.mword 32)
+  = (mword_of_int (Z.of_nat h) : mword 64).
+Proof. intro H. do 8 (destruct h as [|h]; [apply bv_eq; vm_compute; reflexivity|]). lia. Qed.
+
+(* ---- addresses ---- *)
+
+Lemma vt_uelem_off (q : nat) : (q < 8)%nat ->
+  add_vec (mword_of_int (8 * Z.of_nat q) : mword 64)
+          (sign_extend' 64 (mword_of_int 4 : mword 12))
+  = (mword_of_int (Z.of_nat (4 + 8 * q)) : mword 64).
+Proof. intro H. do 8 (destruct q as [|q]; [apply bv_eq; vm_compute; reflexivity|]). lia. Qed.
+
+Lemma vt_status_addr (h : nat) : (h < 8)%nat ->
+  add_vec (add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                            (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                   (disk_base : SailStdpp.Values.mword 64))
+          (sign_extend' 64 (mword_of_int 16 : mword 12))
+  = (d_info_status h : SailStdpp.Values.mword 64).
+Proof. intro H. do 8 (destruct h as [|h]; [apply bv_eq; vm_compute; reflexivity|]). lia. Qed.
+
+Lemma vt_infob_addr (h : nat) : (h < 8)%nat ->
+  add_vec (add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                            (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                   (disk_base : SailStdpp.Values.mword 64))
+          (sign_extend' 64 (mword_of_int 8 : mword 12))
+  = (d_info_b h : SailStdpp.Values.mword 64).
+Proof. intro H. do 8 (destruct h as [|h]; [apply bv_eq; vm_compute; reflexivity|]). lia. Qed.
+
+Lemma vt_ring_off_nat (nr : nat) :
+  Z.to_nat (4 + 2 * Z.of_nat (nr `mod` 8))%Z = (4 + 2 * (nr `mod` 8))%nat.
+Proof. lia. Qed.
+
+Lemma vt_ring_addr (pd pav pu : SailStdpp.Values.mword 64) (nr : nat) :
+  ring_entry_pa (virtio_init_cfg pd pav pu) nr = d_ring pav (nr `mod` 8).
+Proof.
+  unfold ring_entry_pa, d_ring, pa_off, vq_avail_ring_off, virtio_init_cfg.
+  cbn [vc_avail]. rewrite vt_mod8_z vt_ring_off_nat. reflexivity.
+Qed.
+
+(* ---- the 16-bit wrap: c.addiw a5,1 ; c.slli a5,0x30 ; c.srli a5,0x30 ---- *)
+
+Lemma vt_trunc16_subrange (w : mword 64) : trunc16 w = subrange_vec_dec w 15 0.
+Proof.
+  unfold trunc16.
+  change (Z.sub (Z.mul 2 8) 1) with 15%Z.
+  change (15 - 0 + 1)%Z with 16%Z.
+  apply autocast_id.
+Qed.
+
+Lemma vt_trunc16_unsigned (w : mword 64) :
+  bv_unsigned (trunc16 w) = bv_wrap 16 (bv_unsigned w).
+Proof.
+  rewrite vt_trunc16_subrange.
+  unfold subrange_vec_dec. rewrite autocast_id.
+  unfold to_word_idx.
+  rewrite MachineWord.MachineWord.cast_idx_refl.
+  unfold MachineWord.MachineWord.slice.
+  change (MachineWord.MachineWord.Z_idx 0) with 0%N.
+  rewrite bv_extract_0_unsigned.
+  change (MachineWord.MachineWord.Z_idx (15 - 0 + 1)) with 16%N.
+  reflexivity.
+Qed.
+
+Lemma vt_wrap16_z (a : Z) : bv_wrap 16 a = (a `mod` 65536)%Z.
+Proof. unfold bv_wrap, bv_modulus. change (Z.of_N 16) with 16%Z. reflexivity. Qed.
+
+Lemma vt_wrap32_z (a : Z) : bv_wrap 32 a = (a `mod` 4294967296)%Z.
+Proof. unfold bv_wrap, bv_modulus. change (Z.of_N 32) with 32%Z. reflexivity. Qed.
+
+Lemma vt_wrap64_z (a : Z) : bv_wrap 64 a = (a `mod` 18446744073709551616)%Z.
+Proof. unfold bv_wrap, bv_modulus. change (Z.of_N 64) with 64%Z. reflexivity. Qed.
+
+(* a sign extension keeps the low 16 bits *)
+Lemma vt_sext32_mod16 (w : SailStdpp.Values.mword 32) :
+  ((bv_unsigned (sign_extend' 64 w : mword 64)) `mod` 65536)%Z
+  = (bv_unsigned w `mod` 65536)%Z.
+Proof.
+  pose proof (f_equal bv_unsigned (trunc32_sext w)) as He.
+  rewrite trunc32_unsigned vt_wrap32_z in He.
+  rewrite <- vt_mod_32_16. rewrite He. reflexivity.
+Qed.
+
+Lemma vt_sub32_unsigned (x : mword 64) :
+  bv_unsigned (subrange_vec_dec x 31 0 : SailStdpp.Values.mword 32)
+  = (bv_unsigned x `mod` 4294967296)%Z.
+Proof. rewrite <- trunc32_subrange. rewrite trunc32_unsigned. apply vt_wrap32_z. Qed.
+
+(* the shift pair is a zero-extended 16-bit truncation *)
+Lemma vt_shl48_unsigned (x : mword 64) :
+  bv_unsigned (shift_bits_left x (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0))
+  = ((bv_unsigned x * 281474976710656) `mod` 18446744073709551616)%Z.
+Proof.
+  assert (Hn : shift_bits_left x (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0)
+             = shiftl x 48).
+  { unfold shift_bits_left. f_equal; vm_compute; reflexivity. }
+  rewrite Hn.
+  unfold shiftl,
+    MachineWord.MachineWord.logical_shift_left.
+  rewrite bv_shiftl_unsigned.
+  assert (Hsh : bv_unsigned (MachineWord.MachineWord.N_to_word
+                  (MachineWord.MachineWord.Z_idx 64) (MachineWord.MachineWord.Z_idx 48)) = 48%Z)
+    by (vm_compute; reflexivity).
+  rewrite Hsh vt_wrap64_z Z.shiftl_mul_pow2; [| lia].
+  change (2 ^ 48)%Z with 281474976710656%Z. reflexivity.
+Qed.
+
+Lemma vt_shr48_unsigned (x : mword 64) :
+  bv_unsigned (shift_bits_right x (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0))
+  = (bv_unsigned x / 281474976710656)%Z.
+Proof.
+  assert (Hn : shift_bits_right x (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0)
+             = shiftr x 48).
+  { unfold shift_bits_right. f_equal; vm_compute; reflexivity. }
+  rewrite Hn.
+  unfold shiftr,
+    MachineWord.MachineWord.logical_shift_right.
+  rewrite bv_shiftr_unsigned.
+  assert (Hsh : bv_unsigned (MachineWord.MachineWord.N_to_word
+                  (MachineWord.MachineWord.Z_idx 64) (MachineWord.MachineWord.Z_idx 48)) = 48%Z)
+    by (vm_compute; reflexivity).
+  rewrite Hsh Z.shiftr_div_pow2; [| lia].
+  change (2 ^ 48)%Z with 281474976710656%Z. reflexivity.
+Qed.
+
+(* THE store value at +0x7c and the register value the back-edge test sees *)
+Lemma vt_used_idx_next (nr : nat) :
+  shift_bits_right
+    (shift_bits_left
+       (sign_extend' 64 (subrange_vec_dec
+          (add_vec (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))
+                   (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)))) 31 0))
+       (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0))
+    (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0)
+  = (zero_extend' 64 (wrap16 (S nr) : SailStdpp.Values.mword 16) : mword 64).
+Proof.
+  apply bv_eq.
+  rewrite vt_shr48_unsigned vt_shl48_unsigned vt_shift48_z.
+  rewrite vt_zext16_unsigned.
+  rewrite vt_sext32_mod16 vt_sub32_unsigned vt_mod_32_16.
+  rewrite vq_add_vec_unsigned vt_wrap64_z vt_mod_64_16.
+  rewrite vt_zext16_unsigned.
+  replace (bv_unsigned (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)) : mword 64))
+    with 1%Z by (vm_compute; reflexivity).
+  unfold wrap16. rewrite !Z_to_bv_unsigned !vt_wrap16_z.
+  rewrite Zplus_mod_idemp_l. f_equal. lia.
+Qed.
+
+(* ---- the static [struct disk] is kernel DATA (the status byte's tier) ---- *)
+
+Lemma vt_disk_kdata_z (k : Z) :
+  (0 <= k)%Z -> (k < 4096)%Z ->
+  (2147512320 <= (KernelSyms.disk + k) `mod` 18446744073709551616 < 2281701376)%Z.
+Proof.
+  intros H0 H1. unfold KernelSyms.disk. rewrite Z.mod_small; lia.
+Qed.
+
+Lemma vt_disk_kdata (k : nat) : (k < 4096)%nat -> addr_is_kdata (pa_add disk_base k).
+Proof.
+  intro Hk. unfold addr_is_kdata, text_end, ram_base, ram_size.
+  rewrite uint_unsigned pa_add_unsigned vt_wrap64_z.
+  replace (bv_unsigned (disk_base : SailStdpp.Values.mword 64)) with KernelSyms.disk
+    by (vm_compute; reflexivity).
+  change (0x80007000)%Z with 2147512320%Z.
+  change (0x80000000 + 0x8000000)%Z with 2281701376%Z.
+  apply vt_disk_kdata_z; [ exact (Nat2Z.is_nonneg k) | lia ].
+Qed.
+
+
+(* ===================================================================== *)
+(* §7  The LOOP BODY, in four Qed-sealed chunks (optimization.md: a       *)
+(*     monolithic threading proof grows super-linearly in #instructions). *)
+(*     Every chunk states its register effect as a FRAME condition over   *)
+(*     an abstract output map, so the chain never carries a [set]-tower.  *)
+(*                                                                        *)
+(*     Every cell the body touches besides [disk.used_idx] is the device  *)
+(*     invariant's -- the used element, the status byte, [info[id].b] and *)
+(*     [b->disk] -- so every one of those accesses is an atomic-update    *)
+(*     leaf opening [dev_inv] around one instruction, keyed by the record  *)
+(*     at the watermark and the claim the handler read off its own map.  *)
+(*     The first three are peeks; the store is THE DEPOSIT.               *)
+(* ===================================================================== *)
+
+Section VtBody.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Notation ra_idx := (mword_of_int 1 : mword 5).
+  Notation tp_idx := (mword_of_int 4 : mword 5).
+  Notation s0_idx := (mword_of_int 8 : mword 5).
+  Notation s1_idx := (mword_of_int 9 : mword 5).
+  Notation a0_idx := (mword_of_int 10 : mword 5).
+  Notation a4_idx := (mword_of_int 14 : mword 5).
+  Notation a5_idx := (mword_of_int 15 : mword 5).
+
+  Local Ltac reg_neq :=
+    lazymatch goal with |- ?a <> ?b =>
+      tryif unify a b then fail else (vm_compute; discriminate) end.
+
+  (* ---- CHUNK A (+0x3e .. +0x4e): the fence, the used-element address   *)
+  (*      computation and the element load at the watermark [nr].  Only  *)
+  (*      a4/a5 move; a5 ends holding the reported id, the head of the    *)
+  (*      claim [dc] at the position [p] the record names.  The           *)
+  (*      completed-count observation [nr < c] is what entitles the       *)
+  (*      handler to that record.                                          *)
+  Lemma wp_vt_reclaim (γu : uart_names) (γd : disk_names) (pd pav pu : mword 64) (M : regfile) (n : nat)
+      (np c nr : nat) (cm : gmap nat dclaim) (pp : mword 64) (V0 : nat) :
+    (M !!! Regidx s1_idx : mword 64) = (disk_base : mword 64) ->
+    (nr < c)%nat ->
+    sie_cap_gpr KT1 M n false pp -∗
+    kernel_text -∗ pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x3e) : mword 64) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    disk_pub γd np -∗ disk_done_lb γd c -∗ disk_read_at γd nr -∗
+    ghost_map_auth_frac (dn_claim γd) 1 cm -∗
+    d_used_idx ↦₂ wrap16 nr -∗
+    (* A6.126 §6 / relaxed-rr.md §4.3: the view the index read settled at --
+       as the load's READ receipt, which the fence below turns into the view
+       receipt -- with the record at [nr]'s completion position in it *)
+    hart_rview_lb_at cpu_id V0 -∗
+    (∃ q0 : nat, disk_done_pos γd nr q0 ∗ ⌜(q0 <= V0)%nat⌝) -∗
+    ( ∀ (M' : regfile) (p : nat) (dc : dclaim),
+        ⌜ cm !! p = Some dc ⌝ -∗
+        ⌜ M' !!! Regidx a5_idx
+            = sign_extend' 64 (Z_to_bv 32 (bv_unsigned (vr_head (vs_req (dc_slot dc))))
+                               : SailStdpp.Values.mword 32)
+          /\ (forall r : mword 5, r <> a4_idx -> r <> a5_idx ->
+                M' !!! Regidx r = M !!! Regidx r) ⌝ -∗
+        disk_ord γd p nr -∗
+        sie_cap_gpr KT1 M' n false pp -∗
+        pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x50) : mword 64) -∗
+        d_used_idx ↦₂ wrap16 nr -∗
+        disk_pub γd np -∗ disk_read_at γd nr -∗ ghost_map_auth_frac (dn_claim γd) 1 cm -∗
+        (* the read's view, ACQUIRED by the fence, and the handler's context
+           bound raised to it *)
+        TsoCtx.hart_view_lb V0 -∗
+        TsoCtx.ctx_floor cur_ctx V0 -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HMs1 Hnrc.
+    iIntros "Hcg #Htext Hpc #Hdinv #Hgeom Hpub #Hlbc Hrd Hauth Hidx #HR0 #Hq0 Hcont".
+    iDestruct (vt_done_lb_le γd (S nr) c Hnrc with "Hlbc") as "#Hlbs".
+    iDestruct (disk_geom_used_ptr with "Hgeom") as "#Hup".
+    (* ---- +0x3e: fence rw,rw -- THE ACQUIRE (relaxed-rr.md §4.3).  The
+       index read minted a READ receipt at [V0]; this fence is where it
+       becomes the VIEW receipt, and only then can the handler's context
+       bound move to [V0] (A6.126 §6: the completion's position and the
+       payload's reader floor [max F V0] are then floors of this context). ---- *)
+    iApply (wp_fence_acq_rwrw_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x3e))
+              (mword_of_int 0) (mword_of_int 15) (mword_of_int 15)
+              (Regidx (mword_of_int 0)) (Regidx (mword_of_int 0)) M n V0
+              fbits11_15 fbits11_15 with "Hcg Hpc [] HR0").
+    { iApply (vti_3e with "Htext"). }
+    iNext. iIntros "Hcg Hpc #HV0".
+    iApply fupd_wp.
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (TsoCtx.ctx_bound_raise cur_ctx V0 with "Hrun HV0") as "[Hrun #HflV]".
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iModIntro.
+    assert (Hp42 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x3e) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x42))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp42) in "Hpc".
+    (* ---- +0x42: c.ld a4,16(s1) -- a4 := disk.used ---- *)
+    assert (Hup : add_vec (rget M s1_idx) (sign_extend' 64 (mword_of_int 16 : mword 12))
+                  = (d_used_ptr : mword 64)).
+    { rgne. rewrite HMs1 vt_sext_16. reflexivity. }
+    iApply (wp_cld_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_intr + 0x42)) a4_idx s1_idx
+              (mword_of_int 16 : mword 12) M n pu false (dqm := DfracDiscarded)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] []").
+    { iApply (vti_42 with "Htext"). }
+    { iEval (rewrite Hup). iExact "Hup". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc _".
+    set (K0 := <[Regidx a4_idx := regval_into_reg pu]> M).
+    change (<[Regidx a4_idx := regval_into_reg pu]> M) with K0.
+    assert (Hp44 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x42) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x44))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp44) in "Hpc".
+    assert (HK0s1 : K0 !!! Regidx s1_idx = (disk_base : mword 64))
+      by (rewrite /K0 upd_ne; [exact HMs1 | reg_neq]).
+    (* ---- +0x44: lhu a5,32(s1) -- a5 := disk.used_idx ---- *)
+    assert (Huidx : add_vec (rget K0 s1_idx) (sign_extend' 64 (mword_of_int 32 : mword 12))
+                    = (d_used_idx : mword 64)).
+    { rgne. rewrite HK0s1 vt_sext_32. reflexivity. }
+    iApply (wp_lhu_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_intr + 0x44)) a5_idx s1_idx
+              (mword_of_int 32 : mword 12) K0 n (wrap16 nr) false (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [Hidx]").
+    { iApply (vti_44 with "Htext"). }
+    { iEval (rewrite Huidx). iExact "Hidx". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc Hidx". iEval (rewrite Huidx) in "Hidx".
+    set (K1 := <[Regidx a5_idx := regval_into_reg
+        (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))]> K0).
+    change (<[Regidx a5_idx := regval_into_reg
+        (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))]> K0) with K1.
+    assert (Hp48 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x44) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x48))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp48) in "Hpc".
+    (* ---- +0x48: c.andi a5,7 -- a5 := used_idx % NUM ---- *)
+    assert (HK1a5 : K1 !!! Regidx a5_idx
+                    = zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))
+      by (rewrite /K1; apply upd_eq).
+    iApply (wp_candi_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x48)) a5_idx (mword_of_int 7 : mword 6)
+              K1 n false ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_48 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    assert (HK2v : and_vec (rget K1 a5_idx)
+                     (sign_extend' 64 (sign_extend' 12 (mword_of_int 7 : mword 6)))
+                   = (mword_of_int (Z.of_nat (nr `mod` 8)) : mword 64)).
+    { rgne. rewrite HK1a5. apply vt_ring_idx. }
+    set (K2 := <[Regidx a5_idx := regval_into_reg
+        (mword_of_int (Z.of_nat (nr `mod` 8)) : mword 64)]> K1).
+    iEval (rewrite HK2v) in "Hcg".
+    change (<[Regidx a5_idx := regval_into_reg
+        (mword_of_int (Z.of_nat (nr `mod` 8)) : mword 64)]> K1) with K2.
+    assert (Hp4a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x48) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x4a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp4a) in "Hpc".
+    (* ---- +0x4a: c.slli a5,3 -- * sizeof(used elem) ---- *)
+    assert (Hq8 : (nr `mod` 8 < 8)%nat) by (apply Nat.mod_upper_bound; lia).
+    assert (HK2a5 : K2 !!! Regidx a5_idx = (mword_of_int (Z.of_nat (nr `mod` 8)) : mword 64))
+      by (rewrite /K2; apply upd_eq).
+    iApply (wp_cslli_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x4a)) (Regidx a5_idx) a5_idx
+              (mword_of_int 3 : mword 6) K2 n false eq_refl
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_4a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    assert (HK3v : shift_bits_left (rget K2 a5_idx)
+                     (subrange_vec_dec (mword_of_int 3 : mword 6) (Z.sub log2_xlen 1) 0)
+                   = (mword_of_int (8 * Z.of_nat (nr `mod` 8)) : mword 64)).
+    { rgne. rewrite HK2a5. apply vt_shl3. exact Hq8. }
+    set (K3 := <[Regidx a5_idx := regval_into_reg
+        (mword_of_int (8 * Z.of_nat (nr `mod` 8)) : mword 64)]> K2).
+    iEval (rewrite HK3v) in "Hcg".
+    change (<[Regidx a5_idx := regval_into_reg
+        (mword_of_int (8 * Z.of_nat (nr `mod` 8)) : mword 64)]> K2) with K3.
+    assert (Hp4c : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x4a) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x4c))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp4c) in "Hpc".
+    (* ---- +0x4c: c.add a5,a5,a4 -- &used->ring[nr % NUM] ---- *)
+    assert (HK3a4 : K3 !!! Regidx a4_idx = pu).
+    { rewrite /K3 upd_ne; [| reg_neq]. rewrite /K2 upd_ne; [| reg_neq].
+      rewrite /K1 upd_ne; [| reg_neq]. rewrite /K0. apply upd_eq. }
+    assert (HK3a5 : K3 !!! Regidx a5_idx = (mword_of_int (8 * Z.of_nat (nr `mod` 8)) : mword 64))
+      by (rewrite /K3; apply upd_eq).
+    iApply (wp_cadd_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x4c)) a5_idx a4_idx K3 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_4c with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (K4 := <[Regidx a5_idx := regval_into_reg
+        (add_vec (mword_of_int (8 * Z.of_nat (nr `mod` 8)) : mword 64) pu)]> K3).
+    assert (HK4v : add_vec (rget K3 a5_idx) (rget K3 a4_idx)
+                   = add_vec (mword_of_int (8 * Z.of_nat (nr `mod` 8)) : mword 64) pu).
+    { rgne. rgne. rewrite HK3a4 HK3a5. reflexivity. }
+    iEval (rewrite HK4v) in "Hcg".
+    change (<[Regidx a5_idx := regval_into_reg
+        (add_vec (mword_of_int (8 * Z.of_nat (nr `mod` 8)) : mword 64) pu)]> K3) with K4.
+    assert (Hp4e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x4c) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x4e))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp4e) in "Hpc".
+    (* ---- +0x4e: c.lw a5,4(a5) -- the RECLAIM ---- *)
+    assert (HK4a5 : K4 !!! Regidx a5_idx
+                    = add_vec (mword_of_int (8 * Z.of_nat (nr `mod` 8)) : mword 64) pu)
+      by (rewrite /K4; apply upd_eq).
+    assert (Hea : add_vec (rget K4 a5_idx) (sign_extend' 64 (mword_of_int 4 : mword 12))
+                  = (pa_add pu (vt_uoff nr) : SailStdpp.Values.mword 64)).
+    { rgne. rewrite HK4a5 vt_uoff_q.
+      apply (vt_addv_pa pu _ _ (4 + 8 * (nr `mod` 8))%nat).
+      apply vt_uelem_off. exact Hq8. }
+    iApply (wp_vt_lw_used_elem γu γd pd pav pu (mword_of_int (KernelSyms.virtio_disk_intr + 0x4e))
+              a5_idx a5_idx (mword_of_int 4 : mword 12) K4 n np nr cm pp V0
+              Hea ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] Hdinv Hgeom Hpub Hlbs Hrd Hauth HV0 Hq0").
+    { iApply (vti_4e with "Htext"). }
+    iIntros (p dc) "%Hcm %Hspo #Hord Hcg Hpc Hpub Hrd Hauth".
+    set (K5 := <[Regidx a5_idx := regval_into_reg
+        (sign_extend' 64 (Z_to_bv 32 (bv_unsigned (vr_head (vs_req (dc_slot dc))))
+                          : SailStdpp.Values.mword 32))]> K4).
+    change (<[Regidx a5_idx := regval_into_reg
+        (sign_extend' 64 (Z_to_bv 32 (bv_unsigned (vr_head (vs_req (dc_slot dc))))
+                          : SailStdpp.Values.mword 32))]> K4) with K5.
+    assert (Hp50 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x4e) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x50))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp50) in "Hpc".
+    iApply ("Hcont" $! K5 p dc with "[%] [%] Hord Hcg Hpc Hidx Hpub Hrd Hauth HV0 HflV").
+    { exact Hcm. }
+    { split.
+      - rewrite /K5. apply upd_eq.
+      - intros r N4 N5.
+        rewrite /K5 upd_ne; [| congruence].
+        rewrite /K4 upd_ne; [| congruence].
+        rewrite /K3 upd_ne; [| congruence].
+        rewrite /K2 upd_ne; [| congruence].
+        rewrite /K1 upd_ne; [| congruence].
+        rewrite /K0 upd_ne; [| congruence]. reflexivity. }
+  Qed.
+
+  (* ---- the [struct disk] byte tier: the status cell is kernel DATA ---- *)
+  Lemma vt_kdata_canon (a : Arch.pa) :
+    addr_is_kdata a -> (uint (a : SailStdpp.Values.mword 64) < 274877906944)%Z.
+  Proof using .
+    intro Hka. unfold addr_is_kdata, ram_base, ram_size, text_end in Hka.
+    first [ lia
+          | (assert (Heq : (uint (a : SailStdpp.Values.mword 64) = uint a)%Z)
+               by reflexivity; rewrite Heq; lia) ].
+  Qed.
+
+  Lemma vt_status_kdata (h : nat) : (h < 8)%nat -> addr_is_kdata (d_info_status h).
+  Proof using . intro H. unfold d_info_status. apply vt_disk_kdata. lia. Qed.
+
+  Lemma vt_infob_kdata (h : nat) : (h < 8)%nat -> addr_is_kdata (d_info_b h).
+  Proof using . intro H. unfold d_info_b. apply vt_disk_kdata. lia. Qed.
+
+  Lemma vt_sext_4 : sign_extend' 64 (mword_of_int 4 : mword 12) = (mword_of_int 4 : mword 64).
+  Proof using . apply bv_eq; vm_compute; reflexivity. Qed.
+
+  Lemma vt_bdisk_addr (b : Arch.pa) :
+    add_vec (b : SailStdpp.Values.mword 64) (sign_extend' 64 (mword_of_int 4 : mword 12))
+    = (b_disk b : SailStdpp.Values.mword 64).
+  Proof using . rewrite vt_sext_4. unfold b_disk, pa_add, add_vec_int. reflexivity. Qed.
+
+  (* ---- CHUNK B (+0x50 .. +0x5e): &disk.info[id].status, the load, and  *)
+  (* ---- CHUNK B (+0x50 .. +0x5e): &disk.info[id].status, the load, and  *)
+  (*      the REFUTED panic branch.  The byte is the chain's status       *)
+  (*      descriptor -- the device's, so the [lbu] opens the device        *)
+  (*      invariant: [virtio_proto_status_peek] at the claim [dc] says it *)
+  (*      reads 0, and the claim's [slot_buf_link] says its address is    *)
+  (*      [disk.info[h].status], the one the code computes.  a4/a5 move.  *)
+  Lemma wp_vt_status (γu : uart_names) (γd : disk_names) (M : regfile) (n h : nat)
+      (np p u : nat) (cm : gmap nat dclaim) (dc : dclaim) (pp : mword 64) (V0 : nat) :
+    (M !!! Regidx s1_idx : mword 64) = (disk_base : mword 64) ->
+    (M !!! Regidx a5_idx : mword 64) = (mword_of_int (Z.of_nat h) : mword 64) ->
+    (h < 8)%nat ->
+    cm !! p = Some dc ->
+    vr_status (vs_req (dc_slot dc)) = d_info_status h ->
+    sie_cap_gpr KT1 M n false pp -∗
+    kernel_text -∗ pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x50) : mword 64) -∗
+    dev_inv γu γd -∗
+    disk_pub γd np -∗ disk_ord γd p u -∗ disk_read_at γd u -∗
+    ghost_map_auth_frac (dn_claim γd) 1 cm -∗
+    (* the status byte is the lease's STAMPED cell until the deposit; the
+       handler reads it exactly at the index read's view [V0] *)
+    TsoCtx.hart_view_lb V0 -∗
+    (∃ q0 : nat, disk_done_pos γd u q0 ∗ ⌜(q0 <= V0)%nat⌝) -∗
+    ( ∀ M' : regfile,
+        ⌜ M' !!! Regidx a5_idx = (mword_of_int (Z.of_nat h) : mword 64)
+          /\ (forall r : mword 5, r <> a4_idx -> r <> a5_idx ->
+                M' !!! Regidx r = M !!! Regidx r) ⌝ -∗
+        sie_cap_gpr KT1 M' n false pp -∗
+        pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x60) : mword 64) -∗
+        disk_pub γd np -∗ disk_read_at γd u -∗ ghost_map_auth_frac (dn_claim γd) 1 cm -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HMs1 HMa5 Hh8 Hcm Hstatus.
+    iIntros "Hcg #Htext Hpc #Hdinv Hpub #Hord Hrd Hauth #HV0 #Hq0 Hcont".
+    iDestruct "Hq0" as (q0) "[#Hpos0 %Hq0V]".
+    iDestruct (sie_cap_gpr_kmap_claims with "Hcg") as "[#Hkm Hcg]".
+    pose proof (kdata_svpn_class _ (vt_status_kdata h Hh8)) as Hstk.
+    pose proof (vt_kdata_canon _ (vt_status_kdata h Hh8)) as Hstc.
+    iDestruct (dev_inv_disk with "Hdinv") as "#Hvinv".
+    (* ---- +0x50: slli a4,a5,0x4 ---- *)
+    assert (Hsh4 : shift_bits_left (rget M a5_idx)
+                     (subrange_vec_dec (mword_of_int 4 : mword 6) (Z.sub log2_xlen 1) 0)
+                   = (mword_of_int (16 * Z.of_nat h) : mword 64)).
+    { rgne. rewrite HMa5. apply vt_shl4. exact Hh8. }
+    iApply (wp_slli_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x50)) a4_idx a5_idx
+              (mword_of_int 4 : mword 6) (mword_of_int (16 * Z.of_nat h) : mword 64) M n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              Hsh4
+              with "Hcg Hpc []").
+    { iApply (vti_50 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (B0 := <[Regidx a4_idx := regval_into_reg
+        (mword_of_int (16 * Z.of_nat h) : mword 64)]> M).
+    change (<[Regidx a4_idx := regval_into_reg
+        (mword_of_int (16 * Z.of_nat h) : mword 64)]> M) with B0.
+    assert (Hp54 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x50) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x54))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp54) in "Hpc".
+    (* ---- +0x54: addi a4,a4,32 ---- *)
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x54)) a4_idx a4_idx
+              (mword_of_int 32 : mword 12) B0 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_54 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    assert (HB0a4 : B0 !!! Regidx a4_idx = (mword_of_int (16 * Z.of_nat h) : mword 64))
+      by (rewrite /B0; apply upd_eq).
+    set (B1 := <[Regidx a4_idx := regval_into_reg
+        (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                 (sign_extend' 64 (mword_of_int 32 : mword 12)))]> B0).
+    iEval (rgne) in "Hcg". iEval (rewrite HB0a4) in "Hcg".
+    change (<[Regidx a4_idx := regval_into_reg
+        (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                 (sign_extend' 64 (mword_of_int 32 : mword 12)))]> B0) with B1.
+    assert (Hp58 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x54) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x58))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp58) in "Hpc".
+    (* ---- +0x58: c.add a4,a4,s1 -- &disk.info[id] - 16 ---- *)
+    assert (HB1a4 : B1 !!! Regidx a4_idx
+                    = add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                              (sign_extend' 64 (mword_of_int 32 : mword 12)))
+      by (rewrite /B1; apply upd_eq).
+    assert (HB1s1 : B1 !!! Regidx s1_idx = (disk_base : mword 64)).
+    { rewrite /B1 upd_ne; [| reg_neq]. rewrite /B0 upd_ne; [| reg_neq]. exact HMs1. }
+    iApply (wp_cadd_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x58)) a4_idx s1_idx B1 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_58 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (B2 := <[Regidx a4_idx := regval_into_reg
+        (add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                          (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                 (disk_base : SailStdpp.Values.mword 64))]> B1).
+    assert (HB2v : add_vec (rget B1 a4_idx) (rget B1 s1_idx)
+                   = add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                                      (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                             (disk_base : SailStdpp.Values.mword 64)).
+    { rgne. rgne. rewrite HB1a4 HB1s1. reflexivity. }
+    iEval (rewrite HB2v) in "Hcg".
+    change (<[Regidx a4_idx := regval_into_reg
+        (add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                          (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                 (disk_base : SailStdpp.Values.mword 64))]> B1) with B2.
+    assert (Hp5a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x58) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x5a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp5a) in "Hpc".
+    (* ---- +0x5a: lbu a4,16(a4) -- disk.info[id].status ---- *)
+    assert (HB2a4 : B2 !!! Regidx a4_idx
+                    = add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                                       (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                              (disk_base : SailStdpp.Values.mword 64))
+      by (rewrite /B2; apply upd_eq).
+    assert (Hsa : add_vec (rget B2 a4_idx) (sign_extend' 64 (mword_of_int 16 : mword 12))
+                  = (d_info_status h : SailStdpp.Values.mword 64)).
+    { rgne. rewrite HB2a4. apply vt_status_addr. exact Hh8. }
+    (* THE ADDRESS CLAIM, off the status byte's own RAM fact: one read-only
+       opening around [virtio_proto_status_peek], which hands the stamped
+       byte back (the leaf wants the claim BESIDE the atomic update). *)
+    iApply fupd_wp.
+    iInv "Hvinv" as ">Hdbodyp" "Hdclosep".
+    iDestruct "Hdbodyp" as (vstp) "(Hvfp & Hprotop & %Hvokp)".
+    iDestruct (virtio_proto_status_peek γd vstp np p u cm dc Hcm
+                 with "Hprotop Hpub Hord Hrd Hauth")
+      as "(_ & _ & _ & (%qp & #Hposp & Hstp & Hbackp))".
+    iEval (rewrite Hstatus) in "Hstp".
+    iAssert (⌜addr_is_ram (d_info_status h)⌝)%I as %Hram.
+    { iDestruct (ledger_le_ledger with "Hstp") as "Hc".
+      iApply (phys_ledger_ram with "Hc"). }
+    iDestruct (vt_claim_of_ram 1 (d_info_status h) (is_aligned_paddr_1 _) Hstk Hstc Hram
+                 with "Hkm") as "#Hcl".
+    iEval (rewrite -Hstatus) in "Hstp".
+    iDestruct ("Hbackp" with "Hstp") as "(Hprotop & Hpub & Hrd & Hauth)".
+    iMod ("Hdclosep" with "[Hvfp Hprotop]") as "_".
+    { iNext. iExists vstp. iFrame. iPureIntro. exact Hvokp. }
+    iModIntro.
+    (* A6.126 §6: the RACY read of the lease's stamped byte, exact because
+       the handler's view [V0] has the completion's position [q0] in it *)
+    iApply (wp_load_s_sconf_au_rel (CID:=CID) (kt := KT1) (ktd := KT0) 1 false true
+              (mword_of_int (KernelSyms.virtio_disk_intr + 0x5a)) a4_idx a4_idx
+              (mword_of_int 16 : mword 12) B2 n
+              (fun w => zero_extend' 64 w)
+              (⊤ ∖ ↑minstretN ∖ ↑diskN) false
+              (fun w _ => w = (byte_zero : SailStdpp.Values.mword 8))
+              (TsoCtx.hart_view_lb (CID := CID) V0 ∗ ⌜(q0 <= V0)%nat⌝ ∗
+               ledger_le (d_info_status h) byte_zero q0 ∗
+               (ledger_le (d_info_status h) byte_zero q0 -∗
+                |={⊤ ∖ ↑minstretN ∖ ↑diskN, ⊤ ∖ ↑minstretN}=>
+                  disk_pub γd np ∗ disk_read_at γd u ∗ ghost_map_auth_frac (dn_claim γd) 1 cm))%I
+              (disk_pub γd np ∗ disk_read_at γd u ∗ ghost_map_auth_frac (dn_claim γd) 1 cm)%I
+              ltac:(lia) ltac:(lia) ltac:(unfold vmem_width; lia) ltac:(exists 4096; reflexivity) ltac:(vm_compute; reflexivity)
+              WpSconfMem.exec_read_ram_plain_1 vt_ext1
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(solve_ndisj)
+              ltac:(rewrite Hsa; exact (vt_byte_read_ok (d_info_status h) q0 V0 byte_zero pp _))
+              with "Hcg Hpc [] [] [Hpub Hrd Hauth] [Hcont]").
+    { iApply (vti_5a with "Htext"). }
+    { rewrite Hsa. iExact "Hcl". }
+    { iInv "Hvinv" as ">Hdbody" "Hdclose".
+      iDestruct "Hdbody" as (vst) "(Hvf & Hproto & %Hvok)".
+      iDestruct (virtio_proto_status_peek γd vst np p u cm dc Hcm
+                   with "Hproto Hpub Hord Hrd Hauth")
+        as "(_ & _ & _ & (%q & #Hposq & Hst & Hback))".
+      iDestruct (disk_done_pos_agree with "Hpos0 Hposq") as %<-.
+      iEval (rewrite Hstatus) in "Hst".
+      iModIntro.
+      iSplitL "Hst Hback Hvf Hdclose".
+      { iFrame "HV0 Hst". iSplitR; [iPureIntro; exact Hq0V|].
+        iIntros "Hst". iEval (rewrite -Hstatus) in "Hst".
+        iDestruct ("Hback" with "Hst") as "(Hproto & Hpub & Hrd & Hauth)".
+        iMod ("Hdclose" with "[Hvf Hproto]") as "_".
+        { iNext. iExists vst. iFrame. iPureIntro. exact Hvok. }
+        iModIntro. iFrame "Hpub Hrd Hauth". }
+      iIntros "(_ & _ & Hst & Hclose)". iApply ("Hclose" with "Hst"). }
+    iIntros (w). iApply wp_next_off_intro.
+    iIntros "Hcg Hpc HQ (Hpub & Hrd & Hauth)".
+    iDestruct "HQ" as (V1) "[_ %Hw]". subst w.
+    set (B3 := <[Regidx a4_idx := regval_into_reg
+        (zero_extend' 64 (byte_zero : SailStdpp.Values.mword 8))]> B2).
+    change (<[Regidx a4_idx := regval_into_reg
+        (zero_extend' 64 (byte_zero : SailStdpp.Values.mword 8))]> B2) with B3.
+    assert (Hp5e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x5a) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x5e))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp5e) in "Hpc".
+    (* ---- +0x5e: c.bnez a4 -- the status panic, REFUTED ---- *)
+    assert (HB3a4 : B3 !!! Regidx a4_idx
+                    = zero_extend' 64 (byte_zero : SailStdpp.Values.mword 8))
+      by (rewrite /B3; apply upd_eq).
+    assert (Hnz5e : neq_vec (rget B3 a4_idx) zero_reg = false).
+    { rgne. rewrite HB3a4. vm_compute. reflexivity. }
+    iApply (wp_cbnez_fall_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x5e)) (mword_of_int 33 : mword 8)
+              (Cregidx (mword_of_int 6)) a4_idx B3 n false
+              ltac:(vm_compute; reflexivity) ltac:(vm_compute; discriminate)
+              Hnz5e
+              with "Hcg Hpc []").
+    { iApply (vti_5e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    assert (Hp60 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x5e) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x60))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp60) in "Hpc".
+    iApply ("Hcont" $! B3 with "[%] Hcg Hpc Hpub Hrd Hauth").
+    split.
+    - rewrite /B3 upd_ne; [| reg_neq].
+      rewrite /B2 upd_ne; [| reg_neq].
+      rewrite /B1 upd_ne; [| reg_neq].
+      rewrite /B0 upd_ne; [| reg_neq]. exact HMa5.
+    - intros r N4 N5.
+      rewrite /B3 upd_ne; [| congruence].
+      rewrite /B2 upd_ne; [| congruence].
+      rewrite /B1 upd_ne; [| congruence].
+      rewrite /B0 upd_ne; [| congruence]. reflexivity.
+  Qed.
+
+  (* ---- CHUNK C (+0x60 .. +0x6a): b = disk.info[id].b ; b->disk = 0.    *)
+  (*      Both cells are the receipt's, so both instructions open the     *)
+  (*      device invariant at the claim [dc]: the [ld] is a peek           *)
+  (*      ([virtio_proto_infob_acc]) whose value is [dc_buf dc] -- the     *)
+  (*      pure fact that carries to the store -- and the [sw] is THE       *)
+  (*      DEPOSIT ([virtio_proto_deposit_acc]): reclaim and hand-back in   *)
+  (*      one step, which is what advances the watermark.  a0/a5 move.    *)
+  Lemma wp_vt_clear_disk (γu : uart_names) (γd : disk_names) (M : regfile) (n h : nat)
+      (np p u F : nat) (cm : gmap nat dclaim) (dc : dclaim) (pp : mword 64) (V0 : nat) :
+    (M !!! Regidx s1_idx : mword 64) = (disk_base : mword 64) ->
+    (M !!! Regidx a5_idx : mword 64) = (mword_of_int (Z.of_nat h) : mword 64) ->
+    (h < 8)%nat ->
+    cm !! p = Some dc ->
+    bv_unsigned (vr_head (vs_req (dc_slot dc))) = Z.of_nat h ->
+    sie_cap_gpr KT1 M n false pp -∗
+    kernel_text -∗ pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x60) : mword 64) -∗
+    dev_inv γu γd -∗
+    disk_pub γd np -∗ disk_ord γd p u -∗ disk_read_at γd u -∗
+    ghost_map_auth_frac (dn_claim γd) 1 cm -∗
+    (* the reader floor, and the record's completion position under the view
+       the index read settled at: what the deposit moves the floor to *)
+    disk_flr γd F -∗
+    (∃ q0 : nat, disk_done_pos γd u q0 ∗ ⌜(q0 <= V0)%nat⌝) -∗
+    (* THE CLAIM ROW's cells (DiskInv.claim_cells, Left arm): [info[h].b] and
+       the buffer's [b->disk], still 1.  Both are the handler's own ctx cells
+       under the vdisk lock, so the load and the store are plain leaves. *)
+    d_info_b h ↦₈ (dc_buf dc : SailStdpp.Values.mword 64) -∗
+    b_disk (dc_buf dc) ↦₄ (SailStdpp.Values.mword_of_int (len := 32) 1) -∗
+    ( ∀ M' : regfile,
+        ⌜ M' !!! Regidx a0_idx = (dc_buf dc : SailStdpp.Values.mword 64)
+          /\ (forall r : mword 5, r <> a0_idx -> r <> a5_idx ->
+                M' !!! Regidx r = M !!! Regidx r) ⌝ -∗
+        sie_cap_gpr KT1 M' n false pp -∗
+        pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x6e) : mword 64) -∗
+        disk_pub γd np -∗ disk_done_lb γd (S u) -∗ disk_read_at γd (S u) -∗
+        ghost_map_auth_frac (dn_claim γd) 1 cm -∗
+        disk_flr γd (Nat.max F V0) -∗
+        d_info_b h ↦₈ (dc_buf dc : SailStdpp.Values.mword 64) -∗
+        b_disk (dc_buf dc) ↦₄ (SailStdpp.Values.mword_of_int (len := 32) 0) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HMs1 HMa5 Hh8 Hcm Hhead.
+    iIntros "Hcg #Htext Hpc #Hdinv Hpub #Hord Hrd Hauth Hflr #Hq0 Hib Hbd Hcont".
+    iDestruct "Hq0" as (q0) "[#Hpos0 %Hq0V]".
+    iDestruct (dev_inv_disk with "Hdinv") as "#Hvinv".
+    (* ---- +0x60: c.slli a5,4 ---- *)
+    iApply (wp_cslli_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x60)) (Regidx a5_idx) a5_idx
+              (mword_of_int 4 : mword 6) M n false eq_refl
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_60 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    assert (HC0v : shift_bits_left (rget M a5_idx)
+                     (subrange_vec_dec (mword_of_int 4 : mword 6) (Z.sub log2_xlen 1) 0)
+                   = (mword_of_int (16 * Z.of_nat h) : mword 64)).
+    { rgne. rewrite HMa5. apply vt_shl4. exact Hh8. }
+    set (C0 := <[Regidx a5_idx := regval_into_reg
+        (mword_of_int (16 * Z.of_nat h) : mword 64)]> M).
+    iEval (rewrite HC0v) in "Hcg".
+    change (<[Regidx a5_idx := regval_into_reg
+        (mword_of_int (16 * Z.of_nat h) : mword 64)]> M) with C0.
+    assert (Hp62 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x60) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x62))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp62) in "Hpc".
+    (* ---- +0x62: addi a5,a5,32 ---- *)
+    assert (HC0a5 : C0 !!! Regidx a5_idx = (mword_of_int (16 * Z.of_nat h) : mword 64))
+      by (rewrite /C0; apply upd_eq).
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x62)) a5_idx a5_idx
+              (mword_of_int 32 : mword 12) C0 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_62 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (C1 := <[Regidx a5_idx := regval_into_reg
+        (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                 (sign_extend' 64 (mword_of_int 32 : mword 12)))]> C0).
+    iEval (rgne) in "Hcg". iEval (rewrite HC0a5) in "Hcg".
+    change (<[Regidx a5_idx := regval_into_reg
+        (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                 (sign_extend' 64 (mword_of_int 32 : mword 12)))]> C0) with C1.
+    assert (Hp66 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x62) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x66))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp66) in "Hpc".
+    (* ---- +0x66: c.add a5,a5,s1 ---- *)
+    assert (HC1a5 : C1 !!! Regidx a5_idx
+                    = add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                              (sign_extend' 64 (mword_of_int 32 : mword 12)))
+      by (rewrite /C1; apply upd_eq).
+    assert (HC1s1 : C1 !!! Regidx s1_idx = (disk_base : mword 64)).
+    { rewrite /C1 upd_ne; [| reg_neq]. rewrite /C0 upd_ne; [| reg_neq]. exact HMs1. }
+    iApply (wp_cadd_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x66)) a5_idx s1_idx C1 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_66 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (C2 := <[Regidx a5_idx := regval_into_reg
+        (add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                          (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                 (disk_base : SailStdpp.Values.mword 64))]> C1).
+    assert (HC2v : add_vec (rget C1 a5_idx) (rget C1 s1_idx)
+                   = add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                                      (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                             (disk_base : SailStdpp.Values.mword 64)).
+    { rgne. rgne. rewrite HC1a5 HC1s1. reflexivity. }
+    iEval (rewrite HC2v) in "Hcg".
+    change (<[Regidx a5_idx := regval_into_reg
+        (add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                          (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                 (disk_base : SailStdpp.Values.mword 64))]> C1) with C2.
+    assert (Hp68 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x66) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x68))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp68) in "Hpc".
+    (* ---- +0x68: c.ld a0,8(a5) -- b = disk.info[id].b ---- *)
+    assert (HC2a5 : C2 !!! Regidx a5_idx
+                    = add_vec (add_vec (mword_of_int (16 * Z.of_nat h) : mword 64)
+                                       (sign_extend' 64 (mword_of_int 32 : mword 12)))
+                              (disk_base : SailStdpp.Values.mword 64))
+      by (rewrite /C2; apply upd_eq).
+    assert (Hba : add_vec (rget C2 a5_idx) (sign_extend' 64 (mword_of_int 8 : mword 12))
+                  = (d_info_b h : SailStdpp.Values.mword 64)).
+    { rgne. rewrite HC2a5. apply vt_infob_addr. exact Hh8. }
+    iApply (wp_cld_s_sconf (kt := KT1) (ktd := KT0)
+              (mword_of_int (KernelSyms.virtio_disk_intr + 0x68)) a0_idx a5_idx
+              (mword_of_int 8 : mword 12) C2 n (dc_buf dc : SailStdpp.Values.mword 64) false
+              (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [Hib]").
+    { iApply (vti_68 with "Htext"). }
+    { rewrite Hba. iExact "Hib". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc Hib". iEval (rewrite Hba) in "Hib".
+    set (C3 := <[Regidx a0_idx := regval_into_reg (dc_buf dc : SailStdpp.Values.mword 64)]> C2).
+    change (<[Regidx a0_idx := regval_into_reg (dc_buf dc : SailStdpp.Values.mword 64)]> C2) with C3.
+    assert (Hp6a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x68) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x6a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp6a) in "Hpc".
+    (* ---- +0x6a: sw zero,4(a0) -- b->disk = 0: THE DEPOSIT, then the store
+       through the row's own cell ---- *)
+    assert (HC3a0 : C3 !!! Regidx a0_idx = (dc_buf dc : SailStdpp.Values.mword 64))
+      by (rewrite /C3; apply upd_eq).
+    assert (Hbda : add_vec (rget C3 a0_idx) (sign_extend' 64 (mword_of_int 4 : mword 12))
+                   = (b_disk (dc_buf dc) : SailStdpp.Values.mword 64)).
+    { rgne. rewrite HC3a0. apply vt_bdisk_addr. }
+    (* the stored value is x0's *)
+    assert (Hu0 : uint (mword_of_int 0 : mword 5) = 0) by (vm_compute; reflexivity).
+    iDestruct (sie_cap_gpr_x0 (kt := KT1) C3 n false pp (mword_of_int 0 : mword 5) Hu0
+                 with "Hcg") as "[%Hx0 Hcg]".
+    assert (Hzero : trunc32 (rget C3 (mword_of_int 0 : mword 5)) = (mword_of_int 0 : mword 32)).
+    { rgne. rewrite Hx0. apply bv_eq; vm_compute; reflexivity. }
+    (* THE DEPOSIT (finding 5 / A6.126 §6): the record at [u] is spent into
+       the chain-back, the watermark advances, the reader floor moves to the
+       read's view.  A ghost step under one opening of the device invariant --
+       no memory moves here; the cell the store below writes is the ROW's. *)
+    iApply fupd_wp.
+    iInv "Hvinv" as ">Hdbody" "Hdclose".
+    iDestruct "Hdbody" as (vst) "(Hvf & Hproto & %Hvok)".
+    iMod (virtio_proto_deposit_acc γd vst np p u F q0 V0 cm dc Hcm
+            with "Hproto Hpub Hord Hrd Hauth Hflr Hpos0 [%]")
+      as "(_ & _ & _ & _ & Hproto & Hpub & #Hlbs & Hrd & Hflr & Hauth)"; [exact Hq0V|].
+    iMod ("Hdclose" with "[Hvf Hproto]") as "_".
+    { iNext. iExists vst. iFrame. iPureIntro. exact Hvok. }
+    iModIntro.
+    iApply (wp_sw_s_sconf (kt := KT1) (ktd := KT0)
+              (mword_of_int (KernelSyms.virtio_disk_intr + 0x6a))
+              (mword_of_int 0 : mword 5) a0_idx (mword_of_int 4 : mword 12) C3 n
+              (SailStdpp.Values.mword_of_int (len := 32) 1) false
+              with "Hcg Hpc [] [Hbd]").
+    { iApply (vti_6a with "Htext"). }
+    { rewrite Hbda. iExact "Hbd". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc Hbd". iEval (rewrite Hbda Hzero) in "Hbd".
+    assert (Hp6e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x6a) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x6e))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp6e) in "Hpc".
+    iApply ("Hcont" $! C3 with "[%] Hcg Hpc Hpub Hlbs Hrd Hauth Hflr Hib Hbd").
+    split; [exact HC3a0|].
+    intros r N0 N5.
+    rewrite /C3 upd_ne; [| congruence].
+    rewrite /C2 upd_ne; [| congruence].
+    rewrite /C1 upd_ne; [| congruence].
+    rewrite /C0 upd_ne; [| congruence]. reflexivity.
+  Qed.
+
+  Lemma vt_trunc16_zext (x : SailStdpp.Values.mword 16) :
+    trunc16 (zero_extend' 64 (x : SailStdpp.Values.mword 16) : mword 64) = x.
+  Proof using .
+    apply bv_eq. rewrite vt_trunc16_unsigned vt_zext16_unsigned.
+    apply bv_wrap_bv_unsigned.
+  Qed.
+
+  (* ---- CHUNK E (+0x72 .. +0x82): disk.used_idx += 1 (16-bit wrap) and  *)
+  (*      the back-edge re-read of the device's used->idx.                *)
+  Lemma wp_vt_advance (γu : uart_names) (γd : disk_names) (pd pav pu : mword 64) (M : regfile) (n : nat)
+      (np nr F t0 t1 : nat) (pp : mword 64) :
+    (M !!! Regidx s1_idx : mword 64) = (disk_base : mword 64) ->
+    sie_cap_gpr KT1 M n false pp -∗
+    kernel_text -∗ pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x72) : mword 64) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    disk_pub γd np -∗
+    d_used_idx ↦₂ wrap16 nr -∗
+    disk_read_at γd (S nr) -∗ disk_flr γd F -∗ disk_fl γd t0 t1 -∗
+    lk_floor cur_ctx t0 -∗ lk_floor cur_ctx t1 -∗ TsoCtx.ctx_floor cur_ctx F -∗
+    ( ∀ (M' : regfile) (nc V0 : nat),
+        ⌜ M' !!! Regidx a5_idx
+            = (zero_extend' 64 (wrap16 (S nr) : SailStdpp.Values.mword 16) : mword 64)
+          /\ M' !!! Regidx a4_idx
+            = (zero_extend' 64 (wrap16 nc : SailStdpp.Values.mword 16) : mword 64)
+          /\ (forall r : mword 5, r <> a4_idx -> r <> a5_idx ->
+                M' !!! Regidx r = M !!! Regidx r) ⌝ -∗
+        ⌜ (S nr <= nc)%nat /\ (nc <= np)%nat ⌝ -∗
+        disk_done_lb γd nc -∗
+        hart_rview_lb_at cpu_id V0 -∗
+        ([∗ list] p ∈ seq 0 nc, ∃ q : nat, disk_done_pos γd p q ∗ ⌜(q <= V0)%nat⌝) -∗
+        sie_cap_gpr KT1 M' n false pp -∗
+        pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x86) : mword 64) -∗
+        disk_pub γd np -∗ d_used_idx ↦₂ wrap16 (S nr) -∗
+        disk_read_at γd (S nr) -∗ disk_flr γd F -∗ disk_fl γd t0 t1 -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HMs1.
+    iIntros "Hcg #Htext Hpc #Hdinv #Hgeom Hpub Hidx Hnr Hflr Hfl #Hf0 #Hf1 #HfF Hcont".
+    iDestruct (disk_geom_used_ptr with "Hgeom") as "#Hup".
+    (* ---- +0x72: lhu a5,32(s1) ---- *)
+    assert (Huidx : add_vec (rget M s1_idx) (sign_extend' 64 (mword_of_int 32 : mword 12))
+                    = (d_used_idx : mword 64)).
+    { rgne. rewrite HMs1 vt_sext_32. reflexivity. }
+    iApply (wp_lhu_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_intr + 0x72)) a5_idx s1_idx
+              (mword_of_int 32 : mword 12) M n (wrap16 nr) false (dqm := DfracOwn 1)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] [Hidx]").
+    { iApply (vti_72 with "Htext"). }
+    { iEval (rewrite Huidx). iExact "Hidx". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc Hidx". iEval (rewrite Huidx) in "Hidx".
+    set (D0 := <[Regidx a5_idx := regval_into_reg
+        (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))]> M).
+    change (<[Regidx a5_idx := regval_into_reg
+        (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))]> M) with D0.
+    assert (Hp76 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x72) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x76))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp76) in "Hpc".
+    assert (HD0a5 : D0 !!! Regidx a5_idx
+                    = zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))
+      by (rewrite /D0; apply upd_eq).
+    (* ---- +0x76: c.addiw a5,1 ---- *)
+    iApply (wp_caddiw_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x76)) a5_idx (mword_of_int 1 : mword 6)
+              D0 n false ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_76 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (D1 := <[Regidx a5_idx := regval_into_reg
+        (sign_extend' 64 (subrange_vec_dec
+           (add_vec (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))
+                    (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)))) 31 0))]> D0).
+    iEval (rgne) in "Hcg". iEval (rewrite HD0a5) in "Hcg".
+    change (<[Regidx a5_idx := regval_into_reg
+        (sign_extend' 64 (subrange_vec_dec
+           (add_vec (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))
+                    (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)))) 31 0))]> D0) with D1.
+    assert (Hp78 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x76) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x78))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp78) in "Hpc".
+    assert (HD1a5 : D1 !!! Regidx a5_idx
+                    = sign_extend' 64 (subrange_vec_dec
+                        (add_vec (zero_extend' 64 (wrap16 nr : SailStdpp.Values.mword 16))
+                                 (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)))) 31 0))
+      by (rewrite /D1; apply upd_eq).
+    (* ---- +0x78: c.slli a5,0x30 ---- *)
+    iApply (wp_cslli_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x78)) (Regidx a5_idx) a5_idx
+              (mword_of_int 48 : mword 6) D1 n false eq_refl
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (vti_78 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    iEval (rgne) in "Hcg".
+    set (D2 := <[Regidx a5_idx := regval_into_reg
+        (shift_bits_left (D1 !!! Regidx a5_idx)
+           (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0))]> D1).
+    change (<[Regidx a5_idx := regval_into_reg
+        (shift_bits_left (D1 !!! Regidx a5_idx)
+           (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0))]> D1) with D2.
+    assert (Hp7a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x78) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x7a))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp7a) in "Hpc".
+    assert (HD2a5 : D2 !!! Regidx a5_idx
+                    = shift_bits_left (D1 !!! Regidx a5_idx)
+                        (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0))
+      by (rewrite /D2; apply upd_eq).
+    (* ---- +0x7a: c.srli a5,0x30 -- the 16-bit wrap ---- *)
+    assert (Hcv : creg2reg_idx (Cregidx (mword_of_int 7)) = Regidx a5_idx)
+      by (vm_compute; reflexivity).
+    iApply (wp_csrli_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x7a)) (Cregidx (mword_of_int 7)) a5_idx
+              (mword_of_int 48 : mword 6) D2 n false Hcv
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iEval (rewrite -Hcv); iApply (vti_7a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    assert (HD3v : shift_bits_right (rget D2 a5_idx)
+                     (subrange_vec_dec (mword_of_int 48 : mword 6) (Z.sub log2_xlen 1) 0)
+                   = (zero_extend' 64 (wrap16 (S nr) : SailStdpp.Values.mword 16) : mword 64)).
+    { rgne. rewrite HD2a5 HD1a5. apply vt_used_idx_next. }
+    set (D3 := <[Regidx a5_idx := regval_into_reg
+        (zero_extend' 64 (wrap16 (S nr) : SailStdpp.Values.mword 16) : mword 64)]> D2).
+    iEval (rewrite HD3v) in "Hcg".
+    change (<[Regidx a5_idx := regval_into_reg
+        (zero_extend' 64 (wrap16 (S nr) : SailStdpp.Values.mword 16) : mword 64)]> D2) with D3.
+    assert (Hp7c : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x7a) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x7c))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp7c) in "Hpc".
+    assert (HD3a5 : D3 !!! Regidx a5_idx
+                    = (zero_extend' 64 (wrap16 (S nr) : SailStdpp.Values.mword 16) : mword 64))
+      by (rewrite /D3; apply upd_eq).
+    assert (HD3s1 : D3 !!! Regidx s1_idx = (disk_base : mword 64)).
+    { rewrite /D3 upd_ne; [| reg_neq]. rewrite /D2 upd_ne; [| reg_neq].
+      rewrite /D1 upd_ne; [| reg_neq]. rewrite /D0 upd_ne; [| reg_neq]. exact HMs1. }
+    (* ---- +0x7c: sh a5,32(s1) -- disk.used_idx = nr+1 ---- *)
+    assert (Huidx3 : add_vec (rget D3 s1_idx) (sign_extend' 64 (mword_of_int 32 : mword 12))
+                     = (d_used_idx : mword 64)).
+    { rgne. rewrite HD3s1 vt_sext_32. reflexivity. }
+    iApply (wp_sh_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_intr + 0x7c)) a5_idx s1_idx
+              (mword_of_int 32 : mword 12) D3 n (wrap16 nr) false
+              with "Hcg Hpc [] [Hidx]").
+    { iApply (vti_7c with "Htext"). }
+    { iEval (rewrite Huidx3). iExact "Hidx". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc Hidx".
+    iEval (rewrite Huidx3) in "Hidx". iEval (rgne) in "Hidx".
+    iEval (rewrite HD3a5 vt_trunc16_zext) in "Hidx".
+    assert (Hp80 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x7c) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x80))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp80) in "Hpc".
+    (* ---- +0x80: c.ld a4,16(s1) ---- *)
+    assert (Hup : add_vec (rget D3 s1_idx) (sign_extend' 64 (mword_of_int 16 : mword 12))
+                  = (d_used_ptr : mword 64)).
+    { rgne. rewrite HD3s1 vt_sext_16. reflexivity. }
+    iApply (wp_cld_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_intr + 0x80)) a4_idx s1_idx
+              (mword_of_int 16 : mword 12) D3 n pu false (dqm := DfracDiscarded)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] []").
+    { iApply (vti_80 with "Htext"). }
+    { iEval (rewrite Hup). iExact "Hup". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc _".
+    set (D4 := <[Regidx a4_idx := regval_into_reg pu]> D3).
+    change (<[Regidx a4_idx := regval_into_reg pu]> D3) with D4.
+    assert (Hp82 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x80) : mword 64) 2 = mword_of_int (KernelSyms.virtio_disk_intr + 0x82))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp82) in "Hpc".
+    (* ---- +0x82: lhu a4,2(a4) -- the device's used->idx ---- *)
+    assert (HD4a4 : D4 !!! Regidx a4_idx = pu) by (rewrite /D4; apply upd_eq).
+    assert (Hued : add_vec (rget D4 a4_idx) (sign_extend' 64 (mword_of_int 2 : mword 12))
+                   = (pa_add pu 2%nat : SailStdpp.Values.mword 64)).
+    { rgne. rewrite HD4a4 vt_sext_2. reflexivity. }
+    iApply (wp_vt_lhu_used_idx γu γd pd pav pu (mword_of_int (KernelSyms.virtio_disk_intr + 0x82))
+              a4_idx a4_idx (mword_of_int 2 : mword 12) D4 n np (S nr) F t0 t1 pp Hued
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] Hdinv Hgeom Hpub Hnr Hflr Hfl Hf0 Hf1 HfF").
+    { iApply (vti_82 with "Htext"). }
+    iIntros (nc V0) "%Hbnd #Hlbc #HV0 #Hfr Hpub Hnr Hflr Hfl Hcg Hpc".
+    set (D5 := <[Regidx a4_idx := regval_into_reg
+        (zero_extend' 64 (wrap16 nc : SailStdpp.Values.mword 16))]> D4).
+    change (<[Regidx a4_idx := regval_into_reg
+        (zero_extend' 64 (wrap16 nc : SailStdpp.Values.mword 16))]> D4) with D5.
+    assert (Hp86 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x82) : mword 64) 4 = mword_of_int (KernelSyms.virtio_disk_intr + 0x86))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp86) in "Hpc".
+    iApply ("Hcont" $! D5 nc V0 with "[%] [%] Hlbc HV0 Hfr Hcg Hpc Hpub Hidx Hnr Hflr Hfl").
+    { split_and!.
+      - rewrite /D5 upd_ne; [| reg_neq]. exact HD3a5.
+      - rewrite /D5. apply upd_eq.
+      - intros r N4 N5.
+        rewrite /D5 upd_ne; [| congruence].
+        rewrite /D4 upd_ne; [| congruence].
+        rewrite /D3 upd_ne; [| congruence].
+        rewrite /D2 upd_ne; [| congruence].
+        rewrite /D1 upd_ne; [| congruence].
+        rewrite /D0 upd_ne; [| congruence]. reflexivity. }
+    { exact Hbnd. }
+  Qed.
+
+End VtBody.
+
+(* ===================================================================== *)
+(* §8  The loop's register invariant, its exit continuation, and the      *)
+(*     Löb-quantified loop proposition.                                   *)
+(* ===================================================================== *)
+
+(* NOTE: no tp conjunct.  The register file PINS tp (HartTp.v), so a
+   statement about the map's tp slot says nothing observable. *)
+Definition vt_regs_ok (m MB : regfile) (sp0 : mword 64) : Prop :=
+  MB !!! Regidx csp_rs1
+    = add_vec sp0 (sign_extend' 64 (sign_extend' 12 (mword_of_int 32 : mword 6)))
+  /\ MB !!! Regidx (mword_of_int 9 : mword 5) = (disk_base : mword 64)
+  /\ (forall r : mword 5, is_cs_idx r = true ->
+        r <> csp_rs1 -> r <> (mword_of_int 8 : mword 5) -> r <> (mword_of_int 9 : mword 5) ->
+        MB !!! Regidx r = m !!! Regidx r).
+
+Section VtLoopDefs.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Definition vt_exit (γd : disk_names)
+      (pd pav pu : mword 64) (m : regfile) (av lvl : nat) (eb : bool)
+      (pme : mword 64) (sp0 : mword 64) (lks : gset string) : iProp Σ :=
+    (∀ MB : regfile,
+       ⌜ vt_regs_ok m MB sp0 ⌝ -∗
+       sie_cap_gpr KT1 MB (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat false pme -∗
+       pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x8a) : mword 64) -∗
+       cpu_own (S lvl) eb pme false ({["virtio_disk"]} ∪ lks) -∗
+       disk_res γd pd pav pu -∗
+       mWP (Loop : expr riscv_lang))%I.
+
+  Definition vt_loop (γd : disk_names)
+      (pd pav pu : mword 64) (m : regfile) (av lvl : nat) (eb : bool)
+      (pme : mword 64) (sp0 : mword 64) (lks : gset string) : iProp Σ :=
+    (∀ MB : regfile,
+       ⌜ vt_regs_ok m MB sp0 ⌝ -∗
+       sie_cap_gpr KT1 MB (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat false pme -∗
+       pc_is (mword_of_int (KernelSyms.virtio_disk_intr + 0x3e) : mword 64) -∗
+       cpu_own (S lvl) eb pme false ({["virtio_disk"]} ∪ lks) -∗
+       vt_loop_state γd pd pav pu -∗
+       vt_exit γd pd pav pu m av lvl eb pme sp0 lks -∗
+       mWP (Loop : expr riscv_lang))%I.
+
+End VtLoopDefs.
+
+(* small pure side conditions of the avail-ring cell's tier bridge *)
+Lemma vt_ring_off_lt (q : nat) : (q < 8)%nat -> (Z.of_nat (4 + 2 * q) < 4096)%Z.
+Proof. intro H. lia. Qed.
+
+Lemma vt_ring_off_mod2 (q : nat) : (Z.of_nat (4 + 2 * q) `mod` 2 = 0)%Z.
+Proof.
+  replace (Z.of_nat (4 + 2 * q))%Z with ((2 + Z.of_nat q) * 2)%Z by lia.
+  apply Z.mod_mul. lia.
+Qed.
+
+Lemma vt_ring_off_add_lt (q j : nat) : (q < 8)%nat -> (j < 2)%nat -> (4 + 2 * q + j < 4096)%nat.
+Proof. intros Hq Hj. lia. Qed.
+
+Lemma vt_neq_vec_refl (x : mword 64) : neq_vec x x = false.
+Proof.
+  unfold neq_vec. rewrite (proj2 (eq_vec_true_iff x x) eq_refl). reflexivity.
+Qed.
+
+Lemma vt_neq_vec_true (x y : mword 64) : x <> y -> neq_vec x y = true.
+Proof.
+  intro H. unfold neq_vec. destruct (eq_vec x y) eqn:E; [| reflexivity].
+  exfalso. apply H. apply eq_vec_true_iff. exact E.
+Qed.
+
+(* ===================================================================== *)
+(* §9  THE LOOP (KernelSyms.virtio_disk_intr+0x3e .. KernelSyms.virtio_disk_intr+0x86), by Löb induction.                 *)
+(*                                                                        *)
+(*     One iteration: read the used element at the watermark [nr] (which *)
+(*     names the record's position and, off the lock's own claim map,    *)
+(*     its claim), refute the status panic, deposit the completed chain  *)
+(*     with the store [b->disk = 0] (which advances the watermark), wake  *)
+(*     the sleeper, bump [disk.used_idx], and re-read the device's used   *)
+(*     index.  The lock resource comes back at [S nr] with its claim map  *)
+(*     untouched: the handler retires nothing -- the woken publisher does *)
+(*     that at free_chain.                                                *)
+(* ===================================================================== *)
+Module VtLoopProof (Wakeup : WAKEUP).
+Section VtLoopProof.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Notation ra_idx := (mword_of_int 1 : mword 5).
+  Notation tp_idx := (mword_of_int 4 : mword 5).
+  Notation s0_idx := (mword_of_int 8 : mword 5).
+  Notation s1_idx := (mword_of_int 9 : mword 5).
+  Notation a0_idx := (mword_of_int 10 : mword 5).
+  Notation a4_idx := (mword_of_int 14 : mword 5).
+  Notation a5_idx := (mword_of_int 15 : mword 5).
+
+  Local Ltac reg_neq :=
+    lazymatch goal with |- ?a <> ?b =>
+      tryif unify a b then fail else (vm_compute; discriminate) end.
+
+  Lemma wp_vt_loop  (γs : list gname)
+      (γu : uart_names) (γd : disk_names) (pd pav pu : mword 64)
+      (m : regfile) (av lvl : nat) (eb : bool) (pme : mword 64)
+      (sp0 : mword 64) (lks : gset string) :
+    (22 <= av)%nat -> length γs = NPROC -> (Z.of_nat lvl + 2 < 2 ^ 31)%Z ->
+    (* the loop enters with "virtio_disk" already held (the prologue's
+       acquire); wakeup's own order premise ("proc") is derived from this at
+       the +0x6e call site via [locks_below_union_singleton]/[locks_below_mono] *)
+    locks_below lks "virtio_disk" ->
+    kernel_text -∗ procs_inv γs -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    vt_loop γd pd pav pu m av lvl eb pme sp0 lks.
+  Proof using .
+    intros Hav Hlen Hlvl Hfresh.
+    iIntros "#Htext #Hpi #Hdinv #Hgeom".
+    iLöb as "IH". rewrite {2}/vt_loop.
+    iIntros (MB) "%Hregs Hcg Hpc Hown Hst Hexit".
+    pose proof Hregs as Hregs'.
+    destruct Hregs' as (Hsp & Hs1 & Hthr).
+    iDestruct "Hst" as (np nr cm fr c) "(%Hbnd & #Hlbc & Hrcpt0 & Hres)".
+    iDestruct "Hrcpt0" as (V0) "[#HR0 #Hfr]".
+    destruct Hbnd as [Hnrc Hcnp].
+    (* the record at [nr]'s completion position, under the read's view *)
+    iDestruct (big_sepL_lookup _ (seq 0 c) nr nr with "Hfr") as (q0) "[#Hposnr %Hq0V]".
+    { rewrite lookup_seq_lt; [reflexivity | lia]. }
+    rewrite /disk_res_at.
+    iDestruct "Hres" as "(%Hcl & Hpub & #Hlbnr & Hrd & Hflrs & Hstage & Hauth & Hrows & Hidx & Hfree & Hring & Havh)".
+    iDestruct "Hflrs" as (t0 t1 F) "(Hdfl & Hflr & #Hf0 & #Hf1 & #HfF)".
+    (* ================= CHUNK A: +0x3e .. +0x4e ================= *)
+    iApply (wp_vt_reclaim γu γd pd pav pu MB (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat np c nr cm pme V0
+              Hs1 Hnrc
+              with "Hcg Htext Hpc Hdinv Hgeom Hpub Hlbc Hrd Hauth Hidx HR0 []").
+    { iExists q0. iFrame "Hposnr". iPureIntro. exact Hq0V. }
+    iIntros (M1 p dc) "%Hcm %Hfr1 #Hord Hcg Hpc Hidx Hpub Hrd Hauth #HV0 #HflV".
+    destruct Hfr1 as [HM1a5 HM1thr].
+    (* the payload's reader floor after the deposit is a floor of this context *)
+    iAssert (TsoCtx.ctx_floor cur_ctx (Nat.max F V0)) as "#HflM".
+    { rewrite /TsoCtx.ctx_floor. iApply (TsoGhost.llb_max with "HfF HflV"). }
+    (* the claim the record names, read off the lock's own map: its slot is
+       linked to its buffer, which is what puts the head [h] below 8 and the
+       status byte at [disk.info[h].status] *)
+    destruct (Hcl p dc Hcm) as (_ & _ & (h & Hh8 & Hhead & Hstatus & _ & _)).
+    assert (HM1a5h : M1 !!! Regidx a5_idx = (mword_of_int (Z.of_nat h) : mword 64))
+      by (rewrite HM1a5 Hhead; apply vt_id_word; exact Hh8).
+    assert (Hslh : sl_head (dc_slot dc) = h)
+      by (unfold sl_head; rewrite Hhead; apply Nat2Z.id).
+    (* THE CLAIM ROW at [p] (DiskInv.claim_cells): still on its Left arm --
+       its Right arm would put the record [disk_ord γd p u'] below [nr], and
+       the record the handler is looking at is the one at [nr] *)
+    iDestruct (big_sepM_delete _ cm p dc Hcm with "Hrows") as "[Hrow Hrows]".
+    iDestruct "Hrow" as "(Hib & Hhc & [Hbd | (Hbd & %u' & #Hord' & %Hlt)])"; last first.
+    { iDestruct (disk_ord_agree with "Hord Hord'") as %Heq. exfalso. lia. }
+    iEval (rewrite Hslh) in "Hib".
+    (* ================= CHUNK B: +0x50 .. +0x5e ================= *)
+    assert (HM1s1 : M1 !!! Regidx s1_idx = (disk_base : mword 64))
+      by (rewrite (HM1thr s1_idx ltac:(reg_neq) ltac:(reg_neq)); exact Hs1).
+    iApply (wp_vt_status γu γd M1 (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat h np p nr cm dc pme V0
+              HM1s1 HM1a5h Hh8 Hcm Hstatus
+              with "Hcg Htext Hpc Hdinv Hpub Hord Hrd Hauth HV0 []").
+    { iExists q0. iFrame "Hposnr". iPureIntro. exact Hq0V. }
+    iIntros (M2) "%Hfr2 Hcg Hpc Hpub Hrd Hauth".
+    destruct Hfr2 as [HM2a5 HM2thr].
+    (* ================= CHUNK C: +0x60 .. +0x6a ================= *)
+    assert (HM2s1 : M2 !!! Regidx s1_idx = (disk_base : mword 64))
+      by (rewrite (HM2thr s1_idx ltac:(reg_neq) ltac:(reg_neq)); exact HM1s1).
+    iApply (wp_vt_clear_disk γu γd M2 (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat h np p nr F cm dc pme V0
+              HM2s1 HM2a5 Hh8 Hcm Hhead
+              with "Hcg Htext Hpc Hdinv Hpub Hord Hrd Hauth Hflr [] Hib Hbd").
+    { iExists q0. iFrame "Hposnr". iPureIntro. exact Hq0V. }
+    iIntros (M3) "%Hfr3 Hcg Hpc Hpub #Hlbs Hrd Hauth Hflr Hib Hbd".
+    destruct Hfr3 as [HM3a0 HM3thr].
+    (* ================= +0x6e: jal ra,wakeup ================= *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x6e)) ra_idx
+              (mword_of_int 2081690 : mword 21) M3 (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (vti_6e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    set (W := <[Regidx ra_idx := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x6e) : mword 64) 4)]> M3).
+    change (<[Regidx ra_idx := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x6e) : mword 64) 4)]> M3) with W.
+    assert (Hjwk : add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x6e) : mword 64)
+                     (sign_extend' 64 (mword_of_int 2081690 : mword 21))
+                   = mword_of_int KernelSyms.wakeup)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hjwk) in "Hpc".
+    (* every premise pre-asserted (optimization.md: never inline [ltac:] at
+       [wp_wakeup_sconf], whose statement is a [let]-chain) *)
+    assert (HWra : W !!! Regidx ra_idx
+                   = add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x6e) : mword 64) 4)
+      by (rewrite /W; apply upd_eq).
+    assert (HWdom : forall r : regidx, r ∈ dom (rf_to_gmap W))
+      by (intro r; apply rf_to_gmap_dom).
+    assert (HwK : (18 <= trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat) by lia.
+    assert (Hwlvl : (Z.of_nat (S lvl) + 1 < 2 ^ 31)%Z) by lia.
+    (* wakeup's own order premise: the loop enters with "virtio_disk" already
+       held ([Hfresh] widened past it, then the acquire's own singleton added
+       back on top) -- "virtio_disk" (9) < "proc" (11) *)
+    assert (Hwproc : locks_below ({["virtio_disk"]} ∪ lks) "proc").
+    { lkbelow. }
+    iApply (Wakeup.wp_wakeup_sconf W γs pme (S lvl)
+              (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat eb false _ HwK HWdom Hlen Hwlvl
+              Hwproc
+              with "Hcg Hown Htext Hpc Hpi").
+    all: try lkbelow.
+    iApply wp_next_off_intro.
+    iIntros (MW) "[%HcsW %HdomW] Hcg Hown #Htext2 Hpc".
+    assert (Hpc72 : ret_pc (W !!! Regidx ra_idx) = mword_of_int (KernelSyms.virtio_disk_intr + 0x72))
+      by (rewrite HWra; apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpc72) in "Hpc".
+    (* ================= CHUNK E: +0x72 .. +0x82 ================= *)
+    assert (HMWs1 : MW !!! Regidx s1_idx = (disk_base : mword 64)).
+    { rewrite (callee_saved_lookup HcsW s1_idx ltac:(vm_compute; reflexivity)).
+      rewrite /W upd_ne; [| reg_neq].
+      rewrite (HM3thr s1_idx ltac:(reg_neq) ltac:(reg_neq)). exact HM2s1. }
+    iApply (wp_vt_advance γu γd pd pav pu MW (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat np nr (Nat.max F V0) t0 t1 pme HMWs1
+              with "Hcg Htext Hpc Hdinv Hgeom Hpub Hidx Hrd Hflr Hdfl Hf0 Hf1 HflM").
+    iIntros (M5 nc V1) "%Hfr5 %Hbnd5 #Hlbc2 #HV1 #Hfr2 Hcg Hpc Hpub Hidx Hrd Hflr Hdfl".
+    destruct Hfr5 as (HM5a5 & HM5a4 & HM5thr).
+    (* ---- the register invariant survives the whole body ---- *)
+    assert (Hchain : forall r : mword 5, is_cs_idx r = true ->
+                       M5 !!! Regidx r = MB !!! Regidx r).
+    { intros r Hcs.
+      assert (N0 : r <> a0_idx)
+        by (intro He; rewrite He in Hcs; vm_compute in Hcs; discriminate).
+      assert (N1 : r <> ra_idx)
+        by (intro He; rewrite He in Hcs; vm_compute in Hcs; discriminate).
+      assert (N4 : r <> a4_idx)
+        by (intro He; rewrite He in Hcs; vm_compute in Hcs; discriminate).
+      assert (N5 : r <> a5_idx)
+        by (intro He; rewrite He in Hcs; vm_compute in Hcs; discriminate).
+      rewrite (HM5thr r N4 N5).
+      rewrite (callee_saved_lookup HcsW r Hcs).
+      rewrite /W upd_ne; [| congruence].
+      rewrite (HM3thr r N0 N5).
+      rewrite (HM2thr r N4 N5).
+      rewrite (HM1thr r N4 N5). reflexivity. }
+    assert (HregsM5 : vt_regs_ok m M5 sp0).
+    { split_and!.
+      - rewrite (Hchain csp_rs1 ltac:(vm_compute; reflexivity)). exact Hsp.
+      - rewrite (Hchain s1_idx ltac:(vm_compute; reflexivity)). exact Hs1.
+      - intros r Hcs Ncsp N8 N9.
+        rewrite (Hchain r Hcs). exact (Hthr r Hcs Ncsp N8 N9). }
+    (* ================= the lock resource, one record further ================= *)
+    (* nothing per-request moves: the chain went into the receipt at the
+       deposit, and the claim map is the publisher's to retire.  The row at
+       [p] flips to its Right arm -- [b->disk = 0] with the record [disk_ord
+       γd p nr] below the advanced watermark -- and every other row is below
+       [S nr] because it was below [nr]. *)
+    iAssert (claim_cells γd (S nr) p dc) with "[Hib Hhc Hbd]" as "Hrow".
+    { rewrite /claim_cells. iEval (rewrite Hslh). iFrame "Hib Hhc".
+      iRight. iFrame "Hbd". iExists nr. iFrame "Hord". iPureIntro. lia. }
+    iAssert ([∗ map] p' ↦ dc' ∈ delete p cm, claim_cells γd (S nr) p' dc')%I
+      with "[Hrows]" as "Hrows".
+    { iApply (big_sepM_mono with "Hrows"). iIntros (p' dc' _) "H".
+      iApply (claim_cells_nr_mono γd nr (S nr) p' dc' with "H"). lia. }
+    iAssert (disk_res_at γd pd pav pu np (S nr) cm fr)
+      with "[Hpub Hrd Hstage Hauth Hidx Hfree Hrow Hrows Hring Havh Hdfl Hflr]" as "Hres".
+    { rewrite /disk_res_at.
+      iSplitR; [iPureIntro; exact Hcl|].
+      iFrame "Hpub Hlbs Hrd".
+      iSplitL "Hdfl Hflr".
+      { iExists t0, t1, (Nat.max F V0). iFrame "Hdfl Hflr Hf0 Hf1 HflM". }
+      rewrite (big_sepM_delete _ cm p dc Hcm).
+      iFrame "Hstage Hauth Hrow Hrows Hidx Hfree Hring Havh". }
+    (* ================= +0x86: bne a4,a5 ================= *)
+    destruct (decide ((wrap16 nc : SailStdpp.Values.mword 16) = wrap16 (S nr))) as [Heq|Hne].
+    - (* EXIT: the driver has caught up with the device *)
+      assert (Hcmp : neq_vec (rget M5 a4_idx) (rget M5 a5_idx) = false).
+      { rgne. rgne. rewrite HM5a4 HM5a5 Heq. apply vt_neq_vec_refl. }
+      iApply (wp_bne_fall_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x86)) (mword_of_int 8120 : mword 13)
+                a5_idx a4_idx M5 (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat false
+                ltac:(vm_compute; discriminate) ltac:(vm_compute; discriminate)
+                Hcmp
+                with "Hcg Hpc []").
+      { iApply (vti_86 with "Htext"). }
+      iApply wp_next_off_intro.
+      iIntros "Hcg Hpc".
+      assert (Hp8a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_intr + 0x86) : mword 64) 4
+                     = mword_of_int (KernelSyms.virtio_disk_intr + 0x8a))
+        by (apply bv_eq; vm_compute; reflexivity).
+      iEval (rewrite Hp8a) in "Hpc".
+      iApply ("Hexit" $! M5 with "[%] Hcg Hpc Hown [Hres]").
+      { exact HregsM5. }
+      { iApply (disk_res_at_intro with "Hres"). }
+    - (* BACK EDGE: another completion is visible *)
+      assert (Hnrnc : (S nr < nc)%nat).
+      { destruct Hbnd5 as [Hle _].
+        destruct (decide (nc = S nr)) as [->|Hne2]; [ exfalso; apply Hne; reflexivity |]. lia. }
+      assert (Hcmp : neq_vec (rget M5 a4_idx) (rget M5 a5_idx) = true).
+      { rgne. rgne. rewrite HM5a4 HM5a5. apply vt_neq_vec_true.
+        intro Hc. apply Hne. exact (vt_zext16_inj _ _ Hc). }
+      iApply (wp_bne_taken_s_sconf (mword_of_int (KernelSyms.virtio_disk_intr + 0x86)) (mword_of_int 8120 : mword 13)
+                a5_idx a4_idx M5 (trap_res (match lvl with O => eb | S _ => false end) + (av - 4))%nat false
+                ltac:(vm_compute; discriminate) ltac:(vm_compute; discriminate)
+                Hcmp
+                ltac:(vm_compute; reflexivity)
+                with "Hcg Hpc []").
+      { iApply (vti_86 with "Htext"). }
+      iNext. iApply wp_next_off_intro. iIntros "Hcg Hpc".
+      assert (Hbk : add_vec (mword_of_int (KernelSyms.virtio_disk_intr + 0x86) : mword 64)
+                      (sign_extend' 64 (mword_of_int 8120 : mword 13))
+                    = mword_of_int (KernelSyms.virtio_disk_intr + 0x3e))
+        by (apply bv_eq; vm_compute; reflexivity).
+      iEval (rewrite Hbk) in "Hpc".
+      iApply ("IH" $! M5 with "[%] Hcg Hpc Hown [Hres] Hexit").
+      { exact HregsM5. }
+      { rewrite /vt_loop_state.
+        iExists np, (S nr), cm, fr, nc.
+        iFrame "Hlbc2 Hres".
+        iSplitR; [iPureIntro; split; [ exact Hnrnc | exact (proj2 Hbnd5) ]|].
+        iExists V1. iFrame "HV1 Hfr2". }
+  Qed.
+
+End VtLoopProof.
+End VtLoopProof.
+
+(* ===================================================================== *)
+(* §10  THE WHOLE FUNCTION: prologue, ISR ack, entry test, loop, release. *)
+(* ===================================================================== *)
+
+Lemma vt_lvl_weaken (lvl : nat) :
+  (Z.of_nat lvl + 2 < 2 ^ 31)%Z -> (Z.of_nat lvl + 1 < 2 ^ 31)%Z.
+Proof. lia. Qed.
+
+Module VirtioDiskIntrProof (Acquire : ACQUIRE) (Release : RELEASE) (Wakeup : WAKEUP)
+  : VIRTIODISKINTR.
+
+Module Pro := VtPrologue Acquire.
+Module Epi := VtEpilogue Release.
+Module Lp  := VtLoopProof Wakeup.
+
+Section ProofVirtioDiskIntr.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Notation ra_idx := (mword_of_int 1 : mword 5).
+  Notation tp_idx := (mword_of_int 4 : mword 5).
+  Notation s0_idx := (mword_of_int 8 : mword 5).
+  Notation s1_idx := (mword_of_int 9 : mword 5).
+  Notation a4_idx := (mword_of_int 14 : mword 5).
+  Notation a5_idx := (mword_of_int 15 : mword 5).
+
+  Local Ltac reg_neq :=
+    lazymatch goal with |- ?a <> ?b =>
+      tryif unify a b then fail else (vm_compute; discriminate) end.
+
+
+  Lemma wp_virtio_disk_intr_sconf  (γs : list gname)
+      (γu : uart_names) (γd : disk_names) (γk : gname)
+      (pd pav pu : mword 64)
+      (m : regfile) (K lvl : nat) (eb : bool) (pme : mword 64)
+      (b : bool) (lks : gset string)
+    : wp_virtio_disk_intr_sconf_body γs γu γd γk pd pav pu m K lvl eb pme b lks.
+  Proof using .
+    cbv beta delta [wp_virtio_disk_intr_sconf_body].
+    intros pcE ret_tgt HK Hdom Hlen Hlvl Hfresh.
+    assert (HKav : (22 <= K)%nat) by (exact HK).
+    pose proof (vt_lvl_weaken lvl Hlvl) as Hlvl1.
+    iIntros "Hcg Hown #Htext Hpc #Hpi #Hdinv #Hgeom #Hlk Hcont".
+    iDestruct (cpu_own_eb_agree with "Hcg Hown") as %Hbeq.
+    (* ===================== PROLOGUE + acquire ===================== *)
+    iApply (Pro.wp_vt_prologue γk γd pd pav pu m K lvl eb pme b lks
+              Hlvl1 HKav Hfresh
+              with "Hcg Hown Htext Hpc Hlk").
+    iIntros (CIDa Hsa MA sp0) "%Hpro Hcg Hpc Htok HR Hown Hpay Hr24 Hr16 Hr8 Hgap".
+    destruct Hpro as (Hsp0 & HMAcsp & HMAs1 & HMAthr).
+    (* ===================== the ISR read/ack ===================== *)
+    iApply (wp_vt_isr γu γd MA (trap_res b + (K - 4))%nat pme with "Hcg Htext Hpc Hdinv").
+    iIntros (MI) "%HMIthr Hcg Hpc".
+    (* ---- the exit continuation, capturing the epilogue's resources ---- *)
+    iAssert (vt_exit (CID:=CIDa) γd pd pav pu m K lvl eb pme sp0 lks)
+      with "[Hcont Htok Hpay Hr24 Hr16 Hr8 Hgap]" as "Hexit".
+    { iIntros (MB) "%HregsB Hcg Hpc Hown HR".
+      destruct HregsB as (HBcsp & HBs1 & HBthr).
+      (* [vt_exit] is stated where [b] is not in scope, so it spells the window
+         index with [outb]; [Hbeq] folds it back to [b] for the epilogue. *)
+      iEval (rewrite Hbeq) in "Hcg".
+      iApply (Epi.wp_vt_epilogue (CID:=CIDa) γk γd pd pav pu m MB K lvl eb pme sp0 b lks
+                Hsp0 HBcsp HBthr HKav Hbeq Hfresh
+                with "Hcg Htext Hpc Hlk Htok HR Hown Hpay Hr24 Hr16 Hr8 Hgap").
+      iIntros (CIDz Hsz MF HcsF) "Hcg Hown Hpc".
+      iSpecialize ("Hcont" $! CIDz with "[%]"); [wp_next_chain|].
+      iApply ("Hcont" $! MF with "[%] Hcg Hown Htext Hpc").
+      split; [exact HcsF | intro r; apply rf_to_gmap_dom]. }
+    (* ===================== the loop-entry test ===================== *)
+    assert (HMIs1 : MI !!! Regidx s1_idx = (disk_base : mword 64))
+      by (rewrite (HMIthr s1_idx ltac:(reg_neq) ltac:(reg_neq)); exact HMAs1).
+    iDestruct (disk_res_at_elim with "HR") as (np nr cm fr) "Hres".
+    rewrite /disk_res_at.
+    iDestruct "Hres" as "(%Hcl & Hpub & #Hlbnr & Hrd & Hflrs & Hstage & Hauth & Hrows & Hidx & Hfree & Hring & Havh)".
+    iDestruct "Hflrs" as (t0 t1 F) "(Hdfl & Hflr & #Hf0 & #Hf1 & #HfF)".
+    iApply (wp_vt_entry_test γu γd pd pav pu MI (trap_res b + (K - 4))%nat np nr F t0 t1 pme HMIs1
+              with "Hcg Htext Hpc Hdinv Hgeom Hpub Hidx Hrd Hflr Hdfl Hf0 Hf1 HfF").
+    iSplit.
+    - (* ---- the loop is never entered: straight to release ---- *)
+      iIntros (ME) "%HMEthr Hcg Hpc Hpub Hidx Hrd Hflr Hdfl".
+      (* [vt_exit] spells its window index with [outb] (no [b] in scope where it
+         is defined); [Hbeq] bridges the two spellings. *)
+      iEval (rewrite -Hbeq) in "Hcg".
+      iApply ("Hexit" $! ME with "[%] Hcg Hpc Hown [Hpub Hrd Hstage Hauth Hrows Hidx Hfree Hring Havh Hdfl Hflr]").
+      { split_and!.
+        - rewrite (HMEthr csp_rs1 ltac:(reg_neq) ltac:(reg_neq)).
+          rewrite (HMIthr csp_rs1 ltac:(reg_neq) ltac:(reg_neq)). exact HMAcsp.
+        - rewrite (HMEthr s1_idx ltac:(reg_neq) ltac:(reg_neq)). exact HMIs1.
+        - intros r Hcs Ncsp N8 N9.
+          assert (N4 : r <> a4_idx)
+            by (intro He; rewrite He in Hcs; vm_compute in Hcs; discriminate).
+          assert (N5 : r <> a5_idx)
+            by (intro He; rewrite He in Hcs; vm_compute in Hcs; discriminate).
+          rewrite (HMEthr r N4 N5). rewrite (HMIthr r N4 N5).
+          exact (HMAthr r Hcs Ncsp N8 N9). }
+      { iApply (disk_res_at_intro γd pd pav pu np nr cm fr). rewrite /disk_res_at.
+        iSplitR; [iPureIntro; exact Hcl|].
+        iFrame "Hpub Hlbnr Hrd".
+        iSplitL "Hdfl Hflr". { iExists t0, t1, F. iFrame "Hdfl Hflr Hf0 Hf1 HfF". }
+        iFrame "Hstage Hauth Hrows Hidx Hfree Hring Havh". }
+    - (* ---- the loop is entered ---- *)
+      iIntros (ME nc V0) "%HMEthr %Hbnd #Hlbc #HV0 #Hfr Hcg Hpc Hpub Hidx Hrd Hflr Hdfl".
+      (* [vt_loop] also spells the window index with [outb]. *)
+      iEval (rewrite -Hbeq) in "Hcg".
+      iPoseProof (Lp.wp_vt_loop (CID:=CIDa)  γs γu γd pd pav pu m K lvl eb pme sp0 lks
+                    HKav Hlen Hlvl Hfresh
+                    with "Htext Hpi Hdinv Hgeom") as "Hloop".
+      iApply ("Hloop" $! ME with "[%] Hcg Hpc Hown [Hpub Hrd Hstage Hauth Hrows Hidx Hfree Hring Havh Hdfl Hflr] Hexit").
+      { split_and!.
+        - rewrite (HMEthr csp_rs1 ltac:(reg_neq) ltac:(reg_neq)).
+          rewrite (HMIthr csp_rs1 ltac:(reg_neq) ltac:(reg_neq)). exact HMAcsp.
+        - rewrite (HMEthr s1_idx ltac:(reg_neq) ltac:(reg_neq)). exact HMIs1.
+        - intros r Hcs Ncsp N8 N9.
+          assert (N4 : r <> a4_idx)
+            by (intro He; rewrite He in Hcs; vm_compute in Hcs; discriminate).
+          assert (N5 : r <> a5_idx)
+            by (intro He; rewrite He in Hcs; vm_compute in Hcs; discriminate).
+          rewrite (HMEthr r N4 N5). rewrite (HMIthr r N4 N5).
+          exact (HMAthr r Hcs Ncsp N8 N9). }
+      { rewrite /vt_loop_state.
+        iExists np, nr, cm, fr, nc. iFrame "Hlbc".
+        iSplitR; [iPureIntro; exact Hbnd|].
+        iSplitR; [iExists V0; iFrame "HV0 Hfr"|].
+        rewrite /disk_res_at.
+        iSplitR; [iPureIntro; exact Hcl|].
+        iFrame "Hpub Hlbnr Hrd".
+        iSplitL "Hdfl Hflr". { iExists t0, t1, F. iFrame "Hdfl Hflr Hf0 Hf1 HfF". }
+        iFrame "Hstage Hauth Hrows Hidx Hfree Hring Havh". }
+  Qed.
+
+End ProofVirtioDiskIntr.
+End VirtioDiskIntrProof.

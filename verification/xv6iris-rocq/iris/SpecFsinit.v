@@ -1,0 +1,562 @@
+(* SpecFsinit.v -- the public interface of fsinit, stated independently of
+   its proof, AND THE HOME OF THE FILE SYSTEM'S BOOT GEOMETRY.
+
+     void fsinit(int dev) {
+       struct buf *bp;
+
+       bp = bread(dev, 1);                 // readsb(dev, &sb), INLINED
+       memmove(&sb, bp->data, sizeof(sb));
+       brelse(bp);
+
+       if(sb.magic != FSMAGIC)
+         panic("invalid file system");
+       initlog(dev, &sb);
+       ireclaim(dev);
+     }
+
+   112 bytes, a FOUR-slot frame ([c.addi sp,sp,-32] at +0x00, a plain
+   [c.addi] -- so [stk_push_32] / [stk_pop_32] / [stk_fp_32], not the
+   [c.addi16sp] family every deeper fs function uses).  [s2 = dev],
+   [s1 = bp].  readsb is INLINED: there is no [jal readsb], only the
+   bread / memmove / brelse triple at +0x10 / +0x26 / +0x2c.
+
+   ==== WHY THIS FILE IS DIFFERENT FROM EVERY OTHER Spec IN THE TREE ====
+
+   THE [memmove] AT +0x26 IS WHERE EVERY SUPERBLOCK CELL IS BORN.
+
+   Thirteen contracts in this tree take a superblock field as a premise --
+   [BitmapInv.sb_size], [BitmapInv.sb_bmapstart], [InodeInv.sb_ninodes],
+   [InodeInv.sb_inodestart], and the [sb + 20] fsc_logst cell SpecInitlog
+   names inline -- always in the same shape: a plain fractional cell, read,
+   never written, handed straight back.  NONE of them says where the cell
+   came from or why its VALUE is any particular number.  There is
+   deliberately no superblock abstraction anywhere below this file
+   (BitmapInv.v and InodeInv.v both say so out loud).
+
+   This is the function that answers both questions at once.  Before +0x26,
+   [&sb] is 32 bytes of .bss -- raw, untyped, uninitialised.  After it, the
+   eight words are there, and their VALUES are the mkfs image's block 1.  So
+   this contract is the only place in the tree where a fact about the
+   superblock can be stated as a fact about anything at all, and that is why
+   the whole campaign has been parking its geometry IOUs here since N4b.
+
+   ---- THE IOUs, NOW PAID -- OR RATHER, NOW STATED SOMEWHERE REAL ------
+
+   Every one of these was flagged "owed to SpecFsinit" by an earlier stage
+   and none of them could be stated before this file existed:
+
+   - [1 < ninodes]                   (N5c, SpecIalloc / SpecIreclaim: kills
+                                      the empty-region early return)
+   - [ninodes <= 16 * Z.of_nat nib]  (N5c's NEW premise -- nothing anywhere
+                                      in the tree tied sb.ninodes to the
+                                      inode region's block count)
+   - [ninodes < 2 ^ 31]              (makes the scan's [lw]/[bgeu] numeric)
+   - [icfg_dev = ROOTDEV]            (N4b/N4d, namex's absolute arm)
+   - [(0 < icfg_nib)%nat]            (N4b/N4d, iget's region bound)
+
+   They are stated here as premises ABOUT THE IMAGE'S BLOCK 1 -- see
+   [sb_image] below -- and they are THREADED, not discharged.  That is the
+   honest shape and it is deliberate: they are claims about what mkfs wrote,
+   so they belong to the same image-well-formedness family as
+   [IcacheBoot.ipool_alloc]'s allocated-inum bundles, [InodeLock.inode_ok]
+   and [DirView.dir_ok].  The boot client supplies them; no function proof
+   can, and an axiom would be a lie.  What this file BUYS is that from here
+   up they are premises about a named 32-byte record instead of five
+   free-floating unexplained hypotheses on five different contracts.
+
+   ---- THE TWO-LINE DEVICE PREMISE, IN SpecNamex's EXACT SHAPE ---------
+
+   N5a's ledger settled where these go and it is here, not in IcacheBoot:
+   [icache_boot] is device-generic BY CONSTRUCTION (it takes [dv] and [nib]
+   as parameters), and the [dv = icfg_dev] tie is [IcacheRefDefs.icfg_alloc]'s to
+   make.  The two TIES that used to ride here ([dev = icfg_dev],
+   [nib = icfg_nib]) are gone with the threaded copies (rank 1c); what is
+   left is what they were there to enable -- [icfg_dev = ROOTDEV] and
+   [(0 < icfg_nib)%nat] -- and ireclaim gets the same form as before.
+
+   [ROOTDEV] itself was hoisted out of [SpecNamex.v] into [InodeInv.v] (N5d,
+   beside [sb_ninodes]) precisely so that this file could name it: a Spec
+   file must not require another function's Spec.  SpecNamex keeps
+   unqualified abbreviations, so nothing there moved.
+
+   ---- THE MAGIC TEST IS A LIVE ARM, AND IT IS AN IMAGE PREMISE --------
+
+   [bne a4,a5] at +0x40 compares [sb.magic] against [FSMAGIC = 0x10203040]
+   ([lui a5,0x10203 / addi a5,a5,64] at +0x38/+0x3c) and jumps to
+   [jal panic] at +0x6c.  Unlike balloc's and ialloc's out-of-space arms --
+   which this kernel turned into [printk] and which are therefore LIVE
+   BEHAVIOUR -- this one really is a panic, so a contract that promises to
+   RETURN has to refute it.  [sb_magic (sb_image ...) = FSMAGIC] is what
+   does, and it is an image premise of exactly the same kind as the rest:
+   mkfs writes the magic.  The panic credentials still ride, because the
+   callees have their own panic arms.
+
+   ---- ONE SLOT MORE THAN initlog GIVES BACK (a real composition fact) --
+
+   [SpecInitlog] takes [bslots ((LOGBLOCKS + 2) + 2)] = 34 and returns
+   only TWO: the other 32 are sealed into [log_state]'s pool inside the log
+   spinlock, forever.  But [SpecIreclaim] needs THREE (iput's indirect arm,
+   [iput_units]).  So fsinit cannot simply pass initlog's leftovers on, and
+   it enters with [((LOGBLOCKS + 2) + 2 + 1)] = 35: one is held back across
+   the [jal initlog] at +0x4e and rejoins initlog's two to make ireclaim's
+   three.  fsinit's own bread at +0x10 borrows and returns one before any of
+   that.  The postcondition therefore hands the caller [bslots 3], not
+   [bslots 2].
+
+   ---- WHAT COMPOSES, AND IN WHICH ORDER ------------------------------
+
+   fsinit threads two PROVEN contracts and one of this stage's own:
+   [SpecInitlog.wp_initlog_sconf] (whose whole struct-log bundle, era mirror
+   and FsBlocks material ride straight through untouched) and
+   [SpecIreclaim.wp_ireclaim_sconf].  Note the ORDER is load-bearing:
+   initlog is what PRODUCES [log_ctx icfg_log bn fsc_fs fsc_cov fsc_logst dev], and
+   ireclaim CONSUMES it (begin_op / end_op / iput).  So the log context does
+   not cross this contract's boundary as an input at all -- it is born at
+   +0x4e and handed to the caller at the end.
+
+   ---- THE LOG'S GNAMES ARE [icfg_log]'s, NOT AN EXISTENTIAL -----------
+
+   [initlog] is now an [_at] form (claude-notes/projects/fs-cfg-boot.md
+   staging step 1): it FILLS a [log_names] it is handed instead of minting
+   one, so what crosses this boundary in is [LogDefs.log_free_tok] -- the
+   era fupd's receipt for the four gnames -- and what crosses out is
+   [log_ctx] AT THOSE NAMES.  Here they are BAKED at [icfg_log], the
+   configuration record's own field, for one reason: this contract's post is
+   what the seal site turns into [FsReady.fs_ready], whose log conjunct is
+   spelled [log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev].  An
+   existential [∃ γ] could never be shown equal to the ambient field
+   (fs-ghost-state.md §7d, and IcacheRef.v's own §G.14/§G.16 note that a tie
+   carried in a body existential admits no agreement with a consumer's γ).
+   [wp_initlog_sconf] itself stays general in γ; the baking happens exactly
+   here, one level below the seal.  The boot kit is what delivers
+   [log_free_tok icfg_log] to forkret's first arm ([FirstTok.first_tok]'s
+   widened left disjunct, fs-cfg-boot.md "Transport").
+
+   fsinit is single-threaded boot context, it SLEEPS (bread, and everything
+   under initlog and ireclaim), so it threads the full running-process bundle
+   and takes the parking premise.  It enters and returns at noff 0.        *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes.
+(* [fs_sb]/[fs_parse_sb]/[fs_sb_ok] -- block 1's park (durable-disk lane
+   C-3a).  EARLY, because this file's later imports own the names it
+   shadows. *)
+Require Import FsImg.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import KernelDataInv.
+Require Import SpecPrintk.
+Require Import FdSlots.
+Require Import ProcGeom.
+Require Export SwtchCtx.
+Require Import CpuOwn.
+Require Import SchedCtx.
+Require Import ProcDefs.  (* [proc_priv_bare] *)
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import BlockWords.
+Require Import FsBlocks LogInv.
+Require Import BioDefs.
+Require Import LogDefs.
+Require Import BitmapInv.
+Require Import InodeInv.
+Require Import InodeRegion.
+Require Import AppCfg.       (* [appcfg]: the era's application record, bound beside [icfg] (app-instances.md round A) *)
+Require Import AppDur.       (* [app_dur_laws]: kit 2's crash seam and merge, one row (round C; SY3-A3b) *)
+(* the commit's collection geometry and the law it supports (durable-disk
+   C-8): fsinit is what carries the law down to [initlog], which is the one
+   site that can compose it with block 1's park *)
+Require Import FsCollect.
+Require Import IrefSlots.
+Require Import IcacheRefDefs.
+Require Import IcacheInv.
+Require Import IcacheEscrow.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Import Defs.
+Require Import TsoCtx.
+
+Local Open Scope Z_scope.
+
+(* fsinit's own frame is 32 bytes (4 slots) -- [c.addi sp,sp,-32] at +0x00,
+   with ra/s0/s1/s2 pushed at 24/16/8/0.  Its deepest callee is ireclaim
+   (88); initlog wants 78, bread 62, brelse 26, memmove 2. *)
+Notation K_fsinit := (92%nat) (only parsing).
+(* ===================================================================== *)
+(*  THE SUPERBLOCK: ITS EIGHT CELLS, ITS 32 BYTES, AND ITS MAGIC          *)
+(*                                                                        *)
+(*  This is the ONLY superblock abstraction in the tree, and it exists    *)
+(*  only because fsinit is the only function that touches the record as   *)
+(*  a whole -- [li a2,32] at +0x16 is [sizeof(struct superblock)] and the *)
+(*  [memmove] at +0x26 writes all 32 bytes at once.  Every other contract *)
+(*  keeps taking its one field as a bare fractional cell; nothing below   *)
+(*  this file changes.                                                    *)
+(* ===================================================================== *)
+
+(* fs.h's layout, as eight 32-bit fields.  The four that already have names
+   elsewhere ARE these addresses: [BitmapInv.sb_size] is [sb + 4],
+   [InodeInv.sb_ninodes] is [sb + 12], [InodeInv.sb_inodestart] is [sb + 24]
+   and [BitmapInv.sb_bmapstart] is [sb + 28].  The other four are named here
+   because fsinit is what brings them into existence. *)
+Definition sb_base : mword 64 := mword_of_int KernelSyms.sb.
+Definition sb_magic    : mword 64 := pa_add sb_base 0.
+Definition sb_nblocks  : mword 64 := pa_add sb_base 8.
+Definition sb_nlog     : mword 64 := pa_add sb_base 16.
+Definition sb_logstart : mword 64 := pa_add sb_base 20.
+
+Lemma sb_size_addr      : BitmapInv.sb_size      = pa_add sb_base 4.
+Proof. reflexivity. Qed.
+Lemma sb_ninodes_addr   : InodeInv.sb_ninodes    = pa_add sb_base 12.
+Proof. reflexivity. Qed.
+Lemma sb_inodestart_addr : InodeInv.sb_inodestart = pa_add sb_base 24.
+Proof. reflexivity. Qed.
+Lemma sb_bmapstart_addr : BitmapInv.sb_bmapstart = pa_add sb_base 28.
+Proof. reflexivity. Qed.
+
+(* [lui a5,0x10203 / addi a5,a5,64] at +0x38/+0x3c *)
+Definition FSMAGIC : Z := 0x10203040.
+
+(* THE IMAGE'S BLOCK 1, as the 32 bytes the memmove reads.  Stated with
+   [BlockWords.word_bytes] rather than an inverse decode so that the premise
+   below is an EQUATION ON BYTES the proof can rewrite with, not a
+   proposition it has to invert. *)
+Definition sb_image (magic fssize nblocks ninodes
+                     nlog logstart inodestart bmapstart : mword 32)
+    : list (bv 8) :=
+  word_bytes magic ++ word_bytes fssize ++
+  word_bytes nblocks ++ word_bytes ninodes ++
+  word_bytes nlog ++ word_bytes logstart ++
+  word_bytes inodestart ++ word_bytes bmapstart.
+
+Lemma sb_image_length (magic fssize nblocks ninodes
+                       nlog logstart inodestart bmapstart : mword 32) :
+  length (sb_image magic fssize nblocks ninodes
+                   nlog logstart inodestart bmapstart) = 32%nat.
+Proof.
+  rewrite /sb_image !length_app !word_bytes_length. reflexivity.
+Qed.
+
+Definition wp_fsinit_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ,
+      ICFG : icfg, APP : appcfg Σ, FSC : fscfg, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γs : list gname) (j : nat) (γl : gname)          (* the running process *)
+  (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+    (* ---- the image's block 1, field by field ---- *)
+    (v_magic v_size v_nblocks v_ninodes v_nlog
+     v_logstart v_inodestart v_bmapstart : mword 32)
+    (bs_sb : list (bv 8))
+    (sb_old : nat -> bv 8)                     (* the .bss bytes memmove kills *)
+    (* ---- initlog's own bundle, threaded verbatim ---- *)
+    (bs_hdr : list (bv 8))
+    (* THE BYTE VIEW'S RECORD ON THE EXCEPTION SET (durable-disk lane
+       E-except): what the era's logged view holds at the pending home
+       blocks.  Threaded straight into [initlog]. *)
+    (Xv : Z -> list (bv 8))
+    (M : log_mirror)            (* the era's BORN-TRUE picture (1a) *)
+    (L : gmap Z (list (bv 8))) (D : gmap Z bool)
+    (vlock : mword 32) (vname vcpu : mword 64)
+    (v_start v_dev v_nc v_n : mword 32)
+    (pidv : mword 32) (dq : dfrac)
+    (m : regfile) (K : nat) (eb : bool)
+    (b : bool) (lks : gset string) (Upr : ustate)
+    (* ---- the record block 1's bytes decode to (durable-disk lane C-3a) ---- *)
+    (sbrec : fs_sb) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.fsinit in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (K_fsinit <= K)%nat ->
+  (* ---- bread's / the log's block-number arithmetic ---- *)
+  log_geom_ok fsc_cov fsc_logst ->
+  (* THE SUPERBLOCK'S OWN BLOCK: block 1, covered, and not log storage *)
+  (1 : Z) ∈ fsc_cov ->
+  ~ ((1 : Z) ∈ log_region_set fsc_logst) ->
+  (* ================================================================== *)
+  (*  THE IMAGE PREMISES.  Everything below is a claim about what mkfs   *)
+  (*  wrote into block 1, threaded from the boot client exactly as       *)
+  (*  IcacheBoot's allocated-inum bundles are.  This is the family the   *)
+  (*  N4b / N4d / N5a / N5c ledgers have been parking here.              *)
+  (* ================================================================== *)
+  (* (a) the block IS a superblock: its first 32 bytes are the eight
+         fields, in fs.h's order *)
+  take 32 bs_sb = sb_image v_magic v_size v_nblocks v_ninodes
+                           v_nlog v_logstart v_inodestart v_bmapstart ->
+  (* (a') ...AND THE RECORD THEY DECODE TO (durable-disk lane C-3a).  Block
+         1's run stops being dropped at fsinit's return: it goes down into
+         [initlog], which parks it in [SbPark.sbN] and seals the handle into
+         [LogInv.log_ctx], so the commit's collection can finally say what
+         block 1 holds.  These two premises are what the park is stated at,
+         and both are read off the boot image (W1 of
+         [FsCfgBoot.fs_boot_image_wf]) rather than recomputed. *)
+  fs_parse_sb (fun _ => bs_sb) = Some sbrec ->
+  fs_sb_ok sbrec ->
+  (* (a'') THE COLLECTION'S GEOMETRY AND THE TWO FIELD TIES (durable-disk
+          C-8).  fsinit's invariants are stated at the CONFIG numbers and
+          the durable snapshot at the record block 1 DECODES to; these are
+          the bridge, and [FsCollect.cg_ist] is the third tie.  All three
+          come off [FirstTok.first_fsinit_pures], where the region's width
+          tie that [cg_reg] rests on actually lives -- see that file.  They
+          are consumed here and nowhere else: fsinit builds the file
+          system's law out of the invariants it already holds and hands it
+          to [initlog], which parks it in [LogInv.log_ctx]. *)
+  col_geom sbrec icfg_ist icfg_nib (fs_home_set fsc_cov fsc_logst) ->
+  FsImg.sb_bmapstart sbrec = fsc_bmapstart ->
+  FsImg.sb_size sbrec = fsc_size ->
+  (* (b) the magic, which is what refutes the LIVE panic arm at +0x40 *)
+  bv_unsigned v_magic = FSMAGIC ->
+  (* (c) the three field values every fs contract downstream reads *)
+  v_ninodes = (mword_of_int fsc_ninodes : mword 32) ->
+  v_inodestart = (mword_of_int icfg_ist : mword 32) ->
+  v_bmapstart = (mword_of_int fsc_bmapstart : mword 32) ->
+  v_logstart = (mword_of_int fsc_logst : mword 32) ->
+  (* (d) THE THREE ninodes TIES -- SpecIalloc's and SpecIreclaim's, finally
+         stated about a real record.  [ninodes <= 16 * nib] is the one that
+         existed nowhere in the tree before (N5c). *)
+  1 < fsc_ninodes ->
+  fsc_ninodes <= 16 * Z.of_nat icfg_nib ->
+  fsc_ninodes < 2 ^ 31 ->
+  icfg_dev = ROOTDEV ->
+  (0 < icfg_nib)%nat ->
+  (* (f) the inode region's block geometry, and itrunc's, threaded to
+         ireclaim *)
+  0 <= icfg_ist ->
+  ireg_blocks_ok icfg_ist icfg_nib fsc_cov fsc_logst ->
+  0 < fsc_size <= BPB ->
+  0 <= fsc_bmapstart ->
+  fsc_bmapstart ∈ fsc_cov ->
+  ~ (fsc_bmapstart ∈ log_region_set fsc_logst) ->
+  cov_below fsc_cov fsc_size ->
+  (* (g) THE ON-DISK HEADER IS WELL FORMED, AND THAT IS ALL (durable-disk
+         lane E-except; the CLEAN-IMAGE premise [hdr_n bs_hdr = 0] IS GONE).
+         These are [FsCrash.hdr_wf]'s three clauses at the header block's
+         content, plus its block-1 row: the decoded write set is bounded by
+         the log region, duplicate-free, and names covered HOME blocks other
+         than the superblock.  At a clean image the decode is empty and all
+         of them are trivial; at a real crash they are what the durable
+         header invariant delivers, and recovery is what consumes them --
+         [initlog]'s copy loop runs, [install_trans] lands every entry (and
+         SHRINKS the byte view's exception set as it goes), and the closing
+         [write_head] clears the log. *)
+  ((hdr_dec bs_hdr).1 <= LOGBLOCKS)%nat ->
+  NoDup (hdr_dec bs_hdr).2 ->
+  (forall b : Z, b ∈ (hdr_dec bs_hdr).2 ->
+     b ∈ fsc_cov /\ b ∉ log_region_set fsc_logst /\ b <> FsImg.SB_BNO) ->
+  (* (g'') THE EXCEPTION SET'S VALUES ARE THE SLOTS' (durable-disk lane
+         E-except), threaded verbatim into [initlog]. *)
+  (forall (i : nat) (b : Z),
+     (hdr_dec bs_hdr).2 !! i = Some b ->
+     Xv b = lm_view M (log_slot_bno fsc_logst i)) ->
+  (* (g') THE ERA'S TWO READINGS OF ONE IMAGE (durable-disk 1a): the logged
+         view and the era's born-true mirror agree on the covered range.
+         Threaded verbatim into [initlog], where it is what makes the boot
+         [log_state] pack's row (b) provable. *)
+  (forall b : Z, b ∈ fsc_cov -> L !! b = Some (lm_view M b)) ->
+  (* ---- ireclaim's printk, as a hypothesis and not a functor ---- *)
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  (* a0 = dev *)
+  m !!! Regidx (mword_of_int 10 : mword 5) = (sign_extend' 64 icfg_dev : mword 64) ->
+  (* fsinit's cone: its own bread/brelse ("bcache", 4), initlog
+     ("bcache", 4) and ireclaim ("itable", 2) -- "itable" is the lowest,
+     so one premise there covers the whole cone via [locks_below_mono]. *)
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m K b pj -∗
+  cpu_own 0 eb pj b lks -∗
+  (* THE TRAP-CSR COMPLEMENT, in and out.  fsinit takes no lock of its own,
+     so nothing here mints the pay its sleeping callees (bread, initlog,
+     ireclaim) need; it threads the caller's.  [emp] at [eb = true], the real
+     pair at [eb = false] -- which is the index forkret's [if (first)] arm
+     reaches it at, since this revision's scheduler leaves [intena = 0].
+     claude-notes/completed/eb-generic-sweep.md is the recipe. *)
+  trap_csrs_ext KT1 eb -∗
+  cpu_claim_ext eb pj -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  printk_env fsc_printk fsc_uart fsc_disk -∗
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  (* THE CRASH SEAM AT THE APPLICATION'S GUEST, AND THE MERGE WITH THE SYNC
+     RUNNER (app-instances.md round C; SY3-K2; K3-3), kit 2's last row --
+     one package at the guest's durable-copy predicate since SY3-A3b
+     ([AppDur.app_dur_laws]): fsinit builds the commit's law and the ghost
+     commit's HOOKED law from it ([FsCollectAll.fs_snap_law_build],
+     [fs_snap_law_ghost_build], which produce the snapshot AND the
+     application's durable claim beside it) and derives initlog's
+     arity-free seam from the seam.  Then the era certificate and the
+     era's BORN-TRUE mirror half + swap receipt (durable-disk 1a). *)
+  app_dur_laws fsc_cov fsc_logst -∗
+  gen_cert -∗
+  (* ...and THE CRASH INVARIANT (sync K3-3), off [FirstTok.first_boot_persist]
+     beside the certificate: initlog parks it into [LogInv.log_ctx] for the
+     ghost commit to open *)
+  crash_inv -∗
+  log_mirror_born M -∗
+  (* THE LOG'S FOUR GNAMES, AT THEIR GENESIS VALUES, AND THEY ARE
+     [icfg_log]'s.  Threaded straight into [initlog] at +0x4e, which fills
+     them rather than minting its own.  See the header: this is the
+     conjunct that makes fsinit's post assemble into [FsReady.fs_ready]. *)
+  log_free_tok icfg_log -∗
+  (* ================================================================== *)
+  (*  THE SUPERBLOCK, BEFORE AND AFTER                                   *)
+  (* ================================================================== *)
+  (* IN: block 1's client half, which is what pins the bytes bread returns
+     to the image; and 32 bytes of RAW .bss at [&sb], which is all the
+     superblock is until +0x26 runs. *)
+  (* THE BYTE VIEW'S ROW, NAMED (durable-disk lane E-except): fsinit
+     spends it twice -- at the [readsb] crossing above +0x4e, which runs
+     BEFORE recovery and so goes through the [b ∉ X] form, and inside
+     [initlog], which is where the exception set is emptied and sealed. *)
+  fs_bytes_inv (fs_bytes fsc_fs) (fs_cache fsc_fs) (fs_exc fsc_fs)
+               (fs_home_set fsc_cov fsc_logst) Xv -∗
+  fsblock (fs_bytes fsc_fs) 1 bs_sb -∗
+  (* THE BYTE VIEW'S EXCEPTION HANDLE (durable-disk lane E-except), from
+     the era's mint, threaded straight into [initlog], which empties it and
+     seals it into [LogInv.log_ctx].  fsinit itself spends it once, at the
+     [readsb] crossing above +0x4e: block 1 is never in the exception set
+     ([FsCrash.hdr_wf]'s block-1 row, lane E-blk1).  It is [∅] while the
+     era's mint still reads the RAW home blocks. *)
+  exc_own (fs_exc fsc_fs) (list_to_set (hdr_dec bs_hdr).2) -∗
+  ([∗ list] i ∈ seq 0 32, pa_add sb_base i ↦ₘ sb_old i) -∗
+  (* ---- the icache's four persistent things, straight from
+         [IcacheBoot.icache_boot] ---- *)
+  ireg_reg fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  (* THE BOOT-SHELTER TOKEN (fs-fragments.md §7.12), from [icfg_alloc] through
+     the boot chain: fsinit frames it across bread/memmove/initlog and hands it
+     to ireclaim, which is the only reason it is safe there (§7.1.7).  Returned
+     in the post, so the boot caller can seal it to [ireg_open] after fsinit
+     returns and before [kexec("/init")] -- that seal is OWED to forkret's
+     first branch. *)
+  ireg_boot -∗
+  is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst icfg_nib icfg_dev -∗
+  itable_inv -∗
+  ic_escrows fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst -∗
+  ic_sleeplocks fsc_ic -∗
+  (* itrunc's bitmap, through ireclaim's iput *)
+  bitmap_reg fsc_fs fsc_bmapstart fsc_cov fsc_logst fsc_size -∗
+  (* ---- initlog's RAW struct log cells, threaded straight through ---- *)
+  log_addr ↦₄ vlock -∗
+  lock_name_field log_addr ↦₈ vname -∗
+  lock_cpu log_addr ↦₈ vcpu -∗
+  l_start ↦₄ v_start -∗
+  l_dev ↦₄ v_dev -∗
+  l_out ↦₄ (mword_of_int 0 : mword 32) -∗
+  l_cmt ↦₄ (mword_of_int 0 : mword 32) -∗
+  l_ncommit ↦₄ v_nc -∗
+  lh_n_pa ↦₄ v_n -∗
+  ([∗ list] i ∈ seq 0 LOGBLOCKS, ∃ w : mword 32, lh_block i ↦₄ w) -∗
+  (* ---- initlog's FsBlocks material ---- *)
+  ghost_map_auth_frac (fs_cache fsc_fs) 1 L -∗
+  ghost_map_auth_frac (fs_dirty fsc_fs) 1 D -∗
+  ([∗ set] z ∈ fsc_cov, z ↪[fs_dirty fsc_fs]{#(1/2)} false) -∗
+  fs_chalf fsc_fs (log_hdr_bno fsc_logst) bs_hdr -∗
+  ([∗ list] i ∈ seq 0 LOGBLOCKS,
+     ∃ bs : list (bv 8), fs_chalf fsc_fs (log_slot_bno fsc_logst i) bs) -∗
+  (* the caller's own pid cell *)
+  proc_priv_bare pj pidv Upr -∗
+  (* the running-thread bundle and the disk fabric *)
+  procs_inv γs -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  (* THIRTY-FIVE slot units.  initlog seals 32 of them into [log_state]'s
+     pool and returns two; ireclaim needs three; so ONE is held back across
+     the [jal initlog] at +0x4e.  See the header. *)
+  bslots ((LOGBLOCKS + 2) + 2 + 1)%nat -∗
+  (* ONE ledger unit for ireclaim's iget/iput pair; it comes back *)
+  iref_slot -∗
+  (* THE CROSSING IS THE LITERAL [true], NOT [b].  This function can SLEEP
+     (its bread / ilock / bwrite does), and a park moves the hart with
+     interrupts off, so the crossing has nothing to do with SIE -- the
+     porting guide's "a PARKING function's [wp_next] index is [true]
+     UNCONDITIONALLY".  Spelled [b] the two coincide at the only instance
+     the [eb = true] premise admits, which is why this went unnoticed; once
+     [eb = false] is reachable the [b] form would promise the caller it
+     comes back on the hart it called from, which a park makes false. *)
+  wp_next true pj (fun (CID : CpuId) =>
+  ∀ (mf : regfile),
+      ⌜callee_saved m mf⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      trap_csrs_ext KT1 eb -∗
+      cpu_claim_ext eb pj -∗
+      pc_is ret_tgt -∗
+      proc_priv_bare pj pidv Upr -∗
+      (* ================================================================ *)
+      (*  THE EIGHT CELLS ARE BORN.  This is the whole point of the        *)
+      (*  contract: the caller handed in 32 raw .bss bytes and gets back   *)
+      (*  the typed fields every other fs contract in the tree takes as a  *)
+      (*  premise, at the image's values.  [sb_size], [sb_ninodes],        *)
+      (*  [sb_inodestart] and [sb_bmapstart] are literally the same        *)
+      (*  addresses BitmapInv.v and InodeInv.v already name.               *)
+      (* ================================================================ *)
+      sb_magic ↦₄ v_magic -∗
+      BitmapInv.sb_size ↦₄ v_size -∗
+      sb_nblocks ↦₄ v_nblocks -∗
+      InodeInv.sb_ninodes ↦₄ (mword_of_int fsc_ninodes : mword 32) -∗
+      sb_nlog ↦₄ v_nlog -∗
+      sb_logstart ↦₄ (mword_of_int fsc_logst : mword 32) -∗
+      InodeInv.sb_inodestart ↦₄ (mword_of_int icfg_ist : mword 32) -∗
+      BitmapInv.sb_bmapstart ↦₄ (mword_of_int fsc_bmapstart : mword 32) -∗
+      (* NOTHING COMES BACK FOR BLOCK 1 (durable-disk lane C-3a).  The run
+         used to be returned here and DROPPED by forkret; it is now spent
+         inside, into [initlog]'s [SbPark] park, and rides out as a conjunct
+         of the [log_ctx] below. *)
+      (* THE LOG LAYER, BUILT by initlog at +0x4e and already USED by
+         ireclaim at +0x54.  It does not cross the boundary as an input.
+         AT [icfg_log], not existentially: this is [FsReady.fs_ready]'s log
+         conjunct, modulo the seal site's instantiation of [bn]/[fsc_fs]/[fsc_cov]/
+         [fsc_logst] at [fsc_bio]/[fsc_fs]/[fsc_cov]/[fsc_logst] -- the
+         device it is stated at IS [icfg_dev] since rank 1c. *)
+      log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+      (* three, not two: see the header *)
+      bslots 3 -∗
+      iref_slot -∗
+      (* the boot-shelter token, handed back for the seal (fs-fragments.md
+         §7.12) *)
+      ireg_boot -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type FSINIT.
+  Parameter wp_fsinit_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ,
+             ICFG : icfg, APP : appcfg Σ, FSC : fscfg, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γs : list gname) (j : nat) (γl : gname)
+      (pd pav pu : mword 64)
+      (v_magic v_size v_nblocks v_ninodes v_nlog
+       v_logstart v_inodestart v_bmapstart : mword 32)
+      (bs_sb : list (bv 8))
+      (sb_old : nat -> bv 8)
+      (bs_hdr : list (bv 8))
+      (Xv : Z -> list (bv 8))
+      (M : log_mirror)
+      (L : gmap Z (list (bv 8))) (D : gmap Z bool)
+      (vlock : mword 32) (vname vcpu : mword 64)
+      (v_start v_dev v_nc v_n : mword 32)
+      (pidv : mword 32) (dq : dfrac)
+      (m : regfile) (K : nat) (eb : bool)
+      (b : bool) (lks : gset string) (Upr : ustate)
+      (sbrec : fs_sb),
+      wp_fsinit_sconf_body γs j γl pd pav pu
+
+
+                           v_magic v_size v_nblocks v_ninodes v_nlog
+                           v_logstart v_inodestart v_bmapstart bs_sb sb_old
+                           bs_hdr Xv M L D vlock vname vcpu v_start v_dev v_nc v_n
+                           pidv dq m K eb b lks Upr sbrec.
+End FSINIT.

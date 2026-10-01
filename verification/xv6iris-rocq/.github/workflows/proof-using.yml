@@ -1,0 +1,189 @@
+name: Proof using
+
+# Nightly `Proof using` sweep for iris/: give every opaque proof the MINIMAL
+# annotation Rocq computes for it, and push the additions to main.
+#
+# WHY IT MATTERS: `rocq compile -vos` skips a proof only when it is told up
+# front which section variables that proof captures.  With no annotation Rocq
+# has to RUN the proof to find out, and a -vos build then costs exactly what a
+# full one does -- so `run-on-gcp --check`, the seconds-not-minutes edit loop,
+# is only fast for files whose proofs carry these.  A proof added without one
+# silently drops its file back to the slow path, which is what this sweep
+# repairs.
+#
+# WHY IT IS SAFE: the annotation written is the MINIMAL one, which is the set
+# Rocq would have computed anyway -- so no lemma's type changes and nothing
+# downstream can notice.  (A blanket `Set Default Proof Using` is NOT safe here:
+# every selector over-captures for some proofs, growing the argument lists the
+# sealed functors match against, and under-captures for others, because section
+# HYPOTHESES never appear in a statement.  See claude-notes/remote-build-gcp.md.)
+#
+# The suggestions come from the build itself: `-set "Suggest Proof Using=yes"`
+# makes Rocq print, per proof, the annotations that would work, minimal first.
+# It costs no build time and prints nothing once a file is fully annotated.
+#
+# AUTO-GENERATED files are left alone -- tools/gen_code.py and tools/gen_ucode.py
+# emit the annotation themselves, so an edit here would be reverted by the next
+# `make gen-code`/`gen-ucode` and would fail `check-decode`/`check-ucode`.  The
+# sweep regenerates both layers instead, which is also how a newly generated
+# catalog gets annotated.
+#
+# Like the dead-import sweep, the gate on what lands is a full green rebuild:
+# a push made with GITHUB_TOKEN does not trigger other workflows, so ci.yml will
+# NOT run on the commit this job creates.
+
+on:
+  schedule:
+    # 05:00 UTC nightly -- three hours ahead of the dead-import sweep, so the two
+    # never contend for the runner or race each other's push to main.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: proof-using
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sweep:
+    runs-on: coqdev
+    # Two full builds: one to collect the suggestions, one to gate the push.
+    timeout-minutes: 300
+
+    # pipefail, so a failed make in a `… | tee` pipeline fails the step rather
+    # than exiting with tee's status.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # ---- Toolchain: identical to ci.yml, so the switch cache is shared. ----
+      - name: Set up OCaml / opam
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.3.0"
+          opam-repositories: |
+            rocq-released: https://rocq-prover.org/opam/released
+            default: https://opam.ocaml.org
+
+      - name: Cache opam switch
+        uses: actions/cache@v5
+        with:
+          path: _opam
+          key: ${{ runner.os }}-${{ runner.name }}-opam-5.3-${{ hashFiles('opam/xv6rocq.export') }}
+
+      - name: Install Rocq / Iris / Sail toolchain
+        run: opam switch import --yes opam/xv6rocq.export
+
+      # ---- 1. Build, collecting the suggestions ----
+      # Same ELF-free / regen-free path as ci.yml.  `--output-sync=target` is
+      # what makes the log attributable: each file's output is emitted whole, so
+      # a suggestion can be tied to the `ROCQ compile <file>` that precedes it.
+      - name: Build Sail model + kernel/user dumps
+        run: |
+          make SWITCH="$GITHUB_WORKSPACE" kernel-rocq/CoqMakefile
+          make SWITCH="$GITHUB_WORKSPACE" user-rocq/CoqMakefile
+
+          make SWITCH="$GITHUB_WORKSPACE" model &
+          pid_model=$!
+          opam exec -- make -C kernel-rocq -f CoqMakefile -j"$(nproc)" &
+          pid_kernel=$!
+          opam exec -- make -C user-rocq -f CoqMakefile -j"$(nproc)" &
+          pid_user=$!
+
+          rc=0
+          wait $pid_model || rc=1
+          wait $pid_kernel || rc=1
+          wait $pid_user || rc=1
+          exit $rc
+
+      - name: Build Iris proofs, collecting suggestions
+        run: |
+          make SWITCH="$GITHUB_WORKSPACE" iris/CoqMakefile
+          opam exec -- make -C iris -f CoqMakefile -j"$(nproc)" \
+            --output-sync=target COQEXTRAFLAGS='-set "Suggest Proof Using=yes"' \
+            2>&1 | tee "$RUNNER_TEMP/suggest.log"
+
+          # Grep the log as well as trusting the exit status, per
+          # claude-notes/durable-notes.md.
+          if grep -q "^Error" "$RUNNER_TEMP/suggest.log"; then
+            echo "::error::Errors in the build log despite a zero exit status."
+            grep -B5 "^Error" "$RUNNER_TEMP/suggest.log" | head -50
+            exit 1
+          fi
+
+      # ---- 2. Add the annotations ----
+      - name: Add Proof using annotations
+        id: apply
+        run: |
+          python3 tools/add_proof_using.py --log "$RUNNER_TEMP/suggest.log" \
+            --iris iris --apply 2>&1 | tee "$RUNNER_TEMP/apply.log"
+
+          # Generated layers carry the annotation from their generators, so the
+          # sweep regenerates rather than edits.  Both targets are no-ops when
+          # the tracked output already matches.
+          #
+          # SWITCH is not optional: gen-ucode reads every AST off the model
+          # through coqc, and the Makefile runs that as
+          # `opam exec --switch=$(SWITCH)`, whose default is the DEV switch
+          # (/shared/xv6rocq) -- absent here.  Same override ci.yml passes.
+          make SWITCH="$GITHUB_WORKSPACE" gen-code
+          make SWITCH="$GITHUB_WORKSPACE" gen-ucode
+
+          n=$(grep -oE '^annotated [0-9]+' "$RUNNER_TEMP/apply.log" | grep -oE '[0-9]+' || echo 0)
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/apply.log" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Anything to land?
+        id: changed
+        run: |
+          if [ -z "$(git status --porcelain -- '*.v')" ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "Every proof already carries its annotation; nothing to do."
+          else
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            git status --porcelain -- '*.v' | head -20
+          fi
+
+      # Only .v files: the build drops .vo/.glob/CoqMakefile all over the tree.
+      - name: Commit
+        if: steps.changed.outputs.any == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- '*.v'
+          git commit -m "iris: annotate ${{ steps.apply.outputs.count }} proof(s) with Proof using (nightly sweep)" \
+                     -m "Each annotation is the MINIMAL set Rocq itself suggests, i.e. the one it would otherwise compute by running the proof -- so no lemma's type changes. What it buys is that 'rocq compile -vos' can skip the proof, which is what makes run-on-gcp --check an edit check of seconds rather than minutes. AUTO-GENERATED files are regenerated rather than edited. Generated by .github/workflows/proof-using.yml."
+
+      # Rebase BEFORE the gate, so what gets verified is what gets pushed.
+      - name: Rebase onto current main
+        if: steps.changed.outputs.any == 'true'
+        run: git pull --rebase origin main
+
+      # ---- 3. The gate: green tree, or nothing is pushed ----
+      - name: End-to-end build check
+        if: steps.changed.outputs.any == 'true'
+        run: |
+          make SWITCH="$GITHUB_WORKSPACE" model 2>&1 | tee "$RUNNER_TEMP/build.log"
+          opam exec -- make -C kernel-rocq -f CoqMakefile -j"$(nproc)" 2>&1 \
+            | tee -a "$RUNNER_TEMP/build.log"
+          opam exec -- make -C user-rocq -f CoqMakefile -j"$(nproc)" 2>&1 \
+            | tee -a "$RUNNER_TEMP/build.log"
+          opam exec -- make -C iris -f CoqMakefile -j"$(nproc)" 2>&1 \
+            | tee -a "$RUNNER_TEMP/build.log"
+
+          if grep -q "Error" "$RUNNER_TEMP/build.log"; then
+            echo "::error::Tree does not build after annotating; not pushing."
+            grep -B5 "Error" "$RUNNER_TEMP/build.log" | head -50
+            exit 1
+          fi
+
+      - name: Push to main
+        if: steps.changed.outputs.any == 'true'
+        run: git push origin HEAD:main

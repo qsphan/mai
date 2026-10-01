@@ -1,0 +1,3898 @@
+(* ===================================================================== *)
+(* UkShRun.v -- sh's [runcmd] on the urun engine, SH LANE STAGE 5: the     *)
+(* COMMAND TREE walk.  [runcmd] (0x8e, 102 instructions) dispatches on the *)
+(* node type through the 0x1398 jump table and never returns; its five     *)
+(* arms are EXEC, REDIR, PIPE, LIST and BACK, and four of the five call    *)
+(* [runcmd] again on a SUBTREE.  [fork1] (0x68) is fork with a panic on    *)
+(* -1, and LIST, PIPE and BACK all go through it.                         *)
+(*                                                                        *)
+(* THE RECURSION IS ORDINARY STRUCTURAL INDUCTION, not an [iLob].  The     *)
+(* argument is a FINITE tree -- [ushcmd] below -- so [wp_kshr_runcmd] is   *)
+(* proved by [induction c], and each arm applies the induction hypothesis  *)
+(* to its child.  What the recursion costs is STACK: one 48-byte frame per *)
+(* level, so the budget is [6 * ush_ht c] words plus a constant, and the   *)
+(* child's instance of the theorem is the parent's with the surplus rolled *)
+(* into the caller-supplied tail [n].                                      *)
+(*                                                                        *)
+(* THE SCOPE IS [ush_simple c] -- no REDIRECT and no PIPE node.  Those two *)
+(* arms are the two that MOVE THE DESCRIPTOR TABLE, which is spent against *)
+(* the program-side ledger this walk does not carry, so they are REFUTED   *)
+(* from the premise rather than assumed: [ush_cmd] pins the type word and  *)
+(* the jump table's rows 2 and 3 become as dead as its DEFAULT row.  It is *)
+(* the scope stage 4 already hands over -- a line with no symbol byte in   *)
+(* it parses to a single EXEC node -- and the fd-row port is what takes    *)
+(* the premise off.                                                        *)
+(*                                                                        *)
+(* THE TREE IS A PREMISE, NOT A PARSE.  [ush_cmd g t c] says: a well-formed *)
+(* node of shape [c] sits at address [t].  Stage 4 BUILDS such a node;    *)
+(* this file only consumes one, and stage 6 reconciles the two lanes      *)
+(* predicates.  Two design points about it:                                *)
+(*                                                                        *)
+(*  - IT IS PERSISTENT.  Every byte it names is [DfracDiscarded].  That is *)
+(*    what the code allows (nothing in runcmd writes a node) and what the  *)
+(*    proof NEEDS: three of the five arms fork, and after a fork the child *)
+(*    runs a subtree under a FRESH gname triple, so the tree has to cross  *)
+(*    as a [UkFork.Forkable] payload -- [ush_cmd_forkable], proved by the  *)
+(*    same induction as the walk.                                          *)
+(*  - IT PINS THE TYPE WORD, which is what makes the DEFAULT arm dead: the *)
+(*    [bltu a5,a4] at 0xa0 tests [5 <u type], and the predicate says the   *)
+(*    type is one of 1..5, so [panic("runcmd")] is refuted rather than     *)
+(*    walked.                                                             *)
+(*                                                                        *)
+(* THE DIAGNOSTIC CODE IS CUT HERE AND WALKED IN [UkShDiag.v].  Three      *)
+(* places hand control to sh's printer: [panic] (from fork1's -1 arm and   *)
+(* from PIPE's [pipe] failure), and the two per-cent-s failed tails inside *)
+(* runcmd itself (0xda after a returning [exec], 0x10e after a failing     *)
+(* [open]).  All three END IN [exit] and none of them returns, and all     *)
+(* three run [fprintf] -- 279 instructions of printf.  [ush_diag_leaf] is  *)
+(* that whole subtree as one premise, at the three entry pcs, with exactly *)
+(* what each site has in hand; [UkShDiag.ush_diag_leaf_holds] proves it    *)
+(* and [UkShDiag.wp_kshr_runcmd_final] / [_fork1_final] are the two        *)
+(* theorems below with it supplied.                                        *)
+(*                                                                        *)
+(* WHAT DISCHARGING IT COST THIS FILE, and it is worth knowing why: the    *)
+(* premise as first written handed the walk only [shk_code], which is      *)
+(* [ShInstrs.sh_bytes] -- the INSTRUCTIONS.  The format strings are at     *)
+(* 0x1280..0x12b7, i.e. in [ShData.sh_data], and panic's own '%s' argument *)
+(* is a .rodata literal too, so no amount of [shk_code] produces them: the *)
+(* premise was not dischargeable, and its ∀ over the gname triple (a       *)
+(* forked child runs it at FRESH names) meant no caller could supply the   *)
+(* image from outside either.  The fix is one conjunct threaded where      *)
+(* [ush_jtab] already goes -- [ush_jtab] now carries [shk_rodata] beside   *)
+(* the five rows, so [wp_kshr_runcmd]'s statement, all four fork payloads  *)
+(* and every budget are exactly where stage 5 left them.  [wp_kshr_fork1]  *)
+(* is the one exception: it has no [ush_jtab] of its own, so it takes      *)
+(* [shk_rodata] as a premise and forwards it to the child through the      *)
+(* payload it already carries.  The second short conjunct was the two      *)
+(* tails' first instruction, [c.ld a2,<k>(s1)], which is 8-aligned or it   *)
+(* is not a step at all -- so [ush_diag_at] now names the node's alignment *)
+(* alongside the pc, which both sites read off [ush_cmd].                  *)
+(*                                                                        *)
+(* THREE LANE LEAVES.  [wp_uk_cldq]/[wp_uk_clwq]/                          *)
+(* [wp_uk_lwuq] are UkRunMem's [wp_uk_cld]/[wp_uk_clw]/[wp_uk_lwu] at a    *)
+(* DFRAC: those three are stated at [DfracOwn 1] though their proofs are   *)
+(* dfrac-generic ([uheap_access] already takes a [dq], and [wp_uk_ld]/     *)
+(* [wp_uk_lbu] already expose it), and a persistent tree cannot be read    *)
+(* without them.  RELOCATION ASK, beside [UkRunBr.wp_uk_btype0]'s.         *)
+(*                                                                        *)
+(* THE JUMP TABLE'S READ IS AN ENGINE LEAF.  The table at 0x1398 lives in  *)
+(* .rodata, which shares the executable segment's pages, so the heap files *)
+(* its words under [utext] as X-and-not-W and [UkLoad.uk_load_ok]'s        *)
+(* WRITABLE target page is not available: the read is driven at the memory *)
+(* node instead of through the walker (claude-notes/design/icache.md).     *)
+(* [UkRunMem.wp_uk_clw_text] is that leaf -- the engine's text reader is   *)
+(* width-generic (WpUmodeTextLoad.v) -- and this file just calls it.       *)
+(* ===================================================================== *)
+From Stdlib Require Import ZArith Bool Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import ghost_map ghost_var invariants.
+From iris.program_logic Require Import language lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto RiscvExtras RiscvModelBytes.
+Require Import RegFile.
+Require Import WpMmodeLeafBase.
+Require Import UserBits.
+Require Import WpUmodeBranch.
+Require Import UmodeArith UmodeAbi.
+Require Import ProcGeom.     (* [PIDMAX] -- the fork answer's pid range *)
+Require Import UsysMemOk.
+Require Import UserHeap UkRun UkRunLeaf UkRunMem UkRunSys UkRunBr.
+Require UkLoad.
+Require Import UkFork.
+Require Import UCodeShK.
+Require Import UkSh.
+Require Import CtxIdDefs.
+Require User.ShSyms User.ShInstrs.
+Require Import ChildTok.  (* [genF] -- the capacity the slot's fork arms name *)
+Require Import UexecRet.  (* [uwait_ans] -- what the wait leaf answers *)
+Local Open Scope Z_scope.
+Import Defs.
+
+(* ===================================================================== *)
+(* §1 THE COMMAND TREE, AS DATA.                                          *)
+(*                                                                        *)
+(* sh.c's five node kinds, with exactly the fields runcmd READS.  An EXEC  *)
+(* node's argument vector is [UserHeap.uarg]s -- the tier's own            *)
+(* pointer-and-string record, which is what [uargv] and its [Forkable]     *)
+(* instance are already written for; runcmd itself only ever looks at      *)
+(* [argv[0]], but the whole vector is what the node IS and what stage 6's  *)
+(* exec statement will want.                                              *)
+(* ===================================================================== *)
+Inductive ushcmd : Type :=
+  | UExec  (args : list uarg)
+  | URedir (c : ushcmd) (file : uarg) (mode fd : Z)
+  | UPipe  (l r : ushcmd)
+  | UList  (l r : ushcmd)
+  | UBack  (c : ushcmd).
+
+(* THE MEASURE: the tree's height, which is the depth of the runcmd call
+   chain and so the number of 48-byte frames the walk needs.  BACK and the
+   child arm of LIST/PIPE recurse without returning, so nothing is ever
+   given back -- the budget is a height, not a size. *)
+Fixpoint ush_ht (c : ushcmd) : nat :=
+  match c with
+  | UExec _ => 1%nat
+  | URedir c1 _ _ _ => S (ush_ht c1)
+  | UPipe l r => S (Nat.max (ush_ht l) (ush_ht r))
+  | UList l r => S (Nat.max (ush_ht l) (ush_ht r))
+  | UBack c1 => S (ush_ht c1)
+  end.
+
+Lemma ush_ht_pos (c : ushcmd) : (1 <= ush_ht c)%nat.
+Proof. destruct c; cbn; lia. Qed.
+
+(* THE SCOPE OF THE WALK: a tree with no REDIRECT and no PIPE node in it.
+
+   The two arms this excludes are the two that MOVE THE PROCESS'S
+   DESCRIPTOR TABLE -- REDIR is [close(fd); open(file)] and each half of a
+   PIPE is [close(0 or 1); dup(p[i]); close(p[0]); close(p[1])] -- and a
+   descriptor move is spent against the program-side LEDGER
+   ([UserFd.ustd], [UkSh.ush_std]), which this walk does not carry.  So
+   they are REFUTED here rather than assumed away, exactly as the parser
+   refutes its five constructor arms from [UkShParse.ushp_no_symbols]:
+   [ush_cmd] pins the node's type word, so a tree that is [ush_simple]
+   cannot reach the jump table's rows 2 and 3 at all and their code is
+   never fetched.
+
+   IT IS THE SAME SCOPE THE PARSER ALREADY HAS.  A command line with no
+   symbol byte in it ('<', '>', '|', '&', ';', '(') parses to a single
+   EXEC node -- [UkShParse.wp_kshp_parser]'s [UshpExec toks] -- so the
+   premise is discharged by the shape of what stage 4 hands stage 6, not
+   by an assumption about the input.  Threading the ledger through the two
+   excluded arms is the fd-row port's work; when it lands, this premise
+   comes off. *)
+Fixpoint ush_simple (c : ushcmd) : Prop :=
+  match c with
+  | UExec _ => True
+  | URedir _ _ _ _ => False
+  | UPipe _ _ => False
+  | UList l r => ush_simple l /\ ush_simple r
+  | UBack c1 => ush_simple c1
+  end.
+
+(* the [int] the node's type word holds, one per constructor -- sh.c's
+   EXEC 1, REDIR 2, PIPE 3, LIST 4, BACK 5 *)
+Definition ush_ty (c : ushcmd) : Z :=
+  match c with
+  | UExec _ => 1 | URedir _ _ _ _ => 2 | UPipe _ _ => 3
+  | UList _ _ => 4 | UBack _ => 5
+  end.
+
+Lemma ush_ty_range (c : ushcmd) : 1 <= ush_ty c <= 5.
+Proof. destruct c; cbn; lia. Qed.
+
+(* THE JUMP TABLE'S ADDRESS AND ITS SIX ENTRIES ARE [UkSh]'S NOW (lane
+   SH-LINE 2b, (b)): [UkSh.ush_rest] takes [ush_jtab] as a premise -- the
+   entry pays it off the key's own text -- and [UkSh.v] is below this one.
+   Kept here as abbreviations. *)
+Notation SH_JTAB := UkSh.SH_JTAB.
+Notation ush_jent := UkSh.ush_jent.
+(* ...and the table AS A RESOURCE, moved down for the same reason: it is a
+   premise of [UkSh.ush_rest] now, and only the entry can pay it
+   ([UkSh.ush_jtab_of_rodata]).  OUTSIDE the section, so the abbreviations
+   survive its close and every file above this one is unaffected. *)
+Notation ush_jrow := UkSh.ush_jrow.
+Notation ush_jtab := UkSh.ush_jtab.
+Notation ush_jtab_ro := UkSh.ush_jtab_ro.
+
+(* ...and the pc the [add a5,a5,a4 ; jr a5] pair lands on. *)
+Definition ush_jarm (c : ushcmd) : Z :=
+  match c with
+  | UExec _ => 0xce | URedir _ _ _ _ => 0xf6 | UPipe _ _ => 0x13c
+  | UList _ _ => 0x124 | UBack _ => 0x1c4
+  end.
+
+Require Import FdSlots.   (* [fdstate] / [fdtype] -- pipe's two ends *)
+Require Import UserFd.   (* [ufd_auth] -- the PROGRAM's own view of
+                            its descriptor table, the authority for
+                            which rides inside [urun] *)
+Require Import UexecSG.   (* [uexecSG] / [uprogSG]: the ARM deposit class *)
+Require Import UserCwd.  (* [ucwd] / [ucwd_any] -- the process's own view of its working directory *)
+Require Import UserChildren.  (* [uch_any] -- the process's own half of its children set *)
+
+Section UkShRun.
+  Context `{!riscvGS Σ}.
+  Context `{!ufdG Σ}.
+  Context `{GEN : GenId} `{XI : CurCtx}.
+  Context `{!ghost_varG Σ Z}.
+  (* ...and the children set's ([Xv6Cameras.uchG]), which [UkRun.urun]
+     carries beside the cwd's *)
+  Context `{!ghost_varG Σ (gset gname)}.
+
+  (* THE DIAGNOSTIC CODE'S OWN STACK NEED.  [ush_diag_leaf] below is the      *)
+  (* whole printf-and-exit subtree as one premise; whoever discharges it      *)
+  (* fixes this constant, and every budget in the file carries it.           *)
+  Context (Dg : nat).
+  (* [ChildTok.ctokG]: the slot's fork arms name the generation's pieces,
+     and this file binds no whole-system bundle. *)
+  Context `{!ctokG Σ}.
+  Context {SG : uexecSG Σ}.
+  Context `{PS : uprogSG Σ}.
+  (* THE NUMBERS THIS PROGRAM ADMITS ([UexecSG.uprogSG]'s [psok]).  A SECTION
+     hypothesis, so no lemma statement in this file names it and the ~570
+     [urun] sites did not move; the program's kernel-side constructor
+     discharges it.
+     AT THE FREE NUMBERS AND NO MORE (lane SUPPLY-SPLIT).  It used to read
+     "every number but exec", which at the generic instance is true and at
+     a VERIFIED program's instance is not: a program whose supplier is the
+     application's ([AppInv.app_sup] -- for the echo application, the
+     TAINT) could only ever be entered tainted.  What a verified program
+     admits is [UexecSG.free_num] -- every number whose bundle is [emp],
+     plus chdir, whose branch is a closed fact -- and at
+     [UexecExecInst.uprogSG_free] this hypothesis is the identity.  A call
+     at a number OUTSIDE that set takes its own deposit as a premise
+     ([UkRun.udepw_law]) and is named at its site. *)
+  Hypothesis Hpsok_free : forall k : Z, free_num k -> psok k.
+
+  Local Notation ra_idx := (mword_of_int 1 : mword 5).
+  Local Notation s0_idx := (mword_of_int 8 : mword 5).
+  Local Notation s1_idx := (mword_of_int 9 : mword 5).
+  Local Notation a0_idx := (mword_of_int 10 : mword 5).
+  Local Notation a1_idx := (mword_of_int 11 : mword 5).
+  Local Notation a2_idx := (mword_of_int 12 : mword 5).
+  Local Notation a4_idx := (mword_of_int 14 : mword 5).
+  Local Notation a5_idx := (mword_of_int 15 : mword 5).
+  Local Notation a7_idx := (mword_of_int 17 : mword 5).
+
+  (* ===================================================================== *)
+  (* §1a THE SYMBOL PINS.  [shk_syms_pins] grows a clause per stage, so it  *)
+  (* is destructed ONCE, here, exactly as UkSh.v does for stages 1-2.       *)
+  (* ===================================================================== *)
+  Local Lemma shr_exit   : ShSyms.exit   = 0xc62.
+  Proof using . destruct shk_syms_pins as (_&_&_&_&_&_&_&H&_). exact H. Qed.
+  Local Lemma shr_runcmd : ShSyms.runcmd = 0x8e.
+  Proof using . destruct shk_syms_pins as (_&_&_&_&_&_&_&_&_&_&H&_). exact H. Qed.
+  Local Lemma shr_fork1  : ShSyms.fork1  = 0x68.
+  Proof using . destruct shk_syms_pins as (_&_&_&_&_&_&_&_&_&_&_&H&_). exact H. Qed.
+  Local Lemma shr_fork   : ShSyms.fork   = 0xc5a.
+  Proof using . destruct shk_syms_pins as (_&_&_&_&_&_&_&_&_&_&_&_&H&_). exact H. Qed.
+  Local Lemma shr_exec   : ShSyms.exec   = 0xc9a.
+  Proof using . destruct shk_syms_pins as (_&_&_&_&_&_&_&_&_&_&_&_&_&H&_). exact H. Qed.
+  Local Lemma shr_pipe   : ShSyms.pipe   = 0xc72.
+  Proof using . destruct shk_syms_pins as (_&_&_&_&_&_&_&_&_&_&_&_&_&_&H&_). exact H. Qed.
+  Local Lemma shr_wait   : ShSyms.wait   = 0xc6a.
+  Proof using . destruct shk_syms_pins as (_&_&_&_&_&_&_&_&_&_&_&_&_&_&_&H&_). exact H. Qed.
+  Local Lemma shr_dup    : ShSyms.dup    = 0xcda.
+  Proof using . destruct shk_syms_pins as (_&_&_&_&_&_&_&_&_&_&_&_&_&_&_&_&H&_). exact H. Qed.
+  Local Lemma shr_panic  : ShSyms.panic  = 0x4a.
+  Proof using . reflexivity. Qed.
+
+  (* ===================================================================== *)
+  (* §2 THE NODE PREDICATE.                                                 *)
+  (* ===================================================================== *)
+
+  (* a 4-byte field, read-only: the type word, and REDIR's mode and fd *)
+  Definition ush_w32 (g : gname) (a v : Z) : iProp Σ :=
+    ubytesq g DfracDiscarded a 4 (nth_byte (mword_of_int v : mword 32)).
+
+  (* a read-only pointer slot *)
+  Definition ush_ptr (g : gname) (a p : Z) : iProp Σ :=
+    uwordq g DfracDiscarded a (mword_of_int p).
+
+  (* a read-only NUL-terminated string, at an address a program may test *)
+  Definition ush_str (g : gname) (x : uarg) : iProp Σ :=
+    (⌜ 0 < ua_ptr x < 2 ^ 38 ⌝ ∗
+     ustr g DfracDiscarded (ua_ptr x) (ua_len x) (ua_bytes x))%I.
+
+  (* THE TREE.  Structural in [c]; every byte [DfracDiscarded], so the whole
+     thing is persistent and crosses a fork as a payload. *)
+  Fixpoint ush_cmd (g : gname) (t : Z) (c : ushcmd) : iProp Σ :=
+    (⌜ 0 < t < 2 ^ 38 ⌝ ∗ ⌜ t mod 8 = 0 ⌝ ∗
+     ush_w32 g t (ush_ty c) ∗
+     match c with
+     | UExec args =>
+         (* [argv] at t+8, [eargv] at t+88; runcmd reads argv[0] and hands
+            [&argv[0]] to exec, so the vector and its NUL are the node. *)
+         uargv g (t + 8) args ∗
+         ush_ptr g (t + 8 + 8 * Z.of_nat (length args)) 0 ∗
+         ([∗ list] x ∈ args, ush_str g x)
+     | URedir c1 file mode fd =>
+         (∃ q : Z, ush_ptr g (t + 8) q ∗ ush_cmd g q c1) ∗
+         ush_ptr g (t + 16) (ua_ptr file) ∗ ush_str g file ∗
+         ush_w32 g (t + 32) mode ∗ ush_w32 g (t + 36) fd
+     | UPipe l r =>
+         (∃ q : Z, ush_ptr g (t + 8) q ∗ ush_cmd g q l) ∗
+         (∃ q : Z, ush_ptr g (t + 16) q ∗ ush_cmd g q r)
+     | UList l r =>
+         (∃ q : Z, ush_ptr g (t + 8) q ∗ ush_cmd g q l) ∗
+         (∃ q : Z, ush_ptr g (t + 16) q ∗ ush_cmd g q r)
+     | UBack c1 =>
+         (∃ q : Z, ush_ptr g (t + 8) q ∗ ush_cmd g q c1)
+     end)%I.
+
+  Global Instance ush_w32_persistent g a v : Persistent (ush_w32 g a v).
+  Proof using . apply _. Qed.
+  Global Instance ush_ptr_persistent g a p : Persistent (ush_ptr g a p).
+  Proof using . apply _. Qed.
+  Global Instance ush_str_persistent g x : Persistent (ush_str g x).
+  Proof using . apply _. Qed.
+
+  (* Structural, not one [apply _] per branch: [apply] peels straight through
+     [ush_w32]/[ush_ptr]/[ush_str] -- each of which already HAS its instance
+     right above -- and re-derives them from the bytes.  Descend through the
+     connectives by name and let the search see only the leaves; [cbn
+     [ush_cmd]] (not bare [cbn]) is what keeps those leaves folded for it. *)
+  Local Ltac ush_pers :=
+    lazymatch goal with
+    | |- Persistent (bi_sep _ _) => apply bi.sep_persistent; [ush_pers|ush_pers]
+    | |- Persistent (bi_exist _) => apply bi.exist_persistent; intro; ush_pers
+    | |- _ => apply _
+    end.
+
+  Global Instance ush_cmd_persistent g t c : Persistent (ush_cmd g t c).
+  Proof using .
+    revert t. induction c as [ args | c1 IH file mode fd | l IHl r IHr
+                             | l IHl r IHr | c1 IH ]; intros t;
+      cbn [ush_cmd]; ush_pers.
+  Qed.
+
+  Lemma ush_cmd_addr (g : gname) (t : Z) (c : ushcmd) :
+    ush_cmd g t c -∗ ⌜ 0 < t < 2 ^ 38 /\ t mod 8 = 0 ⌝.
+  Proof using . destruct c; iIntros "(%H1 & %H2 & _)"; iPureIntro; done. Qed.
+
+  Lemma ush_cmd_type (g : gname) (t : Z) (c : ushcmd) :
+    ush_cmd g t c -∗ ush_w32 g t (ush_ty c).
+  Proof using . destruct c; iIntros "(_ & _ & #H & _)"; iExact "H". Qed.
+
+  (* ===================================================================== *)
+  (* §2a THE TREE CROSSES A FORK.  Every conjunct is one of the class's     *)
+  (* read-only instances, so the induction is mechanical -- but it IS an    *)
+  (* induction, which is why this cannot be an [Instance].                  *)
+  (* ===================================================================== *)
+  Lemma forkable_ush_w32 (a v : Z) :
+    Forkable (fun _ g _ => ush_w32 g a v).
+  Proof using . apply forkable_ubytesq_disc. Qed.
+
+  Lemma forkable_ush_ptr (a p : Z) :
+    Forkable (fun _ g _ => ush_ptr g a p).
+  Proof using . apply forkable_uwordq_disc. Qed.
+
+  Lemma forkable_ush_str (x : uarg) :
+    Forkable (fun _ g _ => ush_str g x).
+  Proof using .
+    apply forkable_sep; [ apply forkable_pure | apply forkable_ustr_disc ].
+  Qed.
+
+  Lemma ush_cmd_forkable (t : Z) (c : ushcmd) :
+    Forkable (fun _ g _ => ush_cmd g t c).
+  Proof using .
+    revert t.
+    induction c as [ args | c1 IH file mode fd | l IHl r IHr
+                   | l IHl r IHr | c1 IH ]; intros t.
+    - apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_ush_w32 | ].
+      apply forkable_sep; [ apply forkable_uargv | ].
+      apply forkable_sep; [ apply forkable_ush_ptr | ].
+      apply (forkable_big_sepL args (fun _ x _ g _ => ush_str g x)).
+      intros _ x. apply forkable_ush_str.
+    - apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_ush_w32 | ].
+      apply forkable_sep.
+      { apply forkable_exist. intros q.
+        apply forkable_sep; [ apply forkable_ush_ptr | apply IH ]. }
+      apply forkable_sep; [ apply forkable_ush_ptr | ].
+      apply forkable_sep; [ apply forkable_ush_str | ].
+      apply forkable_sep; apply forkable_ush_w32.
+    - apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_ush_w32 | ].
+      apply forkable_sep;
+        (apply forkable_exist; intros q;
+         apply forkable_sep; [ apply forkable_ush_ptr | ]);
+        [ apply IHl | apply IHr ].
+    - apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_ush_w32 | ].
+      apply forkable_sep;
+        (apply forkable_exist; intros q;
+         apply forkable_sep; [ apply forkable_ush_ptr | ]);
+        [ apply IHl | apply IHr ].
+    - apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_pure | ].
+      apply forkable_sep; [ apply forkable_ush_w32 | ].
+      apply forkable_exist. intros q.
+      apply forkable_sep; [ apply forkable_ush_ptr | apply IH ].
+  Qed.
+
+  (* ===================================================================== *)
+  (* §2b THE JUMP TABLE AS A RESOURCE IS [UkSh]'S NOW (lane SH-LINE 2b,     *)
+  (* (b)).  [ush_jrow] / [ush_jtab] / [ush_jtab_ro] moved down beside       *)
+  (* [UkSh.ush_rest], which takes the table as a premise; the [Forkable]    *)
+  (* half stays here, because [UkFork] is not in [UkSh]'s cone.  Kept here  *)
+  (* as abbreviations, so nothing above this file moved.                    *)
+  (* ===================================================================== *)
+  Lemma forkable_ush_jrow (k : Z) :
+    Forkable (fun g _ _ => ush_jrow g k).
+  Proof using . apply forkable_utext_run. Qed.
+
+  Lemma forkable_shk_code : Forkable (fun g _ _ => shk_code g).
+  Proof using .
+    eapply Forkable_ext; [ | apply (forkable_utext_map ShInstrs.sh_bytes) ].
+    intros g gd gs. rewrite /shk_code /utext_img. reflexivity.
+  Qed.
+
+  Lemma forkable_shk_rodata : Forkable (fun g _ _ => shk_rodata g).
+  Proof using .
+    eapply Forkable_ext; [ | apply (forkable_utext_map shk_ro) ].
+    intros g gd gs. rewrite /shk_rodata /utext_img. reflexivity.
+  Qed.
+
+  Lemma forkable_ush_jtab : Forkable (fun g _ _ => ush_jtab g).
+  Proof using .
+    apply forkable_sep; [ apply forkable_ush_jrow | ].
+    apply forkable_sep; [ apply forkable_ush_jrow | ].
+    apply forkable_sep; [ apply forkable_ush_jrow | ].
+    apply forkable_sep; [ apply forkable_ush_jrow | ].
+    apply forkable_sep; [ apply forkable_ush_jrow | ].
+    apply forkable_shk_rodata.
+  Qed.
+
+  (* the row a node selects, and the entry it holds *)
+  Lemma ush_jtab_row (g : gname) (c : ushcmd) :
+    ush_jtab g -∗ ush_jrow g (ush_ty c).
+  Proof using .
+    destruct c; cbn [ush_ty];
+      iIntros "(#H1 & #H2 & #H3 & #H4 & #H5 & _)";
+      [ iExact "H1" | iExact "H2" | iExact "H3" | iExact "H4" | iExact "H5" ].
+  Qed.
+
+
+  (* ===================================================================== *)
+  (* §3 FOUR LANE LEAVES.                                                   *)
+  (*                                                                        *)
+  (* The first three are UkRunMem's [wp_uk_cld]/[wp_uk_clw]/[wp_uk_lwu] at  *)
+  (* an arbitrary DFRAC.  Those three are stated at [DfracOwn 1] though     *)
+  (* their bridge ([uheap_access]) already takes a [dq] and their base-form *)
+  (* siblings ([wp_uk_ld], [wp_uk_lbu]) already expose it -- so the         *)
+  (* generalisation is the same proof with [dq] threaded, and without it a  *)
+  (* READ-ONLY data structure cannot be read at all.  RELOCATION ASK.       *)
+  (* ===================================================================== *)
+  Local Lemma wp_uk_cldq (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile) (pc : mword 64)
+      (uimm : mword 5) (crs1 crd : mword 3) (rs1 rd : mword 5) (dq : dfrac)
+      (a : Z) (w : mword 64) (avail : nat) :
+    unot_sp rd ->
+    creg2reg_idx (Cregidx crs1) = Regidx rs1 ->
+    creg2reg_idx (Cregidx crd) = Regidx rd ->
+    a = uint (m !!! Regidx rs1) + uoff_c8 uimm ->
+    a mod 8 = 0 ->
+    uint rd <> 0 ->
+    uinstr_is (ukn_t N) pc true (C_LD (uimm, Cregidx crs1, Cregidx crd)) -∗
+    uwordq (ukn_d N) dq a w -∗
+    urun N h m pc avail -∗
+    (uwordq (ukn_d N) dq a w -∗
+       ∀ h' : CpuId,
+         urun N h' (<[Regidx rd := regval_into_reg w]> m)
+           (add_vec_int pc 2) avail -∗
+         mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hns He1 He2 Ha Hal Hrd. iIntros "#Hi Hw Hrun Hcont".
+    iDestruct "Hrun" as (xi C pt Rfd Rut sz M pm fdv cw gn cs pidv) "(%Hlo & %Hpm & %Hlzf & %HRut & Hheap & Hstk & Hufd & Hcwda & Hcha & #Hmy & #Hdep & #Hnpx & Hb)".
+    iDestruct (uinstr_is_uk_instr with "Hheap Hi") as %Hui.
+    iDestruct (uheap_access (ukn_t N) (ukn_d N) (ukn_s N) M pm sz dq a 8 (nth_byte w)
+                 ltac:(lia) ltac:(right; right; right; reflexivity) Hal
+                 with "Hheap Hw")
+      as %(Hua & Hcan & Hok & Hpg & Hal8 & Hmap).
+    assert (Htgt : (mword_of_int a : mword 64)
+                   = add_vec (m !!! Regidx rs1)
+                       (sign_extend' 64 (zero_extend' 12
+                          (concat_vec uimm ('b"000"))))).
+    { rewrite Ha /uoff_c8. rewrite <- moi_add. rewrite !moi_of_uint.
+      reflexivity. }
+    iApply (UkLoad.wp_uk_cld C pt Rfd Rut pm sz Hlo Hpm HRut Hlzf M m pc fdv cw gn cs pidv uimm crs1 crd rs1 rd
+              (mword_of_int a) w Hui He1 He2 Hrd Htgt
+              Hok
+              Hcan Hal8
+              ltac:(rewrite Hua; exact Hmap)
+              with "Hb [Hheap Hstk Hufd Hcwda Hcha Hw Hcont]").
+    iApply (urun_close_upd _ _ _ m rd _ _ _ _ _ _ _ _ _ Hns with "Hheap Hstk Hufd Hcwda Hcha Hmy Hdep Hnpx").
+    iApply ("Hcont" with "Hw").
+  Qed.
+
+  Local Lemma wp_uk_clwq (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile) (pc : mword 64)
+      (uimm : mword 5) (crs1 crd : mword 3) (rs1 rd : mword 5) (dq : dfrac)
+      (a : Z) (wv : mword 32) (avail : nat) :
+    unot_sp rd ->
+    creg2reg_idx (Cregidx crs1) = Regidx rs1 ->
+    creg2reg_idx (Cregidx crd) = Regidx rd ->
+    a = uint (m !!! Regidx rs1) + uoff_c4 uimm ->
+    a mod 4 = 0 ->
+    uint rd <> 0 ->
+    uinstr_is (ukn_t N) pc true (C_LW (uimm, Cregidx crs1, Cregidx crd)) -∗
+    ubytesq (ukn_d N) dq a 4 (nth_byte wv) -∗
+    urun N h m pc avail -∗
+    (ubytesq (ukn_d N) dq a 4 (nth_byte wv) -∗
+       ∀ h' : CpuId,
+         urun N h'
+           (<[Regidx rd := regval_into_reg (sign_extend' 64 wv)]> m)
+           (add_vec_int pc 2) avail -∗
+         mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hns He1 He2 Ha Hal Hrd. iIntros "#Hi Hw Hrun Hcont".
+    iDestruct "Hrun" as (xi C pt Rfd Rut sz M pm fdv cw gn cs pidv) "(%Hlo & %Hpm & %Hlzf & %HRut & Hheap & Hstk & Hufd & Hcwda & Hcha & #Hmy & #Hdep & #Hnpx & Hb)".
+    iDestruct (uinstr_is_uk_instr with "Hheap Hi") as %Hui.
+    iDestruct (uheap_access (ukn_t N) (ukn_d N) (ukn_s N) M pm sz dq a 4 (nth_byte wv)
+                 ltac:(lia) ltac:(right; right; left; reflexivity) Hal
+                 with "Hheap Hw")
+      as %(Hua & Hcan & Hok & Hpg & Hal8 & Hmap).
+    assert (Htgt : (mword_of_int a : mword 64)
+                   = add_vec (m !!! Regidx rs1)
+                       (sign_extend' 64 (zero_extend' 12
+                          (concat_vec uimm ('b"00"))))).
+    { rewrite Ha /uoff_c4. rewrite <- moi_add. rewrite !moi_of_uint.
+      reflexivity. }
+    iApply (UkLoad.wp_uk_clw C pt Rfd Rut pm sz Hlo Hpm HRut Hlzf M m pc fdv cw gn cs pidv uimm crs1 crd rs1 rd
+              (mword_of_int a) (sign_extend' 64 wv) wv Hui He1 He2 Hrd Htgt
+              Hok
+              Hcan Hal8
+              ltac:(rewrite Hua; exact Hmap) eq_refl
+              with "Hb [Hheap Hstk Hufd Hcwda Hcha Hw Hcont]").
+    iApply (urun_close_upd _ _ _ m rd _ _ _ _ _ _ _ _ _ Hns with "Hheap Hstk Hufd Hcwda Hcha Hmy Hdep Hnpx").
+    iApply ("Hcont" with "Hw").
+  Qed.
+
+  Local Lemma wp_uk_lwuq (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile) (pc : mword 64)
+      (imm : mword 12) (rs1 rd : mword 5) (dq : dfrac) (a : Z)
+      (wv : mword 32) (avail : nat) :
+    unot_sp rd ->
+    a = uint (m !!! Regidx rs1) + uoff_i12 imm ->
+    a mod 4 = 0 ->
+    uint rd <> 0 ->
+    uinstr_is (ukn_t N) pc false (LOAD (imm, Regidx rs1, Regidx rd, true, 4)) -∗
+    ubytesq (ukn_d N) dq a 4 (nth_byte wv) -∗
+    urun N h m pc avail -∗
+    (ubytesq (ukn_d N) dq a 4 (nth_byte wv) -∗
+       ∀ h' : CpuId,
+         urun N h'
+           (<[Regidx rd := regval_into_reg (zero_extend' 64 wv)]> m)
+           (add_vec_int pc 4) avail -∗
+         mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hns Ha Hal Hrd. iIntros "#Hi Hw Hrun Hcont".
+    iDestruct "Hrun" as (xi C pt Rfd Rut sz M pm fdv cw gn cs pidv) "(%Hlo & %Hpm & %Hlzf & %HRut & Hheap & Hstk & Hufd & Hcwda & Hcha & #Hmy & #Hdep & #Hnpx & Hb)".
+    iDestruct (uinstr_is_uk_instr with "Hheap Hi") as %Hui.
+    iDestruct (uheap_access (ukn_t N) (ukn_d N) (ukn_s N) M pm sz dq a 4 (nth_byte wv)
+                 ltac:(lia) ltac:(right; right; left; reflexivity) Hal
+                 with "Hheap Hw")
+      as %(Hua & Hcan & Hok & Hpg & Hal8 & Hmap).
+    assert (Htgt : (mword_of_int a : mword 64)
+                   = add_vec (m !!! Regidx rs1) (sign_extend' 64 imm)).
+    { exact (umoi_add_i12 _ imm a Ha). }
+    iApply (UkLoad.wp_uk_lwu C pt Rfd Rut pm sz Hlo Hpm HRut Hlzf M m pc fdv cw gn cs pidv imm rs1 rd
+              (mword_of_int a) (zero_extend' 64 wv) wv Hui Hrd Htgt
+              Hok
+              Hcan Hal8
+              ltac:(rewrite Hua; exact Hmap) eq_refl
+              with "Hb [Hheap Hstk Hufd Hcwda Hcha Hw Hcont]").
+    iApply (urun_close_upd _ _ _ m rd _ _ _ _ _ _ _ _ _ Hns with "Hheap Hstk Hufd Hcwda Hcha Hmy Hdep Hnpx").
+    iApply ("Hcont" with "Hw").
+  Qed.
+
+  (* ===================================================================== *)
+  (* §4 CALLS.  Every call in runcmd and fork1 is [jal ra,<sym>] followed   *)
+  (* by a three-instruction usys.S stub or by a function that never         *)
+  (* returns, so two combinators cover the file: the [jal] itself, and      *)
+  (* [jal] + a QUIET stub + its [c.jr ra], which is the whole ABI a caller  *)
+  (* sees (callee-saved registers preserved, the result in a0).             *)
+  (* ===================================================================== *)
+  Local Lemma ushr_ridx_ne (r q : mword 5) :
+    uint r <> uint q -> Regidx r <> Regidx q.
+  Proof using .
+    intros H He. apply H.
+    assert (Hrq : r = q) by (injection He; trivial). rewrite Hrq. reflexivity.
+  Qed.
+
+  Local Lemma ushr_ridx_eq (r q : mword 5) :
+    uint r = uint q -> Regidx r = Regidx q.
+  Proof using .
+    intros H. f_equal. apply bv_eq. rewrite <- !(uint_unsigned_n 5). exact H.
+  Qed.
+
+  Local Lemma ushr_cs_bounds (q : mword 5) :
+    ucallee_saved_idx q = true ->
+    uint q = 2 \/ uint q = 3 \/ uint q = 4 \/ uint q = 8 \/ uint q = 9 \/
+    (18 <= uint q <= 27).
+  Proof using .
+    unfold ucallee_saved_idx. cbv zeta. intros H.
+    repeat (apply orb_true_iff in H as [H | H]).
+    all: first [ apply Z.eqb_eq in H; lia
+               | apply andb_true_iff in H as [H1 H2];
+                 apply Z.leb_le in H1; apply Z.leb_le in H2; lia ].
+  Qed.
+
+  (* a callee-saved index is none of ra, a0, a1, a2, a7 -- the five a call
+     sequence writes.  Stated over the VALUE so the caller says which. *)
+  Local Lemma ushr_cs_ne (q r : mword 5) :
+    ucallee_saved_idx q = true ->
+    (uint r = 1 \/ uint r = 10 \/ uint r = 11 \/ uint r = 12 \/ uint r = 17) ->
+    Regidx q <> Regidx r.
+  Proof using .
+    intros Hq Hr. apply ushr_ridx_ne.
+    destruct (ushr_cs_bounds q Hq) as [E | [E | [E | [E | [E | E]]]]];
+      destruct Hr as [Er | [Er | [Er | [Er | Er]]]]; lia.
+  Qed.
+
+  (* PUBLIC (lane E4): the specialised EXEC arm for the disciplined line
+     re-walks runcmd's EXEC arm in [UkShEcho.v], where the pinned exec
+     supply is nameable, and needs this ABI step and [wp_kshr_entry]. *)
+  Lemma wp_kshr_jal (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile) (pc tgt ret : Z)
+      (imm : mword 21) (avail : nat) :
+    (mword_of_int tgt : mword 64)
+      = add_vec (mword_of_int pc : mword 64) (sign_extend' 64 imm) ->
+    (mword_of_int ret : mword 64) = add_vec_int (mword_of_int pc : mword 64) 4 ->
+    eq_vec (access_vec_dec (mword_of_int tgt : mword 64) 0) ('b"0") = true ->
+    uinstr_is (ukn_t N) (mword_of_int pc) false (JAL (imm, Regidx ra_idx)) -∗
+    urun N h m (mword_of_int pc) avail -∗
+    (∀ h' : CpuId,
+       urun N h'
+         (<[Regidx ra_idx := (mword_of_int ret : mword 64)]> m)
+         (mword_of_int tgt) avail -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Htgt Hret Hal. iIntros "#Hi Hrun Hcont".
+    iApply (wp_uk_jal N h m (mword_of_int pc) imm ra_idx
+              (mword_of_int tgt) (mword_of_int ret) avail
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate)
+              Htgt Hret Hal with "Hi Hrun Hcont").
+  Qed.
+
+  (* the ABI, off a quiet stub's exact postcondition *)
+  Local Lemma wp_kshr_qcall (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile) (pc sym ret num : Z)
+      (imm : mword 21) (avail : nat)
+      (Hstub : forall (h0 : CpuId) (m0 : regfile) (av : nat),
+         shk_code (ukn_t N) -∗
+         urun N h0 m0 (mword_of_int sym) av -∗
+         (∀ (h1 : CpuId) (r : mword 64),
+            urun N h1
+              (<[Regidx a0_idx := r]>
+                 (<[Regidx a7_idx := (mword_of_int num : mword 64)]> m0))
+              (ret_pc (m0 !!! Regidx ra_idx)) av -∗
+            mWP (Loop : expr riscv_lang)) -∗
+         mWP (Loop : expr riscv_lang)) :
+    (mword_of_int sym : mword 64)
+      = add_vec (mword_of_int pc : mword 64) (sign_extend' 64 imm) ->
+    (mword_of_int ret : mword 64) = add_vec_int (mword_of_int pc : mword 64) 4 ->
+    eq_vec (access_vec_dec (mword_of_int sym : mword 64) 0) ('b"0") = true ->
+    ret_pc (mword_of_int ret : mword 64) = mword_of_int ret ->
+    shk_code (ukn_t N) -∗
+    uinstr_is (ukn_t N) (mword_of_int pc) false (JAL (imm, Regidx ra_idx)) -∗
+    urun N h m (mword_of_int pc) avail -∗
+    (∀ (h' : CpuId) (m' : regfile) (r : mword 64),
+       ⌜ ucallee_saved m m' ⌝ -∗
+       ⌜ m' !!! Regidx a0_idx = r ⌝ -∗
+       urun N h' m' (mword_of_int ret) avail -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hsym Hret Hal Hrp. iIntros "#Hcode #Hi Hrun Hcont".
+    iApply (wp_kshr_jal N h m pc sym ret imm avail Hsym Hret Hal
+              with "Hi Hrun").
+    iIntros (h1) "Hrun".
+    set (m1 := <[Regidx ra_idx := (mword_of_int ret : mword 64)]> m).
+    assert (Hra1 : m1 !!! Regidx ra_idx = (mword_of_int ret : mword 64))
+      by exact (upd_eq m (Regidx ra_idx) _).
+    iApply (Hstub h1 m1 avail with "Hcode Hrun").
+    iIntros (h2 r) "Hrun". rewrite Hra1 Hrp.
+    iApply ("Hcont" $! h2 _ r with "[%] [%] Hrun").
+    - intros q Hq.
+      rewrite (upd_ne _ (Regidx a0_idx) (Regidx q) r
+                 (ushr_cs_ne q a0_idx Hq
+                    ltac:(right; left; vm_compute; reflexivity))).
+      rewrite (upd_ne _ (Regidx a7_idx) (Regidx q) _
+                 (ushr_cs_ne q a7_idx Hq
+                    ltac:(right; right; right; right;
+                          vm_compute; reflexivity))).
+      rewrite /m1 (upd_ne m (Regidx ra_idx) (Regidx q) _
+                     (ushr_cs_ne q ra_idx Hq
+                        ltac:(left; vm_compute; reflexivity))).
+      reflexivity.
+    - exact (upd_eq _ (Regidx a0_idx) r).
+  Qed.
+
+  (* ===================================================================== *)
+  (* §4' THE SAME CALL, CARRYING A RESOURCE.                                *)
+  (*                                                                       *)
+  (* [wp_kshr_qcall]'s [Hstub] has a type with no room for one, which is    *)
+  (* right for the quiet stubs -- open, write, dup all take the run in and  *)
+  (* give the run back -- and wrong for CLOSE, which SPENDS a handle        *)
+  (* ([UkSh.wp_ksh_close]).  A caller closing an inherited descriptor has   *)
+  (* to hand one in, so the stub's type needs an [R] going in and an [S r]  *)
+  (* coming back.                                                          *)
+  (*                                                                       *)
+  (* THE STUB IS STATED AT THE ONE REGISTER FILE IT IS APPLIED TO, not at   *)
+  (* a ∀-bound [m0] as [wp_kshr_qcall]'s is.  That is forced by close: its  *)
+  (* precondition reads a0 (“the argument register IS the descriptor the    *)
+  (* handle is for”), and a fact about a0 cannot be supplied for an         *)
+  (* arbitrary register file -- only for the one this call actually builds, *)
+  (* [m] with ra re-armed.                                                  *)
+  (* ===================================================================== *)
+  Local Lemma wp_kshr_rcall (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile)
+      (pc sym ret num : Z) (imm : mword 21) (avail : nat)
+      (R : iProp Σ) (S : mword 64 -> iProp Σ)
+      (Hstub : forall (h0 : CpuId) (av : nat),
+         shk_code (ukn_t N) -∗
+         R -∗
+         urun N h0
+           (<[Regidx ra_idx := (mword_of_int ret : mword 64)]> m)
+           (mword_of_int sym) av -∗
+         (∀ (h1 : CpuId) (r : mword 64),
+            S r -∗
+            urun N h1
+              (<[Regidx a0_idx := r]>
+                 (<[Regidx a7_idx := (mword_of_int num : mword 64)]>
+                    (<[Regidx ra_idx := (mword_of_int ret : mword 64)]> m)))
+              (ret_pc ((<[Regidx ra_idx := (mword_of_int ret : mword 64)]> m)
+                         !!! Regidx ra_idx)) av -∗
+            mWP (Loop : expr riscv_lang)) -∗
+         mWP (Loop : expr riscv_lang)) :
+    (mword_of_int sym : mword 64)
+      = add_vec (mword_of_int pc : mword 64) (sign_extend' 64 imm) ->
+    (mword_of_int ret : mword 64) = add_vec_int (mword_of_int pc : mword 64) 4 ->
+    eq_vec (access_vec_dec (mword_of_int sym : mword 64) 0) ('b"0") = true ->
+    ret_pc (mword_of_int ret : mword 64) = mword_of_int ret ->
+    shk_code (ukn_t N) -∗
+    uinstr_is (ukn_t N) (mword_of_int pc) false (JAL (imm, Regidx ra_idx)) -∗
+    R -∗
+    urun N h m (mword_of_int pc) avail -∗
+    (∀ (h' : CpuId) (m' : regfile) (r : mword 64),
+       ⌜ ucallee_saved m m' ⌝ -∗
+       ⌜ m' !!! Regidx a0_idx = r ⌝ -∗
+       S r -∗
+       urun N h' m' (mword_of_int ret) avail -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hsym Hret Hal Hrp. iIntros "#Hcode #Hi HR Hrun Hcont".
+    iApply (wp_kshr_jal N h m pc sym ret imm avail Hsym Hret Hal
+              with "Hi Hrun").
+    iIntros (h1) "Hrun".
+    set (m1 := <[Regidx ra_idx := (mword_of_int ret : mword 64)]> m).
+    assert (Hra1 : m1 !!! Regidx ra_idx = (mword_of_int ret : mword 64))
+      by exact (upd_eq m (Regidx ra_idx) _).
+    iApply (Hstub h1 avail with "Hcode HR Hrun").
+    iIntros (h2 r) "HS Hrun". rewrite Hra1 Hrp.
+    iApply ("Hcont" $! h2 _ r with "[%] [%] HS Hrun").
+    - intros q Hq.
+      rewrite (upd_ne _ (Regidx a0_idx) (Regidx q) r
+                 (ushr_cs_ne q a0_idx Hq
+                    ltac:(right; left; vm_compute; reflexivity))).
+      rewrite (upd_ne _ (Regidx a7_idx) (Regidx q) _
+                 (ushr_cs_ne q a7_idx Hq
+                    ltac:(right; right; right; right;
+                          vm_compute; reflexivity))).
+      rewrite /m1 (upd_ne m (Regidx ra_idx) (Regidx q) _
+                     (ushr_cs_ne q ra_idx Hq
+                        ltac:(left; vm_compute; reflexivity))).
+      reflexivity.
+    - exact (upd_eq _ (Regidx a0_idx) r).
+  Qed.
+
+  (* ===================================================================== *)
+  (* SS4a THE QUIET STUB SHAPE, again -- DELETED (lane SUPPLY-SPLIT).        *)
+  (* [wp_kshr_qstub] was UkSh.v's [wp_ksh_qstub] copied here for a stage-5   *)
+  (* dup instantiation that never landed, and it had no callers at all.  Its *)
+  (* only live consequence was a [psok n] at an UNCONSTRAINED number: the    *)
+  (* stub excludes twelve numbers, which still leaves 16 / 17 / 18 / 19 / 20,*)
+  (* every one of them a CLAIM number.  A dead lemma is not a place to owe   *)
+  (* the application anything, so it is gone; [UkSh.wp_ksh_qstub] is the     *)
+  (* live shape and it takes its deposit as a premise.                      *)
+  (* ===================================================================== *)
+
+  (* ---- wait @0xc6a, SYS_wait = 3, AT A NULL STATUS POINTER ------------- *)
+  (* sh calls [wait] with a0 = 0 at all three of its call sites, so the      *)
+  (* row's null-guard arm is the one that fires and the heap crosses         *)
+  (* untouched -- the quiet shape, at a syscall that is not quiet.           *)
+  (* ...AND IT CARRIES sh's OWN HALF OF ITS CHILDREN SET, AT A NAME (lane
+     IO-LEAF, M3a): wait MOVES the set (the reap takes the reaped
+     generation out of it) and the move needs both halves.  sh used to
+     hand the index-free fragment to [UkRunSys.wp_uk_ecall_wait_any],
+     which DISCARDED the answer; the reaped child's escrow is what pays
+     sh back, so the answer is reported here and the wrapper is gone.
+     [wp_kshr_wait0] below is the index-free arm runcmd's LIST still
+     takes -- it reaps a child it forked for its side effects. *)
+  Lemma wp_kshr_wait (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile)
+      (avail : nat) (Sc : gset gname) :
+    uint (m !!! Regidx a0_idx) = 0 ->
+    shk_code (ukn_t N) -∗
+    urun N h m (mword_of_int ShSyms.wait) avail -∗
+    UserChildren.uch (ukn_ch N) Sc -∗
+    (∀ (h' : CpuId) (ret : mword 64) (Sc' : gset gname),
+       uwait_ans ret Sc Sc' -∗
+       urun N h'
+         (<[Regidx a0_idx := ret]>
+            (<[Regidx a7_idx := (mword_of_int 3 : mword 64)]> m))
+         (ret_pc (m !!! Regidx ra_idx)) avail -∗
+       UserChildren.uch (ukn_ch N) Sc' -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using Hpsok_free.
+    intros Ha0. iIntros "#Hcode Hrun Hch Hcont".
+    rewrite shr_wait.
+    (* ---- 0xc6a  c.li a7,3 ---- *)
+    iApply (wp_uk_cli N h m (mword_of_int 0xc6a)
+              (mword_of_int 3 : mword 6) a7_idx avail
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate) with "[] Hrun").
+    { iApply (uis_shk_c6a with "Hcode"). }
+    assert (Em : <[Regidx a7_idx
+                   := regval_into_reg (sign_extend' 64
+                        (mword_of_int 3 : mword 6) : mword 64)]> m
+                 = <[Regidx a7_idx := (mword_of_int 3 : mword 64)]> m)
+      by (f_equal; apply bv_eq; vm_compute; reflexivity).
+    assert (E0 : add_vec_int (mword_of_int 0xc6a : mword 64) 2
+                 = mword_of_int 0xc6c)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E0 Em. iIntros (h1) "Hrun".
+    set (m1 := <[Regidx a7_idx := (mword_of_int 3 : mword 64)]> m).
+    assert (Ha0_1 : uint (m1 !!! Regidx a0_idx) = 0).
+    { rewrite /m1 (upd_ne m (Regidx a7_idx) (Regidx a0_idx) _
+                     ltac:(vm_compute; discriminate)). exact Ha0. }
+    (* ---- 0xc6c  ecall -- the wait row at a null status pointer ---- *)
+    iApply (wp_uk_ecall_wait_null N h1 m1 (mword_of_int 0xc6c) avail Sc
+              ltac:(rewrite /m1 /usysno
+                      (upd_eq m (Regidx a7_idx) (mword_of_int 3 : mword 64));
+                    vm_compute; reflexivity)
+              Ha0_1
+              ltac:(vm_compute; reflexivity)
+              with "[] Hrun [] Hch").
+    { iApply (uis_shk_c6c with "Hcode"). }
+    { iApply udepw_of_psok; [ apply Hpsok_free; free_lit | ];
+      (discriminate || assumption || (vm_compute; discriminate)). }
+    assert (E1 : add_vec_int (mword_of_int 0xc6c : mword 64) 4
+                 = mword_of_int 0xc70)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E1. iIntros (h2 ret Sc') "Hans Hrun Hch".
+    set (m2 := <[Regidx a0_idx := ret]> m1).
+    assert (Hra : m2 !!! Regidx ra_idx = m !!! Regidx ra_idx).
+    { unfold m2, m1.
+      exact (eq_trans
+               (upd_ne m1 (Regidx a0_idx) (Regidx ra_idx) ret
+                  ltac:(vm_compute; discriminate))
+               (upd_ne m (Regidx a7_idx) (Regidx ra_idx)
+                  (mword_of_int 3 : mword 64)
+                  ltac:(vm_compute; discriminate))). }
+    iApply (wp_uk_cjr N h2 m2 (mword_of_int 0xc70) ra_idx
+              (ret_pc (m !!! Regidx ra_idx)) avail
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Hra; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_c70 with "Hcode"). }
+    iIntros (h3) "Hrun".
+    iApply ("Hcont" $! h3 ret Sc' with "Hans Hrun Hch").
+  Qed.
+
+  (* ...AND THE SAME CALL READ AGAINST sh's OWN PID (lane IO-LEAF, step 4):
+     the row a process that can name its pid takes
+     ([UkRunSys.wp_uk_ecall_wait_null_pid]) -- the middle form of the
+     answer ([UexecRet.uwait_ans_pid]) at the pid the row pinned, and the
+     kernel's row that a -1 leaves NO children -- which is what lets the
+     parent refute the failing arm against the token of the child it just
+     forked, and read the reaping arm as its own child's
+     ([UexecRet.uwait_ans_pid_mine]).  The fragment comes back untouched:
+     a process's pid never moves. *)
+  Lemma wp_kshr_wait_pid (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile)
+      (avail : nat) (Sc : gset gname) (p : Z) :
+    uint (m !!! Regidx a0_idx) = 0 ->
+    shk_code (ukn_t N) -∗
+    urun N h m (mword_of_int ShSyms.wait) avail -∗
+    UserChildren.uch (ukn_ch N) Sc -∗
+    UserChildren.upid (ukn_pid N) p -∗
+    (∀ (h' : CpuId) (ret : mword 64) (Sc' : gset gname) (pidv : mword 32),
+       ⌜bv_unsigned pidv = p⌝ -∗
+       UserChildren.upid (ukn_pid N) p -∗
+       ⌜ret = (mword_of_int (-1) : mword 64) -> Sc' = (∅ : gset gname)⌝ -∗
+       uwait_ans_pid ret Sc Sc' pidv -∗
+       urun N h'
+         (<[Regidx a0_idx := ret]>
+            (<[Regidx a7_idx := (mword_of_int 3 : mword 64)]> m))
+         (ret_pc (m !!! Regidx ra_idx)) avail -∗
+       UserChildren.uch (ukn_ch N) Sc' -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using Hpsok_free.
+    intros Ha0. iIntros "#Hcode Hrun Hch Hpid Hcont".
+    rewrite shr_wait.
+    (* ---- 0xc6a  c.li a7,3 ---- *)
+    iApply (wp_uk_cli N h m (mword_of_int 0xc6a)
+              (mword_of_int 3 : mword 6) a7_idx avail
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate) with "[] Hrun").
+    { iApply (uis_shk_c6a with "Hcode"). }
+    assert (Em : <[Regidx a7_idx
+                   := regval_into_reg (sign_extend' 64
+                        (mword_of_int 3 : mword 6) : mword 64)]> m
+                 = <[Regidx a7_idx := (mword_of_int 3 : mword 64)]> m)
+      by (f_equal; apply bv_eq; vm_compute; reflexivity).
+    assert (E0 : add_vec_int (mword_of_int 0xc6a : mword 64) 2
+                 = mword_of_int 0xc6c)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E0 Em. iIntros (h1) "Hrun".
+    set (m1 := <[Regidx a7_idx := (mword_of_int 3 : mword 64)]> m).
+    assert (Ha0_1 : uint (m1 !!! Regidx a0_idx) = 0).
+    { rewrite /m1 (upd_ne m (Regidx a7_idx) (Regidx a0_idx) _
+                     ltac:(vm_compute; discriminate)). exact Ha0. }
+    (* ---- 0xc6c  ecall -- the wait row at a null status pointer, at sh's
+       own pid ---- *)
+    iApply (wp_uk_ecall_wait_null_pid N h1 m1 (mword_of_int 0xc6c) avail Sc p
+              ltac:(rewrite /m1 /usysno
+                      (upd_eq m (Regidx a7_idx) (mword_of_int 3 : mword 64));
+                    vm_compute; reflexivity)
+              Ha0_1
+              ltac:(vm_compute; reflexivity)
+              with "[] Hrun [] Hch Hpid").
+    { iApply (uis_shk_c6c with "Hcode"). }
+    { iApply udepw_of_psok; [ apply Hpsok_free; free_lit | ];
+      (discriminate || assumption || (vm_compute; discriminate)). }
+    assert (E1 : add_vec_int (mword_of_int 0xc6c : mword 64) 4
+                 = mword_of_int 0xc70)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E1. iIntros (h2 ret Sc' pidv) "%Hpv Hpid %Hm1 Hans Hrun Hch".
+    set (m2 := <[Regidx a0_idx := ret]> m1).
+    assert (Hra : m2 !!! Regidx ra_idx = m !!! Regidx ra_idx).
+    { unfold m2, m1.
+      exact (eq_trans
+               (upd_ne m1 (Regidx a0_idx) (Regidx ra_idx) ret
+                  ltac:(vm_compute; discriminate))
+               (upd_ne m (Regidx a7_idx) (Regidx ra_idx)
+                  (mword_of_int 3 : mword 64)
+                  ltac:(vm_compute; discriminate))). }
+    iApply (wp_uk_cjr N h2 m2 (mword_of_int 0xc70) ra_idx
+              (ret_pc (m !!! Regidx ra_idx)) avail
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Hra; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_c70 with "Hcode"). }
+    iIntros (h3) "Hrun".
+    iApply ("Hcont" $! h3 ret Sc' pidv with "[%] Hpid [%] Hans Hrun Hch");
+      [ exact Hpv | exact Hm1 ].
+  Qed.
+
+  (* ---- exec @0xc9a, SYS_exec = 7 -- THE ARM THAT RETURNS --------------- *)
+  (* A successful exec never comes back to this WP: the new program's is     *)
+  (* minted from the new image.  So the stub's ONLY continuation is the      *)
+  (* failure, and the row pins it: -1, and not one byte moved.               *)
+  Lemma wp_kshr_exec (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile) (avail : nat) :
+    shk_code (ukn_t N) -∗
+    urun N h m (mword_of_int ShSyms.exec) avail -∗
+    (* the exec deposit, on the EXPLICIT route -- see [UkInit.wp_kinit_exec] *)
+    udepw N
+      (<[Regidx a7_idx := (mword_of_int 7 : mword 64)]> m)
+      (mword_of_int 0xc9c) USYS_exec -∗
+    (∀ h' : CpuId,
+       urun N h'
+         (<[Regidx a0_idx := (mword_of_int (-1) : mword 64)]>
+            (<[Regidx a7_idx := (mword_of_int 7 : mword 64)]> m))
+         (ret_pc (m !!! Regidx ra_idx)) avail -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    iIntros "#Hcode Hrun Hsbx Hcont".
+    rewrite shr_exec.
+    iApply (wp_uk_cli N h m (mword_of_int 0xc9a)
+              (mword_of_int 7 : mword 6) a7_idx avail
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate) with "[] Hrun").
+    { iApply (uis_shk_c9a with "Hcode"). }
+    assert (Em : <[Regidx a7_idx
+                   := regval_into_reg (sign_extend' 64
+                        (mword_of_int 7 : mword 6) : mword 64)]> m
+                 = <[Regidx a7_idx := (mword_of_int 7 : mword 64)]> m)
+      by (f_equal; apply bv_eq; vm_compute; reflexivity).
+    assert (E0 : add_vec_int (mword_of_int 0xc9a : mword 64) 2
+                 = mword_of_int 0xc9c)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E0 Em. iIntros (h1) "Hrun".
+    set (m1 := <[Regidx a7_idx := (mword_of_int 7 : mword 64)]> m).
+    iApply (wp_uk_ecall_exec N h1 m1 (mword_of_int 0xc9c) avail
+              ltac:(rewrite /m1 /usysno
+                      (upd_eq m (Regidx a7_idx) (mword_of_int 7 : mword 64));
+                    vm_compute; reflexivity)
+              ltac:(vm_compute; reflexivity)
+              with "[] Hrun Hsbx").
+    { iApply (uis_shk_c9c with "Hcode"). }
+    assert (E1 : add_vec_int (mword_of_int 0xc9c : mword 64) 4
+                 = mword_of_int 0xca0)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E1. iIntros (h2) "Hrun".
+    set (m2 := <[Regidx a0_idx := (mword_of_int (-1) : mword 64)]> m1).
+    assert (Hra : m2 !!! Regidx ra_idx = m !!! Regidx ra_idx).
+    { unfold m2, m1.
+      exact (eq_trans
+               (upd_ne m1 (Regidx a0_idx) (Regidx ra_idx) _
+                  ltac:(vm_compute; discriminate))
+               (upd_ne m (Regidx a7_idx) (Regidx ra_idx)
+                  (mword_of_int 7 : mword 64)
+                  ltac:(vm_compute; discriminate))). }
+    iApply (wp_uk_cjr N h2 m2 (mword_of_int 0xca0) ra_idx
+              (ret_pc (m !!! Regidx ra_idx)) avail
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Hra; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_ca0 with "Hcode"). }
+    iIntros (h3) "Hrun". iApply ("Hcont" $! h3 with "Hrun").
+  Qed.
+
+  (* ---- fork @0xc5a, SYS_fork = 1 -- THE STUB THAT RETURNS TWICE -------- *)
+  (* Both arms come back through the same [c.jr ra] at 0xc60, the child's    *)
+  (* under fresh names -- which is why the payload has to carry the CODE:    *)
+  (* without [shk_code] at the child's text name it cannot walk its return.  *)
+  (* [D] rides through exactly as it does at the leaf: sh's descriptors are
+     the point of the PIPE and REDIR arms, and both processes get them. *)
+  (* CWD-INDEXED (lane E4): the leaf already hands both processes the same
+     working directory ([UkFork.wp_uk_ecall_fork_any] at [cwv]), so the
+     VALUE crosses the fork and the arm can name it.  [wp_kshr_fork1_any]
+     below is the index-free corollary every other caller still takes. *)
+  (* THE THREE BINDERS THE GENERAL LEAF OPENS (lane IO-LEAF, M3a).  sh used
+     to fork through [UkFork.wp_uk_ecall_fork_any], which hard-wired the
+     child's payload at [fun _ => True], the lend at [emp] and the
+     children set at an existential, and DROPPED the token the pid arm
+     mints.  The console credential travels on exactly those three, so the
+     wrapper is gone and the values are the caller's; a caller that wants
+     none of it passes [∅ / fun _ => True / emp] and gets back what the
+     wrapper used to give. *)
+  (* ...AT A NAMED TABLE VIEW (seccomp S4): the parent keeps its view and
+     the child is handed it ([UkFork.wp_uk_ecall_fork_at]) *)
+  Lemma wp_kshr_fork_at (N : uk_names Σ) `{!ukn_const N} (P : gname -> gname -> gname -> iProp Σ)
+      `{FP : !Forkable P} (szv : Z) (l v : list fdstate) (D : gmap nat fdstate)
+      (h : CpuId) (m : regfile) (avail : nat) (cw : Z)
+      (Sc : gset gname) (Q : Z -> iProp Σ) (Rc : iProp Σ) :
+    (* the child's own walk is stated at [UkRun.ukn_const], so the payload
+       the parent chooses has to be status-independent
+       ([UserConsole.ucons_pay_const]'s mould) *)
+    (forall x y : Z, Q x = Q y) ->
+    shk_code (ukn_t N) -∗ P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+    UserFd.ustd_at (ukn_fd N) l v -∗
+    UserCwd.ucwd (ukn_cwd N) cw -∗
+    (* ...AND sh's OWN HALF OF ITS CHILDREN SET, AT A NAME: fork MOVES the
+       set and an update needs both halves, and the pid arm has to say
+       which generation joined it -- which is what makes the token the
+       parent keeps redeemable at the wait. *)
+    UserChildren.uch (ukn_ch N) Sc -∗
+    ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+    (* WHAT THE PARENT LENDS THE CHILD, and HOW A KILLER PAYS FOR IT *)
+    Rc -∗
+    □ (app_taint -∗ Q (-1)) -∗
+    urun N h m (mword_of_int ShSyms.fork) avail -∗
+    ((∀ (h' : CpuId) (r : mword 64),
+        ⌜ r <> (mword_of_int 0 : mword 64) ⌝ -∗
+        (* FORK'S TWO ARMS, verbatim from the leaf: it FAILED, and what was
+           lent comes back (lane FORK-REFUND); or it returned the child's
+           pid, and the parent gets the quarter a later wait() redeems
+           beside the set grown by that child's generation. *)
+        ((⌜r = (mword_of_int (-1) : mword 64)⌝ ∗
+            UserChildren.uch (ukn_ch N) Sc ∗ Rc)
+         ∨ ∃ (γ : gname) (pidv : mword 32),
+             ⌜r = (sign_extend' 64 pidv : mword 64)⌝ ∗
+             ⌜(1 <= bv_unsigned pidv <= PIDMAX)%Z⌝ ∗
+             (* ...AND THE GENERATION IS FRESH (design app-pipe SS4.3y,
+                lane SH-PIPE-ROUND-11): the leaf's own row
+                ([UkFork.wp_uk_ecall_fork]'s parent arm, out of
+                [UexecRet.ufork_ans]), relayed instead of dropped.  What it
+                buys is that a caller forking TWICE grows its children set
+                twice, so a pipeline round can tell its two children's
+                payloads apart; every other caller introduces and drops
+                it. *)
+             ⌜γ ∉ Sc⌝ ∗
+             child_tok γ pidv Q ∗
+             UserChildren.uch (ukn_ch N) (Sc ∪ {[γ]})) -∗
+        P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+        UserFd.ustd_at (ukn_fd N) l v -∗
+        UserCwd.ucwd (ukn_cwd N) cw -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+        urun N h'
+          (<[Regidx a0_idx := r]>
+             (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m))
+          (ret_pc (m !!! Regidx ra_idx)) avail -∗
+        mWP (Loop : expr riscv_lang)) ∗
+     (∀ (N' : uk_names Σ) (h' : CpuId) (γ' : gname),
+        (* THE CHILD'S PAYLOAD IS THE ONE THE PARENT CHOSE, as an equation
+           on the record this arm mints, and the child gets what it was
+           lent.  At [Q := fun _ => True] this is [UkRun.ukn_triv] and the
+           arm reads exactly as it did before. *)
+        ⌜ ukn_pay N' = Q ⌝ -∗
+        (* ...AND ITS HELD SET IS SH'S OWN (lane OFF-HAND-4, S1/S2): the
+           fork leaf mints the child at the set the parent chose, and this
+           arm passes sh's along.  The child's exec of /echo relays it to
+           echo's entry ([UkShFork.ushf_child_law]). *)
+        my_pay γ' Q -∗
+        Rc -∗
+        shk_code (ukn_t N') -∗ P (ukn_t N') (ukn_d N') (ukn_s N') -∗ usz (ukn_s N') szv -∗
+        UserFd.ustd_at (ukn_fd N') l v -∗
+        UserCwd.ucwd (ukn_cwd N') cw -∗
+        UserChildren.uch (ukn_ch N') ∅ -∗
+        (* ...AND ITS OWN PID, AS A HANDLE, WITH THE ONE FACT THAT MAKES IT
+           WORTH HAVING (design app-pipe SS4.3w, purchase 1).  The leaf
+           MINTS it -- [UkFork.wp_uk_ecall_fork]'s child arm hands out
+           [∃ p, ⌜p <> 1⌝ ∗ upid (ukn_pid N') p], "a forked child is the
+           one process that can PROVE it is not <init>" -- and this stub
+           used to DROP it on the floor.  That drop is what left a
+           pipeline round's two reaps PID-ERASED: [UexecRet.uwait_ans]
+           quantifies the caller's pid, so the reaping arm's
+           [γ' ∈ cs \/ pidv = 1] is satisfied by its right disjunct and
+           names nobody (lane SH-PIPE-ROUND-10, witness
+           [UShPipeAssembly.uwait_ans_orphan_arm]).  The pid-carrying wait
+           ([wp_kshr_wait_pid] above) is what refutes it, and it asks for
+           exactly this fragment.  Relayed VERBATIM: a caller that does
+           not want it introduces it and drops it. *)
+        (∃ p : Z, ⌜p <> 1⌝ ∗ UserChildren.upid (ukn_pid N') p) -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N') fd st) -∗
+        urun N' h'
+          (<[Regidx a0_idx := (mword_of_int 0 : mword 64)]>
+             (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m))
+          (ret_pc (m !!! Regidx ra_idx)) avail -∗
+        mWP (Loop : expr riscv_lang))) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HQc.
+    iIntros "#Hcode HP Hsz Hstd Hcwd Hch HD HRc #Hkw Hrun [Hpar Hchi]".
+    rewrite shr_fork.
+    iApply (wp_uk_cli N h m (mword_of_int 0xc5a)
+              (mword_of_int 1 : mword 6) a7_idx avail
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate) with "[] Hrun").
+    { iApply (uis_shk_c5a with "Hcode"). }
+    assert (Em : <[Regidx a7_idx
+                   := regval_into_reg (sign_extend' 64
+                        (mword_of_int 1 : mword 6) : mword 64)]> m
+                 = <[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m)
+      by (f_equal; apply bv_eq; vm_compute; reflexivity).
+    assert (E0 : add_vec_int (mword_of_int 0xc5a : mword 64) 2
+                 = mword_of_int 0xc5c)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E0 Em. iIntros (h1) "Hrun".
+    set (m1 := <[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m).
+    iApply (wp_uk_ecall_fork_at N h1 m1 (mword_of_int 0xc5c) avail szv l D cw v
+              Sc Q Rc
+              (fun gt gd gs => (shk_code gt ∗ P gt gd gs)%I)
+              (FP := forkable_sep (fun gt _ _ => shk_code gt) P
+                       forkable_shk_code FP)
+              ltac:(rewrite /m1 /usysno
+                      (upd_eq m (Regidx a7_idx) (mword_of_int 1 : mword 64));
+                    vm_compute; reflexivity)
+              ltac:(vm_compute; reflexivity)
+              with "[] HRc [HP] Hsz Hstd HD Hcwd Hch Hkw Hrun").
+    { iApply (uis_shk_c5c with "Hcode"). }
+    { iSplitR; [ iExact "Hcode" | iExact "HP" ]. }
+    assert (E1 : add_vec_int (mword_of_int 0xc5c : mword 64) 4
+                 = mword_of_int 0xc60)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E1.
+    assert (Hraf : forall (r : mword 64),
+              (<[Regidx a0_idx := r]> m1) !!! Regidx ra_idx
+              = m !!! Regidx ra_idx).
+    { intros r. rewrite /m1.
+      exact (eq_trans
+               (upd_ne m1 (Regidx a0_idx) (Regidx ra_idx) r
+                  ltac:(vm_compute; discriminate))
+               (upd_ne m (Regidx a7_idx) (Regidx ra_idx)
+                  (mword_of_int 1 : mword 64)
+                  ltac:(vm_compute; discriminate))). }
+    iSplitL "Hpar".
+    - iIntros (hp r) "%Hr Hans [#Hcp HP] Hsz Hstd HD Hcwd Hrun".
+      iApply (wp_uk_cjr N hp (<[Regidx a0_idx := r]> m1)
+                (mword_of_int 0xc60) ra_idx
+                (ret_pc (m !!! Regidx ra_idx)) avail
+                ltac:(vm_compute; discriminate)
+                ltac:(rewrite (Hraf r); reflexivity)
+                with "[] Hrun").
+      { iApply (uis_shk_c60 with "Hcp"). }
+      iIntros (hp2) "Hrun".
+      iApply ("Hpar" $! hp2 r with "[%] Hans HP Hsz Hstd Hcwd HD Hrun").
+      exact Hr.
+    - iIntros (N' hc γ') "%Hpeq Hmy HRc [#Hck HP] Hsz Hstd HD Hcwd Hch Hpid Hrun".
+      (* the weaker class the rest of sh's walk is stated at: the record
+         the arm minted is keyed at [Q], and [Q] does not read the status *)
+      pose proof (ukn_const_of_eq N' Q Hpeq HQc) as Hcst'.
+      iApply (wp_uk_cjr N' hc
+                (<[Regidx a0_idx := (mword_of_int 0 : mword 64)]> m1)
+                (mword_of_int 0xc60) ra_idx
+                (ret_pc (m !!! Regidx ra_idx)) avail
+                ltac:(vm_compute; discriminate)
+                ltac:(rewrite (Hraf (mword_of_int 0 : mword 64)); reflexivity)
+                with "[] Hrun").
+      { iApply (uis_shk_c60 with "Hck"). }
+      iIntros (hc2) "Hrun".
+      iApply ("Hchi" $! N' hc2 γ'
+                with "[%] Hmy HRc Hck HP Hsz Hstd Hcwd Hch Hpid HD Hrun").
+      exact Hpeq.
+  Qed.
+
+  Lemma wp_kshr_fork (N : uk_names Σ) `{!ukn_const N} (P : gname -> gname -> gname -> iProp Σ)
+      `{FP : !Forkable P} (szv : Z) (l : list fdstate) (D : gmap nat fdstate)
+      (h : CpuId) (m : regfile) (avail : nat) (cw : Z)
+      (Sc : gset gname) (Q : Z -> iProp Σ) (Rc : iProp Σ) :
+    (forall x y : Z, Q x = Q y) ->
+    shk_code (ukn_t N) -∗ P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+    UserFd.ustd (ukn_fd N) l -∗
+    UserCwd.ucwd (ukn_cwd N) cw -∗
+    (* ...AND sh's OWN HALF OF ITS CHILDREN SET, AT A NAME: fork MOVES the
+       set and an update needs both halves, and the pid arm has to say
+       which generation joined it -- which is what makes the token the
+       parent keeps redeemable at the wait. *)
+    UserChildren.uch (ukn_ch N) Sc -∗
+    ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+    (* WHAT THE PARENT LENDS THE CHILD, and HOW A KILLER PAYS FOR IT *)
+    Rc -∗
+    □ (app_taint -∗ Q (-1)) -∗
+    urun N h m (mword_of_int ShSyms.fork) avail -∗
+    ((∀ (h' : CpuId) (r : mword 64),
+        ⌜ r <> (mword_of_int 0 : mword 64) ⌝ -∗
+        (* FORK'S TWO ARMS, verbatim from the leaf: it FAILED, and what was
+           lent comes back (lane FORK-REFUND); or it returned the child's
+           pid, and the parent gets the quarter a later wait() redeems
+           beside the set grown by that child's generation. *)
+        ((⌜r = (mword_of_int (-1) : mword 64)⌝ ∗
+            UserChildren.uch (ukn_ch N) Sc ∗ Rc)
+         ∨ ∃ (γ : gname) (pidv : mword 32),
+             ⌜r = (sign_extend' 64 pidv : mword 64)⌝ ∗
+             ⌜(1 <= bv_unsigned pidv <= PIDMAX)%Z⌝ ∗
+             (* ...AND THE GENERATION IS FRESH (design app-pipe SS4.3y,
+                lane SH-PIPE-ROUND-11): the leaf's own row
+                ([UkFork.wp_uk_ecall_fork]'s parent arm, out of
+                [UexecRet.ufork_ans]), relayed instead of dropped.  What it
+                buys is that a caller forking TWICE grows its children set
+                twice, so a pipeline round can tell its two children's
+                payloads apart; every other caller introduces and drops
+                it. *)
+             ⌜γ ∉ Sc⌝ ∗
+             child_tok γ pidv Q ∗
+             UserChildren.uch (ukn_ch N) (Sc ∪ {[γ]})) -∗
+        P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+        UserFd.ustd (ukn_fd N) l -∗
+        UserCwd.ucwd (ukn_cwd N) cw -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+        urun N h'
+          (<[Regidx a0_idx := r]>
+             (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m))
+          (ret_pc (m !!! Regidx ra_idx)) avail -∗
+        mWP (Loop : expr riscv_lang)) ∗
+     (∀ (N' : uk_names Σ) (h' : CpuId) (γ' : gname),
+        (* THE CHILD'S PAYLOAD IS THE ONE THE PARENT CHOSE, as an equation
+           on the record this arm mints, and the child gets what it was
+           lent.  At [Q := fun _ => True] this is [UkRun.ukn_triv] and the
+           arm reads exactly as it did before. *)
+        ⌜ ukn_pay N' = Q ⌝ -∗
+        (* ...AND ITS HELD SET IS SH'S OWN (lane OFF-HAND-4, S1/S2): the
+           fork leaf mints the child at the set the parent chose, and this
+           arm passes sh's along.  The child's exec of /echo relays it to
+           echo's entry ([UkShFork.ushf_child_law]). *)
+        my_pay γ' Q -∗
+        Rc -∗
+        shk_code (ukn_t N') -∗ P (ukn_t N') (ukn_d N') (ukn_s N') -∗ usz (ukn_s N') szv -∗
+        UserFd.ustd (ukn_fd N') l -∗
+        UserCwd.ucwd (ukn_cwd N') cw -∗
+        UserChildren.uch (ukn_ch N') ∅ -∗
+        (* ...AND ITS OWN PID, AS A HANDLE, WITH THE ONE FACT THAT MAKES IT
+           WORTH HAVING (design app-pipe SS4.3w, purchase 1).  The leaf
+           MINTS it -- [UkFork.wp_uk_ecall_fork]'s child arm hands out
+           [∃ p, ⌜p <> 1⌝ ∗ upid (ukn_pid N') p], "a forked child is the
+           one process that can PROVE it is not <init>" -- and this stub
+           used to DROP it on the floor.  That drop is what left a
+           pipeline round's two reaps PID-ERASED: [UexecRet.uwait_ans]
+           quantifies the caller's pid, so the reaping arm's
+           [γ' ∈ cs \/ pidv = 1] is satisfied by its right disjunct and
+           names nobody (lane SH-PIPE-ROUND-10, witness
+           [UShPipeAssembly.uwait_ans_orphan_arm]).  The pid-carrying wait
+           ([wp_kshr_wait_pid] above) is what refutes it, and it asks for
+           exactly this fragment.  Relayed VERBATIM: a caller that does
+           not want it introduces it and drops it. *)
+        (∃ p : Z, ⌜p <> 1⌝ ∗ UserChildren.upid (ukn_pid N') p) -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N') fd st) -∗
+        urun N' h'
+          (<[Regidx a0_idx := (mword_of_int 0 : mword 64)]>
+             (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m))
+          (ret_pc (m !!! Regidx ra_idx)) avail -∗
+        mWP (Loop : expr riscv_lang))) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HQc.
+    iIntros "#Hcode HP Hsz Hstd Hcwd Hch HD HRc #Hkw Hrun [Hpar Hchi]".
+    iDestruct (ustd_ustd_at with "Hstd") as (v) "Hstd".
+    iApply (wp_kshr_fork_at N P szv l v D h m avail cw Sc Q Rc HQc
+              with "Hcode HP Hsz Hstd Hcwd Hch HD HRc Hkw Hrun").
+    iSplitL "Hpar".
+    - iIntros (hp r) "%Hr Hans HP Hsz Hstd Hcwd HD Hrun".
+      iApply ("Hpar" $! hp r with "[%] Hans HP Hsz [Hstd] Hcwd HD Hrun");
+        [ exact Hr | by iApply ustd_at_ustd ].
+    - iIntros (N' hc γ') "%Hpeq Hmy HRc Hck HP Hsz Hstd Hcwd Hch Hpid HD Hrun".
+      iApply ("Hchi" $! N' hc γ'
+                with "[%] Hmy HRc Hck HP Hsz [Hstd] Hcwd Hch Hpid HD Hrun");
+        [ exact Hpeq | by iApply ustd_at_ustd ].
+  Qed.
+
+  (* THE INDEX-FREE COROLLARY [wp_kshr_fork_any] IS GONE (lane IO-LEAF,
+     M3b): it hard-wired the child's payload at [fun _ => True] and had
+     no callers -- [wp_kshr_fork1] goes straight to [wp_kshr_fork] with
+     the three binders open.  What hides the SET and the working
+     directory is [wp_kshr_fork1_any] below, and it hides neither the
+     payload nor the credential any more. *)
+
+  (* ===================================================================== *)
+  (* §5 THE DIAGNOSTIC CUT -- THE FILE'S ONE HYPOTHESIS.                    *)
+  (*                                                                       *)
+  (* Three pcs hand control to sh's printer and none of them comes back:    *)
+  (*                                                                       *)
+  (*   0x4a  panic(s)                     -- fork1's -1 arm, PIPE's failure *)
+  (*   0xda  the exec-failed tail          -- inside runcmd's EXEC arm      *)
+  (*   0x10e the open-failed tail          -- inside runcmd's REDIR arm     *)
+  (*                                                                       *)
+  (* Each runs [fprintf] (0x108e, 279 instructions with vprintf and putc    *)
+  (* under it) and then [exit].  The walk is [UkShDiag.v]'s, so the cut     *)
+  (* here is the subtree as ONE premise, at those three pcs, with exactly   *)
+  (* what each site has in hand:                                            *)
+  (*                                                                       *)
+  (*  - panic is entered with a0 naming one of sh's THREE panic messages    *)
+  (*    (fork, runcmd, pipe), and needs nothing but the image: its own      *)
+  (*    string is .rodata, and so is the "%s\n" it prints it through;       *)
+  (*  - the two tails are entered with s1 still on the node, and each reads *)
+  (*    ONE heap string through it, so each is handed that pointer word,    *)
+  (*    that string and the node's 8-alignment -- all three [DfracDiscarded] *)
+  (*    or pure, and all three straight out of [ush_cmd].                   *)
+  (*                                                                       *)
+  (* Nothing here is quantified away: every premise is satisfied by a       *)
+  (* resource a real caller holds, and [UkShDiag.ush_diag_leaf_holds] is    *)
+  (* the proof of it.  TAINT SET: every lemma below carries it --           *)
+  (* [wp_kshr_fork1], [wp_kshr_runcmd] and the five arm lemmas -- and says  *)
+  (* so in its header; [UkShDiag.wp_kshr_runcmd_final] and                  *)
+  (* [_fork1_final] are those two with it supplied.                         *)
+  (* ===================================================================== *)
+  Definition ush_panic_msg (z : Z) : Prop :=
+    z = 0x1288 \/ z = 0x1290 \/ z = 0x12b8.
+
+  (* The two tails' first instruction is [c.ld a2,<k>(s1)], and a [c.ld] is
+     8-aligned or it is not a step at all -- so the node's own alignment,
+     which every caller has out of [ush_cmd], is part of what the site
+     hands over. *)
+  Definition ush_diag_at (pc : Z) (m : regfile) : Prop :=
+    (pc = ShSyms.panic /\ ush_panic_msg (uint (m !!! Regidx a0_idx)))
+    \/ (pc = 0xda /\ uint (m !!! Regidx s1_idx) mod 8 = 0)
+    \/ (pc = 0x10e /\ uint (m !!! Regidx s1_idx) mod 8 = 0).
+
+  Definition ush_diag_res (g : gname) (pc : Z) (m : regfile) : iProp Σ :=
+    (if decide (pc = 0xda) then
+       ∃ x : uarg, ush_ptr g (uint (m !!! Regidx s1_idx) + 8) (ua_ptr x)
+                   ∗ ush_str g x
+     else if decide (pc = 0x10e) then
+       ∃ x : uarg, ush_ptr g (uint (m !!! Regidx s1_idx) + 16) (ua_ptr x)
+                   ∗ ush_str g x
+     else emp)%I.
+
+  Lemma ush_diag_res_panic (g : gname) (m : regfile) :
+    ush_diag_res g ShSyms.panic m = emp%I.
+  Proof using .
+    rewrite /ush_diag_res.
+    destruct (decide (ShSyms.panic = 0xda)) as [Hc | _];
+      [ exfalso; unfold ShSyms.panic in Hc; discriminate Hc | ].
+    destruct (decide (ShSyms.panic = 0x10e)) as [Hc | _];
+      [ exfalso; unfold ShSyms.panic in Hc; discriminate Hc | ].
+    reflexivity.
+  Qed.
+
+  (* [shk_rodata] IS NOT DECORATION.  All three sites read a format
+     string out of .rodata (0x1280, 0x1298, 0x12a8) and panic's own '%s'
+     argument is a .rodata literal too; none of them is in
+     [ShInstrs.sh_bytes], so [shk_code] cannot produce them and the premise
+     is not dischargeable without this conjunct.  It costs its callers
+     nothing: [ush_jtab] carries it and every site already holds one. *)
+  (* ...AND THE EXIT PAYLOAD IS PART OF WHAT THE SITE HANDS OVER (lane
+     KILL-PAY, K4(a)).  All three diagnostics END IN [exit(1)], and exit's
+     leaf takes the payload out of the PROGRAM's own hand now
+     ([UkRunSys.wp_uk_ecall_exit]): [UkRun.urun]'s row is a WAND from the
+     kill credential and there is nothing in it to spend.  A LINEAR
+     premise and not a Coq-level [⊢ ukn_pay N (-1)], because the caller
+     that is NOT at a trivial record is real -- sh's own [fork1] panics
+     when fork fails, and sh's payload is the console lease.  A forked
+     child passes [UkRun.ukn_pay_free_of_triv]. *)
+  Hypothesis ush_diag_leaf :
+    forall (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile) (pc : Z) (n : nat),
+      ush_diag_at pc m ->
+      UkSh.sh_deps -∗
+      shk_code (ukn_t N) -∗
+      shk_rodata (ukn_t N) -∗
+      ush_diag_res (ukn_d N) pc m -∗
+      ukn_pay N (-1) -∗
+      urun N h m (mword_of_int pc) (Dg + n) -∗
+      mWP (Loop : expr riscv_lang).
+
+  (* ===================================================================== *)
+  (* §6 fork1 @0x68 -- fork, and panic if it failed.                        *)
+  (*                                                                       *)
+  (* TWO-WORD FRAME, spilled and restored, and it CROSSES THE FORK: the     *)
+  (* child returns through the same epilogue, so it needs its own copy of   *)
+  (* the two words AT THEIR VALUES -- which is why the payload carries      *)
+  (* [uword] at [vra] and [vs0] and not an existential [ustack].  (An       *)
+  (* [ustack] would forget the spilled ra and the child would return to an  *)
+  (* unnamed address.)                                                      *)
+  (*                                                                       *)
+  (* THE -1 ARM'S PANIC IS THE CALLER'S (lane IO-LEAF, M4b(2)): the tail   *)
+  (* and [wp_kshr_fork1] hand the run at [panic]'s entry back to the site,  *)
+  (* which pays "fork\n" however it can -- [wp_kshr_fork1_any] below on the *)
+  (* free law ([ush_diag_leaf]), sh's own fork arm through the era's links  *)
+  (* ([UkShFork.wp_kshf_fork]).                                             *)
+  (* ===================================================================== *)
+
+  (* the shared tail, 0x74..0x80 plus the panic branch, at WHATEVER gname
+     triple the arm that reached it is running under *)
+  Local Lemma wp_kshr_fork1_tail (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (mt : regfile)
+      (sp0 vra vs0 : mword 64) (n : nat)
+      (* WHAT THE PANIC IS PAID WITH (lane IO-LEAF, M4b(2)): the site's
+         own resource, abstract here.  It rides through the tail and comes
+         back out on BOTH arms -- to the panic continuation when fork
+         failed, to the returning one otherwise. *)
+      (X : iProp Σ) :
+    uint sp0 mod 8 = 0 ->
+    16 <= uint sp0 ->
+    mt !!! Regidx csp_rs1 = add_vec_int sp0 (- (8 * Z.of_nat 2)) ->
+    shk_code (ukn_t N) -∗
+    shk_rodata (ukn_t N) -∗
+    uword (ukn_d N) (uint sp0 - 8) vra -∗
+    (* WHAT THE PANIC SPENDS, BORROWED (lane KILL-PAY, K4(a); lane
+       IO-LEAF, M4b(2)).  The [-1] arm of this tail is [panic("fork")],
+       which writes and then ends in [exit]; what it spends is the site's
+       [X] -- used to be this record's exit payload, is now whatever the
+       site pays the message and the exit with.  The RETURNING arm spends
+       nothing, so the resource comes straight back out of the
+       continuation below.  Two exclusive branches, one resource. *)
+    uword (ukn_d N) (uint sp0 - 16) vs0 -∗
+    (* ...OR THE FACT THAT THE PANIC IS UNREACHABLE (lane IO-LEAF, M3a).
+       The tail runs in BOTH processes and only the parent can see -1, so
+       the CHILD -- whose a0 is 0 on the nose -- pays nothing here.  It used
+       to pay for free because its record was trivial; once the child's
+       payload is the parent's choice, the disjunct is what stands in for
+       [UkRun.ukn_pay_free_of_triv]. *)
+    (X ∨ ⌜ mt !!! Regidx a0_idx = (mword_of_int 0 : mword 64) ⌝) -∗
+    urun N h mt (mword_of_int 0x74) (Dg + n) -∗
+    (* THE PANIC, at the site's hand (M4b(2)): fork returned -1, a0 is the
+       address of "fork", and the run is at [panic]'s entry with the
+       diagnostic subtree's stack need in hand. *)
+    (∀ (h' : CpuId) (m' : regfile),
+       ⌜ uint (m' !!! Regidx a0_idx) = 0x1288 ⌝ -∗
+       ⌜ mt !!! Regidx a0_idx = (mword_of_int (-1) : mword 64) ⌝ -∗
+       X -∗
+       urun N h' m' (mword_of_int ShSyms.panic) (Dg + n) -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    (∀ (h' : CpuId) (m' : regfile),
+       ⌜ forall q : mword 5, uint q <> 1 -> uint q <> 2 -> uint q <> 8 ->
+           uint q <> 15 -> m' !!! Regidx q = mt !!! Regidx q ⌝ -∗
+       (* ...AND THE RETURN VALUE IS NOT -1 (design app-pipe SS4.3w,
+          purchase 3).  The [beq a0,a5] at 0x76 is fork1's whole body --
+          the panic arm above is the taken branch, this is the fallen
+          one -- so the fact is free here and derivable NOWHERE ELSE: a
+          caller sees only [r <> 0].  What it buys is a fork ANSWER whose
+          [-1] disjunct is refuted, which is what a pipeline round needs
+          at 0xea to have two live children. *)
+       ⌜ mt !!! Regidx a0_idx <> (mword_of_int (-1) : mword 64) ⌝ -∗
+       ⌜ m' !!! Regidx ra_idx = vra ⌝ -∗
+       ⌜ m' !!! Regidx s0_idx = vs0 ⌝ -∗
+       ⌜ m' !!! Regidx csp_rs1 = sp0 ⌝ -∗
+       (* ...and back, unspent: fork1 returned *)
+       (X ∨ ⌜ mt !!! Regidx a0_idx = (mword_of_int 0 : mword 64) ⌝) -∗
+       urun N h' m' (ret_pc vra) (2 + (Dg + n)) -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hal8 Hlo Hsp.
+    iIntros "#Hcode #Hro Hw8 Hw0 Hpayv Hrun Hpanic Hcont".
+    assert (Hbsp1 : bv_unsigned (add_vec_int sp0 (- (8 * Z.of_nat 2)))
+                    = bv_unsigned sp0 - 16).
+    { replace (- (8 * Z.of_nat 2)) with (-16) by lia.
+      exact (uv_avi_neg sp0 16 ltac:(lia)
+               ltac:(rewrite <- uint_unsigned; lia)). }
+    assert (Hsp16 : uint (add_vec_int sp0 (- (8 * Z.of_nat 2)))
+                    = uint sp0 - 16)
+      by (rewrite !uint_unsigned; exact Hbsp1).
+    assert (Ho8 : uoff_sdsp (mword_of_int 1 : mword 6) = 8)
+      by (vm_compute; reflexivity).
+    assert (Ho0 : uoff_sdsp (mword_of_int 0 : mword 6) = 0)
+      by (vm_compute; reflexivity).
+    (* ---- 0x74  c.li a5,-1 ---- *)
+    iApply (wp_uk_cli N h mt (mword_of_int 0x74)
+              (mword_of_int 63 : mword 6) a5_idx (Dg + n)
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate) with "[] Hrun").
+    { iApply (uis_shk_74 with "Hcode"). }
+    assert (E74 : add_vec_int (mword_of_int 0x74 : mword 64) 2
+                  = mword_of_int 0x76)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E74. iIntros (h1) "Hrun".
+    set (t1 := <[Regidx a5_idx
+                 := regval_into_reg (sign_extend' 64
+                      (mword_of_int 63 : mword 6) : mword 64)]> mt).
+    assert (Ht1 : forall q : mword 5, Regidx q <> Regidx a5_idx ->
+                    t1 !!! Regidx q = mt !!! Regidx q)
+      by (intros q Hq; exact (upd_ne mt (Regidx a5_idx) (Regidx q) _ Hq)).
+    assert (Hsp1 : t1 !!! Regidx csp_rs1
+                   = add_vec_int sp0 (- (8 * Z.of_nat 2)))
+      by (rewrite (Ht1 csp_rs1 ltac:(vm_compute; discriminate)); exact Hsp).
+    (* ---- 0x76  beq a0,a5,0x82 -- the -1 test ---- *)
+    iApply (wp_uk_btype N h1 t1 (mword_of_int 0x76)
+              (mword_of_int 12 : mword 13) a5_idx a0_idx BEQ
+              (uv_btaken BEQ (t1 !!! Regidx a0_idx) (t1 !!! Regidx a5_idx))
+              (mword_of_int 0x82) (Dg + n)
+              eq_refl
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(intros _; vm_compute; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_76 with "Hcode"). }
+    assert (E76 : add_vec_int (mword_of_int 0x76 : mword 64) 4
+                  = mword_of_int 0x7a)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E76. iIntros (h2) "Hrun".
+    assert (Ha5_1 : t1 !!! Regidx a5_idx
+                    = (sign_extend' 64 (mword_of_int 63 : mword 6) : mword 64))
+      by exact (upd_eq mt (Regidx a5_idx) _).
+    destruct (uv_btaken BEQ (t1 !!! Regidx a0_idx) (t1 !!! Regidx a5_idx))
+      eqn:Hbt.
+    { (* ---- fork returned -1: panic("fork") ---- *)
+      (* ...WHICH IS THE PARENT, so the payload's second disjunct is dead *)
+      iDestruct "Hpayv" as "[Hpayv | %Hz0]"; last first.
+      { exfalso.
+        rewrite (Ht1 a0_idx ltac:(vm_compute; discriminate)) Hz0 Ha5_1 in Hbt.
+        vm_compute in Hbt. discriminate Hbt. }
+      (* 0x82  auipc a0,0x1 *)
+      iApply (wp_uk_auipc N h2 t1 (mword_of_int 0x82)
+                (mword_of_int 1 : mword 20) a0_idx
+                (mword_of_int 0x1082) (Dg + n)
+                ltac:(unfold unot_sp; vm_compute; discriminate)
+                ltac:(vm_compute; discriminate)
+                ltac:(apply bv_eq; vm_compute; reflexivity)
+                with "[] Hrun").
+      { iApply (uis_shk_82 with "Hcode"). }
+      assert (E82 : add_vec_int (mword_of_int 0x82 : mword 64) 4
+                    = mword_of_int 0x86)
+        by (apply bv_eq; vm_compute; reflexivity).
+      rewrite E82. iIntros (h3) "Hrun".
+      set (t2 := <[Regidx a0_idx
+                   := regval_into_reg (mword_of_int 0x1082 : mword 64)]> t1).
+      assert (Ha0_2 : t2 !!! Regidx a0_idx = (mword_of_int 0x1082 : mword 64))
+        by exact (upd_eq t1 (Regidx a0_idx) _).
+      (* 0x86  addi a0,a0,518 *)
+      iApply (wp_uk_addi N h3 t2 (mword_of_int 0x86)
+                (mword_of_int 518 : mword 12) a0_idx a0_idx
+                (mword_of_int 0x1288) (Dg + n)
+                ltac:(unfold unot_sp; vm_compute; discriminate)
+                ltac:(vm_compute; discriminate)
+                ltac:(rewrite Ha0_2;
+                      assert (Es : (sign_extend' 64
+                                      (mword_of_int 518 : mword 12) : mword 64)
+                                   = mword_of_int 518)
+                        by (apply bv_eq; vm_compute; reflexivity);
+                      rewrite Es moi_add; f_equal; lia)
+                with "[] Hrun").
+      { iApply (uis_shk_86 with "Hcode"). }
+      assert (E86 : add_vec_int (mword_of_int 0x86 : mword 64) 4
+                    = mword_of_int 0x8a)
+        by (apply bv_eq; vm_compute; reflexivity).
+      rewrite E86. iIntros (h4) "Hrun".
+      set (t3 := <[Regidx a0_idx
+                   := regval_into_reg (mword_of_int 0x1288 : mword 64)]> t2).
+      (* 0x8a  jal ra,0x4a <panic> -- and the diagnostic cut takes over *)
+      iApply (wp_kshr_jal N h4 t3 0x8a 0x4a 0x8e
+                (mword_of_int 2097088 : mword 21) (Dg + n)
+                ltac:(apply bv_eq; vm_compute; reflexivity)
+                ltac:(apply bv_eq; vm_compute; reflexivity)
+                ltac:(vm_compute; reflexivity)
+                with "[] Hrun").
+      { iApply (uis_shk_8a with "Hcode"). }
+      iIntros (h5) "Hrun".
+      set (t4 := <[Regidx ra_idx := (mword_of_int 0x8e : mword 64)]> t3).
+      assert (Hmsg : uint (t4 !!! Regidx a0_idx) = 0x1288).
+      { rewrite /t4 (upd_ne t3 (Regidx ra_idx) (Regidx a0_idx) _
+                       ltac:(vm_compute; discriminate)).
+        rewrite /t3 (upd_eq t2 (Regidx a0_idx)
+                       (mword_of_int 0x1288 : mword 64)).
+        apply uint_moi. unfold Z64. lia. }
+      (* the branch was taken, so a0 WAS -1 *)
+      assert (Hneg : mt !!! Regidx a0_idx = (mword_of_int (-1) : mword 64)).
+      { unfold uv_btaken in Hbt. apply eq_vec_true_iff in Hbt.
+        rewrite (Ht1 a0_idx ltac:(vm_compute; discriminate)) Ha5_1 in Hbt.
+        rewrite Hbt. apply bv_eq. vm_compute. reflexivity. }
+      iApply ("Hpanic" $! h5 t4 with "[%] [%] Hpayv Hrun");
+        [ exact Hmsg | exact Hneg ]. }
+    (* ---- fork succeeded: pop and return ---- *)
+    (* ...AND THE BRANCH WAS NOT TAKEN, SO a0 IS NOT -1 (purchase 3): the
+       mirror of the taken branch's [Hneg] above. *)
+    assert (Hnm1 : mt !!! Regidx a0_idx <> (mword_of_int (-1) : mword 64)).
+    { intro He. unfold uv_btaken in Hbt.
+      rewrite (Ht1 a0_idx ltac:(vm_compute; discriminate)) Ha5_1 He in Hbt.
+      vm_compute in Hbt. discriminate Hbt. }
+    (* 0x7a  c.ldsp ra,8(sp) *)
+    iApply (wp_uk_cldsp N h2 t1 (mword_of_int 0x7a)
+              (mword_of_int 1 : mword 6) ra_idx (uint sp0 - 8) vra (Dg + n)
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(rewrite Hsp1 Hsp16 Ho8; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              ltac:(vm_compute; discriminate)
+              with "[] Hw8 Hrun").
+    { iApply (uis_shk_7a with "Hcode"). }
+    iIntros "Hw8".
+    assert (E7a : add_vec_int (mword_of_int 0x7a : mword 64) 2
+                  = mword_of_int 0x7c)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E7a. iIntros (h3) "Hrun".
+    set (e1 := <[Regidx ra_idx := regval_into_reg vra]> t1).
+    assert (Hspe1 : e1 !!! Regidx csp_rs1
+                    = add_vec_int sp0 (- (8 * Z.of_nat 2)))
+      by (rewrite (upd_ne t1 (Regidx ra_idx) (Regidx csp_rs1) _
+                     ltac:(vm_compute; discriminate)); exact Hsp1).
+    (* 0x7c  c.ldsp s0,0(sp) *)
+    iApply (wp_uk_cldsp N h3 e1 (mword_of_int 0x7c)
+              (mword_of_int 0 : mword 6) s0_idx (uint sp0 - 16) vs0 (Dg + n)
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(rewrite Hspe1 Hsp16 Ho0; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              ltac:(vm_compute; discriminate)
+              with "[] Hw0 Hrun").
+    { iApply (uis_shk_7c with "Hcode"). }
+    iIntros "Hw0".
+    assert (E7c : add_vec_int (mword_of_int 0x7c : mword 64) 2
+                  = mword_of_int 0x7e)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E7c. iIntros (h4) "Hrun".
+    set (e2 := <[Regidx s0_idx := regval_into_reg vs0]> e1).
+    assert (Hspe2 : e2 !!! Regidx csp_rs1
+                    = add_vec_int sp0 (- (8 * Z.of_nat 2)))
+      by (rewrite (upd_ne e1 (Regidx s0_idx) (Regidx csp_rs1) _
+                     ltac:(vm_compute; discriminate)); exact Hspe1).
+    (* 0x7e  c.addi sp,sp,16 -- THE POP *)
+    assert (HR : 0 <= bv_unsigned sp0 < 18446744073709551616).
+    { pose proof (bv_unsigned_in_range 64 sp0) as H0.
+      assert (Em : bv_modulus 64 = 18446744073709551616)
+        by (vm_compute; reflexivity).
+      rewrite Em in H0. exact H0. }
+    assert (Hlt2 : bv_unsigned (add_vec_int sp0 (- (8 * Z.of_nat 2)))
+                   + 8 * Z.of_nat 2 < Z64)
+      by (rewrite Hbsp1; unfold Z64; lia).
+    assert (Hup : add_vec_int (add_vec_int sp0 (- (8 * Z.of_nat 2)))
+                    (8 * Z.of_nat 2) = sp0).
+    { apply bv_eq.
+      rewrite (uv_avi_pos (add_vec_int sp0 (- (8 * Z.of_nat 2)))
+                 (8 * Z.of_nat 2) ltac:(lia) Hlt2).
+      rewrite Hbsp1. lia. }
+    iApply (wp_uk_caddi_sp_up N h4 e2 (mword_of_int 0x7e)
+              (mword_of_int 16 : mword 6) 2 (Dg + n)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              with "[] [Hw8 Hw0] Hrun").
+    { iApply (uis_shk_7e with "Hcode"). }
+    { rewrite Hspe2 Hup ustack_2.
+      iSplit; [ iPureIntro; exact Hal8 | ].
+      iSplitL "Hw8"; [ iExists vra; iFrame | iExists vs0; iFrame ]. }
+    assert (E7e : add_vec_int (mword_of_int 0x7e : mword 64) 2
+                  = mword_of_int 0x80)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Hspe2 Hup E7e. iIntros (h5) "Hrun".
+    set (e3 := <[Regidx csp_rs1 := regval_into_reg sp0]> e2).
+    assert (Hra3 : e3 !!! Regidx ra_idx = vra).
+    { rewrite (upd_ne e2 (Regidx csp_rs1) (Regidx ra_idx) _
+                 ltac:(vm_compute; discriminate)).
+      rewrite (upd_ne e1 (Regidx s0_idx) (Regidx ra_idx) _
+                 ltac:(vm_compute; discriminate)).
+      exact (upd_eq t1 (Regidx ra_idx) (regval_into_reg vra)). }
+    assert (Hs03 : e3 !!! Regidx s0_idx = vs0).
+    { rewrite (upd_ne e2 (Regidx csp_rs1) (Regidx s0_idx) _
+                 ltac:(vm_compute; discriminate)).
+      exact (upd_eq e1 (Regidx s0_idx) (regval_into_reg vs0)). }
+    (* 0x80  c.jr ra *)
+    iApply (wp_uk_cjr N h5 e3 (mword_of_int 0x80) ra_idx
+              (ret_pc vra) (2 + (Dg + n))
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Hra3; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_80 with "Hcode"). }
+    iIntros (h6) "Hrun".
+    iApply ("Hcont" $! h6 e3 with "[%] [%] [%] [%] [%] Hpayv Hrun");
+      [ | exact Hnm1 | exact Hra3 | exact Hs03
+        | exact (upd_eq e2 (Regidx csp_rs1) (regval_into_reg sp0)) ].
+    intros q H1 H2 H8 H15.
+    assert (Hc1 : uint ra_idx = 1) by (vm_compute; reflexivity).
+    assert (Hc2 : uint csp_rs1 = 2) by (vm_compute; reflexivity).
+    assert (Hc8 : uint s0_idx = 8) by (vm_compute; reflexivity).
+    assert (Hc15 : uint a5_idx = 15) by (vm_compute; reflexivity).
+    rewrite /e3 (upd_ne e2 (Regidx csp_rs1) (Regidx q) _
+                   (ushr_ridx_ne q csp_rs1 ltac:(rewrite Hc2; exact H2))).
+    rewrite /e2 (upd_ne e1 (Regidx s0_idx) (Regidx q) _
+                   (ushr_ridx_ne q s0_idx ltac:(rewrite Hc8; exact H8))).
+    rewrite /e1 (upd_ne t1 (Regidx ra_idx) (Regidx q) _
+                   (ushr_ridx_ne q ra_idx ltac:(rewrite Hc1; exact H1))).
+    exact (Ht1 q (ushr_ridx_ne q a5_idx ltac:(rewrite Hc15; exact H15))).
+  Qed.
+
+  (* ---- fork1, whole.  THE PANIC IS THE CALLER'S (M4b(2)). ------------- *)
+  (* CWD-INDEXED, as [wp_kshr_fork]: the value crosses, and
+     [wp_kshr_fork1_any] below is the index-free corollary. *)
+  (* ...AT A NAMED TABLE VIEW (seccomp S4) *)
+  Lemma wp_kshr_fork1_at (N : uk_names Σ) `{!ukn_const N}
+      (P : gname -> gname -> gname -> iProp Σ) `{FP : !Forkable P}
+      (szv : Z) (l v : list fdstate) (D : gmap nat fdstate)
+      (h : CpuId) (m : regfile) (n : nat) (cw : Z)
+      (* the three binders [wp_kshr_fork] opens (lane IO-LEAF, M3a) *)
+      (Sc : gset gname) (Q : Z -> iProp Σ) (Rc : iProp Σ)
+      (* ...and what the caller's panic spends (M4b(2)): the resource the
+         site holds for its exit, abstract -- the record's own payload at
+         [wp_kshr_fork1_any], the lease's pieces at sh's fork arm *)
+      (Pex : iProp Σ) :
+    (forall x y : Z, Q x = Q y) ->
+    (* NO FREE WRITE LAW (M4b(2)): nothing on fork1's own path writes, and
+       the panic is the caller's. *)
+    shk_code (ukn_t N) -∗ shk_rodata (ukn_t N) -∗ P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+    UserFd.ustd_at (ukn_fd N) l v -∗
+    UserCwd.ucwd (ukn_cwd N) cw -∗
+    (* the caller's half of its children set, at a name -- see
+       [wp_kshr_fork] *)
+    UserChildren.uch (ukn_ch N) Sc -∗
+    (* the caller's descriptors, which BOTH processes come back holding --
+       see [UkFork.wp_uk_ecall_fork].  This is what PIPE's six closes and
+       REDIR's close-and-reopen are paid for with. *)
+    ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+    (* what the caller lends its child, and how a killer pays for it *)
+    Rc -∗
+    □ (app_taint -∗ Q (-1)) -∗
+    (* WHAT THE PANIC SPENDS, BORROWED (lane KILL-PAY, K4(a); M4b(2)):
+       fork1's [-1] arm panics, and the panic is the caller's (below).
+       The RETURNING arm hands it straight back, on the parent's
+       continuation; the CHILD's tail never reaches the panic
+       ([wp_kshr_fork1_tail]'s second disjunct). *)
+    Pex -∗
+    urun N h m (mword_of_int ShSyms.fork1) (2 + (Dg + n)) -∗
+    ((* THE PANIC (M4b(2)): fork returned -1, and the parent is at
+        [panic]'s entry with "fork" in a0, holding its ledger, fork's
+        answer -- the lend back whole on the row's [-1] arm -- and what it
+        borrowed.  Its text, .rodata, break, cwd and descriptors are
+        dropped: nothing after [panic] reads them. *)
+     (∀ (h' : CpuId) (m' : regfile) (r : mword 64),
+        ⌜ uint (m' !!! Regidx a0_idx) = 0x1288 ⌝ -∗
+        ⌜ r = (mword_of_int (-1) : mword 64) ⌝ -∗
+        ((⌜r = (mword_of_int (-1) : mword 64)⌝ ∗
+            UserChildren.uch (ukn_ch N) Sc ∗ Rc)
+         ∨ ∃ (γ : gname) (pidv : mword 32),
+             ⌜r = (sign_extend' 64 pidv : mword 64)⌝ ∗
+             ⌜(1 <= bv_unsigned pidv <= PIDMAX)%Z⌝ ∗
+             (* ...and the generation is fresh (design app-pipe SS4.3y) --
+                see [wp_kshr_fork] *)
+             ⌜γ ∉ Sc⌝ ∗
+             child_tok γ pidv Q ∗
+             UserChildren.uch (ukn_ch N) (Sc ∪ {[γ]})) -∗
+        UserFd.ustd_at (ukn_fd N) l v -∗
+        Pex -∗
+        urun N h' m' (mword_of_int ShSyms.panic) (Dg + n) -∗
+        mWP (Loop : expr riscv_lang)) ∗
+     (∀ (h' : CpuId) (m' : regfile) (r : mword 64),
+        ⌜ r <> (mword_of_int 0 : mword 64) ⌝ -∗
+        (* ...AND IT IS NOT -1 EITHER (design app-pipe SS4.3w, purchase
+           3): fork1 PANICS at -1 ([wp_kshr_fork1_tail]'s taken branch),
+           so a caller that reaches this arm forked a live child.  The
+           row refutes [ush_fork_ans]'s failing disjunct, which is what
+           puts the two children's tokens in a pipeline round's hand. *)
+        ⌜ r <> (mword_of_int (-1) : mword 64) ⌝ -∗
+        ⌜ ucallee_saved m m' ⌝ -∗
+        ⌜ m' !!! Regidx a0_idx = r ⌝ -∗
+        (* fork's answer, relayed -- see [wp_kshr_fork] *)
+        ((⌜r = (mword_of_int (-1) : mword 64)⌝ ∗
+            UserChildren.uch (ukn_ch N) Sc ∗ Rc)
+         ∨ ∃ (γ : gname) (pidv : mword 32),
+             ⌜r = (sign_extend' 64 pidv : mword 64)⌝ ∗
+             ⌜(1 <= bv_unsigned pidv <= PIDMAX)%Z⌝ ∗
+             (* ...and the generation is fresh (design app-pipe SS4.3y) --
+                see [wp_kshr_fork] *)
+             ⌜γ ∉ Sc⌝ ∗
+             child_tok γ pidv Q ∗
+             UserChildren.uch (ukn_ch N) (Sc ∪ {[γ]})) -∗
+        P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+        UserFd.ustd_at (ukn_fd N) l v -∗
+        UserCwd.ucwd (ukn_cwd N) cw -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+        (* ...and what it borrowed back, unspent: fork1 returned *)
+        Pex -∗
+        urun N h' m' (ret_pc (m !!! Regidx ra_idx)) (2 + (Dg + n)) -∗
+        mWP (Loop : expr riscv_lang)) ∗
+     (∀ (N' : uk_names Σ) (h' : CpuId) (m' : regfile) (γ' : gname),
+        (* THE CHILD'S PAYLOAD IS THE ONE THE CALLER CHOSE, and it gets
+           what it was lent ([wp_kshr_fork]).  At [Q := fun _ => True] the
+           equation is [UkRun.ukn_triv] and the arm reads as before. *)
+        ⌜ ukn_pay N' = Q ⌝ -∗
+        (* ...AND ITS HELD SET IS SH'S OWN (lane OFF-HAND-4, S1/S2):
+           [wp_kshr_fork]'s row, relayed. *)
+        ⌜ ucallee_saved m m' ⌝ -∗
+        ⌜ m' !!! Regidx a0_idx = (mword_of_int 0 : mword 64) ⌝ -∗
+        my_pay γ' Q -∗
+        Rc -∗
+        shk_code (ukn_t N') -∗ P (ukn_t N') (ukn_d N') (ukn_s N') -∗ usz (ukn_s N') szv -∗
+        UserFd.ustd_at (ukn_fd N') l v -∗
+        UserCwd.ucwd (ukn_cwd N') cw -∗
+        UserChildren.uch (ukn_ch N') ∅ -∗
+        (* ...AND ITS OWN PID, AS A HANDLE (design app-pipe SS4.3w,
+           purchase 1): [wp_kshr_fork]'s row, relayed. *)
+        (∃ p : Z, ⌜p <> 1⌝ ∗ UserChildren.upid (ukn_pid N') p) -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N') fd st) -∗
+        urun N' h' m' (ret_pc (m !!! Regidx ra_idx)) (2 + (Dg + n)) -∗
+        mWP (Loop : expr riscv_lang))) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HQc.
+    iIntros "#Hcode #Hro HP Hsz Hstd Hcwd Hch HD HRc #Hkw Hpayv Hrun
+             (Hpanic & Hpar & Hchi)".
+    rewrite shr_fork1.
+    iDestruct (urun_stack with "Hrun") as %[Hal8 Hroom].
+    remember (m !!! Regidx csp_rs1) as sp0 eqn:Hsp0.
+    assert (Hsp : m !!! Regidx csp_rs1 = sp0) by (symmetry; exact Hsp0).
+    clear Hsp0.
+    assert (Hlo : 16 <= uint sp0) by lia.
+    set (vra := m !!! Regidx ra_idx).
+    set (vs0 := m !!! Regidx s0_idx).
+    assert (Hbsp1 : bv_unsigned (add_vec_int sp0 (- (8 * Z.of_nat 2)))
+                    = bv_unsigned sp0 - 16).
+    { replace (- (8 * Z.of_nat 2)) with (-16) by lia.
+      exact (uv_avi_neg sp0 16 ltac:(lia)
+               ltac:(rewrite <- uint_unsigned; lia)). }
+    assert (Hsp16 : uint (add_vec_int sp0 (- (8 * Z.of_nat 2)))
+                    = uint sp0 - 16)
+      by (rewrite !uint_unsigned; exact Hbsp1).
+    assert (Ho8 : uoff_sdsp (mword_of_int 1 : mword 6) = 8)
+      by (vm_compute; reflexivity).
+    assert (Ho0 : uoff_sdsp (mword_of_int 0 : mword 6) = 0)
+      by (vm_compute; reflexivity).
+    (* ---- 0x68  c.addi sp,sp,-16 -- THE PUSH ---- *)
+    iApply (wp_uk_caddi_sp_dn N h m (mword_of_int 0x68)
+              (mword_of_int 48 : mword 6) 2 (Dg + n)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_68 with "Hcode"). }
+    assert (E68 : add_vec_int (mword_of_int 0x68 : mword 64) 2
+                  = mword_of_int 0x6a)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Hsp ustack_2 E68.
+    iIntros "(_ & [%v8 Hw8] & [%v0 Hw0])".
+    iIntros (h1) "Hrun".
+    set (m1 := <[Regidx csp_rs1
+                 := regval_into_reg (add_vec_int sp0 (- (8 * Z.of_nat 2)))]> m).
+    assert (Hsp1 : m1 !!! Regidx csp_rs1
+                   = add_vec_int sp0 (- (8 * Z.of_nat 2)))
+      by exact (upd_eq m (Regidx csp_rs1) _).
+    assert (Hm1 : forall q : mword 5, Regidx q <> Regidx csp_rs1 ->
+                    m1 !!! Regidx q = m !!! Regidx q)
+      by (intros q Hq; exact (upd_ne m (Regidx csp_rs1) (Regidx q) _ Hq)).
+    (* ---- 0x6a  c.sdsp ra,8(sp) ---- *)
+    iApply (wp_uk_csdsp N h1 m1 (mword_of_int 0x6a)
+              (mword_of_int 1 : mword 6) ra_idx (uint sp0 - 8) v8 (Dg + n)
+              ltac:(rewrite Hsp1 Hsp16 Ho8; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              with "[] Hw8 Hrun").
+    { iApply (uis_shk_6a with "Hcode"). }
+    iIntros "Hw8".
+    rewrite (Hm1 ra_idx ltac:(vm_compute; discriminate)).
+    assert (E6a : add_vec_int (mword_of_int 0x6a : mword 64) 2
+                  = mword_of_int 0x6c)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E6a. iIntros (h2) "Hrun".
+    (* ---- 0x6c  c.sdsp s0,0(sp) ---- *)
+    iApply (wp_uk_csdsp N h2 m1 (mword_of_int 0x6c)
+              (mword_of_int 0 : mword 6) s0_idx (uint sp0 - 16) v0 (Dg + n)
+              ltac:(rewrite Hsp1 Hsp16 Ho0; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              with "[] Hw0 Hrun").
+    { iApply (uis_shk_6c with "Hcode"). }
+    iIntros "Hw0".
+    rewrite (Hm1 s0_idx ltac:(vm_compute; discriminate)).
+    assert (E6c : add_vec_int (mword_of_int 0x6c : mword 64) 2
+                  = mword_of_int 0x6e)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E6c. iIntros (h3) "Hrun".
+    (* ---- 0x6e  c.addi4spn s0,sp,16 (s0 is dead until the epilogue) ---- *)
+    iApply (wp_uk_caddi4spn N h3 m1 (mword_of_int 0x6e)
+              (mword_of_int 0 : mword 3) (mword_of_int 4 : mword 8) s0_idx
+              (add_vec (m1 !!! Regidx csp_rs1)
+                 (sign_extend' 64 (caddi4spn_imm (mword_of_int 4 : mword 8))))
+              (Dg + n)
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; reflexivity) ltac:(vm_compute; discriminate)
+              eq_refl
+              with "[] Hrun").
+    { iApply (uis_shk_6e with "Hcode"). }
+    assert (E6e : add_vec_int (mword_of_int 0x6e : mword 64) 2
+                  = mword_of_int 0x70)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E6e. iIntros (h4) "Hrun".
+    set (m2 := <[Regidx s0_idx
+                 := regval_into_reg
+                      (add_vec (m1 !!! Regidx csp_rs1)
+                         (sign_extend' 64
+                            (caddi4spn_imm (mword_of_int 4 : mword 8))))]> m1).
+    assert (Hm2 : forall q : mword 5, Regidx q <> Regidx s0_idx ->
+                    m2 !!! Regidx q = m1 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne m1 (Regidx s0_idx) (Regidx q) _ Hq)).
+    assert (Hsp2 : m2 !!! Regidx csp_rs1
+                   = add_vec_int sp0 (- (8 * Z.of_nat 2)))
+      by (rewrite (Hm2 csp_rs1 ltac:(vm_compute; discriminate)); exact Hsp1).
+    (* ---- 0x70  jal ra,0xc5a <fork> ---- *)
+    iApply (wp_kshr_jal N h4 m2 0x70 0xc5a 0x74
+              (mword_of_int 3050 : mword 21) (Dg + n)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(vm_compute; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_70 with "Hcode"). }
+    iIntros (h5) "Hrun".
+    set (m3 := <[Regidx ra_idx := (mword_of_int 0x74 : mword 64)]> m2).
+    assert (Hra3 : m3 !!! Regidx ra_idx = (mword_of_int 0x74 : mword 64))
+      by exact (upd_eq m2 (Regidx ra_idx) _).
+    assert (Hsp3 : m3 !!! Regidx csp_rs1
+                   = add_vec_int sp0 (- (8 * Z.of_nat 2)))
+      by (rewrite (upd_ne m2 (Regidx ra_idx) (Regidx csp_rs1) _
+                     ltac:(vm_compute; discriminate)); exact Hsp2).
+    assert (Hret3 : ret_pc (m3 !!! Regidx ra_idx)
+                    = (mword_of_int 0x74 : mword 64))
+      by (rewrite Hra3; apply bv_eq; vm_compute; reflexivity).
+    (* ---- the fork stub, and the frame crosses with the payload ---- *)
+    (* THE IMAGE RIDES THE PAYLOAD, because the CHILD's -1 arm needs it at
+       ITS gname triple and nothing else at those names carries it: the
+       caller's [P] is abstract here.  It is one more [Forkable] conjunct,
+       and the caller's [P] is untouched. *)
+    iApply (wp_kshr_fork_at N
+              (fun gt gd gs => (shk_rodata gt
+                                ∗ P gt gd gs
+                                ∗ uword gd (uint sp0 - 8) vra
+                                ∗ uword gd (uint sp0 - 16) vs0)%I)
+              (FP := forkable_sep
+                       (fun g _ _ => shk_rodata g)
+                       (fun gt gd gs => (P gt gd gs
+                                         ∗ uword gd (uint sp0 - 8) vra
+                                         ∗ uword gd (uint sp0 - 16) vs0)%I)
+                       forkable_shk_rodata
+                       (forkable_sep P
+                          (fun _ gd _ => (uword gd (uint sp0 - 8) vra
+                                          ∗ uword gd (uint sp0 - 16) vs0)%I)
+                          FP
+                          (forkable_sep
+                             (fun _ gd _ => uword gd (uint sp0 - 8) vra)
+                             (fun _ gd _ => uword gd (uint sp0 - 16) vs0)
+                             (forkable_uword (uint sp0 - 8) vra)
+                             (forkable_uword (uint sp0 - 16) vs0))))
+              szv l v D h5 m3 (Dg + n) cw Sc Q Rc HQc
+              with "Hcode [HP Hw8 Hw0] Hsz Hstd Hcwd Hch HD HRc Hkw Hrun").
+    { iFrame "Hro HP Hw8 Hw0". }
+    rewrite Hret3.
+    (* the register file both arms resume under, and its sp *)
+    assert (Hspf : forall r : mword 64,
+              (<[Regidx a0_idx := r]>
+                 (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m3))
+                !!! Regidx csp_rs1
+              = add_vec_int sp0 (- (8 * Z.of_nat 2))).
+    { intros r.
+      rewrite (upd_ne _ (Regidx a0_idx) (Regidx csp_rs1) r
+                 ltac:(vm_compute; discriminate)).
+      rewrite (upd_ne m3 (Regidx a7_idx) (Regidx csp_rs1) _
+                 ltac:(vm_compute; discriminate)).
+      exact Hsp3. }
+    (* what the tail's "everything else is untouched" clause gives back
+       about the CALLER's registers *)
+    assert (Hback : forall (r : mword 64) (m' : regfile) (q : mword 5),
+              (forall p : mword 5, uint p <> 1 -> uint p <> 2 -> uint p <> 8 ->
+                 uint p <> 15 ->
+                 m' !!! Regidx p
+                 = (<[Regidx a0_idx := r]>
+                      (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m3))
+                     !!! Regidx p) ->
+              m' !!! Regidx ra_idx = vra ->
+              m' !!! Regidx s0_idx = vs0 ->
+              m' !!! Regidx csp_rs1 = sp0 ->
+              ucallee_saved_idx q = true ->
+              m' !!! Regidx q = m !!! Regidx q).
+    { intros r m' q Hq Hra Hs0 Hsps Hcs.
+      assert (Hc2 : uint csp_rs1 = 2) by (vm_compute; reflexivity).
+      assert (Hc8 : uint s0_idx = 8) by (vm_compute; reflexivity).
+      destruct (Z.eq_dec (uint q) 2) as [E2 | E2].
+      { rewrite (ushr_ridx_eq q csp_rs1 ltac:(rewrite E2 Hc2; reflexivity)).
+        rewrite Hsps Hsp. reflexivity. }
+      destruct (Z.eq_dec (uint q) 8) as [E8 | E8].
+      { rewrite (ushr_ridx_eq q s0_idx ltac:(rewrite E8 Hc8; reflexivity)).
+        rewrite Hs0. reflexivity. }
+      destruct (ushr_cs_bounds q Hcs) as [E | [E | [E | [E | [E | E]]]]];
+        try lia.
+      all: rewrite (Hq q ltac:(lia) ltac:(lia) ltac:(lia) ltac:(lia));
+           rewrite (upd_ne _ (Regidx a0_idx) (Regidx q) r
+                      (ushr_ridx_ne q a0_idx
+                         ltac:(assert (Hz : uint a0_idx = 10)
+                                 by (vm_compute; reflexivity); lia)));
+           rewrite (upd_ne m3 (Regidx a7_idx) (Regidx q) _
+                      (ushr_ridx_ne q a7_idx
+                         ltac:(assert (Hz : uint a7_idx = 17)
+                                 by (vm_compute; reflexivity); lia)));
+           rewrite /m3 (upd_ne m2 (Regidx ra_idx) (Regidx q) _
+                      (ushr_ridx_ne q ra_idx
+                         ltac:(assert (Hz : uint ra_idx = 1)
+                                 by (vm_compute; reflexivity); lia)));
+           rewrite (Hm2 q (ushr_ridx_ne q s0_idx ltac:(lia)));
+           exact (Hm1 q (ushr_ridx_ne q csp_rs1 ltac:(lia))). }
+    (* the borrowed payload goes with the PARENT: the child's tail is at a
+       trivial record and pays its own (lane KILL-PAY, K4(a)) *)
+    iSplitL "Hpanic Hpar Hpayv".
+    - (* ---- THE PARENT ---- *)
+      iIntros (hp r) "%Hr Hans (_ & HP & Hw8 & Hw0) Hsz Hstd Hcwd HD Hrun".
+      (* everything the parent holds rides through the tail as its [X]
+         and comes back on whichever arm runs *)
+      iApply (wp_kshr_fork1_tail N hp
+                (<[Regidx a0_idx := r]>
+                   (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m3))
+                sp0 vra vs0 n
+                (Pex
+                 ∗ ((⌜r = (mword_of_int (-1) : mword 64)⌝ ∗
+                       UserChildren.uch (ukn_ch N) Sc ∗ Rc)
+                    ∨ ∃ (γ : gname) (pidv : mword 32),
+                        ⌜r = (sign_extend' 64 pidv : mword 64)⌝ ∗
+                        ⌜(1 <= bv_unsigned pidv <= PIDMAX)%Z⌝ ∗
+                        ⌜γ ∉ Sc⌝ ∗
+                        child_tok γ pidv Q ∗
+                        UserChildren.uch (ukn_ch N) (Sc ∪ {[γ]}))
+                 ∗ P (ukn_t N) (ukn_d N) (ukn_s N) ∗ usz (ukn_s N) szv
+                 ∗ UserFd.ustd_at (ukn_fd N) l v ∗ UserCwd.ucwd (ukn_cwd N) cw
+                 ∗ ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st))%I
+                Hal8 Hlo (Hspf r)
+                with "Hcode Hro Hw8 Hw0 [Hpayv Hans HP Hsz Hstd Hcwd HD]
+                      Hrun [Hpanic] [Hpar]").
+      { iLeft. iFrame "Hpayv Hans HP Hsz Hstd Hcwd HD". }
+      { (* the panic: what it wants comes out of [X], the rest is dropped *)
+        iIntros (hp2 m') "%Hmsg %Hneg (Hpayv & Hans & _ & _ & Hstd & _ & _)
+                          Hrun".
+        rewrite (upd_eq _ (Regidx a0_idx) r) in Hneg.
+        iApply ("Hpanic" $! hp2 m' r
+                  with "[%] [%] Hans Hstd Hpayv Hrun");
+          [ exact Hmsg | exact Hneg ]. }
+      iIntros (hp2 m') "%Hq %Hnm1 %Hra %Hs0 %Hsps Hpayv Hrun".
+      (* the parent's a0 IS the return value, and it is not 0 -- so what
+         comes back is [X] and not the tail's dead disjunct *)
+      iDestruct "Hpayv" as "[(Hpayv & Hans & HP & Hsz & Hstd & Hcwd & HD)
+                             | %Hz0]"; last first.
+      { exfalso. apply Hr.
+        rewrite <- Hz0. symmetry. exact (upd_eq _ (Regidx a0_idx) r). }
+      iApply ("Hpar" $! hp2 m' r
+                with "[%] [%] [%] [%] Hans HP Hsz Hstd Hcwd HD Hpayv [Hrun]").
+      + exact Hr.
+      + intro Heq. apply Hnm1.
+        rewrite (upd_eq (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m3)
+                   (Regidx a0_idx) r).
+        exact Heq.
+      + exact (fun q => Hback r m' q Hq Hra Hs0 Hsps).
+      + rewrite (Hq a0_idx ltac:(vm_compute; lia) ltac:(vm_compute; lia)
+                   ltac:(vm_compute; lia) ltac:(vm_compute; lia)).
+        exact (upd_eq _ (Regidx a0_idx) r).
+      + iExact "Hrun".
+    - (* ---- THE CHILD, under fresh names ---- *)
+      iIntros (N' hc γ') "%Hpeq Hmy HRc #Hck (#Hcro & HP & Hw8 & Hw0) Hsz Hstd
+                          Hcwd Hch Hpid HD Hrun".
+      pose proof (ukn_const_of_eq N' Q Hpeq HQc) as Hcst'.
+      (* THE CHILD NEVER PANICS: its a0 is 0 on the nose, which is what
+         stands in for the trivial record's free payload. *)
+      iApply (wp_kshr_fork1_tail N' hc
+                (<[Regidx a0_idx := (mword_of_int 0 : mword 64)]>
+                   (<[Regidx a7_idx := (mword_of_int 1 : mword 64)]> m3))
+                sp0 vra vs0 n emp%I Hal8 Hlo (Hspf (mword_of_int 0 : mword 64))
+                with "Hck Hcro Hw8 Hw0 [] Hrun []").
+      { iRight. iPureIntro.
+        exact (upd_eq _ (Regidx a0_idx) (mword_of_int 0 : mword 64)). }
+      { (* ...and it never panics: 0 is not -1 *)
+        iIntros (hc2 m') "_ %Hneg _ _". exfalso.
+        rewrite (upd_eq _ (Regidx a0_idx) (mword_of_int 0 : mword 64)) in Hneg.
+        apply (f_equal bv_unsigned) in Hneg. vm_compute in Hneg.
+        discriminate Hneg. }
+      iIntros (hc2 m') "%Hq _ %Hra %Hs0 %Hsps _ Hrun".
+      iApply ("Hchi" $! N' hc2 m' γ'
+                with "[%] [%] [%] Hmy HRc Hck HP Hsz Hstd Hcwd Hch Hpid HD
+                      [Hrun]").
+      + exact Hpeq.
+      + exact (fun q => Hback (mword_of_int 0 : mword 64) m' q Hq Hra Hs0 Hsps).
+      + rewrite (Hq a0_idx ltac:(vm_compute; lia) ltac:(vm_compute; lia)
+                   ltac:(vm_compute; lia) ltac:(vm_compute; lia)).
+        exact (upd_eq _ (Regidx a0_idx) (mword_of_int 0 : mword 64)).
+      + iExact "Hrun".
+  Qed.
+
+  Lemma wp_kshr_fork1 (N : uk_names Σ) `{!ukn_const N}
+      (P : gname -> gname -> gname -> iProp Σ) `{FP : !Forkable P}
+      (szv : Z) (l : list fdstate) (D : gmap nat fdstate)
+      (h : CpuId) (m : regfile) (n : nat) (cw : Z)
+      (* the three binders [wp_kshr_fork] opens (lane IO-LEAF, M3a) *)
+      (Sc : gset gname) (Q : Z -> iProp Σ) (Rc : iProp Σ)
+      (* ...and what the caller's panic spends (M4b(2)): the resource the
+         site holds for its exit, abstract -- the record's own payload at
+         [wp_kshr_fork1_any], the lease's pieces at sh's fork arm *)
+      (Pex : iProp Σ) :
+    (forall x y : Z, Q x = Q y) ->
+    (* NO FREE WRITE LAW (M4b(2)): nothing on fork1's own path writes, and
+       the panic is the caller's. *)
+    shk_code (ukn_t N) -∗ shk_rodata (ukn_t N) -∗ P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+    UserFd.ustd (ukn_fd N) l -∗
+    UserCwd.ucwd (ukn_cwd N) cw -∗
+    (* the caller's half of its children set, at a name -- see
+       [wp_kshr_fork] *)
+    UserChildren.uch (ukn_ch N) Sc -∗
+    (* the caller's descriptors, which BOTH processes come back holding --
+       see [UkFork.wp_uk_ecall_fork].  This is what PIPE's six closes and
+       REDIR's close-and-reopen are paid for with. *)
+    ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+    (* what the caller lends its child, and how a killer pays for it *)
+    Rc -∗
+    □ (app_taint -∗ Q (-1)) -∗
+    (* WHAT THE PANIC SPENDS, BORROWED (lane KILL-PAY, K4(a); M4b(2)):
+       fork1's [-1] arm panics, and the panic is the caller's (below).
+       The RETURNING arm hands it straight back, on the parent's
+       continuation; the CHILD's tail never reaches the panic
+       ([wp_kshr_fork1_tail]'s second disjunct). *)
+    Pex -∗
+    urun N h m (mword_of_int ShSyms.fork1) (2 + (Dg + n)) -∗
+    ((* THE PANIC (M4b(2)): fork returned -1, and the parent is at
+        [panic]'s entry with "fork" in a0, holding its ledger, fork's
+        answer -- the lend back whole on the row's [-1] arm -- and what it
+        borrowed.  Its text, .rodata, break, cwd and descriptors are
+        dropped: nothing after [panic] reads them. *)
+     (∀ (h' : CpuId) (m' : regfile) (r : mword 64),
+        ⌜ uint (m' !!! Regidx a0_idx) = 0x1288 ⌝ -∗
+        ⌜ r = (mword_of_int (-1) : mword 64) ⌝ -∗
+        ((⌜r = (mword_of_int (-1) : mword 64)⌝ ∗
+            UserChildren.uch (ukn_ch N) Sc ∗ Rc)
+         ∨ ∃ (γ : gname) (pidv : mword 32),
+             ⌜r = (sign_extend' 64 pidv : mword 64)⌝ ∗
+             ⌜(1 <= bv_unsigned pidv <= PIDMAX)%Z⌝ ∗
+             (* ...and the generation is fresh (design app-pipe SS4.3y) --
+                see [wp_kshr_fork] *)
+             ⌜γ ∉ Sc⌝ ∗
+             child_tok γ pidv Q ∗
+             UserChildren.uch (ukn_ch N) (Sc ∪ {[γ]})) -∗
+        UserFd.ustd (ukn_fd N) l -∗
+        Pex -∗
+        urun N h' m' (mword_of_int ShSyms.panic) (Dg + n) -∗
+        mWP (Loop : expr riscv_lang)) ∗
+     (∀ (h' : CpuId) (m' : regfile) (r : mword 64),
+        ⌜ r <> (mword_of_int 0 : mword 64) ⌝ -∗
+        (* ...AND IT IS NOT -1 EITHER (design app-pipe SS4.3w, purchase
+           3): fork1 PANICS at -1 ([wp_kshr_fork1_tail]'s taken branch),
+           so a caller that reaches this arm forked a live child.  The
+           row refutes [ush_fork_ans]'s failing disjunct, which is what
+           puts the two children's tokens in a pipeline round's hand. *)
+        ⌜ r <> (mword_of_int (-1) : mword 64) ⌝ -∗
+        ⌜ ucallee_saved m m' ⌝ -∗
+        ⌜ m' !!! Regidx a0_idx = r ⌝ -∗
+        (* fork's answer, relayed -- see [wp_kshr_fork] *)
+        ((⌜r = (mword_of_int (-1) : mword 64)⌝ ∗
+            UserChildren.uch (ukn_ch N) Sc ∗ Rc)
+         ∨ ∃ (γ : gname) (pidv : mword 32),
+             ⌜r = (sign_extend' 64 pidv : mword 64)⌝ ∗
+             ⌜(1 <= bv_unsigned pidv <= PIDMAX)%Z⌝ ∗
+             (* ...and the generation is fresh (design app-pipe SS4.3y) --
+                see [wp_kshr_fork] *)
+             ⌜γ ∉ Sc⌝ ∗
+             child_tok γ pidv Q ∗
+             UserChildren.uch (ukn_ch N) (Sc ∪ {[γ]})) -∗
+        P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+        UserFd.ustd (ukn_fd N) l -∗
+        UserCwd.ucwd (ukn_cwd N) cw -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+        (* ...and what it borrowed back, unspent: fork1 returned *)
+        Pex -∗
+        urun N h' m' (ret_pc (m !!! Regidx ra_idx)) (2 + (Dg + n)) -∗
+        mWP (Loop : expr riscv_lang)) ∗
+     (∀ (N' : uk_names Σ) (h' : CpuId) (m' : regfile) (γ' : gname),
+        (* THE CHILD'S PAYLOAD IS THE ONE THE CALLER CHOSE, and it gets
+           what it was lent ([wp_kshr_fork]).  At [Q := fun _ => True] the
+           equation is [UkRun.ukn_triv] and the arm reads as before. *)
+        ⌜ ukn_pay N' = Q ⌝ -∗
+        (* ...AND ITS HELD SET IS SH'S OWN (lane OFF-HAND-4, S1/S2):
+           [wp_kshr_fork]'s row, relayed. *)
+        ⌜ ucallee_saved m m' ⌝ -∗
+        ⌜ m' !!! Regidx a0_idx = (mword_of_int 0 : mword 64) ⌝ -∗
+        my_pay γ' Q -∗
+        Rc -∗
+        shk_code (ukn_t N') -∗ P (ukn_t N') (ukn_d N') (ukn_s N') -∗ usz (ukn_s N') szv -∗
+        UserFd.ustd (ukn_fd N') l -∗
+        UserCwd.ucwd (ukn_cwd N') cw -∗
+        UserChildren.uch (ukn_ch N') ∅ -∗
+        (* ...AND ITS OWN PID, AS A HANDLE (design app-pipe SS4.3w,
+           purchase 1): [wp_kshr_fork]'s row, relayed. *)
+        (∃ p : Z, ⌜p <> 1⌝ ∗ UserChildren.upid (ukn_pid N') p) -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N') fd st) -∗
+        urun N' h' m' (ret_pc (m !!! Regidx ra_idx)) (2 + (Dg + n)) -∗
+        mWP (Loop : expr riscv_lang))) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros HQc.
+    iIntros "#Hcode #Hro HP Hsz Hstd Hcwd Hch HD HRc #Hkw Hpayv Hrun
+             (Hpanic & Hpar & Hchi)".
+    iDestruct (ustd_ustd_at with "Hstd") as (v) "Hstd".
+    iApply (wp_kshr_fork1_at N P szv l v D h m n cw Sc Q Rc Pex HQc
+              with "Hcode Hro HP Hsz Hstd Hcwd Hch HD HRc Hkw Hpayv Hrun").
+    iSplitL "Hpanic"; [| iSplitL "Hpar"].
+    - iIntros (h' m' r) "%Hm %Hr Hans Hstd Hpex Hrun".
+      iApply ("Hpanic" $! h' m' r with "[%] [%] Hans [Hstd] Hpex Hrun");
+        [ exact Hm | exact Hr | by iApply ustd_at_ustd ].
+    - iIntros (h' m' r) "%H0 %H1 %H2 %H3 Hans HP Hsz Hstd Hcwd HD Hpex Hrun".
+      iApply ("Hpar" $! h' m' r with "[%] [%] [%] [%] Hans HP Hsz [Hstd] Hcwd HD Hpex Hrun");
+        [ exact H0 | exact H1 | exact H2 | exact H3 | by iApply ustd_at_ustd ].
+    - iIntros (N' h' m' γ') "%H0 %H1 %H2 Hmy HRc Hck HP Hsz Hstd Hcwd Hch Hpid HD Hrun".
+      iApply ("Hchi" $! N' h' m' γ'
+                with "[%] [%] [%] Hmy HRc Hck HP Hsz [Hstd] Hcwd Hch Hpid HD Hrun");
+        [ exact H0 | exact H1 | exact H2 | by iApply ustd_at_ustd ].
+  Qed.
+
+  (* ...AND ITS INDEX-FREE COROLLARY: [wp_kshr_runcmd]'s LIST and BACK
+     arms fork without caring where the child starts. *)
+  Lemma wp_kshr_fork1_any (N : uk_names Σ) `{!ukn_const N}
+      (P : gname -> gname -> gname -> iProp Σ) `{FP : !Forkable P}
+      (szv : Z) (l : list fdstate) (D : gmap nat fdstate)
+      (h : CpuId) (m : regfile) (n : nat) :
+    UkSh.sh_deps -∗
+    shk_code (ukn_t N) -∗ shk_rodata (ukn_t N) -∗ P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+    UserFd.ustd (ukn_fd N) l -∗
+    UserCwd.ucwd_any (ukn_cwd N) -∗
+    (* the caller's half of its children set, index-free -- see
+       [wp_kshr_fork] *)
+    UserChildren.uch_any (ukn_ch N) -∗
+    (* the caller's descriptors, which BOTH processes come back holding --
+       see [UkFork.wp_uk_ecall_fork].  This is what PIPE's six closes and
+       REDIR's close-and-reopen are paid for with. *)
+    ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+    (* ...AND HOW A KILLER PAYS FOR THE CHILD (lane IO-LEAF, M3b).  sh's
+       children are forked AT THE CALLER'S OWN PAYLOAD now, not at the
+       trivial one, so the wand [UkFork.wp_uk_ecall_fork] asks for is no
+       longer free and is a premise: whoever kills the child has to be
+       able to answer what its exit owes.  For the echo era the payload's
+       right arm IS the taint, so the wand is [iIntros "#HT"; iRight]. *)
+    □ (app_taint -∗ ukn_pay N (-1)) -∗
+    (* THE EXIT PAYLOAD, BORROWED (lane KILL-PAY, K4(a)): fork1's [-1] arm
+       panics, and a panic ends in [exit].  The RETURNING arm hands it
+       straight back, on the parent's continuation below; the CHILD's tail
+       runs at the SAME payload and pays its own out of the equation. *)
+    ukn_pay N (-1) -∗
+    urun N h m (mword_of_int ShSyms.fork1) (2 + (Dg + n)) -∗
+    ((∀ (h' : CpuId) (m' : regfile) (r : mword 64),
+        ⌜ r <> (mword_of_int 0 : mword 64) ⌝ -∗
+        ⌜ ucallee_saved m m' ⌝ -∗
+        ⌜ m' !!! Regidx a0_idx = r ⌝ -∗
+        P (ukn_t N) (ukn_d N) (ukn_s N) -∗ usz (ukn_s N) szv -∗
+        UserFd.ustd (ukn_fd N) l -∗
+        UserCwd.ucwd_any (ukn_cwd N) -∗
+        UserChildren.uch_any (ukn_ch N) -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N) fd st) -∗
+        (* ...and the payload back, unspent: fork1 returned *)
+        ukn_pay N (-1) -∗
+        urun N h' m' (ret_pc (m !!! Regidx ra_idx)) (2 + (Dg + n)) -∗
+        mWP (Loop : expr riscv_lang)) ∗
+     (∀ (N' : uk_names Σ) (h' : CpuId) (m' : regfile),
+        (* THE CHILD'S PAYLOAD IS THE CALLER'S (lane IO-LEAF, M3b).  It was
+           [UkRun.ukn_triv] -- sh forked at [fun _ => True] and every leaf
+           below resolved the class -- and that is exactly what a child
+           that has to ECHO A LINE cannot be: what sh's child owes its
+           parent is the era's credential at the alternative it took.  So
+           the fork is at the caller's OWN payload, the arm hands on the
+           EQUATION rather than a class, and everything the walk used the
+           class for -- the free exit row, the exec supply -- transfers
+           through it. *)
+        ⌜ ukn_pay N' = ukn_pay N ⌝ -∗
+        (* ...AND ITS HELD SET IS SH'S OWN (lane OFF-HAND-4, S1/S2):
+           [wp_kshr_fork]'s row, relayed. *)
+        ⌜ ucallee_saved m m' ⌝ -∗
+        ⌜ m' !!! Regidx a0_idx = (mword_of_int 0 : mword 64) ⌝ -∗
+        shk_code (ukn_t N') -∗ P (ukn_t N') (ukn_d N') (ukn_s N') -∗ usz (ukn_s N') szv -∗
+        UserFd.ustd (ukn_fd N') l -∗
+        UserCwd.ucwd_any (ukn_cwd N') -∗
+        UserChildren.uch_any (ukn_ch N') -∗
+        ([∗ map] fd ↦ st ∈ D, UserFd.ufd (ukn_fd N') fd st) -∗
+        urun N' h' m' (ret_pc (m !!! Regidx ra_idx)) (2 + (Dg + n)) -∗
+        mWP (Loop : expr riscv_lang))) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using ush_diag_leaf.
+    iIntros "#Hdp #Hcode #Hro HP Hsz Hstd Hcwd Hch HD #Hkw Hpayv Hrun [Hpar Hchi]".
+    iDestruct "Hcwd" as (cw) "Hcwd".
+    (* both index-free fragments are opened here and closed on both arms;
+       the SET and the working directory are what this corollary hides,
+       and the payload is the caller's own (lane IO-LEAF, M3b). *)
+    iDestruct "Hch" as (Sc) "Hch".
+    iApply (wp_kshr_fork1 N P szv l D h m n cw Sc (ukn_pay N) emp%I
+              (ukn_pay N (-1)) (ukn_const_eq (N := N))
+              with "Hcode Hro HP Hsz Hstd Hcwd Hch HD [] Hkw Hpayv Hrun").
+    { done. }
+    iSplitR.
+    { (* the panic, on the free law: the record's own payload pays the
+         exit, as before (M4b(2) pays sh's own fork arm through the links
+         instead -- [UkShFork.wp_kshf_fork]) *)
+      iIntros (h' m' r) "%Hmsg _ _ _ Hpayv Hrun".
+      iApply (ush_diag_leaf N h' m' ShSyms.panic n
+                ltac:(left; split; [ reflexivity | left; exact Hmsg ])
+                with "Hdp Hcode Hro [] Hpayv Hrun").
+      rewrite ush_diag_res_panic. done. }
+    iSplitL "Hpar".
+    - iIntros (h' m' r) "%Hr _ %Hcs %Ha0 Hans HP Hsz Hstd Hcwd HD Hpayv Hrun".
+      iAssert (UserChildren.uch_any (ukn_ch N)) with "[Hans]" as "Hch".
+      { iDestruct "Hans" as "[(_ & Hf & _) | Hpid]".
+        - iApply (uch_any_of with "Hf").
+        (* one slot more since design app-pipe SS4.3y: the answer's pid
+           arm carries the generation's freshness, which this index-free
+           corollary drops with the rest of the row. *)
+        - iDestruct "Hpid" as (γ pidv) "(_ & _ & _ & _ & Hf)".
+          iApply (uch_any_of with "Hf"). }
+      iApply ("Hpar" $! h' m' r
+                with "[%] [%] [%] HP Hsz Hstd [Hcwd] Hch HD Hpayv Hrun");
+        [ exact Hr | exact Hcs | exact Ha0
+        | iApply (ucwd_any_of with "Hcwd") ].
+    - iIntros (N' h' m' γ') "%Hpeq %Hcs %Ha0 _ _ #Hck HP Hsz Hstd Hcwd Hch _ HD
+                             Hrun".
+      iApply ("Hchi" $! N' h' m'
+                with "[%] [%] [%] Hck HP Hsz Hstd [Hcwd] [Hch] HD Hrun");
+        [ exact Hpeq | exact Hcs | exact Ha0
+        | iApply (ucwd_any_of with "Hcwd")
+        | iApply (uch_any_of with "Hch") ].
+  Qed.
+
+  (* ===================================================================== *)
+  (* §7 runcmd's PROLOGUE AND DISPATCH, 0x8e..0xb8.                         *)
+  (*                                                                       *)
+  (*   push 48 ; spill ra,s0 ; s0 = fp ; if(cmd==0) exit(1) ; spill s1 ;    *)
+  (*   s1 = cmd ; a4 = cmd->type ; if(5 <u a4) panic ;                      *)
+  (*   a5 = 0x1398 + the signed word at 0x1398 + 4*type ; jr a5            *)
+  (*                                                                       *)
+  (* TWO BRANCHES ARE REFUTED HERE, and the node predicate is what refutes  *)
+  (* them: [ush_cmd] says the node's address is positive (so the null test  *)
+  (* falls through) and that its type word is one of 1..5 (so the           *)
+  (* unsigned-above-5 test does).  The DEFAULT arm -- [panic("runcmd")] at  *)
+  (* 0xc2 -- is therefore dead code under this precondition, and so is the  *)
+  (* [exit(1)] at 0xba, which is [wp_kshr_runcmd_null]'s subject instead.   *)
+  (*                                                                       *)
+  (* THE JUMP TABLE IS A TEXT READ.  .rodata shares the executable          *)
+  (* segment, so the [c.lw a5,0(a5)] at 0xb4 goes through the engine leaf   *)
+  (* [UkRunMem.wp_uk_clw_text], and the row comes out of [ush_jtab], not     *)
+  (* out of the data heap.                                                  *)
+  (* ===================================================================== *)
+
+  (* the four closed identities the dispatch needs, one per node kind *)
+  Lemma ush_bltu_false (c : ushcmd) :
+    uv_btaken BLTU (sign_extend' 64 (mword_of_int 5 : mword 6) : mword 64)
+      (sign_extend' 64 (mword_of_int (ush_ty c) : mword 32) : mword 64)
+    = false.
+  Proof using . destruct c; vm_compute; reflexivity. Qed.
+
+  Lemma ush_slli_eq (c : ushcmd) :
+    shift_bits_left
+      (zero_extend' 64 (mword_of_int (ush_ty c) : mword 32) : mword 64)
+      (subrange_vec_dec (mword_of_int 2 : mword 6) (Z.sub log2_xlen 1) 0)
+    = mword_of_int (4 * ush_ty c).
+  Proof using . destruct c; apply bv_eq; vm_compute; reflexivity. Qed.
+
+  Lemma ush_jarm_eq (c : ushcmd) :
+    add_vec (sign_extend' 64 (ush_jent (ush_ty c)) : mword 64)
+      (mword_of_int SH_JTAB)
+    = mword_of_int (ush_jarm c).
+  Proof using . destruct c; apply bv_eq; vm_compute; reflexivity. Qed.
+
+  Lemma ush_jarm_even (c : ushcmd) :
+    ret_pc (mword_of_int (ush_jarm c) : mword 64) = mword_of_int (ush_jarm c).
+  Proof using . destruct c; apply bv_eq; vm_compute; reflexivity. Qed.
+
+  Lemma ush_jtab_align (c : ushcmd) : (SH_JTAB + 4 * ush_ty c) mod 4 = 0.
+  Proof using . destruct c; vm_compute; reflexivity. Qed.
+
+  Lemma ush_jtab_bnd (c : ushcmd) : 0 <= SH_JTAB + 4 * ush_ty c < Z64.
+  Proof using . destruct c; unfold Z64; cbn [ush_ty]; unfold SH_JTAB; lia. Qed.
+
+  (* PUBLIC (lane E4): see [wp_kshr_jal]. *)
+  Lemma wp_kshr_entry (N : uk_names Σ) `{!ukn_const N} (c : ushcmd)
+      (h : CpuId) (m : regfile) (t : Z) (n : nat) :
+    m !!! Regidx a0_idx = (mword_of_int t : mword 64) ->
+    shk_code (ukn_t N) -∗ ush_jtab (ukn_t N) -∗ ush_cmd (ukn_d N) t c -∗
+    urun N h m (mword_of_int ShSyms.runcmd) (6 + n) -∗
+    (∀ (h' : CpuId) (m' : regfile) (sp0 : mword 64),
+       ⌜ uint sp0 mod 8 = 0 ⌝ -∗
+       ⌜ 48 <= uint sp0 ⌝ -∗
+       ⌜ m' !!! Regidx csp_rs1 = add_vec_int sp0 (- (8 * Z.of_nat 6)) ⌝ -∗
+       ⌜ m' !!! Regidx s0_idx = sp0 ⌝ -∗
+       ⌜ m' !!! Regidx s1_idx = (mword_of_int t : mword 64) ⌝ -∗
+       ⌜ m' !!! Regidx a0_idx = (mword_of_int t : mword 64) ⌝ -∗
+       (∃ w : mword 64, uword (ukn_d N) (uint sp0 - 40) w) -∗
+       urun N h' m' (mword_of_int (ush_jarm c)) n -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Ha0. iIntros "#Hcode #Hjt #Htree Hrun Hcont".
+    rewrite shr_runcmd.
+    iDestruct (ush_cmd_addr with "Htree") as %[Htr Ht8].
+    iDestruct (ush_cmd_type with "Htree") as "#Hty".
+    iDestruct (ush_jtab_row (ukn_t N) c with "Hjt") as "#Hrow".
+    iDestruct (urun_stack with "Hrun") as %[Hal8 Hroom].
+    remember (m !!! Regidx csp_rs1) as sp0 eqn:Hsp0.
+    assert (Hsp : m !!! Regidx csp_rs1 = sp0) by (symmetry; exact Hsp0).
+    clear Hsp0.
+    assert (Hlo : 48 <= uint sp0) by lia.
+    assert (Hbsp : bv_unsigned (add_vec_int sp0 (- (8 * Z.of_nat 6)))
+                   = bv_unsigned sp0 - 48).
+    { replace (- (8 * Z.of_nat 6)) with (-48) by lia.
+      exact (uv_avi_neg sp0 48 ltac:(lia)
+               ltac:(rewrite <- uint_unsigned; lia)). }
+    assert (Hsp48 : uint (add_vec_int sp0 (- (8 * Z.of_nat 6)))
+                    = uint sp0 - 48)
+      by (rewrite !uint_unsigned; exact Hbsp).
+    assert (HR : 0 <= bv_unsigned sp0 < 18446744073709551616).
+    { pose proof (bv_unsigned_in_range 64 sp0) as H0.
+      assert (Em : bv_modulus 64 = 18446744073709551616)
+        by (vm_compute; reflexivity).
+      rewrite Em in H0. exact H0. }
+    assert (Hlt6 : bv_unsigned (add_vec_int sp0 (- (8 * Z.of_nat 6)))
+                   + 8 * Z.of_nat 6 < Z64)
+      by (rewrite Hbsp; unfold Z64; lia).
+    assert (Hup : add_vec_int (add_vec_int sp0 (- (8 * Z.of_nat 6)))
+                    (8 * Z.of_nat 6) = sp0).
+    { apply bv_eq.
+      rewrite (uv_avi_pos (add_vec_int sp0 (- (8 * Z.of_nat 6)))
+                 (8 * Z.of_nat 6) ltac:(lia) Hlt6).
+      rewrite Hbsp. lia. }
+    assert (Go5 : uoff_sdsp (mword_of_int 5 : mword 6) = 40)
+      by (vm_compute; reflexivity).
+    assert (Go4 : uoff_sdsp (mword_of_int 4 : mword 6) = 32)
+      by (vm_compute; reflexivity).
+    assert (Go3 : uoff_sdsp (mword_of_int 3 : mword 6) = 24)
+      by (vm_compute; reflexivity).
+    (* ---- 0x8e  c.addi16sp sp,sp,-48 -- THE PUSH ---- *)
+    iApply (wp_uk_caddi16sp_dn N h m (mword_of_int 0x8e)
+              (mword_of_int 61 : mword 6) 6 n
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_8e with "Hcode"). }
+    assert (E8e : add_vec_int (mword_of_int 0x8e : mword 64) 2
+                  = mword_of_int 0x90)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Hsp ustack_6 E8e.
+    iIntros "(_ & [%v1 Hw1] & [%v2 Hw2] & [%v3 Hw3] & [%v4 Hw4]
+              & [%v5 Hw5] & [%v6 Hw6])".
+    iIntros (h1) "Hrun".
+    set (n1 := <[Regidx csp_rs1
+                 := regval_into_reg (add_vec_int sp0 (- (8 * Z.of_nat 6)))]> m).
+    assert (Hsp1 : n1 !!! Regidx csp_rs1
+                   = add_vec_int sp0 (- (8 * Z.of_nat 6)))
+      by exact (upd_eq m (Regidx csp_rs1) _).
+    assert (Hn1 : forall q : mword 5, Regidx q <> Regidx csp_rs1 ->
+                    n1 !!! Regidx q = m !!! Regidx q)
+      by (intros q Hq; exact (upd_ne m (Regidx csp_rs1) (Regidx q) _ Hq)).
+    (* ---- 0x90  c.sdsp ra,40(sp) ---- *)
+    iApply (wp_uk_csdsp N h1 n1 (mword_of_int 0x90)
+              (mword_of_int 5 : mword 6) ra_idx (uint sp0 - 8) v1 n
+              ltac:(rewrite Hsp1 Hsp48 Go5; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              with "[] Hw1 Hrun").
+    { iApply (uis_shk_90 with "Hcode"). }
+    iIntros "Hw1".
+    assert (E90 : add_vec_int (mword_of_int 0x90 : mword 64) 2
+                  = mword_of_int 0x92)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E90. iIntros (h2) "Hrun".
+    (* ---- 0x92  c.sdsp s0,32(sp) ---- *)
+    iApply (wp_uk_csdsp N h2 n1 (mword_of_int 0x92)
+              (mword_of_int 4 : mword 6) s0_idx (uint sp0 - 16) v2 n
+              ltac:(rewrite Hsp1 Hsp48 Go4; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              with "[] Hw2 Hrun").
+    { iApply (uis_shk_92 with "Hcode"). }
+    iIntros "Hw2".
+    assert (E92 : add_vec_int (mword_of_int 0x92 : mword 64) 2
+                  = mword_of_int 0x94)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E92. iIntros (h3) "Hrun".
+    (* ---- 0x94  c.addi4spn s0,sp,48 -- THE FRAME POINTER ---- *)
+    iApply (wp_uk_caddi4spn N h3 n1 (mword_of_int 0x94)
+              (mword_of_int 0 : mword 3) (mword_of_int 12 : mword 8) s0_idx
+              sp0 n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; reflexivity) ltac:(vm_compute; discriminate)
+              ltac:(rewrite Hsp1;
+                    assert (Ei : (sign_extend' 64
+                                    (caddi4spn_imm (mword_of_int 12 : mword 8))
+                                  : mword 64) = mword_of_int (8 * Z.of_nat 6))
+                      by (apply bv_eq; vm_compute; reflexivity);
+                    rewrite Ei; symmetry; exact Hup)
+              with "[] Hrun").
+    { iApply (uis_shk_94 with "Hcode"). }
+    assert (E94 : add_vec_int (mword_of_int 0x94 : mword 64) 2
+                  = mword_of_int 0x96)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E94. iIntros (h4) "Hrun".
+    set (n2 := <[Regidx s0_idx := regval_into_reg sp0]> n1).
+    assert (Hn2 : forall q : mword 5, Regidx q <> Regidx s0_idx ->
+                    n2 !!! Regidx q = n1 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n1 (Regidx s0_idx) (Regidx q) _ Hq)).
+    assert (Hs0_2 : n2 !!! Regidx s0_idx = sp0)
+      by exact (upd_eq n1 (Regidx s0_idx) (regval_into_reg sp0)).
+    assert (Hsp2 : n2 !!! Regidx csp_rs1
+                   = add_vec_int sp0 (- (8 * Z.of_nat 6)))
+      by (rewrite (Hn2 csp_rs1 ltac:(vm_compute; discriminate)); exact Hsp1).
+    assert (Ha0_2 : n2 !!! Regidx a0_idx = (mword_of_int t : mword 64)).
+    { rewrite (Hn2 a0_idx ltac:(vm_compute; discriminate)).
+      rewrite (Hn1 a0_idx ltac:(vm_compute; discriminate)). exact Ha0. }
+    (* ---- 0x96  c.beqz a0,0xba -- REFUTED: the node's address is > 0 ---- *)
+    iApply (wp_uk_cbeqz N h4 n2 (mword_of_int 0x96)
+              (mword_of_int 18 : mword 8) (mword_of_int 2 : mword 3) a0_idx
+              false (mword_of_int 0xba) n
+              ltac:(vm_compute; reflexivity)
+              ltac:(rewrite Ha0_2 (moi_eq_zero t ltac:(unfold Z64; lia));
+                    symmetry; apply Z.eqb_neq; lia)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(discriminate)
+              with "[] Hrun").
+    { iApply (uis_shk_96 with "Hcode"). }
+    assert (E96 : add_vec_int (mword_of_int 0x96 : mword 64) 2
+                  = mword_of_int 0x98)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E96. iIntros (h5) "Hrun".
+    (* ---- 0x98  c.sdsp s1,24(sp) ---- *)
+    iApply (wp_uk_csdsp N h5 n2 (mword_of_int 0x98)
+              (mword_of_int 3 : mword 6) s1_idx (uint sp0 - 24) v3 n
+              ltac:(rewrite Hsp2 Hsp48 Go3; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              with "[] Hw3 Hrun").
+    { iApply (uis_shk_98 with "Hcode"). }
+    iIntros "Hw3".
+    assert (E98 : add_vec_int (mword_of_int 0x98 : mword 64) 2
+                  = mword_of_int 0x9a)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E98. iIntros (h6) "Hrun".
+    (* ---- 0x9a  c.mv s1,a0 ---- *)
+    iApply (wp_uk_cmv N h6 n2 (mword_of_int 0x9a) s1_idx a0_idx
+              (mword_of_int t) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Ha0_2 moi_add_zero_l; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_9a with "Hcode"). }
+    assert (E9a : add_vec_int (mword_of_int 0x9a : mword 64) 2
+                  = mword_of_int 0x9c)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E9a. iIntros (h7) "Hrun".
+    set (n3 := <[Regidx s1_idx
+                 := regval_into_reg (mword_of_int t : mword 64)]> n2).
+    assert (Hn3 : forall q : mword 5, Regidx q <> Regidx s1_idx ->
+                    n3 !!! Regidx q = n2 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n2 (Regidx s1_idx) (Regidx q) _ Hq)).
+    assert (Hs1_3 : n3 !!! Regidx s1_idx = (mword_of_int t : mword 64))
+      by exact (upd_eq n2 (Regidx s1_idx) _).
+    assert (Ha0_3 : n3 !!! Regidx a0_idx = (mword_of_int t : mword 64))
+      by (rewrite (Hn3 a0_idx ltac:(vm_compute; discriminate)); exact Ha0_2).
+    (* ---- 0x9c  c.lw a4,0(a0) -- the TYPE word ---- *)
+    iApply (wp_uk_clwq N h7 n3 (mword_of_int 0x9c)
+              (mword_of_int 0 : mword 5) (mword_of_int 2 : mword 3)
+              (mword_of_int 6 : mword 3) a0_idx a4_idx DfracDiscarded
+              t (mword_of_int (ush_ty c)) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+              ltac:(rewrite Ha0_3 (uint_moi t ltac:(unfold Z64; lia));
+                    vm_compute uoff_c4; lia)
+              ltac:(pose proof (Z.mod_divide t 8 ltac:(lia)) as Hd;
+                    apply Z.mod_divide; [ lia | ];
+                    destruct (proj1 Hd Ht8) as [kq Hkq]; exists (2 * kq); lia)
+              ltac:(vm_compute; discriminate)
+              with "[] Hty Hrun").
+    { iApply (uis_shk_9c with "Hcode"). }
+    iIntros "_".
+    assert (E9c : add_vec_int (mword_of_int 0x9c : mword 64) 2
+                  = mword_of_int 0x9e)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E9c. iIntros (h8) "Hrun".
+    set (n4 := <[Regidx a4_idx
+                 := regval_into_reg (sign_extend'
+                      64 (mword_of_int (ush_ty c) : mword 32))]> n3).
+    assert (Hn4 : forall q : mword 5, Regidx q <> Regidx a4_idx ->
+                    n4 !!! Regidx q = n3 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n3 (Regidx a4_idx) (Regidx q) _ Hq)).
+    assert (Ha4_4 : n4 !!! Regidx a4_idx
+                    = sign_extend' 64 (mword_of_int (ush_ty c) : mword 32))
+      by exact (upd_eq n3 (Regidx a4_idx) _).
+    (* ---- 0x9e  c.li a5,5 ---- *)
+    iApply (wp_uk_cli N h8 n4 (mword_of_int 0x9e)
+              (mword_of_int 5 : mword 6) a5_idx n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate) with "[] Hrun").
+    { iApply (uis_shk_9e with "Hcode"). }
+    assert (E9e : add_vec_int (mword_of_int 0x9e : mword 64) 2
+                  = mword_of_int 0xa0)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E9e. iIntros (h9) "Hrun".
+    set (n5 := <[Regidx a5_idx
+                 := regval_into_reg (sign_extend'
+                      64 (mword_of_int 5 : mword 6) : mword 64)]> n4).
+    assert (Hn5 : forall q : mword 5, Regidx q <> Regidx a5_idx ->
+                    n5 !!! Regidx q = n4 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n4 (Regidx a5_idx) (Regidx q) _ Hq)).
+    assert (Ha5_5 : n5 !!! Regidx a5_idx
+                    = (sign_extend' 64 (mword_of_int 5 : mword 6) : mword 64))
+      by exact (upd_eq n4 (Regidx a5_idx) _).
+    assert (Ha4_5 : n5 !!! Regidx a4_idx
+                    = sign_extend' 64 (mword_of_int (ush_ty c) : mword 32))
+      by (rewrite (Hn5 a4_idx ltac:(vm_compute; discriminate)); exact Ha4_4).
+    (* ---- 0xa0  bltu a5,a4,0xc2 -- REFUTED: the type is at most 5 ---- *)
+    iApply (wp_uk_btype N h9 n5 (mword_of_int 0xa0)
+              (mword_of_int 34 : mword 13) a4_idx a5_idx BLTU false
+              (mword_of_int 0xc2) n
+              ltac:(rewrite Ha5_5 Ha4_5; symmetry; exact (ush_bltu_false c))
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(discriminate)
+              with "[] Hrun").
+    { iApply (uis_shk_a0 with "Hcode"). }
+    assert (Ea0e : add_vec_int (mword_of_int 0xa0 : mword 64) 4
+                   = mword_of_int 0xa4)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Ea0e. iIntros (h10) "Hrun".
+    assert (Ha0_5 : n5 !!! Regidx a0_idx = (mword_of_int t : mword 64)).
+    { rewrite (Hn5 a0_idx ltac:(vm_compute; discriminate)).
+      rewrite (Hn4 a0_idx ltac:(vm_compute; discriminate)). exact Ha0_3. }
+    (* ---- 0xa4  lwu a5,0(a0) -- the type again, ZERO-extended ---- *)
+    iApply (wp_uk_lwuq N h10 n5 (mword_of_int 0xa4)
+              (mword_of_int 0 : mword 12) a0_idx a5_idx DfracDiscarded
+              t (mword_of_int (ush_ty c)) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(rewrite Ha0_5 (uint_moi t ltac:(unfold Z64; lia));
+                    vm_compute uoff_i12; lia)
+              ltac:(pose proof (Z.mod_divide t 8 ltac:(lia)) as Hd;
+                    apply Z.mod_divide; [ lia | ];
+                    destruct (proj1 Hd Ht8) as [kq Hkq]; exists (2 * kq); lia)
+              ltac:(vm_compute; discriminate)
+              with "[] Hty Hrun").
+    { iApply (uis_shk_a4 with "Hcode"). }
+    iIntros "_".
+    assert (Ea4 : add_vec_int (mword_of_int 0xa4 : mword 64) 4
+                  = mword_of_int 0xa8)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Ea4. iIntros (h11) "Hrun".
+    set (n6 := <[Regidx a5_idx
+                 := regval_into_reg (zero_extend'
+                      64 (mword_of_int (ush_ty c) : mword 32))]> n5).
+    assert (Hn6 : forall q : mword 5, Regidx q <> Regidx a5_idx ->
+                    n6 !!! Regidx q = n5 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n5 (Regidx a5_idx) (Regidx q) _ Hq)).
+    assert (Ha5_6 : n6 !!! Regidx a5_idx
+                    = zero_extend' 64 (mword_of_int (ush_ty c) : mword 32))
+      by exact (upd_eq n5 (Regidx a5_idx) _).
+    (* ---- 0xa8  c.slli a5,a5,2 ---- *)
+    iApply (wp_uk_cslli N h11 n6 (mword_of_int 0xa8)
+              (mword_of_int 2 : mword 6) a5_idx
+              (mword_of_int (4 * ush_ty c)) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Ha5_6; symmetry; exact (ush_slli_eq c))
+              with "[] Hrun").
+    { iApply (uis_shk_a8 with "Hcode"). }
+    assert (Ea8 : add_vec_int (mword_of_int 0xa8 : mword 64) 2
+                  = mword_of_int 0xaa)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Ea8. iIntros (h12) "Hrun".
+    set (n7 := <[Regidx a5_idx
+                 := regval_into_reg (mword_of_int (4 * ush_ty c)
+                                     : mword 64)]> n6).
+    assert (Hn7 : forall q : mword 5, Regidx q <> Regidx a5_idx ->
+                    n7 !!! Regidx q = n6 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n6 (Regidx a5_idx) (Regidx q) _ Hq)).
+    assert (Ha5_7 : n7 !!! Regidx a5_idx
+                    = (mword_of_int (4 * ush_ty c) : mword 64))
+      by exact (upd_eq n6 (Regidx a5_idx) _).
+    (* ---- 0xaa  auipc a4,0x1 ---- *)
+    iApply (wp_uk_auipc N h12 n7 (mword_of_int 0xaa)
+              (mword_of_int 1 : mword 20) a4_idx (mword_of_int 0x10aa) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_aa with "Hcode"). }
+    assert (Eaa : add_vec_int (mword_of_int 0xaa : mword 64) 4
+                  = mword_of_int 0xae)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Eaa. iIntros (h13) "Hrun".
+    set (n8 := <[Regidx a4_idx
+                 := regval_into_reg (mword_of_int 0x10aa : mword 64)]> n7).
+    assert (Hn8 : forall q : mword 5, Regidx q <> Regidx a4_idx ->
+                    n8 !!! Regidx q = n7 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n7 (Regidx a4_idx) (Regidx q) _ Hq)).
+    assert (Ha4_8 : n8 !!! Regidx a4_idx = (mword_of_int 0x10aa : mword 64))
+      by exact (upd_eq n7 (Regidx a4_idx) _).
+    (* ---- 0xae  addi a4,a4,750 -- a4 = 0x1398, the table ---- *)
+    iApply (wp_uk_addi N h13 n8 (mword_of_int 0xae)
+              (mword_of_int 750 : mword 12) a4_idx a4_idx
+              (mword_of_int SH_JTAB) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Ha4_8;
+                    assert (Es : (sign_extend' 64
+                                    (mword_of_int 750 : mword 12) : mword 64)
+                                 = mword_of_int 750)
+                      by (apply bv_eq; vm_compute; reflexivity);
+                    rewrite Es moi_add; unfold SH_JTAB; f_equal; lia)
+              with "[] Hrun").
+    { iApply (uis_shk_ae with "Hcode"). }
+    assert (Eae : add_vec_int (mword_of_int 0xae : mword 64) 4
+                  = mword_of_int 0xb2)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Eae. iIntros (h14) "Hrun".
+    set (n9 := <[Regidx a4_idx
+                 := regval_into_reg (mword_of_int SH_JTAB : mword 64)]> n8).
+    assert (Hn9 : forall q : mword 5, Regidx q <> Regidx a4_idx ->
+                    n9 !!! Regidx q = n8 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n8 (Regidx a4_idx) (Regidx q) _ Hq)).
+    assert (Ha4_9 : n9 !!! Regidx a4_idx = (mword_of_int SH_JTAB : mword 64))
+      by exact (upd_eq n8 (Regidx a4_idx) _).
+    assert (Ha5_9 : n9 !!! Regidx a5_idx
+                    = (mword_of_int (4 * ush_ty c) : mword 64)).
+    { rewrite (Hn9 a5_idx ltac:(vm_compute; discriminate)).
+      rewrite (Hn8 a5_idx ltac:(vm_compute; discriminate)). exact Ha5_7. }
+    (* ---- 0xb2  c.add a5,a5,a4 -- the ROW's address ---- *)
+    iApply (wp_uk_cadd N h14 n9 (mword_of_int 0xb2) a5_idx a4_idx
+              (mword_of_int (SH_JTAB + 4 * ush_ty c)) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Ha5_9 Ha4_9 moi_add; f_equal; lia)
+              with "[] Hrun").
+    { iApply (uis_shk_b2 with "Hcode"). }
+    assert (Eb2 : add_vec_int (mword_of_int 0xb2 : mword 64) 2
+                  = mword_of_int 0xb4)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Eb2. iIntros (h15) "Hrun".
+    set (n10 := <[Regidx a5_idx
+                  := regval_into_reg (mword_of_int (SH_JTAB + 4 * ush_ty c)
+                                      : mword 64)]> n9).
+    assert (Hn10 : forall q : mword 5, Regidx q <> Regidx a5_idx ->
+                     n10 !!! Regidx q = n9 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n9 (Regidx a5_idx) (Regidx q) _ Hq)).
+    assert (Ha5_10 : n10 !!! Regidx a5_idx
+                     = (mword_of_int (SH_JTAB + 4 * ush_ty c) : mword 64))
+      by exact (upd_eq n9 (Regidx a5_idx) _).
+    (* ---- 0xb4  c.lw a5,0(a5) -- THE TABLE READ, out of the TEXT ---- *)
+    iApply (wp_uk_clw_text N h15 n10 (mword_of_int 0xb4)
+              (mword_of_int 0 : mword 5) (mword_of_int 7 : mword 3)
+              (mword_of_int 7 : mword 3) a5_idx a5_idx
+              (SH_JTAB + 4 * ush_ty c) (ush_jent (ush_ty c)) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+              ltac:(rewrite Ha5_10
+                      (uint_moi (SH_JTAB + 4 * ush_ty c) (ush_jtab_bnd c));
+                    vm_compute uoff_c4; lia)
+              (ush_jtab_align c)
+              ltac:(vm_compute; discriminate)
+              with "[] Hrow Hrun").
+    { iApply (uis_shk_b4 with "Hcode"). }
+    assert (Eb4 : add_vec_int (mword_of_int 0xb4 : mword 64) 2
+                  = mword_of_int 0xb6)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Eb4. iIntros (h16) "Hrun".
+    set (n11 := <[Regidx a5_idx
+                  := regval_into_reg (sign_extend'
+                       64 (ush_jent (ush_ty c)))]> n10).
+    assert (Hn11 : forall q : mword 5, Regidx q <> Regidx a5_idx ->
+                     n11 !!! Regidx q = n10 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n10 (Regidx a5_idx) (Regidx q) _ Hq)).
+    assert (Ha5_11 : n11 !!! Regidx a5_idx
+                     = sign_extend' 64 (ush_jent (ush_ty c)))
+      by exact (upd_eq n10 (Regidx a5_idx) _).
+    assert (Ha4_11 : n11 !!! Regidx a4_idx
+                     = (mword_of_int SH_JTAB : mword 64)).
+    { rewrite (Hn11 a4_idx ltac:(vm_compute; discriminate)).
+      rewrite (Hn10 a4_idx ltac:(vm_compute; discriminate)). exact Ha4_9. }
+    (* ---- 0xb6  c.add a5,a5,a4 -- the ARM's pc ---- *)
+    iApply (wp_uk_cadd N h16 n11 (mword_of_int 0xb6) a5_idx a4_idx
+              (mword_of_int (ush_jarm c)) n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite Ha5_11 Ha4_11; symmetry; exact (ush_jarm_eq c))
+              with "[] Hrun").
+    { iApply (uis_shk_b6 with "Hcode"). }
+    assert (Eb6 : add_vec_int (mword_of_int 0xb6 : mword 64) 2
+                  = mword_of_int 0xb8)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Eb6. iIntros (h17) "Hrun".
+    set (n12 := <[Regidx a5_idx
+                  := regval_into_reg (mword_of_int (ush_jarm c)
+                                      : mword 64)]> n11).
+    assert (Hn12 : forall q : mword 5, Regidx q <> Regidx a5_idx ->
+                     n12 !!! Regidx q = n11 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n11 (Regidx a5_idx) (Regidx q) _ Hq)).
+    (* ---- 0xb8  c.jr a5 -- INTO THE ARM ---- *)
+    iApply (wp_uk_cjr N h17 n12 (mword_of_int 0xb8) a5_idx
+              (mword_of_int (ush_jarm c)) n
+              ltac:(vm_compute; discriminate)
+              ltac:(rewrite (upd_eq n11 (Regidx a5_idx)
+                               (regval_into_reg (mword_of_int (ush_jarm c)
+                                                 : mword 64)));
+                    symmetry; exact (ush_jarm_even c))
+              with "[] Hrun").
+    { iApply (uis_shk_b8 with "Hcode"). }
+    iIntros (h18) "Hrun".
+    (* ---- and what the arm is handed ---- *)
+    assert (Hchain : forall q : mword 5,
+              Regidx q <> Regidx a4_idx -> Regidx q <> Regidx a5_idx ->
+              n12 !!! Regidx q = n3 !!! Regidx q).
+    { intros q H4 H5.
+      rewrite (Hn12 q H5) (Hn11 q H5) (Hn10 q H5) (Hn9 q H4) (Hn8 q H4)
+              (Hn7 q H5) (Hn6 q H5) (Hn5 q H5) (Hn4 q H4). reflexivity. }
+    iApply ("Hcont" $! h18 n12 sp0 with "[%] [%] [%] [%] [%] [%] [Hw5] Hrun").
+    - exact Hal8.
+    - exact Hlo.
+    - rewrite (Hchain csp_rs1 ltac:(vm_compute; discriminate)
+                 ltac:(vm_compute; discriminate)).
+      rewrite (Hn3 csp_rs1 ltac:(vm_compute; discriminate)). exact Hsp2.
+    - rewrite (Hchain s0_idx ltac:(vm_compute; discriminate)
+                 ltac:(vm_compute; discriminate)).
+      rewrite (Hn3 s0_idx ltac:(vm_compute; discriminate)). exact Hs0_2.
+    - rewrite (Hchain s1_idx ltac:(vm_compute; discriminate)
+                 ltac:(vm_compute; discriminate)). exact Hs1_3.
+    - rewrite (Hchain a0_idx ltac:(vm_compute; discriminate)
+                 ltac:(vm_compute; discriminate)). exact Ha0_3.
+    - iExists v5. iExact "Hw5".
+  Qed.
+
+  (* ===================================================================== *)
+  (* §8 WHAT EACH NODE KIND HANDS ITS ARM.                                  *)
+  (* ===================================================================== *)
+  Lemma ush_cmd_exec (g : gname) (t : Z) (args : list uarg) :
+    ush_cmd g t (UExec args) -∗
+    uargv g (t + 8) args ∗
+    ush_ptr g (t + 8 + 8 * Z.of_nat (length args)) 0 ∗
+    ([∗ list] x ∈ args, ush_str g x).
+  Proof using .
+    cbn [ush_cmd]. iIntros "(_ & _ & _ & #A & #B & #C)". iFrame "A B C".
+  Qed.
+
+  Lemma ush_cmd_redir (g : gname) (t : Z) (c1 : ushcmd) (file : uarg)
+      (mode fd : Z) :
+    ush_cmd g t (URedir c1 file mode fd) -∗
+    (∃ q : Z, ush_ptr g (t + 8) q ∗ ush_cmd g q c1) ∗
+    ush_ptr g (t + 16) (ua_ptr file) ∗ ush_str g file ∗
+    ush_w32 g (t + 32) mode ∗ ush_w32 g (t + 36) fd.
+  Proof using .
+    cbn [ush_cmd]. iIntros "(_ & _ & _ & #A & #B & #C & #D & #E)".
+    iFrame "A B C D E".
+  Qed.
+
+  Lemma ush_cmd_pipe (g : gname) (t : Z) (l r : ushcmd) :
+    ush_cmd g t (UPipe l r) -∗
+    (∃ q : Z, ush_ptr g (t + 8) q ∗ ush_cmd g q l) ∗
+    (∃ q : Z, ush_ptr g (t + 16) q ∗ ush_cmd g q r).
+  Proof using . cbn [ush_cmd]. iIntros "(_ & _ & _ & #A & #B)". iFrame "A B". Qed.
+
+  Lemma ush_cmd_list (g : gname) (t : Z) (l r : ushcmd) :
+    ush_cmd g t (UList l r) -∗
+    (∃ q : Z, ush_ptr g (t + 8) q ∗ ush_cmd g q l) ∗
+    (∃ q : Z, ush_ptr g (t + 16) q ∗ ush_cmd g q r).
+  Proof using . cbn [ush_cmd]. iIntros "(_ & _ & _ & #A & #B)". iFrame "A B". Qed.
+
+  Lemma ush_cmd_back (g : gname) (t : Z) (c1 : ushcmd) :
+    ush_cmd g t (UBack c1) -∗ ∃ q : Z, ush_ptr g (t + 8) q ∗ ush_cmd g q c1.
+  Proof using . cbn [ush_cmd]. iIntros "(_ & _ & _ & #A)". iFrame "A". Qed.
+
+  (* argv[0], which is what the EXEC arm's null test looks at: the NUL cap
+     when the vector is empty, and the first string's pointer otherwise. *)
+  Lemma ush_argv0 (g : gname) (t : Z) (args : list uarg) :
+    ush_cmd g t (UExec args) -∗
+    match args with
+    | [] => ush_ptr g (t + 8) 0
+    | x :: _ => ush_ptr g (t + 8) (ua_ptr x) ∗ ush_str g x
+    end.
+  Proof using .
+    iIntros "#Ht". iDestruct (ush_cmd_exec with "Ht") as "(#Hv & #Hn & #Hs)".
+    destruct args as [| x rest ].
+    - rewrite /ush_ptr. cbn [length]. rewrite Z.mul_0_r Z.add_0_r.
+      iExact "Hn".
+    - iDestruct (uargv_acc g (t + 8) (x :: rest) 0%nat x eq_refl with "Hv")
+        as "[[#Hw #Hstr] _]".
+      rewrite Z.mul_0_r Z.add_0_r.
+      iSplitR; [ iExact "Hw" | ].
+      iDestruct (big_sepL_lookup _ (x :: rest) 0%nat x eq_refl with "Hs")
+        as "#Hs0". iExact "Hs0".
+  Qed.
+
+  (* ===================================================================== *)
+  (* §8a FOUR BYTES OF THE FRAME, NAMED AS A WORD.  The [int p[2]] the PIPE *)
+  (* arm hands to [pipe] comes back as an unnamed run; the [lw]s that read  *)
+  (* p[0] and p[1] want each half as [nth_byte] of a 32-bit word, and any   *)
+  (* four bytes are.                                                        *)
+  (* ===================================================================== *)
+  Local Lemma ush_bytes_as_word (g : gname) (a : Z) (f : nat -> bv 8) :
+    ubytes g a 4 f -∗ ∃ wv : mword 32, ubytes g a 4 (nth_byte wv).
+  Proof using .
+    iIntros "Hbs".
+    iExists (Z_to_bv 32 (assemble_bytes
+                           [f 0%nat; f 1%nat; f 2%nat; f 3%nat])).
+    iApply (ubytes_ext g a 4 f _ with "Hbs").
+    intros j Hj.
+    rewrite (nth_byte_assemble_len 32
+               [f 0%nat; f 1%nat; f 2%nat; f 3%nat] j
+               ltac:(cbn [length]; lia) ltac:(cbn [length]; lia)).
+    destruct j as [| [| [| [| j ]]]]; cbn [list_lookup_total];
+      [ reflexivity | reflexivity | reflexivity | reflexivity | lia ].
+  Qed.
+
+  Local Lemma ush_pipe_halves (g : gname) (a : Z) (f : nat -> bv 8) :
+    ubytes g a 8 f -∗
+    ∃ w0 w1 : mword 32,
+      ubytes g a 4 (nth_byte w0) ∗ ubytes g (a + 4) 4 (nth_byte w1).
+  Proof using .
+    clear dependent GEN. (* unused; else Rocq counts it as used (asks for Proof using … GEN) *)
+    clear dependent Dg. (* unused; else Rocq counts it as used (asks for Proof using … Dg) *)
+    iIntros "Hbs".
+    rewrite (ubytes_split g a 4 8 f ltac:(lia)).
+    iDestruct "Hbs" as "[Hlo Hhi]".
+    iDestruct (ush_bytes_as_word g a f with "Hlo") as (w0) "Hlo".
+    iDestruct (ush_bytes_as_word g (a + Z.of_nat 4)
+                 (fun j => f (4 + j)%nat) with "Hhi") as (w1) "Hhi".
+    iExists w0, w1. iFrame "Hlo".
+    replace (a + 4) with (a + Z.of_nat 4) by lia. iFrame "Hhi".
+  Qed.
+
+  (* ===================================================================== *)
+  (* §8b [wait(0)] AS A CALL: [c.li a0,0] then [jal ra,<wait>].  All three  *)
+  (* of sh's wait sites are this pair, and the row's null-status arm is     *)
+  (* what makes the heap cross untouched.                                   *)
+  (* ===================================================================== *)
+  Local Lemma wp_kshr_wait0 (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile)
+      (pc0 pc1 ret : Z) (imm : mword 21) (avail : nat) :
+    add_vec_int (mword_of_int pc0 : mword 64) 2 = mword_of_int pc1 ->
+    (mword_of_int ShSyms.wait : mword 64)
+      = add_vec (mword_of_int pc1 : mword 64) (sign_extend' 64 imm) ->
+    (mword_of_int ret : mword 64)
+      = add_vec_int (mword_of_int pc1 : mword 64) 4 ->
+    eq_vec (access_vec_dec (mword_of_int ShSyms.wait : mword 64) 0) ('b"0")
+      = true ->
+    ret_pc (mword_of_int ret : mword 64) = mword_of_int ret ->
+    shk_code (ukn_t N) -∗
+    uinstr_is (ukn_t N) (mword_of_int pc0) true
+      (C_LI (mword_of_int 0 : mword 6, Regidx a0_idx)) -∗
+    uinstr_is (ukn_t N) (mword_of_int pc1) false (JAL (imm, Regidx ra_idx)) -∗
+    urun N h m (mword_of_int pc0) avail -∗
+    (* sh's own half of its children set, index-free: the reap moves it and
+       sh does not read it ([wp_kshr_wait]) *)
+    UserChildren.uch_any (ukn_ch N) -∗
+    (∀ (h' : CpuId) (m' : regfile),
+       ⌜ ucallee_saved m m' ⌝ -∗
+       urun N h' m' (mword_of_int ret) avail -∗
+       UserChildren.uch_any (ukn_ch N) -∗
+       mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using Hpsok_free.
+    intros E01 Hsym Hret Hal Hrp. iIntros "#Hcode #Hi0 #Hi1 Hrun Hch Hcont".
+    iApply (wp_uk_cli N h m (mword_of_int pc0)
+              (mword_of_int 0 : mword 6) a0_idx avail
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate) with "Hi0 Hrun").
+    rewrite E01. iIntros (h1) "Hrun".
+    set (m1 := <[Regidx a0_idx
+                 := regval_into_reg (sign_extend' 64
+                      (mword_of_int 0 : mword 6) : mword 64)]> m).
+    iApply (wp_kshr_jal N h1 m1 pc1 ShSyms.wait ret imm avail
+              Hsym Hret Hal with "Hi1 Hrun").
+    iIntros (h2) "Hrun".
+    set (m2 := <[Regidx ra_idx := (mword_of_int ret : mword 64)]> m1).
+    assert (Ha0_2 : uint (m2 !!! Regidx a0_idx) = 0).
+    { rewrite /m2 (upd_ne m1 (Regidx ra_idx) (Regidx a0_idx) _
+                     ltac:(vm_compute; discriminate)).
+      rewrite /m1 (upd_eq m (Regidx a0_idx)
+                     (regval_into_reg (sign_extend' 64
+                        (mword_of_int 0 : mword 6) : mword 64))).
+      vm_compute. reflexivity. }
+    assert (Hra2 : m2 !!! Regidx ra_idx = (mword_of_int ret : mword 64))
+      by exact (upd_eq m1 (Regidx ra_idx) _).
+    iDestruct "Hch" as (Sc) "Hch".
+    iApply (wp_kshr_wait N h2 m2 avail Sc Ha0_2 with "Hcode Hrun Hch").
+    iIntros (h3 ret' Sc') "_ Hrun Hch".
+    iDestruct (uch_any_of with "Hch") as "Hch".
+    rewrite Hra2 Hrp.
+    iApply ("Hcont" $! h3 _ with "[%] Hrun Hch").
+    intros q Hq.
+    rewrite (upd_ne _ (Regidx a0_idx) (Regidx q) ret'
+               (ushr_cs_ne q a0_idx Hq
+                  ltac:(right; left; vm_compute; reflexivity))).
+    rewrite (upd_ne _ (Regidx a7_idx) (Regidx q) _
+               (ushr_cs_ne q a7_idx Hq
+                  ltac:(right; right; right; right; vm_compute; reflexivity))).
+    rewrite /m2 (upd_ne m1 (Regidx ra_idx) (Regidx q) _
+                   (ushr_cs_ne q ra_idx Hq
+                      ltac:(left; vm_compute; reflexivity))).
+    rewrite /m1 (upd_ne m (Regidx a0_idx) (Regidx q) _
+                   (ushr_cs_ne q a0_idx Hq
+                      ltac:(right; left; vm_compute; reflexivity))).
+    reflexivity.
+  Qed.
+
+  (* ---- [exit(k)] AS A CALL: [c.li a0,k] then [jal ra,<exit>] ---------- *)
+  Local Lemma wp_kshr_exit0 (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile)
+      (pc0 pc1 ret : Z) (k : mword 6) (imm : mword 21) (avail : nat) :
+      (* THE PAYLOAD IS FREE AT THIS RECORD (lane KILL-PAY, K4(a)).
+         [UkRunSys.wp_uk_ecall_exit]'s premise takes the exit payload out
+         of the PROGRAM's hand now, and this walk exits; every process
+         that runs it is a forked child at [UkRun.ukn_triv], where
+         [UkRun.ukn_pay_free_of_triv] discharges it. *)
+    (⊢ ukn_pay N (-1)) ->
+    add_vec_int (mword_of_int pc0 : mword 64) 2 = mword_of_int pc1 ->
+    (mword_of_int ShSyms.exit : mword 64)
+      = add_vec (mword_of_int pc1 : mword 64) (sign_extend' 64 imm) ->
+    (mword_of_int ret : mword 64)
+      = add_vec_int (mword_of_int pc1 : mword 64) 4 ->
+    eq_vec (access_vec_dec (mword_of_int ShSyms.exit : mword 64) 0) ('b"0")
+      = true ->
+    shk_code (ukn_t N) -∗
+    uinstr_is (ukn_t N) (mword_of_int pc0) true (C_LI (k, Regidx a0_idx)) -∗
+    uinstr_is (ukn_t N) (mword_of_int pc1) false (JAL (imm, Regidx ra_idx)) -∗
+    urun N h m (mword_of_int pc0) avail -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hpx E01 Hsym Hret Hal. iIntros "#Hcode #Hi0 #Hi1 Hrun".
+    iApply (wp_uk_cli N h m (mword_of_int pc0) k a0_idx avail
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; discriminate) with "Hi0 Hrun").
+    rewrite E01. iIntros (h1) "Hrun".
+    iApply (wp_kshr_jal N h1 _ pc1 ShSyms.exit ret imm avail
+              Hsym Hret Hal with "Hi1 Hrun").
+    iIntros (h2) "Hrun".
+    iDestruct Hpx as "Hpay".
+    iApply (wp_ksh_exit N h2 _ avail with "Hcode Hpay Hrun").
+  Qed.
+
+  (* ===================================================================== *)
+  (* §9 runcmd AT A NULL COMMAND.  [runcmd(0)] is [exit(1)] and nothing     *)
+  (* else; it is a separate lemma because the walk below is about a node    *)
+  (* that EXISTS, and [ush_cmd] refutes the test this one takes.            *)
+  (* ===================================================================== *)
+  Lemma wp_kshr_runcmd_null (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile)
+      (n : nat) :
+      (* THE PAYLOAD IS FREE AT THIS RECORD (lane KILL-PAY, K4(a)).
+         [UkRunSys.wp_uk_ecall_exit]'s premise takes the exit payload out
+         of the PROGRAM's hand now, and this walk exits; every process
+         that runs it is a forked child at [UkRun.ukn_triv], where
+         [UkRun.ukn_pay_free_of_triv] discharges it. *)
+    (⊢ ukn_pay N (-1)) ->
+    m !!! Regidx a0_idx = (mword_of_int 0 : mword 64) ->
+    shk_code (ukn_t N) -∗
+    urun N h m (mword_of_int ShSyms.runcmd) (6 + n) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hpx Ha0. iIntros "#Hcode Hrun".
+    rewrite shr_runcmd.
+    iDestruct (urun_stack with "Hrun") as %[Hal8 Hroom].
+    remember (m !!! Regidx csp_rs1) as sp0 eqn:Hsp0.
+    assert (Hsp : m !!! Regidx csp_rs1 = sp0) by (symmetry; exact Hsp0).
+    clear Hsp0.
+    assert (Hlo : 48 <= uint sp0) by lia.
+    assert (Hbsp : bv_unsigned (add_vec_int sp0 (- (8 * Z.of_nat 6)))
+                   = bv_unsigned sp0 - 48).
+    { replace (- (8 * Z.of_nat 6)) with (-48) by lia.
+      exact (uv_avi_neg sp0 48 ltac:(lia)
+               ltac:(rewrite <- uint_unsigned; lia)). }
+    assert (Hsp48 : uint (add_vec_int sp0 (- (8 * Z.of_nat 6)))
+                    = uint sp0 - 48)
+      by (rewrite !uint_unsigned; exact Hbsp).
+    assert (Go5 : uoff_sdsp (mword_of_int 5 : mword 6) = 40)
+      by (vm_compute; reflexivity).
+    assert (Go4 : uoff_sdsp (mword_of_int 4 : mword 6) = 32)
+      by (vm_compute; reflexivity).
+    assert (Go3 : uoff_sdsp (mword_of_int 3 : mword 6) = 24)
+      by (vm_compute; reflexivity).
+    iApply (wp_uk_caddi16sp_dn N h m (mword_of_int 0x8e)
+              (mword_of_int 61 : mword 6) 6 n
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_8e with "Hcode"). }
+    assert (E8e : add_vec_int (mword_of_int 0x8e : mword 64) 2
+                  = mword_of_int 0x90)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Hsp ustack_6 E8e.
+    iIntros "(_ & [%v1 Hw1] & [%v2 Hw2] & [%v3 Hw3] & _ & _ & _)".
+    iIntros (h1) "Hrun".
+    set (n1 := <[Regidx csp_rs1
+                 := regval_into_reg (add_vec_int sp0 (- (8 * Z.of_nat 6)))]> m).
+    assert (Hsp1 : n1 !!! Regidx csp_rs1
+                   = add_vec_int sp0 (- (8 * Z.of_nat 6)))
+      by exact (upd_eq m (Regidx csp_rs1) _).
+    assert (Hn1 : forall q : mword 5, Regidx q <> Regidx csp_rs1 ->
+                    n1 !!! Regidx q = m !!! Regidx q)
+      by (intros q Hq; exact (upd_ne m (Regidx csp_rs1) (Regidx q) _ Hq)).
+    iApply (wp_uk_csdsp N h1 n1 (mword_of_int 0x90)
+              (mword_of_int 5 : mword 6) ra_idx (uint sp0 - 8) v1 n
+              ltac:(rewrite Hsp1 Hsp48 Go5; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              with "[] Hw1 Hrun").
+    { iApply (uis_shk_90 with "Hcode"). }
+    iIntros "_".
+    assert (E90 : add_vec_int (mword_of_int 0x90 : mword 64) 2
+                  = mword_of_int 0x92)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E90. iIntros (h2) "Hrun".
+    iApply (wp_uk_csdsp N h2 n1 (mword_of_int 0x92)
+              (mword_of_int 4 : mword 6) s0_idx (uint sp0 - 16) v2 n
+              ltac:(rewrite Hsp1 Hsp48 Go4; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              with "[] Hw2 Hrun").
+    { iApply (uis_shk_92 with "Hcode"). }
+    iIntros "_".
+    assert (E92 : add_vec_int (mword_of_int 0x92 : mword 64) 2
+                  = mword_of_int 0x94)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E92. iIntros (h3) "Hrun".
+    iApply (wp_uk_caddi4spn N h3 n1 (mword_of_int 0x94)
+              (mword_of_int 0 : mword 3) (mword_of_int 12 : mword 8) s0_idx
+              (add_vec (n1 !!! Regidx csp_rs1)
+                 (sign_extend' 64 (caddi4spn_imm (mword_of_int 12 : mword 8))))
+              n
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(vm_compute; reflexivity) ltac:(vm_compute; discriminate)
+              eq_refl
+              with "[] Hrun").
+    { iApply (uis_shk_94 with "Hcode"). }
+    assert (E94 : add_vec_int (mword_of_int 0x94 : mword 64) 2
+                  = mword_of_int 0x96)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite E94. iIntros (h4) "Hrun".
+    set (n2 := <[Regidx s0_idx
+                 := regval_into_reg
+                      (add_vec (n1 !!! Regidx csp_rs1)
+                         (sign_extend' 64
+                            (caddi4spn_imm (mword_of_int 12 : mword 8))))]> n1).
+    assert (Hn2 : forall q : mword 5, Regidx q <> Regidx s0_idx ->
+                    n2 !!! Regidx q = n1 !!! Regidx q)
+      by (intros q Hq; exact (upd_ne n1 (Regidx s0_idx) (Regidx q) _ Hq)).
+    assert (Hsp2 : n2 !!! Regidx csp_rs1
+                   = add_vec_int sp0 (- (8 * Z.of_nat 6)))
+      by (rewrite (Hn2 csp_rs1 ltac:(vm_compute; discriminate)); exact Hsp1).
+    assert (Ha0_2 : n2 !!! Regidx a0_idx = (mword_of_int 0 : mword 64)).
+    { rewrite (Hn2 a0_idx ltac:(vm_compute; discriminate)).
+      rewrite (Hn1 a0_idx ltac:(vm_compute; discriminate)). exact Ha0. }
+    (* ---- 0x96  c.beqz a0,0xba -- TAKEN ---- *)
+    iApply (wp_uk_cbeqz N h4 n2 (mword_of_int 0x96)
+              (mword_of_int 18 : mword 8) (mword_of_int 2 : mword 3) a0_idx
+              true (mword_of_int 0xba) n
+              ltac:(vm_compute; reflexivity)
+              ltac:(rewrite Ha0_2; vm_compute; reflexivity)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(intros _; vm_compute; reflexivity)
+              with "[] Hrun").
+    { iApply (uis_shk_96 with "Hcode"). }
+    iIntros (h5) "Hrun".
+    (* ---- 0xba  c.sdsp s1,24(sp) ---- *)
+    iApply (wp_uk_csdsp N h5 n2 (mword_of_int 0xba)
+              (mword_of_int 3 : mword 6) s1_idx (uint sp0 - 24) v3 n
+              ltac:(rewrite Hsp2 Hsp48 Go3; lia)
+              ltac:(rewrite Zminus_mod Hal8; reflexivity)
+              with "[] Hw3 Hrun").
+    { iApply (uis_shk_ba with "Hcode"). }
+    iIntros "_".
+    assert (Eba : add_vec_int (mword_of_int 0xba : mword 64) 2
+                  = mword_of_int 0xbc)
+      by (apply bv_eq; vm_compute; reflexivity).
+    rewrite Eba. iIntros (h6) "Hrun".
+    (* ---- 0xbc  c.li a0,1 ; 0xbe  jal ra,0xc62 <exit> ---- *)
+    iApply (wp_kshr_exit0 N h6 n2 0xbc 0xbe 0xc2
+              (mword_of_int 1 : mword 6) (mword_of_int 2980 : mword 21) n Hpx
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(apply bv_eq; vm_compute; reflexivity)
+              ltac:(vm_compute; reflexivity)
+              with "Hcode [] [] Hrun").
+    { iApply (uis_shk_bc with "Hcode"). }
+    { iApply (uis_shk_be with "Hcode"). }
+  Qed.
+
+  (* WHAT AN ARM CARRIES IN REGISTERS: the frame pointer and the node.
+     Both are callee-saved, so every call in every arm preserves them and
+     the plumbing is two lemmas rather than one rewrite per call. *)
+  Definition ush_st (m : regfile) (sp0 : mword 64) (t : Z) : Prop :=
+    m !!! Regidx s0_idx = sp0 /\
+    m !!! Regidx s1_idx = (mword_of_int t : mword 64).
+
+  Lemma ush_st_cs (m m' : regfile) (sp0 : mword 64) (t : Z) :
+    ush_st m sp0 t -> ucallee_saved m m' -> ush_st m' sp0 t.
+  Proof using .
+    intros [H0 H1] Hcs. split.
+    - rewrite (Hcs s0_idx ltac:(vm_compute; reflexivity)). exact H0.
+    - rewrite (Hcs s1_idx ltac:(vm_compute; reflexivity)). exact H1.
+  Qed.
+
+  Lemma ush_st_upd (m : regfile) (sp0 : mword 64) (t : Z) (q : mword 5)
+      (v : mword 64) :
+    ush_st m sp0 t -> uint q <> 8 -> uint q <> 9 ->
+    ush_st (<[Regidx q := v]> m) sp0 t.
+  Proof using .
+    intros [H0 H1] H8 H9. split.
+    - rewrite (upd_ne m (Regidx q) (Regidx s0_idx) v
+                 (ushr_ridx_ne s0_idx q
+                    ltac:(assert (Hz : uint s0_idx = 8)
+                            by (vm_compute; reflexivity); lia))).
+      exact H0.
+    - rewrite (upd_ne m (Regidx q) (Regidx s1_idx) v
+                 (ushr_ridx_ne s1_idx q
+                    ltac:(assert (Hz : uint s1_idx = 9)
+                            by (vm_compute; reflexivity); lia))).
+      exact H1.
+  Qed.
+
+  (* ===================================================================== *)
+  (* [lw a0,<off>(s0)] then [jal ra,<a quiet stub>] -- the PIPE arm's fd    *)
+  (* plumbing, six times over with two different callees.                   *)
+  (* ===================================================================== *)
+  Local Lemma wp_kshr_fd_call (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile)
+      (pc0 pc1 ret sym num : Z) (imm12 : mword 12) (imm : mword 21)
+      (sp0 : mword 64) (a : Z) (wv : mword 32) (avail : nat)
+      (Hstub : forall (h0 : CpuId) (m0 : regfile) (av : nat),
+         shk_code (ukn_t N) -∗
+         urun N h0 m0 (mword_of_int sym) av -∗
+         (∀ (h1 : CpuId) (r : mword 64),
+            urun N h1
+              (<[Regidx a0_idx := r]>
+                 (<[Regidx a7_idx := (mword_of_int num : mword 64)]> m0))
+              (ret_pc (m0 !!! Regidx ra_idx)) av -∗
+            mWP (Loop : expr riscv_lang)) -∗
+         mWP (Loop : expr riscv_lang)) :
+    m !!! Regidx s0_idx = sp0 ->
+    a = uint sp0 + uoff_i12 imm12 ->
+    a mod 4 = 0 ->
+    add_vec_int (mword_of_int pc0 : mword 64) 4 = mword_of_int pc1 ->
+    (mword_of_int sym : mword 64)
+      = add_vec (mword_of_int pc1 : mword 64) (sign_extend' 64 imm) ->
+    (mword_of_int ret : mword 64)
+      = add_vec_int (mword_of_int pc1 : mword 64) 4 ->
+    eq_vec (access_vec_dec (mword_of_int sym : mword 64) 0) ('b"0") = true ->
+    ret_pc (mword_of_int ret : mword 64) = mword_of_int ret ->
+    shk_code (ukn_t N) -∗
+    uinstr_is (ukn_t N) (mword_of_int pc0) false
+      (LOAD (imm12, Regidx s0_idx, Regidx a0_idx, false, 4)) -∗
+    uinstr_is (ukn_t N) (mword_of_int pc1) false (JAL (imm, Regidx ra_idx)) -∗
+    ubytes (ukn_d N) a 4 (nth_byte wv) -∗
+    urun N h m (mword_of_int pc0) avail -∗
+    (ubytes (ukn_d N) a 4 (nth_byte wv) -∗
+       ∀ (h' : CpuId) (m' : regfile),
+         ⌜ ucallee_saved m m' ⌝ -∗
+         urun N h' m' (mword_of_int ret) avail -∗
+         mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hs0 Ha Hal E01 Hsym Hret Halv Hrp.
+    iIntros "#Hcode #Hi0 #Hi1 Hbs Hrun Hcont".
+    iApply (wp_uk_lw N h m (mword_of_int pc0) imm12 s0_idx a0_idx
+              a wv avail
+              ltac:(unfold unot_sp; vm_compute; discriminate)
+              ltac:(rewrite Hs0; exact Ha) Hal
+              ltac:(vm_compute; discriminate)
+              with "Hi0 Hbs Hrun").
+    iIntros "Hbs". rewrite E01. iIntros (h1) "Hrun".
+    iApply (wp_kshr_qcall N h1 _ pc1 sym ret num imm avail Hstub
+              Hsym Hret Halv Hrp with "Hcode Hi1 Hrun").
+    iIntros (h2 m' r) "%Hcs _ Hrun".
+    iApply ("Hcont" with "Hbs [%] Hrun").
+    intros q Hq.
+    rewrite (Hcs q Hq).
+    exact (upd_ne m (Regidx a0_idx) (Regidx q) _
+             (ushr_cs_ne q a0_idx Hq
+                ltac:(right; left; vm_compute; reflexivity))).
+  Qed.
+
+  (* fork's return value tested against zero, at the abstract pid the leaf
+     hands back: the parent's is non-zero by the leaf's own arm. *)
+  Local Lemma ush_neqv_true (x : mword 64) :
+    x <> (mword_of_int 0 : mword 64) -> neq_vec x zero_reg = true.
+  Proof using .
+    intros H. unfold neq_vec.
+    rewrite (proj2 (eq_vec_false_iff x zero_reg)
+               ltac:(rewrite zero_reg_moi; exact H)).
+    reflexivity.
+  Qed.
+
+  (* the two payload shapes the three forking arms carry across [fork] *)
+  Local Lemma forkable_ush_pay (t : Z) (c : ushcmd) :
+    Forkable (fun gt gd _ => (ush_jtab gt ∗ ush_cmd gd t c)%I).
+  Proof using .
+    apply forkable_sep; [ apply forkable_ush_jtab | apply ush_cmd_forkable ].
+  Qed.
+
+  Local Lemma forkable_ush_paypipe (t a b : Z) (c : ushcmd) (w0 w1 : mword 32) :
+    Forkable (fun gt gd _ => (ush_jtab gt ∗ ush_cmd gd t c
+                              ∗ ubytes gd a 4 (nth_byte w0)
+                              ∗ ubytes gd b 4 (nth_byte w1))%I).
+  Proof using .
+    apply forkable_sep; [ apply forkable_ush_jtab | ].
+    apply forkable_sep; [ apply ush_cmd_forkable | ].
+    apply forkable_sep; apply forkable_ubytes.
+  Qed.
+
+  (* ===================================================================== *)
+  (* §10 runcmd, WHOLE -- THE TREE WALK.                                    *)
+  (*                                                                       *)
+  (* ORDINARY STRUCTURAL INDUCTION on the command tree.  Four of the five   *)
+  (* arms recurse, and each recursion is one 48-byte frame deeper, so the   *)
+  (* budget is [6 * ush_ht c] words plus the constant every arm needs       *)
+  (* ([2] for fork1's own frame, [Dg] for the diagnostic subtree) plus the  *)
+  (* caller's tail.  A child's instance of the theorem is this one with the *)
+  (* surplus rolled into that tail, which is what makes the induction       *)
+  (* hypothesis applicable at a SMALLER height without weakening the        *)
+  (* statement.                                                             *)
+  (*                                                                       *)
+  (* WHAT EACH ARM CONSUMES:                                                *)
+  (*   EXEC  -- [wp_kshr_exec] (the -1 arm), [wp_kshr_exit0].               *)
+  (*   LIST  -- [wp_kshr_fork1] (two continuations), [wp_kshr_wait0],       *)
+  (*            then ITSELF twice, once in each process.                    *)
+  (*   BACK  -- [wp_kshr_fork1], then ITSELF in the child.                  *)
+  (*   REDIR and PIPE -- REFUTED from [ush_simple], not walked: both move   *)
+  (*            the DESCRIPTOR TABLE and a descriptor move is spent against *)
+  (*            the program-side ledger ([UkSh.ush_std]), which this walk    *)
+  (*            does not carry.  [ush_cmd] pins the type word, so the two    *)
+  (*            jump-table rows are dead exactly as the DEFAULT row is.      *)
+  (*                                                                       *)
+  (* DEPENDS ON [ush_diag_leaf]: EXEC's returning exec, REDIR's failing     *)
+  (* open, PIPE's failing pipe, and fork1's -1 all end in the printer.      *)
+  (* ===================================================================== *)
+  (* AT ONE CLASS ([ukn_const]).  The EXEC arm pays its deposit out of the
+     exec supply AT THIS RECORD'S OWN PAYLOAD ([UkRun.uxsup_at]), which is
+     what the supplier names, so nothing here reads whether that payload is
+     trivial.  A caller whose record IS trivial passes [UkRun.uxsup] and
+     rewrites by its own equation.
+     ...BUT THE PAYLOAD IS FREE ALL THE SAME (lane KILL-PAY, K4(a), ruling
+     R-B).  The earlier promise -- "runcmd becomes usable by a process that
+     owes its parent something" -- is WITHDRAWN: this walk ends in [exit],
+     and exit's leaf takes the payload out of the program's own hand now
+     ([UkRunSys.wp_uk_ecall_exit]), which a record at a real resource
+     cannot supply from nothing.  THE FACT that makes the Coq-level premise
+     below honest is that EVERY process which runs [runcmd] is sh's FORKED
+     CHILD, whose record is trivial ([UkFork.wp_uk_ecall_fork_any]'s child
+     arm gives the equation) -- sh itself never calls it -- so
+     [UkRun.ukn_pay_free_of_triv] discharges it at every call site. *)
+  Lemma wp_kshr_runcmd (c : ushcmd) :
+    ush_simple c ->
+    forall (N : uk_names Σ) `{!ukn_const N} (h : CpuId) (m : regfile) (t szv : Z)
+           (ld : list fdstate) (n : nat),
+      (* THE PAYLOAD IS FREE AT THIS RECORD (lane KILL-PAY, K4(a)).
+         [UkRunSys.wp_uk_ecall_exit]'s premise takes the exit payload out
+         of the PROGRAM's hand now, and this walk exits; every process
+         that runs it is a forked child at [UkRun.ukn_triv], where
+         [UkRun.ukn_pay_free_of_triv] discharges it. *)
+      (⊢ ukn_pay N (-1)) ->
+      m !!! Regidx a0_idx = (mword_of_int t : mword 64) ->
+      UkSh.sh_deps -∗
+      shk_code (ukn_t N) -∗
+      (* THE EXEC DEPOSIT'S SUPPLIER.  runcmd's EXEC arm ecalls exec, whose
+         bundle the key-free minting law cannot pay ([UkRun.uxsup_at]); sh
+         takes it as an explicit premise and its kernel-side constructor
+         pays it.  AT THIS RECORD'S OWN PAYLOAD, which is what exec's
+         bundle reads ([UexecExecInst.exec_sbundle]). *)
+      uxsup_at (ukn_pay N) -∗
+      (* ...AND IT SERVES THE FORKED CHILDREN TOO (lane IO-LEAF, M3b).
+         There used to be a SECOND supply here, [UkRun.uxsup] at the
+         trivial payload, because the LIST and BACK arms fork and the
+         child's record paid nothing.  The child is forked AT THIS
+         RECORD'S OWN PAYLOAD now, so its record satisfies the same
+         equation and the supply above is its own. *)
+      (* ...AND HOW A KILLER PAYS FOR A FORKED CHILD (lane IO-LEAF, M3b):
+         forking at a payload that is not [fun _ => True] is what makes
+         [UkFork.wp_uk_ecall_fork]'s wand a real obligation. *)
+      □ (app_taint -∗ ukn_pay N (-1)) -∗
+      ush_jtab (ukn_t N) -∗ ush_cmd (ukn_d N) t c -∗ usz (ukn_s N) szv -∗
+      UserFd.ustd (ukn_fd N) ld -∗
+      UserCwd.ucwd_any (ukn_cwd N) -∗
+      (* the caller's half of its children set, index-free -- LIST and BACK
+         both fork, and the set moves at each ([wp_kshr_fork1]) *)
+      UserChildren.uch_any (ukn_ch N) -∗
+      urun N h m (mword_of_int ShSyms.runcmd)
+        (6 * ush_ht c + (2 + (Dg + n))) -∗
+      mWP (Loop : expr riscv_lang).
+  Proof using Hpsok_free ush_diag_leaf.
+    induction c as [ args | c1 IH file mode fd | l IHl r IHr
+                   | l IHl r IHr | c1 IH ];
+      intros Hs N Hcst h m t szv ld n Hpx Ha0;
+      iIntros "#Hdp #Hcode #Hexs #Hkw #Hjt #Htree Hsz Hstd Hcwd Hch Hrun";
+      iDestruct (ush_jtab_ro with "Hjt") as "#Hro";
+      iDestruct (ush_cmd_addr with "Htree") as %[Htr Ht8];
+      assert (Ht4 : t mod 4 = 0)
+        by (pose proof (Z.mod_divide t 8 ltac:(lia)) as Hd;
+            apply Z.mod_divide; [ lia | ];
+            destruct (proj1 Hd Ht8) as [kq Hkq]; exists (2 * kq); lia).
+
+    - (* =================== EXEC =================== *)
+      iDestruct (ush_argv0 with "Htree") as "#Hav".
+      replace (6 * ush_ht (UExec args) + (2 + (Dg + n)))%nat
+        with (6 + (2 + (Dg + n)))%nat by (cbn [ush_ht]; lia).
+      iApply (wp_kshr_entry N (UExec args) h m t (2 + (Dg + n)) Ha0
+                with "Hcode Hjt Htree Hrun").
+      iIntros (h1 m1 sp0) "%Hal8 %Hlo %Hsp1 %Hs0_1 %Hs1_1 %Ha0_1 _ Hrun".
+      assert (E8 : (t + 8) mod 8 = 0)
+        by (rewrite Zplus_mod Ht8; reflexivity).
+      assert (Ece : add_vec_int (mword_of_int 0xce : mword 64) 2
+                    = mword_of_int 0xd0)
+        by (apply bv_eq; vm_compute; reflexivity).
+      destruct args as [| x rest ].
+      + (* ---- argv[0] is the NUL cap: exit(1) ---- *)
+        iApply (wp_uk_cldq N h1 m1 (mword_of_int 0xce)
+                  (mword_of_int 1 : mword 5) (mword_of_int 2 : mword 3)
+                  (mword_of_int 2 : mword 3) a0_idx a0_idx DfracDiscarded
+                  (t + 8) (mword_of_int 0) (2 + (Dg + n))
+                  ltac:(unfold unot_sp; vm_compute; discriminate)
+                  ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite Ha0_1 (uint_moi t ltac:(unfold Z64; lia));
+                        vm_compute uoff_c8; lia)
+                  E8 ltac:(vm_compute; discriminate)
+                  with "[] Hav Hrun").
+        { iApply (uis_shk_ce with "Hcode"). }
+        iIntros "_". rewrite Ece. iIntros (h2) "Hrun".
+        set (k1 := <[Regidx a0_idx
+                     := regval_into_reg (mword_of_int 0 : mword 64)]> m1).
+        iApply (wp_uk_cbeqz N h2 k1 (mword_of_int 0xd0)
+                  (mword_of_int 16 : mword 8) (mword_of_int 2 : mword 3) a0_idx
+                  true (mword_of_int 0xf0) (2 + (Dg + n))
+                  ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite /k1 (upd_eq m1 (Regidx a0_idx)
+                                       (mword_of_int 0 : mword 64));
+                        vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(intros _; vm_compute; reflexivity)
+                  with "[] Hrun").
+        { iApply (uis_shk_d0 with "Hcode"). }
+        iIntros (h3) "Hrun".
+        iApply (wp_kshr_exit0 N h3 k1 0xf0 0xf2 0xf6
+                  (mword_of_int 1 : mword 6) (mword_of_int 2928 : mword 21)
+                  (2 + (Dg + n)) Hpx
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(vm_compute; reflexivity)
+                  with "Hcode [] [] Hrun").
+        { iApply (uis_shk_f0 with "Hcode"). }
+        { iApply (uis_shk_f2 with "Hcode"). }
+      + (* ---- argv[0] is a string: exec, and it can only come back -1 ---- *)
+        iDestruct "Hav" as "[#Hw0 #Hstr]".
+        iDestruct "Hstr" as "[%Hxr #Hxs]".
+        iApply (wp_uk_cldq N h1 m1 (mword_of_int 0xce)
+                  (mword_of_int 1 : mword 5) (mword_of_int 2 : mword 3)
+                  (mword_of_int 2 : mword 3) a0_idx a0_idx DfracDiscarded
+                  (t + 8) (mword_of_int (ua_ptr x)) (2 + (Dg + n))
+                  ltac:(unfold unot_sp; vm_compute; discriminate)
+                  ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite Ha0_1 (uint_moi t ltac:(unfold Z64; lia));
+                        vm_compute uoff_c8; lia)
+                  E8 ltac:(vm_compute; discriminate)
+                  with "[] Hw0 Hrun").
+        { iApply (uis_shk_ce with "Hcode"). }
+        iIntros "_". rewrite Ece. iIntros (h2) "Hrun".
+        set (k1 := <[Regidx a0_idx
+                     := regval_into_reg (mword_of_int (ua_ptr x)
+                                         : mword 64)]> m1).
+        assert (Hk1 : forall q : mword 5, Regidx q <> Regidx a0_idx ->
+                        k1 !!! Regidx q = m1 !!! Regidx q)
+          by (intros q Hq; exact (upd_ne m1 (Regidx a0_idx) (Regidx q) _ Hq)).
+        assert (Hs1_k : k1 !!! Regidx s1_idx = (mword_of_int t : mword 64))
+          by (rewrite (Hk1 s1_idx ltac:(vm_compute; discriminate));
+              exact Hs1_1).
+        iApply (wp_uk_cbeqz N h2 k1 (mword_of_int 0xd0)
+                  (mword_of_int 16 : mword 8) (mword_of_int 2 : mword 3) a0_idx
+                  false (mword_of_int 0xf0) (2 + (Dg + n))
+                  ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite /k1 (upd_eq m1 (Regidx a0_idx)
+                                       (mword_of_int (ua_ptr x) : mword 64));
+                        rewrite (moi_eq_zero (ua_ptr x)
+                                   ltac:(unfold Z64; lia));
+                        symmetry; apply Z.eqb_neq; lia)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(discriminate)
+                  with "[] Hrun").
+        { iApply (uis_shk_d0 with "Hcode"). }
+        assert (Ed0 : add_vec_int (mword_of_int 0xd0 : mword 64) 2
+                      = mword_of_int 0xd2)
+          by (apply bv_eq; vm_compute; reflexivity).
+        rewrite Ed0. iIntros (h3) "Hrun".
+        (* ---- 0xd2  addi a1,s1,8 -- &argv[0] ---- *)
+        iApply (wp_uk_addi N h3 k1 (mword_of_int 0xd2)
+                  (mword_of_int 8 : mword 12) s1_idx a1_idx
+                  (mword_of_int (t + 8)) (2 + (Dg + n))
+                  ltac:(unfold unot_sp; vm_compute; discriminate)
+                  ltac:(vm_compute; discriminate)
+                  ltac:(rewrite Hs1_k;
+                        assert (Es : (sign_extend' 64
+                                        (mword_of_int 8 : mword 12) : mword 64)
+                                     = mword_of_int 8)
+                          by (apply bv_eq; vm_compute; reflexivity);
+                        rewrite Es moi_add; reflexivity)
+                  with "[] Hrun").
+        { iApply (uis_shk_d2 with "Hcode"). }
+        assert (Ed2 : add_vec_int (mword_of_int 0xd2 : mword 64) 4
+                      = mword_of_int 0xd6)
+          by (apply bv_eq; vm_compute; reflexivity).
+        rewrite Ed2. iIntros (h4) "Hrun".
+        set (k2 := <[Regidx a1_idx
+                     := regval_into_reg (mword_of_int (t + 8)
+                                         : mword 64)]> k1).
+        (* ---- 0xd6  jal ra,0xc9a <exec> ---- *)
+        iApply (wp_kshr_jal N h4 k2 0xd6 ShSyms.exec 0xda
+                  (mword_of_int 3012 : mword 21) (2 + (Dg + n))
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(vm_compute; reflexivity)
+                  with "[] Hrun").
+        { iApply (uis_shk_d6 with "Hcode"). }
+        iIntros (h5) "Hrun".
+        set (k3 := <[Regidx ra_idx := (mword_of_int 0xda : mword 64)]> k2).
+        assert (Hrk3 : ret_pc (k3 !!! Regidx ra_idx)
+                       = (mword_of_int 0xda : mword 64))
+          by (rewrite /k3 (upd_eq k2 (Regidx ra_idx) _);
+              apply bv_eq; vm_compute; reflexivity).
+        iApply (wp_kshr_exec N h5 k3 (2 + (Dg + n))
+                  with "Hcode Hrun []").
+        { iApply (udepw_of_uxsup_at with "Hexs"). }
+        rewrite Hrk3. iIntros (h6) "Hrun".
+        (* ---- 0xda: "exec %s failed" -- THE DIAGNOSTIC CUT ---- *)
+        set (k4 := <[Regidx a0_idx := (mword_of_int (-1) : mword 64)]>
+                     (<[Regidx a7_idx := (mword_of_int 7 : mword 64)]> k3)).
+        assert (Hs1_k4 : uint (k4 !!! Regidx s1_idx) = t).
+        { rewrite /k4 (upd_ne _ (Regidx a0_idx) (Regidx s1_idx) _
+                         ltac:(vm_compute; discriminate)).
+          rewrite (upd_ne k3 (Regidx a7_idx) (Regidx s1_idx) _
+                     ltac:(vm_compute; discriminate)).
+          rewrite /k3 (upd_ne k2 (Regidx ra_idx) (Regidx s1_idx) _
+                         ltac:(vm_compute; discriminate)).
+          rewrite /k2 (upd_ne k1 (Regidx a1_idx) (Regidx s1_idx) _
+                         ltac:(vm_compute; discriminate)).
+          rewrite Hs1_k. apply uint_moi. unfold Z64. lia. }
+        replace (2 + (Dg + n))%nat with (Dg + (2 + n))%nat by lia.
+        iDestruct Hpx as "Hpay".
+        iApply (ush_diag_leaf N h6 k4 0xda (2 + n)
+                  ltac:(right; left; split;
+                        [ reflexivity | rewrite Hs1_k4; exact Ht8 ])
+                  with "Hdp Hcode Hro [] Hpay Hrun").
+        rewrite /ush_diag_res.
+        destruct (decide ((0xda : Z) = 0xda)) as [_ | Hc];
+          [ | exfalso; exact (Hc eq_refl) ].
+        iExists x. rewrite Hs1_k4. iSplitR; [ iExact "Hw0" | ].
+        iSplitR; [ iPureIntro; exact Hxr | iExact "Hxs" ].
+
+    - (* =================== REDIR: REFUTED =================== *)
+      (* [ush_simple] excludes the node, and [ush_cmd] pins the type word,
+         so no instruction of the arm is fetched.  See [ush_simple]. *)
+      cbn [ush_simple] in Hs. destruct Hs.
+
+    - (* =================== PIPE: REFUTED =================== *)
+      cbn [ush_simple] in Hs. destruct Hs.
+
+    - (* =================== LIST =================== *)
+      iDestruct (ush_cmd_list with "Htree") as "[#Hsl #Hsr]".
+      iDestruct "Hsl" as (ql) "[#Hqlp #Hqlc]".
+      iDestruct "Hsr" as (qr) "[#Hqrp #Hqrc]".
+      pose proof (Nat.le_max_l (ush_ht l) (ush_ht r)) as HM1.
+      pose proof (Nat.le_max_r (ush_ht l) (ush_ht r)) as HM2.
+      replace (6 * ush_ht (UList l r) + (2 + (Dg + n)))%nat
+        with (6 + (6 * Nat.max (ush_ht l) (ush_ht r) + (2 + (Dg + n))))%nat
+        by (cbn [ush_ht]; lia).
+      iApply (wp_kshr_entry N (UList l r) h m t
+                (6 * Nat.max (ush_ht l) (ush_ht r) + (2 + (Dg + n))) Ha0
+                with "Hcode Hjt Htree Hrun").
+      iIntros (h1 m1 sp0) "%Hal8 %Hlo %Hsp1 %Hs0_1 %Hs1_1 %Ha0_1 _ Hrun".
+      assert (Hst_m1 : ush_st m1 sp0 t) by (split; assumption).
+      replace (6 * Nat.max (ush_ht l) (ush_ht r) + (2 + (Dg + n)))%nat
+        with (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))%nat by lia.
+      (* ---- 0x124  jal ra,0x68 <fork1> ---- *)
+      iApply (wp_kshr_jal N h1 m1 0x124 ShSyms.fork1 0x128
+                (mword_of_int 2096964 : mword 21)
+                (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))
+                ltac:(apply bv_eq; vm_compute; reflexivity)
+                ltac:(apply bv_eq; vm_compute; reflexivity)
+                ltac:(vm_compute; reflexivity)
+                with "[] Hrun").
+      { iApply (uis_shk_124 with "Hcode"). }
+      iIntros (h2) "Hrun".
+      set (g1 := <[Regidx ra_idx := (mword_of_int 0x128 : mword 64)]> m1).
+      assert (Hra_g1 : ret_pc (g1 !!! Regidx ra_idx)
+                       = (mword_of_int 0x128 : mword 64))
+        by (rewrite /g1 (upd_eq m1 (Regidx ra_idx) _);
+            apply bv_eq; vm_compute; reflexivity).
+      assert (Hst_g1 : ush_st g1 sp0 t)
+        by (apply ush_st_upd;
+            [ exact Hst_m1 | vm_compute; lia | vm_compute; lia ]).
+      iDestruct Hpx as "Hpay".
+      iApply (wp_kshr_fork1_any N
+                (fun gt gd _ => (ush_jtab gt ∗ ush_cmd gd t (UList l r))%I)
+                (FP := forkable_ush_pay t (UList l r))
+                szv ld ∅ h2 g1 (6 * Nat.max (ush_ht l) (ush_ht r) + n)
+                with "Hdp Hcode Hro [] Hsz Hstd Hcwd Hch [] Hkw Hpay Hrun").
+      { iFrame "Hjt Htree". }
+      { rewrite big_sepM_empty. done. }
+      rewrite Hra_g1.
+      iSplitL "".
+      + (* ---- the PARENT: wait(0), then runcmd(lcmd->right) ---- *)
+        iIntros (hA mA rA) "%HrA %HcsA %Ha0A (#Hjt2 & #Ht2) Hsz Hstd Hcwd Hch _ _ Hrun".
+        pose proof (ush_st_cs g1 mA sp0 t Hst_g1 HcsA) as HstA.
+        iApply (wp_uk_cbnez N hA mA (mword_of_int 0x128)
+                  (mword_of_int 4 : mword 8) (mword_of_int 2 : mword 3)
+                  a0_idx true (mword_of_int 0x130)
+                  (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))
+                  ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite Ha0A; symmetry; exact (ush_neqv_true rA HrA))
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(intros _; vm_compute; reflexivity)
+                  with "[] Hrun").
+        { iApply (uis_shk_128 with "Hcode"). }
+        iIntros (hB) "Hrun".
+        (* 0x130..0x136  wait(0) *)
+        iApply (wp_kshr_wait0 N hB mA 0x130 0x132 0x136
+                  (mword_of_int 2872 : mword 21)
+                  (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  with "Hcode [] [] Hrun Hch").
+        { iApply (uis_shk_130 with "Hcode"). }
+        { iApply (uis_shk_132 with "Hcode"). }
+        iIntros (hC mC) "%HcsC Hrun Hch".
+        pose proof (ush_st_cs mA mC sp0 t HstA HcsC) as HstC.
+        destruct HstC as [Hs0C Hs1C].
+        (* 0x136  c.ld a0,16(s1) *)
+        iApply (wp_uk_cldq N hC mC (mword_of_int 0x136)
+                  (mword_of_int 2 : mword 5) (mword_of_int 1 : mword 3)
+                  (mword_of_int 2 : mword 3) s1_idx a0_idx DfracDiscarded
+                  (t + 16) (mword_of_int qr)
+                  (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))
+                  ltac:(unfold unot_sp; vm_compute; discriminate)
+                  ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite Hs1C (uint_moi t ltac:(unfold Z64; lia));
+                        vm_compute uoff_c8; lia)
+                  ltac:(rewrite Zplus_mod Ht8; reflexivity)
+                  ltac:(vm_compute; discriminate)
+                  with "[] Hqrp Hrun").
+        { iApply (uis_shk_136 with "Hcode"). }
+        iIntros "_".
+        assert (E136 : add_vec_int (mword_of_int 0x136 : mword 64) 2
+                       = mword_of_int 0x138)
+          by (apply bv_eq; vm_compute; reflexivity).
+        rewrite E136. iIntros (hD) "Hrun".
+        set (g2 := <[Regidx a0_idx
+                     := regval_into_reg (mword_of_int qr : mword 64)]> mC).
+        iApply (wp_kshr_jal N hD g2 0x138 ShSyms.runcmd 0x13c
+                  (mword_of_int 2096982 : mword 21)
+                  (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(vm_compute; reflexivity)
+                  with "[] Hrun").
+        { iApply (uis_shk_138 with "Hcode"). }
+        iIntros (hE) "Hrun".
+        set (g3 := <[Regidx ra_idx := (mword_of_int 0x13c : mword 64)]> g2).
+        assert (Ha0_g3 : g3 !!! Regidx a0_idx = (mword_of_int qr : mword 64)).
+        { rewrite /g3 (upd_ne g2 (Regidx ra_idx) (Regidx a0_idx) _
+                         ltac:(vm_compute; discriminate)).
+          exact (upd_eq mC (Regidx a0_idx) (mword_of_int qr : mword 64)). }
+        replace (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))%nat
+          with (6 * ush_ht r
+                + (2 + (Dg + (6 * (Nat.max (ush_ht l) (ush_ht r)
+                                   - ush_ht r) + n))))%nat by lia.
+        iApply (IHr (proj2 Hs) N Hcst hE g3 qr szv ld
+                  ((6 * (Nat.max (ush_ht l) (ush_ht r) - ush_ht r) + n)%nat)
+                  Hpx Ha0_g3
+                  with "Hdp Hcode Hexs Hkw Hjt2 Hqrc Hsz Hstd Hcwd Hch Hrun").
+      + (* ---- the CHILD: runcmd(lcmd->left) ---- *)
+        (* AT THE CALLER'S OWN PAYLOAD (lane IO-LEAF, M3b): what the arm
+           hands on is the EQUATION, and every use the class had --
+           [UkRun.ukn_const], the free exit row, the exec supply --
+           transfers through it. *)
+        iIntros (N' hA mA) "%Hti' %HcsA %Ha0A #Hck (#Hjt2 & #Ht2) Hsz Hstd Hcwd Hch _ Hrun".
+        pose proof (ukn_const_of_eq N' (ukn_pay N) Hti'
+                      (ukn_const_eq (N := N))) as Hcst'.
+        assert (Hpx' : ⊢ ukn_pay N' (-1)) by (rewrite Hti'; exact Hpx).
+        iAssert (□ (app_taint -∗ ukn_pay N' (-1)))%I as "#Hkw'".
+        { rewrite Hti'. iExact "Hkw". }
+        iDestruct (ush_cmd_list with "Ht2") as "[#Hsl2 _]".
+        iDestruct "Hsl2" as (ql2) "[#Hqlp2 #Hqlc2]".
+        pose proof (ush_st_cs g1 mA sp0 t Hst_g1 HcsA) as HstA.
+        destruct HstA as [Hs0A Hs1A].
+        iApply (wp_uk_cbnez N' hA mA (mword_of_int 0x128)
+                  (mword_of_int 4 : mword 8) (mword_of_int 2 : mword 3)
+                  a0_idx false (mword_of_int 0x130)
+                  (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))
+                  ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite Ha0A; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(discriminate)
+                  with "[] Hrun").
+        { iApply (uis_shk_128 with "Hck"). }
+        assert (E128 : add_vec_int (mword_of_int 0x128 : mword 64) 2
+                       = mword_of_int 0x12a)
+          by (apply bv_eq; vm_compute; reflexivity).
+        rewrite E128. iIntros (hB) "Hrun".
+        (* 0x12a  c.ld a0,8(s1) *)
+        iApply (wp_uk_cldq N' hB mA (mword_of_int 0x12a)
+                  (mword_of_int 1 : mword 5) (mword_of_int 1 : mword 3)
+                  (mword_of_int 2 : mword 3) s1_idx a0_idx DfracDiscarded
+                  (t + 8) (mword_of_int ql2)
+                  (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))
+                  ltac:(unfold unot_sp; vm_compute; discriminate)
+                  ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite Hs1A (uint_moi t ltac:(unfold Z64; lia));
+                        vm_compute uoff_c8; lia)
+                  ltac:(rewrite Zplus_mod Ht8; reflexivity)
+                  ltac:(vm_compute; discriminate)
+                  with "[] Hqlp2 Hrun").
+        { iApply (uis_shk_12a with "Hck"). }
+        iIntros "_".
+        assert (E12a : add_vec_int (mword_of_int 0x12a : mword 64) 2
+                       = mword_of_int 0x12c)
+          by (apply bv_eq; vm_compute; reflexivity).
+        rewrite E12a. iIntros (hC) "Hrun".
+        set (g2 := <[Regidx a0_idx
+                     := regval_into_reg (mword_of_int ql2 : mword 64)]> mA).
+        iApply (wp_kshr_jal N' hC g2 0x12c ShSyms.runcmd 0x130
+                  (mword_of_int 2096994 : mword 21)
+                  (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(vm_compute; reflexivity)
+                  with "[] Hrun").
+        { iApply (uis_shk_12c with "Hck"). }
+        iIntros (hD) "Hrun".
+        set (g3 := <[Regidx ra_idx := (mword_of_int 0x130 : mword 64)]> g2).
+        assert (Ha0_g3 : g3 !!! Regidx a0_idx = (mword_of_int ql2 : mword 64)).
+        { rewrite /g3 (upd_ne g2 (Regidx ra_idx) (Regidx a0_idx) _
+                         ltac:(vm_compute; discriminate)).
+          exact (upd_eq mA (Regidx a0_idx) (mword_of_int ql2 : mword 64)). }
+        replace (2 + (Dg + (6 * Nat.max (ush_ht l) (ush_ht r) + n)))%nat
+          with (6 * ush_ht l
+                + (2 + (Dg + (6 * (Nat.max (ush_ht l) (ush_ht r)
+                                   - ush_ht l) + n))))%nat by lia.
+        (* the child's record is at the caller's payload, so the caller's
+           OWN exec supply is its own (lane IO-LEAF, M3b) *)
+        iAssert (uxsup_at (ukn_pay N')) as "#Hexs'".
+        { rewrite Hti'. iExact "Hexs". }
+        iApply (IHl (proj1 Hs) N' Hcst' hD g3 ql2 szv ld
+                  ((6 * (Nat.max (ush_ht l) (ush_ht r) - ush_ht l) + n)%nat)
+                  Hpx' Ha0_g3
+                  with "Hdp Hck Hexs' Hkw' Hjt2 Hqlc2 Hsz Hstd Hcwd Hch Hrun").
+
+    - (* =================== BACK =================== *)
+      iDestruct (ush_cmd_back with "Htree") as (q) "[#Hqp #Hqc]".
+      replace (6 * ush_ht (UBack c1) + (2 + (Dg + n)))%nat
+        with (6 + (6 * ush_ht c1 + (2 + (Dg + n))))%nat by (cbn [ush_ht]; lia).
+      iApply (wp_kshr_entry N (UBack c1) h m t
+                (6 * ush_ht c1 + (2 + (Dg + n))) Ha0
+                with "Hcode Hjt Htree Hrun").
+      iIntros (h1 m1 sp0) "%Hal8 %Hlo %Hsp1 %Hs0_1 %Hs1_1 %Ha0_1 _ Hrun".
+      assert (Hst_m1 : ush_st m1 sp0 t) by (split; assumption).
+      replace (6 * ush_ht c1 + (2 + (Dg + n)))%nat
+        with (2 + (Dg + (6 * ush_ht c1 + n)))%nat by lia.
+      (* ---- 0x1c4  jal ra,0x68 <fork1> ---- *)
+      iApply (wp_kshr_jal N h1 m1 0x1c4 ShSyms.fork1 0x1c8
+                (mword_of_int 2096804 : mword 21)
+                (2 + (Dg + (6 * ush_ht c1 + n)))
+                ltac:(apply bv_eq; vm_compute; reflexivity)
+                ltac:(apply bv_eq; vm_compute; reflexivity)
+                ltac:(vm_compute; reflexivity)
+                with "[] Hrun").
+      { iApply (uis_shk_1c4 with "Hcode"). }
+      iIntros (h2) "Hrun".
+      set (b1 := <[Regidx ra_idx := (mword_of_int 0x1c8 : mword 64)]> m1).
+      assert (Hra_b1 : ret_pc (b1 !!! Regidx ra_idx)
+                       = (mword_of_int 0x1c8 : mword 64))
+        by (rewrite /b1 (upd_eq m1 (Regidx ra_idx) _);
+            apply bv_eq; vm_compute; reflexivity).
+      assert (Hst_b1 : ush_st b1 sp0 t)
+        by (apply ush_st_upd;
+            [ exact Hst_m1 | vm_compute; lia | vm_compute; lia ]).
+      iDestruct Hpx as "Hpay".
+      iApply (wp_kshr_fork1_any N
+                (fun gt gd _ => (ush_jtab gt ∗ ush_cmd gd t (UBack c1))%I)
+                (FP := forkable_ush_pay t (UBack c1))
+                szv ld ∅ h2 b1 (6 * ush_ht c1 + n)
+                with "Hdp Hcode Hro [] Hsz Hstd Hcwd Hch [] Hkw Hpay Hrun").
+      { iFrame "Hjt Htree". }
+      { rewrite big_sepM_empty. done. }
+      rewrite Hra_b1.
+      iSplitL "".
+      + (* ---- the PARENT: exit(0) immediately ---- *)
+        iIntros (hA mA rA) "%HrA %HcsA %Ha0A (#Hjt2 & #Ht2) Hsz Hstd Hcwd Hch _ _ Hrun".
+        iApply (wp_uk_btype0 N hA mA (mword_of_int 0x1c8)
+                  (mword_of_int 7970 : mword 13) a0_idx BNE
+                  true (mword_of_int 0xea)
+                  (2 + (Dg + (6 * ush_ht c1 + n)))
+                  ltac:(cbn [uv_btaken]; rewrite Ha0A; symmetry;
+                        exact (ush_neqv_true rA HrA))
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(intros _; vm_compute; reflexivity)
+                  with "[] Hrun").
+        { iApply (uis_shk_1c8 with "Hcode"). }
+        iIntros (hB) "Hrun".
+        iApply (wp_kshr_exit0 N hB mA 0xea 0xec 0xf0
+                  (mword_of_int 0 : mword 6) (mword_of_int 2934 : mword 21)
+                  (2 + (Dg + (6 * ush_ht c1 + n))) Hpx
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(vm_compute; reflexivity)
+                  with "Hcode [] [] Hrun").
+        { iApply (uis_shk_ea with "Hcode"). }
+        { iApply (uis_shk_ec with "Hcode"). }
+      + (* ---- the CHILD: runcmd(bcmd->cmd), in the background ---- *)
+        (* at the caller's own payload -- see the LIST arm *)
+        iIntros (N' hA mA) "%Hti' %HcsA %Ha0A #Hck (#Hjt2 & #Ht2) Hsz Hstd Hcwd Hch _ Hrun".
+        pose proof (ukn_const_of_eq N' (ukn_pay N) Hti'
+                      (ukn_const_eq (N := N))) as Hcst'.
+        assert (Hpx' : ⊢ ukn_pay N' (-1)) by (rewrite Hti'; exact Hpx).
+        iAssert (□ (app_taint -∗ ukn_pay N' (-1)))%I as "#Hkw'".
+        { rewrite Hti'. iExact "Hkw". }
+        iDestruct (ush_cmd_back with "Ht2") as (q2) "[#Hqp2 #Hqc2]".
+        pose proof (ush_st_cs b1 mA sp0 t Hst_b1 HcsA) as HstA.
+        destruct HstA as [Hs0A Hs1A].
+        iApply (wp_uk_btype0 N' hA mA (mword_of_int 0x1c8)
+                  (mword_of_int 7970 : mword 13) a0_idx BNE
+                  false (mword_of_int 0xea)
+                  (2 + (Dg + (6 * ush_ht c1 + n)))
+                  ltac:(cbn [uv_btaken]; rewrite Ha0A;
+                        vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(discriminate)
+                  with "[] Hrun").
+        { iApply (uis_shk_1c8 with "Hck"). }
+        assert (E1c8 : add_vec_int (mword_of_int 0x1c8 : mword 64) 4
+                       = mword_of_int 0x1cc)
+          by (apply bv_eq; vm_compute; reflexivity).
+        rewrite E1c8. iIntros (hB) "Hrun".
+        (* 0x1cc  c.ld a0,8(s1) *)
+        iApply (wp_uk_cldq N' hB mA (mword_of_int 0x1cc)
+                  (mword_of_int 1 : mword 5) (mword_of_int 1 : mword 3)
+                  (mword_of_int 2 : mword 3) s1_idx a0_idx DfracDiscarded
+                  (t + 8) (mword_of_int q2)
+                  (2 + (Dg + (6 * ush_ht c1 + n)))
+                  ltac:(unfold unot_sp; vm_compute; discriminate)
+                  ltac:(vm_compute; reflexivity) ltac:(vm_compute; reflexivity)
+                  ltac:(rewrite Hs1A (uint_moi t ltac:(unfold Z64; lia));
+                        vm_compute uoff_c8; lia)
+                  ltac:(rewrite Zplus_mod Ht8; reflexivity)
+                  ltac:(vm_compute; discriminate)
+                  with "[] Hqp2 Hrun").
+        { iApply (uis_shk_1cc with "Hck"). }
+        iIntros "_".
+        assert (E1cc : add_vec_int (mword_of_int 0x1cc : mword 64) 2
+                       = mword_of_int 0x1ce)
+          by (apply bv_eq; vm_compute; reflexivity).
+        rewrite E1cc. iIntros (hC) "Hrun".
+        set (b2 := <[Regidx a0_idx
+                     := regval_into_reg (mword_of_int q2 : mword 64)]> mA).
+        iApply (wp_kshr_jal N' hC b2 0x1ce ShSyms.runcmd 0x1d2
+                  (mword_of_int 2096832 : mword 21)
+                  (2 + (Dg + (6 * ush_ht c1 + n)))
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(apply bv_eq; vm_compute; reflexivity)
+                  ltac:(vm_compute; reflexivity)
+                  with "[] Hrun").
+        { iApply (uis_shk_1ce with "Hck"). }
+        iIntros (hD) "Hrun".
+        set (b3 := <[Regidx ra_idx := (mword_of_int 0x1d2 : mword 64)]> b2).
+        assert (Ha0_b3 : b3 !!! Regidx a0_idx = (mword_of_int q2 : mword 64)).
+        { rewrite /b3 (upd_ne b2 (Regidx ra_idx) (Regidx a0_idx) _
+                         ltac:(vm_compute; discriminate)).
+          exact (upd_eq mA (Regidx a0_idx) (mword_of_int q2 : mword 64)). }
+        replace (2 + (Dg + (6 * ush_ht c1 + n)))%nat
+          with (6 * ush_ht c1 + (2 + (Dg + n)))%nat by lia.
+        iAssert (uxsup_at (ukn_pay N')) as "#Hexs'".
+        { rewrite Hti'. iExact "Hexs". }
+        iApply (IH Hs N' Hcst' hD b3 q2 szv ld n
+                  Hpx' Ha0_b3
+                  with "Hdp Hck Hexs' Hkw' Hjt2 Hqc2 Hsz Hstd Hcwd Hch Hrun").
+  Qed.
+
+End UkShRun.

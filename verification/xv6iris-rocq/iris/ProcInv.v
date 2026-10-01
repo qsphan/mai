@@ -1,0 +1,4070 @@
+(* ProcInv.v -- the [struct proc] resources beyond the five fields the
+   scheduler needed: the PRIVATE field block a running process owns without
+   holding any lock, the open-file-descriptor array (each non-null slot
+   holding a real [FileInv.file_ref]), and the DORMANT shape that block
+   collapses to when nobody is running the process.
+
+   The analysis this realises is in claude-notes/design/proc-struct.md; the
+   short version:
+
+   * [state]/[chan]/[killed]/[xstate] are lock-protected and mutable, so all
+     four cells live unconditionally in the proc lock's resource (SchedCtx.v).
+   * [pid] is lock-protected but immutable-while-allocated, and is read BOTH
+     by other cores under p->lock (kill's scan) and unlocked by the owning
+     process (sys_getpid, acquiresleep).  That is FileInv's discipline 2, and
+     it takes the same answer: a points-to FRACTION, half resident in the lock
+     resource, half travelling with the runner.  Agreement between the halves
+     is [ctx_word4_pointsto_agree] -- no ghost algebra.
+   * [sz]/[pagetable]/[trapframe]/[ofile]/[cwd]/[name] are written by the
+     running process with NO lock held (sys_sbrk's [myproc()->sz += n],
+     sys_chdir, fdalloc, exec).  So the invariant can retain no fraction of
+     them: it must give the whole block away while the process is live and
+     take it back when it is not.  [proc_priv] is the block; [proc_dormant]
+     is what the invariant holds instead.
+   * [kstack] is written once by procinit and never again: persistent.
+
+   [proc_priv] is the resource that rides alongside [cur_proc p]
+   (ProcGeom.v).  myproc() returns the [p] of [cur_proc p]; [proc_priv] is
+   what makes [myproc()->pid] / [->sz] / [->cwd] / [->ofile[fd]] readable
+   with no lock in hand.
+
+   The lock invariant that consumes [proc_dormant] / [inv_dormant] lives in
+   SchedCtx.v, since it also mentions [proc_ctx]: [proc_pub] (the
+   always-resident killed/xstate/pid-half row) + [proc_slots] (the two flat
+   guards) + [proc_lock_res].  This file stays below it and mentions neither.
+
+   Also here: [tf_page], the whole trapframe PAGE that [p_trapframe]'s
+   pointer names -- all 36 [struct trapframe] words with their values plus
+   the 3808-byte tail.  It is here rather than in ProcPtOwn because the
+   syscall path needs the VALUE of [tf->aN], which a contents-existential
+   page cannot supply. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import gen_heap invariants own.
+Require Import SailStdpp.Base SailStdpp.Operators_mwords SailStdpp.Values.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import RiscvModelBytes RiscvPtsto.
+Require Import ProcGeom.
+Require Import UserPtTree ProcPtOwn.
+Require Import UserPerm.   (* [lazy_free] -- what [ProcDefs.pv_lazy] claims *)
+Require Import Pt4kWalk CommonWalk PtTree KptPt TrampPt KMap.
+Require Import SwtchCtx.
+Require Import FdSlots FileInvDefs.
+Require Import ChildTok.  (* [gen_kq] / [my_pay]: the block's generation *)
+Require Export ProcDefs.
+(* [Typeclasses Opaque] is compilation-local: repeat the declaration here so
+   broad [iFrame] calls do not unfold the 4 KiB [tf_page] big-op imported
+   from [ProcDefs]. *)
+Typeclasses Opaque tf_words tf_tail tf_page.
+(* [IcacheHeld.inode_held]: what [p->cwd] owns, and [IrefSlots.iref_slots]:
+   the supply a dormant block parks.  Exported, because a consumer of
+   [proc_priv] that has to name the reference should not have to know which
+   of the two files it came from. *)
+Require Export InodeRef.
+Require Import KallocInv PageFields ByteBuf.
+(* [FirstTok.first_tok], which is a CONJUNCT of the private block below.  It
+   is a leaf import for this file's purposes: [FirstTok] sits entirely in the
+   fs/kalloc layers and its cone does not reach any process file, so the edge
+   runs one way only.  See the note at [proc_priv_core]. *)
+(* ...and [RiscvLang], for the CLASS [GenId] alone: without the name in
+   scope the backtick binder below generalizes a fresh [GenId : Type] and
+   [first_tok]'s own [GEN] is then unresolvable (durable-notes.md's
+   "missing/late imports auto-generalize silently"). *)
+Require Import RiscvLang.
+Require Import FirstTok.
+(* [Typeclasses Opaque] is compilation-local (same note as [tf_page]'s above),
+   and for [first_tok] it is CORRECTNESS, not speed: the token is a conjunct
+   of [proc_priv], and an unsealed disjunction lets a broad [iFrame] frame a
+   [kernel_text] into its boot arm.  See [FirstTok.v]'s note at the seal. *)
+Typeclasses Opaque first_tok first_boot_persist.
+From Kernel Require KernelSyms.
+Require Import RiscvExtras.
+Require Import IcacheHeld.   (* [inode_held]: what p->cwd holds (Import is not transitive) *)
+(* The [set_solver] override.  EXPORT, not Import: this import is         *)
+(* deliberately "dead" -- the file compiles without it, just far slower --  *)
+(* and the nightly dead-import sweep skips [Require Export] lines.         *)
+(* It has to be HERE rather than inherited: [Require Export] only          *)
+(* propagates through an unbroken chain of Exports, and this tree's        *)
+(* intermediate files use [Require Import], so nothing downstream inherits *)
+(* it.  See FastSetSolver.v.                                              *)
+Require Export FastSetSolver.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Require Import CtxMorphTac.   (* [ctx_morph_solve] for the day-one instances (r25 pass 1) *)
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(* One generic bigop fact, needed by the fd-deficit accessor below.        *)
+(* ===================================================================== *)
+(* The REMAINDER after deleting index [i] cannot see a store at [i]: both
+   sides are [take i l] ++ emp ++ [drop (S i) l].  This is what lets one
+   accessor change the value at [i] AND the predicate everywhere else in a
+   single step.  [big_sepL_insert_acc] does the value alone and
+   [big_sepL_lookup_acc_impl] the predicate alone; a descriptor going on loan
+   changes both at once (its cell is written, and it leaves the set of
+   descriptors that own a payload), so neither suffices. *)
+Lemma big_sepL_delete_insert {PROP : bi} {A : Type} (Φ : nat -> A -> PROP)
+    (l : list A) (i : nat) (x y : A) :
+  l !! i = Some x ->
+  ([∗ list] k↦z ∈ l, if decide (k = i) then emp else Φ k z)
+  ⊣⊢ ([∗ list] k↦z ∈ <[i := y]> l, if decide (k = i) then emp else Φ k z).
+Proof.
+  intro Hi.
+  assert (Hlt : (i < length l)%nat) by (eapply lookup_lt_Some; exact Hi).
+  rewrite -{1}(take_drop_middle l i x Hi) (insert_take_drop l i y Hlt).
+  rewrite !big_sepL_app /= !Nat.add_0_r.
+  rewrite length_take_le; [|lia].
+  by rewrite !decide_True.
+Qed.
+
+(* ===================================================================== *)
+(* The private field block's contents.                                    *)
+(* ===================================================================== *)
+(* [pid] is NOT a member: it is the one field of the group with a SPLIT
+   discipline (half here, half permanently in the lock resource), and call
+   sites want to name it directly.  [kstack] is not a member either: it is
+   persistent (see [is_kstack] below), so it needs no threading. *)
+(* [pagetable] and [trapframe] are NOT value fields: [ProcPtOwn.proc_pt_at]
+   owns both cells and pins them to [page_base (ud_root …)] / [page_base
+   (ud_tfp …)], so a separate value here could only be dead weight or
+   disagree.  The descriptor [pv_upt] determines both. *)
+(* functional update of one fd slot -- fdalloc / sys_close / kexit. *)
+Definition upd_ofile (V : pprivate) (fd : nat) (v : mword 64) : pprivate :=
+  MkPPriv (pv_sz V) (pv_upt V) (pv_tf V) (<[fd := v]> (pv_ofile V)) (pv_fdg V)
+          (pv_cwd V) (pv_name V) (pv_cwi V) (pv_gen V) (pv_chg V) (pv_lazy V) (pv_secc V) (pv_ev V).
+
+(* THE ONE UPDATE THAT MOVES THE GHOST NAME: allocproc's mint.  A slot comes
+   out of [proc_dormant] with whatever junk name its existential carried (a
+   dormant slot has no descriptors, so nothing constrains it) and the fresh
+   process is given a name nothing has ever seen -- see
+   [proc_dormant_unused], which is the only caller, and FdSlots.v's header
+   for why the name must not outlive the incarnation. *)
+Definition upd_fdg (V : pprivate) (g : gname) : pprivate :=
+  MkPPriv (pv_sz V) (pv_upt V) (pv_tf V) (pv_ofile V) g (pv_cwd V) (pv_name V)
+          (pv_cwi V) (pv_gen V) (pv_chg V) (pv_lazy V) (pv_secc V) (pv_ev V).
+
+Definition upd_sz (V : pprivate) (v : mword 64) : pprivate :=
+  MkPPriv v (pv_upt V) (pv_tf V) (pv_ofile V) (pv_fdg V) (pv_cwd V) (pv_name V)
+          (pv_cwi V) (pv_gen V) (pv_chg V) (pv_lazy V) (pv_secc V) (pv_ev V).
+
+(* functional update of the trapframe words -- what prepare_return does to
+   the four KERNEL slots (kernel_satp / kernel_sp / kernel_trap /
+   kernel_hartid) it re-arms for the next uservec, and what a syscall's
+   return value write does to the a0 slot.  The page itself is unchanged;
+   only [pv_tf]'s contents move. *)
+Definition upd_tf (V : pprivate) (ws : list (mword 64)) : pprivate :=
+  MkPPriv (pv_sz V) (pv_upt V) ws (pv_ofile V) (pv_fdg V) (pv_cwd V) (pv_name V)
+          (pv_cwi V) (pv_gen V) (pv_chg V) (pv_lazy V) (pv_secc V) (pv_ev V).
+
+(* the descriptor moves, everything else stays -- what copyin / copyout /
+   vmfault do to a process when they fault a page in ([uptd_ext], below). *)
+Definition upd_upt (V : pprivate) (P : uptd) : pprivate :=
+  MkPPriv (pv_sz V) P (pv_tf V) (pv_ofile V) (pv_fdg V) (pv_cwd V) (pv_name V)
+          (pv_cwi V) (pv_gen V) (pv_chg V) (pv_lazy V) (pv_secc V) (pv_ev V).
+
+(* [upd_cwd] and [upd_cwd_id] live in [ProcDefs], next to [pprivate]
+   itself and to [proc_priv_bare_cwd], the borrow that needs them. *)
+
+(* a process GAINS its address space: the descriptor and the trapframe words
+   move, the scalar fields stay.  allocproc's move, once kalloc has produced
+   the trapframe page and proc_pagetable the table. *)
+Definition upd_pt (V : pprivate) (P : uptd) (ws : list (mword 64)) : pprivate :=
+  MkPPriv (pv_sz V) P ws (pv_ofile V) (pv_fdg V) (pv_cwd V) (pv_name V) (pv_cwi V)
+          (pv_gen V) (pv_chg V) (pv_lazy V) (pv_secc V) (pv_ev V).
+
+(* the 16 debug-name bytes -- kfork's [safestrcpy(np->name, p->name, 16)] and
+   kexec's [safestrcpy(p->name, last, 16)]. *)
+Definition upd_name (V : pprivate) (ns : list (bv 8)) : pprivate :=
+  MkPPriv (pv_sz V) (pv_upt V) (pv_tf V) (pv_ofile V) (pv_fdg V) (pv_cwd V) ns
+          (pv_cwi V) (pv_gen V) (pv_chg V) (pv_lazy V) (pv_secc V) (pv_ev V).
+
+(* EXEC'S MOVE: a process REPLACES its address space.  The size, the
+   descriptor, the trapframe words and the name all change at once; the
+   descriptor array and the working directory survive (xv6's exec closes no
+   file and does not chdir).  This is exactly the composite kexec's two
+   accessors below produce, and [upd_exec_compose] is the equation that says
+   so -- stating the postcondition with this one name is what keeps
+   KexecDefs's success arm readable. *)
+Definition upd_exec (V : pprivate) (szv : mword 64) (P : uptd)
+    (ws : list (mword 64)) (ns : list (bv 8)) : pprivate :=
+  MkPPriv szv P ws (pv_ofile V) (pv_fdg V) (pv_cwd V) ns (pv_cwi V)
+          (pv_gen V) (pv_chg V) false (pv_secc V) (pv_ev V).
+
+(* EXEC CLEARS THE LAZY BIT, and that is the one field [upd_exec] does not
+   carry over -- it installs a NEW address space, so the old bit's claim is
+   about a table that no longer exists.
+
+   IT IS [false] BECAUSE THE IMAGE EXEC LOADS IS EAGER: kexec's uvmalloc
+   runs from the current size for every segment and then adds the
+   guard+stack pair, so every page below the size it settles on is in the
+   table -- the guard page included, since [UserPerm.lazy_free] is about the
+   DOMAIN and uvmclear only clears U.  The fact travels as a ROW:
+   [KexecBuilt.kexec_built]'s coverage conjunct, minted at phase D's commit
+   out of [UmCovered.um_covered] (lane LAZY-FLAG, K4), and the close that
+   writes this bit ([proc_priv_newspace]) is what spends it.  A process
+   resumed on a fresh image therefore reads [false] off its own key
+   ([SpecKexec.exec_slot_pre]'s row), which is what makes the U tier's
+   copyout arguments work at all. *)
+Lemma upd_exec_compose (V : pprivate) (szv : mword 64) (P : uptd)
+    (ws : list (mword 64)) (ns : list (bv 8)) :
+  upd_lazy (upd_sz (upd_pt (upd_name V ns) P ws) szv) false
+  = upd_exec V szv P ws ns.
+Proof. by destruct V. Qed.
+
+(* ...AND THE IDENTITY THE ADDRESS-SPACE ACCESSOR CLOSES AT (lane
+   LAZY-FLAG, K2): [proc_priv_addrspace]'s wand NAMES the bit the block
+   comes back at, and every caller but sbrk's LAZY arm hands back the one
+   it was given -- which is this equation. *)
+Lemma upd_lazy_sz_upt_id (V : pprivate) (P : uptd) (szv : mword 64) :
+  upd_lazy (upd_sz (upd_upt V P) szv) (pv_lazy V) = upd_sz (upd_upt V P) szv.
+Proof. by destruct V. Qed.
+
+Lemma upd_name_id (V : pprivate) : upd_name V (pv_name V) = V.
+Proof. by destruct V. Qed.
+
+(* writing back what was already there is a no-op -- what a caller that only
+   READS a descriptor (argfd) needs to close [proc_priv_ofile]'s accessor
+   without its [V] drifting. *)
+Lemma upd_ofile_id (V : pprivate) (fd : nat) (v : mword 64) :
+  pv_ofile V !! fd = Some v -> upd_ofile V fd v = V.
+Proof.
+  intro Hlk. unfold upd_ofile. rewrite (list_insert_id _ _ _ Hlk).
+  by destruct V.
+Qed.
+
+Lemma upd_ofile_length (V : pprivate) (fd : nat) (v : mword 64) :
+  length (pv_ofile (upd_ofile V fd v)) = length (pv_ofile V).
+Proof. simpl. apply length_insert. Qed.
+
+(* ===================================================================== *)
+(* THE SAME UPDATERS, LIFTED TO [ustate].                                 *)
+(*                                                                       *)
+(* [ProcInv.proc_priv] takes ONE argument now                             *)
+(* ([ProcDefs.ustate] = the private block plus the page image), so a      *)
+(* postcondition that used to read [proc_priv … (upd_tf V ws') M] reads   *)
+(* [proc_priv … (us_tf U ws')].  Each is [upd_usV] composed with its      *)
+(* [pprivate] namesake and therefore leaves [us_M] alone -- which is      *)
+(* exactly right for these eight: none of them touches the process's      *)
+(* memory.  (A move that DOES touch the image spells the image with       *)
+(* [upd_usM], and the two compose.)                                       *)
+(*   Every one reduces to a [MkUstate] applied to projections, so the     *)
+(* field equations a closer needs hold by [reflexivity]:                  *)
+(*   [us_V (us_tf U ws) = upd_tf (us_V U) ws]   [us_M (us_tf U ws) = us_M U]. *)
+(* ===================================================================== *)
+Definition us_ofile (U : ustate) (fd : nat) (v : mword 64) : ustate :=
+  upd_usV U (upd_ofile (us_V U) fd v).
+Definition us_fdg (U : ustate) (g : gname) : ustate :=
+  upd_usV U (upd_fdg (us_V U) g).
+Definition us_sz (U : ustate) (v : mword 64) : ustate :=
+  upd_usV U (upd_sz (us_V U) v).
+Definition us_tf (U : ustate) (ws : list (mword 64)) : ustate :=
+  upd_usV U (upd_tf (us_V U) ws).
+Definition us_upt (U : ustate) (P : uptd) : ustate :=
+  upd_usV U (upd_upt (us_V U) P).
+Definition us_pt (U : ustate) (P : uptd) (ws : list (mword 64)) : ustate :=
+  upd_usV U (upd_pt (us_V U) P ws).
+Definition us_name (U : ustate) (ns : list (bv 8)) : ustate :=
+  upd_usV U (upd_name (us_V U) ns).
+Definition us_exec (U : ustate) (szv : mword 64) (P : uptd)
+    (ws : list (mword 64)) (ns : list (bv 8)) : ustate :=
+  upd_usV U (upd_exec (us_V U) szv P ws ns).
+
+(* THE MASK'S TWO WRITES, lifted (upstream a083670): sys_seccomp's AND and
+   the raw store (userinit's [secc_all], kfork's copy of the parent's). *)
+Definition us_secc (U : ustate) (m : mword 64) : ustate :=
+  upd_usV U (upd_secc (us_V U) m).
+Definition us_set_secc (U : ustate) (m : mword 64) : ustate :=
+  upd_usV U (set_secc (us_V U) m).
+
+Lemma us_secc_set (U : ustate) (m : mword 64) :
+  us_secc U m = us_set_secc U (and_vec (pv_secc (us_V U)) m).
+Proof. reflexivity. Qed.
+
+Lemma us_set_secc_id (U : ustate) : us_set_secc U (pv_secc (us_V U)) = U.
+Proof. destruct U as [V M]. rewrite /us_set_secc /upd_usV /=. by rewrite set_secc_id. Qed.
+
+(* ...and exec CLEARS the lazy bit here too -- [us_lazy] is the lift of
+   [ProcDefs.upd_lazy], and the extra step is [upd_exec_compose]'s.  See
+   its note for why the value is [false]: exec's image is eager. *)
+Lemma us_exec_compose (U : ustate) (szv : mword 64) (P : uptd)
+    (ws : list (mword 64)) (ns : list (bv 8)) :
+  us_lazy (us_sz (us_pt (us_name U ns) P ws) szv) false = us_exec U szv P ws ns.
+Proof. by destruct U as [V M]; destruct V. Qed.
+
+Lemma us_name_id (U : ustate) : us_name U (pv_name (us_V U)) = U.
+Proof. destruct U as [V M]. rewrite /us_name /upd_usV /=. by rewrite upd_name_id. Qed.
+
+Lemma us_tf_id (U : ustate) : us_tf U (pv_tf (us_V U)) = U.
+Proof. destruct U as [V M]. rewrite /us_tf /upd_usV /=. by destruct V. Qed.
+
+Lemma us_upt_id (U : ustate) : us_upt U (pv_upt (us_V U)) = U.
+Proof. destruct U as [V M]. rewrite /us_upt /upd_usV /=. by destruct V. Qed.
+
+Lemma us_ofile_id (U : ustate) (fd : nat) (v : mword 64) :
+  pv_ofile (us_V U) !! fd = Some v -> us_ofile U fd v = U.
+Proof.
+  intro Hlk. destruct U as [V M]. rewrite /us_ofile /upd_usV /=.
+  by rewrite (upd_ofile_id _ _ _ Hlk).
+Qed.
+
+Lemma us_ofile_length (U : ustate) (fd : nat) (v : mword 64) :
+  length (pv_ofile (us_V (us_ofile U fd v))) = length (pv_ofile (us_V U)).
+Proof. apply upd_ofile_length. Qed.
+
+Section ProcInv.
+  Context `{!riscvGS Σ}.
+  Context `{XI : CurCtx}.
+
+  (* =================================================================== *)
+  (* The scalar private cells.                                           *)
+  (* =================================================================== *)
+  (* the SCALAR private cells.  pagetable and trapframe are absent: those two
+     cells belong to [ProcPtOwn.proc_pt_at], which rides beside this in
+     [proc_priv]. *)
+  (* =================================================================== *)
+  (* p->ofile[fd]: the cell, plus the reference it names.                *)
+  (* =================================================================== *)
+  (* Bare cells, no validity clause: what the DORMANT bundle holds (every
+     slot is null there, so there is no reference to describe). *)
+  (* [irefNameG] carries the itable's reference authority CANONICALLY --
+     there is exactly one itable per system, and threading its gname would
+     put a filesystem ghost NAME on [proc_priv], hence on the thirty-three
+     spec files that mention it, purely so a process can name its cwd.
+     [FdSlots] and [IrefSlots] already do this and [IrefSlots.v]'s header
+     spells out the argument.  What propagates is the CLASS -- capacity, no
+     resource, no change to any statement's shape. *)
+  Context `{ !fileG Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ}.
+  (* [FirstTok.first_tok] rides inside the private block (see
+     [proc_priv_core]), and its boot arm names [RiscvPtsto.gen_cert]; that
+     is the ONLY new index the block acquires.  The file-system's own two
+     configuration classes are NOT new binders here: [fileG] already carries
+     [IcacheRefDefs.icfg] and [FsCfg.fscfg] as superclass fields
+     ([FileInvDefs.file_icfg] / [file_fscfg]), so every mention of the token
+     below -- and hence [proc_priv]'s own elaboration -- is at exactly the
+     instance the whole process layer already shares.  Nothing downstream
+     grows a binder for the file system. *)
+  Context `{GEN : GenId}.
+
+  (* A LIVE fd slot: the cell, and -- when non-null -- an actual reference on
+     the [struct file] it points at.  [file_ref] is deliberately neither
+     persistent nor duplicable: duplicating an fd IS filedup, which must bump
+     the physical count under ftable.lock.  Naming the file by its ftable slot
+     index [k] with [v = fnode k] is what bridges FileInv's index-keyed
+     algebra to the pointer actually stored in memory. *)
+  (* Either way the slot owns ONE unit of fd-slot capability (FdSlots.v),
+     and the disjunction is where it currently is: an EMPTY descriptor holds
+     the unit itself; a descriptor naming a file has given it away, and the
+     ftable holds it against that file's count.  That conservation is what
+     bounds any file's [ref] by FDSLOTS, hence what makes filedup's unchecked
+     [f->ref++] safe -- so this predicate is the proc-side end of the law
+     whose file-side end is [FileInv.fslot]. *)
+  (* [γd] IS THE PROCESS'S OWN fd-state ghost ([ProcDefs.pv_fdg] of its
+     private block), and this is where the ghost is PINNED TO THE MACHINE:
+     a null cell is a CLOSED descriptor, and a cell naming a file is an OPEN
+     descriptor whose state is THE REFERENCE'S OWN STATE INDEX -- the [st] of
+     [file_ref γf k q st], not a function applied to it.  So the ghost
+     cannot drift: [st] occurs twice in one predicate, and no step can move
+     one occurrence without the other.  See FdSlots.v's header for the
+     two-halves shape and why the name is per-INCARNATION, and
+     [FileInvDefs.file_ref] for why the reference is what carries the state
+     (short version: the inode NUMBER is not a [struct file] field, so
+     [fcontent] cannot supply it).
+       [st <> FdClosed] on the file disjunct is the statement that a
+     descriptor never names an UNTYPED file -- filealloc's fresh file gets
+     [FdClosed] ([FileInv.file_alloc_step]) and reaches a descriptor only
+     after sys_open or pipealloc has retyped it.  It has to be said HERE,
+     because it is what makes "the cell is non-null" and "the ghost says
+     open" the same fact.
+       ONLY THE AUTHORITY IS HERE.  The matching fragments live in
+     [FdSlots.fd_frags], a bundle that travels BESIDE the block
+     ([UsertrapRes.ut_own]); read that predicate's header for why.  The
+     consequence is the point of the split: this predicate alone can no
+     longer MOVE a descriptor's state, so every operation that retypes one
+     has to hold the bundle, and says so in its contract. *)
+  Definition ofile_slot (γf γd : gname) (pa : mword 64) (fd : nat) (v : mword 64)
+      : iProp Σ :=
+    (p_ofile pa fd ↦₈ v ∗
+     (⌜v = (zero_reg : mword 64)⌝ ∗ fd_slot ∗ fd_st_auth γd fd FdClosed ∨
+      ∃ (k : nat) (q : Qp) (st : fdstate),
+        ⌜v = fnode k /\ (k < NFILE)%nat /\ st <> FdClosed⌝ ∗
+        file_ref γf k q st ∗ fd_st_auth γd fd st))%I.
+
+  (* ---- the two ends of "filling a descriptor", as accessors ----
+     An EMPTY descriptor owns the fd-slot unit itself, so opening one YIELDS
+     that unit; installing a file consumes a reference and gives the slot
+     back.  Both directions are what fdalloc's install arm is made of, and in
+     the null direction the file disjunct is REFUTED rather than assumed --
+     a [struct file *] out of the global table is never NULL
+     ([FileInv.fnode_ne_zero]). *)
+  Lemma ofile_slot_null (γf γd : gname) (pa : mword 64) (fd : nat) :
+    ofile_slot γf γd pa fd (zero_reg : mword 64) -∗
+    p_ofile pa fd ↦₈ (zero_reg : mword 64) ∗ fd_slot ∗
+    fd_st_auth γd fd FdClosed.
+  Proof using .
+    iIntros "[$ [(_ & $ & $) | (%k & %q & %st & (%Hfn & %Hk & _) & _)]]".
+    exfalso. apply (fnode_ne_zero k Hk). symmetry. exact Hfn.
+  Qed.
+
+  Lemma ofile_slot_file (γf γd : gname) (pa : mword 64) (fd k : nat) (q : Qp)
+      (st : fdstate) :
+    (k < NFILE)%nat -> st <> FdClosed ->
+    p_ofile pa fd ↦₈ fnode k -∗ file_ref γf k q st -∗
+    fd_st_auth γd fd st -∗ ofile_slot γf γd pa fd (fnode k).
+  Proof using .
+    iIntros (Hk Hty) "Hc Href Hst". iFrame "Hc". iRight.
+    iExists k, q, st. iFrame "Href Hst". iPureIntro.
+    split; [reflexivity | split; [exact Hk | exact Hty]].
+  Qed.
+
+  (* THE READING, AND IT IS A CLIENT LEMMA NOW.  A holder of one descriptor's
+     FRAGMENT learns from its value alone whether the cell is null -- with no
+     access to the array, and without disturbing it.  This is what the split
+     bought: stated before it, the premises were unsatisfiable (the slot held
+     both halves, so a third share was invalid) and the lemma was vacuous.
+     It is also how an fd operation learns which state it is updating FROM --
+     the bundle hands out a fragment at an existential [st]
+     ([FdSlots.fd_frags_any_acc]) and this pins it against the slot. *)
+  Lemma ofile_slot_agree (γf γd : gname) (pa : mword 64) (fd : nat)
+      (v : mword 64) (st : fdstate) :
+    fd_st γd fd st -∗ ofile_slot γf γd pa fd v -∗
+    ⌜(v = (zero_reg : mword 64) /\ st = FdClosed)
+     \/ (v <> (zero_reg : mword 64) /\ st <> FdClosed)⌝.
+  Proof using .
+    iIntros "Hst [_ [(-> & _ & Ha) | (%k & %q & %st' & (%Hfn & %Hk & %Hty) & _ & Ha)]]".
+    - iDestruct (fd_st_agree with "Ha Hst") as %<-. iPureIntro. by left.
+    - iDestruct (fd_st_agree with "Ha Hst") as %<-. iPureIntro. right.
+      split; [rewrite Hfn; exact (fnode_ne_zero k Hk) | exact Hty].
+  Qed.
+
+  (* [ofile_slot_parked] IS DELETED (lane OFF-LINK, L2): it read
+     [FileInvDefs.file_ref_parked], i.e. [fdstate_ok]'s [m = OffParked]
+     pin, which is now the OBJECT'S mode ([fpnames.fp_om]).  Nothing in
+     the tree applied it or anything above it. *)
+
+  Definition proc_ofiles (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      : iProp Σ :=
+    (⌜length fs = NOFILE⌝ ∗ [∗ list] fd ↦ v ∈ fs, ofile_slot γf γd pa fd v)%I.
+
+  (* =================================================================== *)
+  (* THE DEFICIT: descriptors whose payload is on loan.                   *)
+  (* =================================================================== *)
+  (* A syscall that must hold one of its OWN descriptors' references in a
+     register cannot leave the array satisfying [proc_ofiles]: the cell still
+     names the file, so [ofile_slot]'s file disjunct demands a reference that
+     is not there.  sys_dup is the case that forces it -- [fdalloc] stores the
+     pointer before [filedup] bumps the count, and [filedup] wants the SOURCE
+     descriptor's reference in hand to split, so two descriptors are payloadless
+     at once.  Crucially [fdalloc] itself needs the array, so the reference
+     cannot merely be borrowed with [proc_ofiles_ofile] across the call: that
+     accessor's wand demands a whole [ofile_slot] back first.
+       [proc_ofiles_owe γf γd pa fs D] is the array with the payloads of [D]
+     missing -- each such descriptor contributes only its cell.
+
+     WHY THE NON-NULL CLAUSE.  A lent descriptor's cell is never null (one only
+     lends a descriptor that names a file), and saying so HERE is what lets
+     fdalloc's install arm conclude [fd ∉ D] from "the cell I found is null":
+     fdalloc is generic in [D] and never learns it, so without this it could
+     not tell a free descriptor from a lent one, and could install a second
+     reference over a loan.
+
+     THE AUTHORITY LEAVES WITH THE REFERENCE, so a lent descriptor carries
+     no ghost at all.  That is what makes the fragment bundle needed by
+     exactly the operations that RETYPE a descriptor and by no others:
+     read / write / fstat lend a descriptor and give the SAME file back, so
+     the authority they took out at the file's [st] is the one they return
+     and nothing has to move; open / pipe / dup / close / fork install a
+     DIFFERENT state, and only they have to reach into the bundle
+     ([FdSlots.fd_st_move]).  An arm that parked the authority here instead
+     would have to update on the way out even when nothing changed, which
+     would put the bundle in every descriptor-touching contract and say
+     something false about read.
+
+     WHY NOT A THIRD [ofile_slot] DISJUNCT.  Because only the holder of the
+     block sees [D].  A "maybe on loan" case inside [ofile_slot] would have to
+     be REFUTED by every consumer of a non-null descriptor (argfd's callers,
+     sys_close), and none of them can do that from [v <> 0] alone.  See
+     claude-notes/design/file-table.md. *)
+  Definition ofile_lent_or_slot (γf γd : gname) (pa : mword 64) (D : gset nat)
+      (fd : nat) (v : mword 64) : iProp Σ :=
+    (if bool_decide (fd ∈ D)
+     then ⌜v <> (zero_reg : mword 64)⌝ ∗ p_ofile pa fd ↦₈ v
+     else ofile_slot γf γd pa fd v)%I.
+
+  Definition proc_ofiles_owe (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      (D : gset nat) : iProp Σ :=
+    (⌜length fs = NOFILE⌝ ∗
+     [∗ list] fd ↦ v ∈ fs, ofile_lent_or_slot γf γd pa D fd v)%I.
+
+  Lemma ofile_lent_or_slot_in (γf γd : gname) (pa : mword 64) (D : gset nat)
+      (fd : nat) (v : mword 64) :
+    fd ∈ D ->
+    ofile_lent_or_slot γf γd pa D fd v ⊣⊢
+    ⌜v <> (zero_reg : mword 64)⌝ ∗ p_ofile pa fd ↦₈ v.
+  Proof using . intro Hin. rewrite /ofile_lent_or_slot bool_decide_true //. Qed.
+
+  Lemma ofile_lent_or_slot_out (γf γd : gname) (pa : mword 64) (D : gset nat)
+      (fd : nat) (v : mword 64) :
+    fd ∉ D -> ofile_lent_or_slot γf γd pa D fd v ⊣⊢ ofile_slot γf γd pa fd v.
+  Proof using . intro Hin. rewrite /ofile_lent_or_slot bool_decide_false //. Qed.
+
+  (* NO deficit is the array itself -- so [proc_priv] never has to change
+     shape for a function that lends nothing. *)
+  Lemma proc_ofiles_owe_empty (γf γd : gname) (pa : mword 64) (fs : list (mword 64)) :
+    proc_ofiles_owe γf γd pa fs ∅ ⊣⊢ proc_ofiles γf γd pa fs.
+  Proof using .
+    rewrite /proc_ofiles_owe /proc_ofiles.
+    apply bi.sep_proper; [reflexivity|].
+    apply big_sepL_proper. intros fd v _.
+    apply ofile_lent_or_slot_out. set_solver.
+  Qed.
+
+  Lemma proc_ofiles_owe_len (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      (D : gset nat) :
+    proc_ofiles_owe γf γd pa fs D -∗ ⌜length fs = NOFILE⌝.
+  Proof using . iIntros "[$ _]". Qed.
+
+  (* Away from [fd], two deficit sets that agree give the same remainder. *)
+  Lemma ofiles_rest_agree (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      (D D' : gset nat) (fd : nat) :
+    (forall j, j <> fd -> (j ∈ D <-> j ∈ D')) ->
+    ([∗ list] k↦y ∈ fs, if decide (k = fd) then emp else ofile_lent_or_slot γf γd pa D k y)
+    ⊣⊢ ([∗ list] k↦y ∈ fs, if decide (k = fd) then emp else ofile_lent_or_slot γf γd pa D' k y).
+  Proof using .
+    intro Hag. apply big_sepL_proper. intros k y _.
+    case_decide as Hk; [reflexivity|].
+    rewrite /ofile_lent_or_slot.
+    destruct (decide (k ∈ D)) as [Hin|Hin].
+    - rewrite !bool_decide_true //. by apply Hag.
+    - rewrite !bool_decide_false //. intro Hc. apply Hin. by apply (Hag k Hk).
+  Qed.
+
+  (* THE workhorse.  Open descriptor [fd] and close it back with a new VALUE
+     and under a new deficit set, provided the two sets agree away from [fd].
+     Lend, repay and install are all instances -- which is the point: the
+     surgery happens once, here, and the three uses below are one line each. *)
+  Lemma proc_ofiles_owe_acc (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      (D D' : gset nat) (fd : nat) (v : mword 64) :
+    fs !! fd = Some v ->
+    (forall j, j <> fd -> (j ∈ D <-> j ∈ D')) ->
+    proc_ofiles_owe γf γd pa fs D -∗
+    ofile_lent_or_slot γf γd pa D fd v ∗
+    (∀ v', ofile_lent_or_slot γf γd pa D' fd v' -∗
+           proc_ofiles_owe γf γd pa (<[fd := v']> fs) D').
+  Proof using .
+    iIntros (Hfd Hag) "[%Hlen Ho]".
+    rewrite (big_sepL_delete _ fs fd v Hfd).
+    iDestruct "Ho" as "[$ Hrest]".
+    rewrite (ofiles_rest_agree _ _ _ _ D D' fd Hag).
+    iIntros (v') "Hnew". iSplitR.
+    { iPureIntro. rewrite length_insert. exact Hlen. }
+    rewrite (big_sepL_delete _ (<[fd := v']> fs) fd v').
+    2:{ apply list_lookup_insert_eq. eapply lookup_lt_Some; exact Hfd. }
+    iFrame "Hnew".
+    rewrite -(big_sepL_delete_insert _ fs fd v v' Hfd). iFrame "Hrest".
+  Qed.
+
+  (* =================================================================== *)
+  (* WHAT A NON-NULL CELL SAYS ABOUT THE STATE LIST.                     *)
+  (*                                                                     *)
+  (* [ofile_slot_agree] is the per-descriptor reading and it needs the    *)
+  (* slot in hand; this is the same fact against the WHOLE array and the  *)
+  (* process's own fragment bundle, which is the shape a caller holding   *)
+  (* [proc_ofiles_owe] and [fd_frags] actually has.  It is what turns     *)
+  (* fdalloc's scan -- stated on p->ofile's POINTERS ([SpecFdalloc]'s     *)
+  (* [fd_frees]) -- into a statement about the STATES the syscall rows    *)
+  (* speak in, and hence what makes                                       *)
+  (* [FdSlots.fd_least_closed] provable at all.                           *)
+  (*                                                                     *)
+  (* THE LENT DESCRIPTORS ARE EXCLUDED, and they have to be: a slot in    *)
+  (* [D] has given its ghost authority away, so the array knows its cell  *)
+  (* is non-null and knows NOTHING about its state.  A caller that needs  *)
+  (* the reading at a lent slot knows that slot's state some other way -- *)
+  (* it is holding the authority itself -- and reads it off that.         *)
+  (* =================================================================== *)
+  Lemma proc_ofiles_owe_nonnull_open (γf γd : gname) (pa : mword 64)
+      (fs : list (mword 64)) (D : gset nat) (sts : list fdstate)
+      (fd : nat) (v : mword 64) :
+    fs !! fd = Some v ->
+    v <> (zero_reg : mword 64) ->
+    fd ∉ D ->
+    proc_ofiles_owe γf γd pa fs D -∗ fd_frags γd sts -∗
+    ⌜sts !! fd <> Some FdClosed⌝.
+  Proof using .
+    iIntros (Hfd Hnn Hout) "Ho Hfr".
+    iDestruct (proc_ofiles_owe_len with "Ho") as %Hlen.
+    assert (HfdN : (fd < NOFILE)%nat)
+      by (rewrite <- Hlen; exact (lookup_lt_Some _ _ _ Hfd)).
+    iDestruct (proc_ofiles_owe_acc γf γd pa fs D D fd v Hfd
+                 ltac:(intros j _; reflexivity) with "Ho") as "[Hslot _]".
+    rewrite (ofile_lent_or_slot_out γf γd pa D fd v Hout).
+    iDestruct (fd_frags_acc_lt γd sts fd HfdN with "Hfr")
+      as (st) "(%Hst & Hfrag & _ & _)".
+    iDestruct (ofile_slot_agree with "Hfrag Hslot") as %[[Hz _] | [_ Hne]];
+      [ contradiction (Hnn Hz) | ].
+    iPureIntro. rewrite Hst. intros Hc. apply Hne. by injection Hc.
+  Qed.
+
+  (* ...AND THE SAME READING AT EVERY SLOT AT ONCE.                       *)
+  (*                                                                     *)
+  (* The single-slot form above CONSUMES the array and the bundle, so it  *)
+  (* answers for one descriptor and then it is spent.                     *)
+  (* [FdSlots.fd_least_closed] needs an answer for every slot BELOW the   *)
+  (* one allocated, and [fd] separate applications is not available -- so *)
+  (* this is one induction down the two lists together, peeling a slot    *)
+  (* and its fragment at each step.                                       *)
+  (*                                                                     *)
+  (* At the EMPTY deficit, which is what [proc_priv] carries: a caller    *)
+  (* mid-syscall with descriptors on loan has a [D] to worry about, and   *)
+  (* the sites that need this (the dispatch arms, reading a completed     *)
+  (* call's post) are past that point and hold the whole array again.     *)
+  Local Lemma ofile_slots_states_agree (γf γd : gname) (pa : mword 64)
+      (n : nat) (fs : list (mword 64)) (sts : list fdstate) :
+    ([∗ list] i ↦ v ∈ fs, ofile_slot γf γd pa (n + i)%nat v) -∗
+    ([∗ list] i ↦ st ∈ sts, fd_st γd (n + i)%nat st) -∗
+    ⌜forall (j : nat) (v : mword 64) (st : fdstate),
+       fs !! j = Some v -> sts !! j = Some st ->
+       (v = (zero_reg : mword 64) <-> st = FdClosed)⌝.
+  Proof using .
+    revert n sts. induction fs as [| a fs' IH]; intros n sts.
+    { iIntros "_ _". iPureIntro. intros j v st Hv. rewrite lookup_nil in Hv.
+      discriminate Hv. }
+    destruct sts as [| b sts'].
+    { iIntros "_ _". iPureIntro. intros j v st _ Hst.
+      rewrite lookup_nil in Hst. discriminate Hst. }
+    iIntros "[Hh Ht] [Hbh Hbt]".
+    rewrite Nat.add_0_r.
+    iDestruct (ofile_slot_agree with "Hbh Hh") as %Hhead.
+    iDestruct (IH (S n) sts' with "[Ht] [Hbt]") as %Htail.
+    { iApply (big_sepL_mono with "Ht").
+      intros i v _. by replace (n + S i)%nat with (S n + i)%nat by lia. }
+    { iApply (big_sepL_mono with "Hbt").
+      intros i st _. by replace (n + S i)%nat with (S n + i)%nat by lia. }
+    iPureIntro. intros j v st Hv Hst.
+    destruct j as [| j'].
+    - cbn in Hv, Hst. injection Hv as <-. injection Hst as <-.
+      destruct Hhead as [[-> ->] | [Hnz Hno]]; [ by split |].
+      split; [ intros Hc; contradiction (Hnz Hc)
+             | intros Hc; contradiction (Hno Hc) ].
+    - exact (Htail j' v st Hv Hst).
+  Qed.
+
+  (* [ofile_slots_parked] and [proc_ofiles_parked] ARE DELETED with
+     [ofile_slot_parked] above (lane OFF-LINK, L2). *)
+
+  Lemma proc_ofiles_states_agree (γf γd : gname) (pa : mword 64)
+      (fs : list (mword 64)) (sts : list fdstate) :
+    proc_ofiles γf γd pa fs -∗ fd_frags γd sts -∗
+    ⌜forall (j : nat) (v : mword 64) (st : fdstate),
+       fs !! j = Some v -> sts !! j = Some st ->
+       (v = (zero_reg : mword 64) <-> st = FdClosed)⌝.
+  Proof using .
+    iIntros "[_ Ho] (_ & Hs & _)".
+    iApply (ofile_slots_states_agree γf γd pa 0%nat fs sts with "[Ho] [Hs]").
+    - iApply (big_sepL_mono with "Ho"). intros i v _. by rewrite Nat.add_0_l.
+    - iApply (big_sepL_mono with "Hs"). intros i st _. by rewrite Nat.add_0_l.
+  Qed.
+
+  (* LEND: a descriptor that names a file gives its reference up, and joins
+     the deficit.  The caller only has to know the cell is non-null -- which
+     is exactly what [SpecArgfd.arg_fd] reports.
+       It hands back the reference AT ITS STATE, and the descriptor's ghost
+     AUTHORITY at the same [st].  The pairing is the point: the borrower
+     cannot separate them, so it cannot return a reference to one file while
+     the fd's ghost still claims another.  See [ofile_lent_or_slot]'s note --
+     a borrower that returns what it took returns the authority it took, and
+     needs no fragment. *)
+  Lemma proc_ofiles_lend (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      (D : gset nat) (fd : nat) (v : mword 64) :
+    fd ∉ D ->
+    fs !! fd = Some v ->
+    v <> (zero_reg : mword 64) ->
+    proc_ofiles_owe γf γd pa fs D -∗
+    ∃ (k : nat) (q : Qp) (st : fdstate),
+      ⌜v = fnode k /\ (k < NFILE)%nat /\ st <> FdClosed⌝ ∗
+      file_ref γf k q st ∗ fd_st_auth γd fd st ∗
+      proc_ofiles_owe γf γd pa fs ({[fd]} ∪ D).
+  Proof using .
+    iIntros (Hnin Hfd Hnz) "Ho".
+    iDestruct (proc_ofiles_owe_acc _ _ _ _ D ({[fd]} ∪ D) fd v Hfd
+                 ltac:(set_solver) with "Ho") as "[Hs Hback]".
+    rewrite (ofile_lent_or_slot_out _ _ _ _ _ _ Hnin) /ofile_slot.
+    iDestruct "Hs" as "[Hc [(%Hz & _) |
+                           (%k & %q & %st & (%Hfn & %Hk & %Hty) & Href & Hst)]]";
+      [contradiction|].
+    iDestruct ("Hback" $! v with "[Hc]") as "Ho".
+    { rewrite (ofile_lent_or_slot_in _ _ _ _ _ _ (elem_of_union_l _ _ _
+                 (elem_of_singleton_2 _ _ (eq_refl fd)))).
+      iFrame "Hc". iPureIntro. exact Hnz. }
+    rewrite list_insert_id; [|exact Hfd].
+    iExists k, q, st. iFrame "Href Hst Ho". iPureIntro.
+    split; [exact Hfn | split; [exact Hk | exact Hty]].
+  Qed.
+
+  (* REPAY: hand a reference back -- AND the authority that came out with
+     it -- and the descriptor leaves the deficit.
+       THERE IS NO GHOST STEP HERE, and that is the design.  A borrower that
+     returns the file it took returns the authority it took, so the state
+     does not move and no fragment is involved: read / write / fstat are
+     exactly this shape and their contracts stay bundle-free.  An arm that
+     wants to install a DIFFERENT state (open, pipe, dup's destination)
+     moves the authority itself with [FdSlots.fd_st_move] -- which needs the
+     bundle -- and hands the moved one in here. *)
+  Lemma proc_ofiles_repay (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      (D : gset nat) (fd k : nat) (q : Qp) (st : fdstate) :
+    fd ∉ D ->
+    fs !! fd = Some (fnode k) ->
+    (k < NFILE)%nat ->
+    st <> FdClosed ->
+    proc_ofiles_owe γf γd pa fs ({[fd]} ∪ D) -∗ file_ref γf k q st -∗
+    fd_st_auth γd fd st -∗
+    proc_ofiles_owe γf γd pa fs D.
+  Proof using .
+    iIntros (Hnin Hfd Hk Hty) "Ho Href Ha".
+    iDestruct (proc_ofiles_owe_acc _ _ _ _ ({[fd]} ∪ D) D fd (fnode k) Hfd
+                 ltac:(set_solver) with "Ho") as "[Hs Hback]".
+    rewrite (ofile_lent_or_slot_in _ _ _ _ _ _ (elem_of_union_l _ _ _
+               (elem_of_singleton_2 _ _ (eq_refl fd)))).
+    iDestruct "Hs" as "(_ & Hc)".
+    iDestruct ("Hback" $! (fnode k) with "[Hc Href Ha]") as "Ho".
+    { rewrite (ofile_lent_or_slot_out _ _ _ _ _ _ Hnin).
+      iApply (ofile_slot_file _ _ _ _ _ q st Hk Hty with "Hc Href Ha"). }
+    rewrite list_insert_id; [|exact Hfd]. iExact "Ho".
+  Qed.
+
+  (* INSTALL: fdalloc's whole move.  A free descriptor's unit comes out with
+     its cell; writing a non-null pointer puts the descriptor in the deficit,
+     for the caller to settle.  fdalloc needs no [file_ref] at all -- its code
+     only stores a pointer, and [fd ∉ D] is DERIVED from the cell being null
+     (the non-null clause on the lent case).  THE AUTHORITY COMES OUT, at
+     [FdClosed]: fdalloc has made the cell non-null but the descriptor is
+     not OPEN until a typed file is behind it, and moving the authority to
+     that file's type is the caller's step -- the one that needs the
+     fragment bundle. *)
+  Lemma proc_ofiles_install (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      (D : gset nat) (fd : nat) :
+    fs !! fd = Some (zero_reg : mword 64) ->
+    proc_ofiles_owe γf γd pa fs D -∗
+    p_ofile pa fd ↦₈ (zero_reg : mword 64) ∗ fd_slot ∗
+    fd_st_auth γd fd FdClosed ∗
+    (∀ v', ⌜v' <> (zero_reg : mword 64)⌝ -∗ p_ofile pa fd ↦₈ v' -∗
+           proc_ofiles_owe γf γd pa (<[fd := v']> fs) ({[fd]} ∪ D)).
+  Proof using .
+    iIntros (Hfd) "Ho".
+    (* the cell is null, so this descriptor is NOT on loan *)
+    iAssert (⌜fd ∉ D⌝)%I as "%Hnin".
+    { iDestruct "Ho" as "[_ Ho]".
+      iDestruct (big_sepL_lookup_acc _ _ _ _ Hfd with "Ho") as "[Hs _]".
+      destruct (decide (fd ∈ D)) as [Hin|Hin]; [|iPureIntro; exact Hin].
+      rewrite (ofile_lent_or_slot_in _ _ _ _ _ _ Hin).
+      iDestruct "Hs" as "[%Hnz _]". done. }
+    iDestruct (proc_ofiles_owe_acc _ _ _ _ D ({[fd]} ∪ D) fd _ Hfd
+                 ltac:(set_solver) with "Ho") as "[Hs Hback]".
+    rewrite (ofile_lent_or_slot_out _ _ _ _ _ _ Hnin).
+    iDestruct (ofile_slot_null with "Hs") as "($ & $ & $)".
+    iIntros (v' Hnz) "Hc".
+    iApply ("Hback" $! v' with "[Hc]").
+    rewrite (ofile_lent_or_slot_in _ _ _ _ _ _ (elem_of_union_l _ _ _
+               (elem_of_singleton_2 _ _ (eq_refl fd)))).
+    iFrame "Hc". iPureIntro. exact Hnz.
+  Qed.
+
+  (* READ one cell, loan or no loan: fdalloc's scan.  Touching the payload
+     disjunction per iteration would put a case split in a loop invariant for
+     no reason. *)
+  Lemma proc_ofiles_owe_read (γf γd : gname) (pa : mword 64) (fs : list (mword 64))
+      (D : gset nat) (fd : nat) (v : mword 64) :
+    fs !! fd = Some v ->
+    proc_ofiles_owe γf γd pa fs D -∗
+    p_ofile pa fd ↦₈ v ∗ (p_ofile pa fd ↦₈ v -∗ proc_ofiles_owe γf γd pa fs D).
+  Proof using .
+    iIntros (Hfd) "Ho".
+    iDestruct (proc_ofiles_owe_acc _ _ _ _ D D fd v Hfd
+                 (fun j _ => iff_refl (j ∈ D)) with "Ho") as "[Hs Hback]".
+    destruct (decide (fd ∈ D)) as [Hin|Hin].
+    - rewrite (ofile_lent_or_slot_in _ _ _ _ _ _ Hin).
+      iDestruct "Hs" as "(%Hnz & Hc)". iFrame "Hc". iIntros "Hc".
+      iDestruct ("Hback" $! v with "[Hc]") as "Ho".
+      { rewrite (ofile_lent_or_slot_in _ _ _ _ _ _ Hin). iFrame "Hc".
+        iPureIntro. exact Hnz. }
+      rewrite list_insert_id; [|exact Hfd]. iExact "Ho".
+    - rewrite (ofile_lent_or_slot_out _ _ _ _ _ _ Hin) /ofile_slot.
+      iDestruct "Hs" as "[Hc Hpay]". iFrame "Hc". iIntros "Hc".
+      iDestruct ("Hback" $! v with "[Hc Hpay]") as "Ho".
+      { rewrite (ofile_lent_or_slot_out _ _ _ _ _ _ Hin) /ofile_slot.
+        iFrame "Hc Hpay". }
+      rewrite list_insert_id; [|exact Hfd]. iExact "Ho".
+  Qed.
+
+  (* =================================================================== *)
+  (* The trapframe PAGE.                                                  *)
+  (* =================================================================== *)
+  (* These 4096 bytes are owned HERE, not in [ProcPtOwn] as a
+     contents-EXISTENTIAL [phys_page_own]: that shape cannot serve the
+     syscall path, which needs the VALUE of [tf->aN].
+
+     Covering the WHOLE page, not just the argument slots: the 36
+     [struct trapframe] words carry values, and the 3808 bytes of tail
+     padding are owned anonymously.  Anything less would leave part of a
+     kalloc'd page unaccounted for, and [freeproc]'s [kfree] needs the
+     whole page back.
+
+     Stated at the PHYSICAL tier, indexed by the ppn: that is the tier
+     kalloc hands out, and it is
+     tier-neutral (no va inside), which matters because this page is
+     reached from BOTH sides -- the kernel's identity map (argraw's
+     [ld a0,112(a5)]) and the user table's TRAPFRAME va (uservec /
+     userret).  Each access site converts with
+     [RiscvPtsto.phys_to_mem_claim] / [mem_to_phys_claim], the same idiom
+     the software page-table walks already use for PT slots. *)
+  Lemma tf_page_length (tfp : mword 44) (ws : list (mword 64)) :
+    tf_page tfp ws -∗ ⌜length ws = TFWORDS⌝.
+  Proof using . rewrite /tf_page. iIntros "(%Hlen & _ & _)". done. Qed.
+
+  (* [tf_pa]'s address IS [pa_add (page_base tfp) off] -- same value, built
+     via [bits_of_virtaddr]'s concat instead of [pa_add]'s addition -- so
+     [tf_words]/[tf_tail] (below, addressed the two different ways their
+     two construction paths need) still land on the same bytes.  Mirrors
+     [Pt4kWalk.pte_addr_at_unsigned]'s derivation. *)
+  Lemma tf_pa_unsigned (tfp : mword 44) (off : Z) :
+    0 <= off < 4096 ->
+    bv_unsigned (tf_pa tfp off) = bv_unsigned tfp * 4096 + off.
+  Proof using .
+    intro Hoff. unfold tf_pa.
+    rewrite zext64_concat44_12_unsigned.
+    cbn [bits_of_virtaddr].
+    rewrite subrange64_unsigned_11_0. change (2 ^ 12) with 4096.
+    assert (Hmv : bv_unsigned (mword_of_int (TRAPFRAME + off) : mword 64) = TRAPFRAME + off).
+    { unfold mword_of_int. cbn.
+      rewrite Z_to_bv_unsigned. apply bv_wrap_small.
+      unfold bv_modulus. cbn. unfold TRAPFRAME. lia. }
+    rewrite Hmv.
+    assert (Htmod : (TRAPFRAME + off) mod 4096 = off).
+    { unfold TRAPFRAME. rewrite <- Z.add_mod_idemp_l; [| lia].
+      replace (0x3FFFFFE000 mod 4096) with 0 by (vm_compute; reflexivity).
+      rewrite Z.add_0_l. apply Z.mod_small. lia. }
+    rewrite Htmod. reflexivity.
+  Qed.
+
+  Lemma tf_pa_eq_pa_add (tfp : mword 44) (off : nat) :
+    (off < 4096)%nat ->
+    tf_pa tfp (Z.of_nat off) = pa_add (page_base tfp) off.
+  Proof using .
+    intro Hoff. apply bv_eq.
+    rewrite (tf_pa_unsigned tfp (Z.of_nat off) ltac:(lia)).
+    symmetry. exact (pa_add_page_unsigned tfp off ltac:(lia)).
+  Qed.
+
+  (* the [8 * Z.of_nat i] (Z-mult, [tf_words]'s own index shape) vs
+     [Z.of_nat (8 * i)] (nat-mult then cast, [tf_pa_eq_pa_add]'s own) forms
+     are propositionally but not syntactically equal, which defeats a bare
+     [rewrite] at either call site below -- fold that mismatch into ONE
+     lemma instead of chasing it at each one. *)
+  Lemma tf_pa_eq_pa_add8 (tfp : mword 44) (i : nat) :
+    (i < 512)%nat ->
+    tf_pa tfp (8 * Z.of_nat i) = pa_add (page_base tfp) (8 * i)%nat.
+  Proof using .
+    intro Hi. rewrite <- (tf_pa_eq_pa_add tfp (8 * i) ltac:(lia)).
+    f_equal. lia.
+  Qed.
+
+  (* [a_tf_word]: the pre-physical-native WORD-INDEXED address helper, kept
+     as a plain arithmetic alias (not a resource predicate any more -- that
+     role is [tf_pa]'s, via [tf_words]) purely so callers stating a REGISTER
+     VALUE equals "the trapframe's i-th word's address" (kfork's copy loop,
+     kexec's argv walk) don't have to carry a [Z.of_nat]/[8 *] conversion at
+     every call site. Its VALUE is the same formula it always was, so a
+     caller that already unfolds it (as several do, for the arithmetic
+     underneath) is unaffected -- see [tf_pa_eq_pa_add8] for the bridge to
+     [tf_pa] when one is needed. *)
+  Definition a_tf_word (tfp : mword 44) (i : nat) : Arch.pa :=
+    pa_add (page_base tfp) (8 * i).
+
+  (* THE BRIDGE a caller needs when it has an [a_tf_word]-shaped fact (its
+     own premise, stated that way) but is calling into a [tf_pa]-shaped
+     lemma (every physical-native one now is) -- one [rewrite] instead of
+     re-deriving [tf_pa_eq_pa_add8] at the call site. *)
+  Lemma a_tf_word_eq_tf_pa (tfp : mword 44) (i : nat) :
+    (i < 512)%nat ->
+    a_tf_word tfp i = tf_pa tfp (8 * Z.of_nat i).
+  Proof using . intro Hi. rewrite /a_tf_word (tf_pa_eq_pa_add8 tfp i Hi). reflexivity. Qed.
+
+  (* A6.87: the trapframe page comes in FILLED -- it is the one kalloc
+     memset, and a trapframe's slots are word cells. *)
+  Lemma tf_page_of_page_own (tfp : mword 44) (c : bv 8) :
+    page_valid (page_base tfp) ->
+    kmap_static_claims -∗ page_filled (page_base tfp) c -∗ ∃ ws : list (mword 64), tf_page tfp ws.
+  Proof using .
+    iIntros (Hpv) "#Hb Hp".
+    iDestruct (page_filled_to_phys tfp c Hpv with "Hb Hp") as "Hp".
+    rewrite /phys_page_own.
+    replace 4096%nat with (8 * TFWORDS + 3808)%nat by (vm_compute; reflexivity).
+    rewrite (phys_bwin_split (page_base tfp) 0 (8 * TFWORDS) 3808).
+    iDestruct "Hp" as "[Hpre Htail]".
+    iDestruct (phys_page_words8 (page_base tfp) TFWORDS Hpv ltac:(vm_compute; lia)
+                 with "Hpre") as (ws) "[%Hlen Hws]".
+    iExists ws. rewrite /tf_page /tf_words /tf_tail.
+    iSplit; [done|]. iSplitL "Hws".
+    - iApply (big_sepL_impl with "Hws"). iIntros "!>" (i w Hi) "Hw".
+      assert (Hilt : (i < TFWORDS)%nat) by (rewrite -Hlen; apply lookup_lt_is_Some_1; eauto).
+      rewrite (tf_pa_eq_pa_add8 tfp i ltac:(unfold TFWORDS in Hilt; lia)). iExact "Hw".
+    - rewrite Nat.add_0_l.
+      replace (Z.to_nat TFBYTES) with (8 * TFWORDS)%nat by (vm_compute; reflexivity).
+      replace (4096 - Z.to_nat TFBYTES)%nat with 3808%nat by (vm_compute; reflexivity).
+      rewrite /phys_byte_any. iExact "Htail".
+  Qed.
+
+  (* DESTRUCTION, the converse: freeproc hands the page back to kfree, which
+     wants the 4096 anonymous bytes and nothing else.  The struct words and
+     the tail forget their contents and rejoin, then cross back mem-tier
+     once via [ProcPtOwn.phys_to_page_own]. *)
+  Lemma tf_page_to_page_own (tfp : mword 44) (ws : list (mword 64)) :
+    page_valid (page_base tfp) ->
+    kmap_static_claims -∗ tf_page tfp ws -∗ page_own (page_base tfp).
+  Proof using .
+    intro Hpv. rewrite /tf_page /tf_words /tf_tail.
+    iIntros "#Hb (%Hlen & Hws & Htail)".
+    iApply (phys_to_page_own tfp Hpv with "Hb").
+    rewrite /phys_page_own.
+    replace 4096%nat with (8 * TFWORDS + 3808)%nat by (vm_compute; reflexivity).
+    rewrite (phys_bwin_split (page_base tfp) 0 (8 * TFWORDS) 3808).
+    iSplitL "Hws".
+    - rewrite -Hlen. iApply (phys_page_words8_back (page_base tfp) ws).
+      iApply (big_sepL_impl with "Hws"). iIntros "!>" (i w Hi) "Hw".
+      assert (Hilt : (i < TFWORDS)%nat) by (rewrite -Hlen; apply lookup_lt_is_Some_1; eauto).
+      rewrite <- (tf_pa_eq_pa_add8 tfp i ltac:(unfold TFWORDS in Hilt; lia)). iExact "Hw".
+    - rewrite Nat.add_0_l.
+      replace (8 * TFWORDS)%nat with (Z.to_nat TFBYTES) by (vm_compute; reflexivity).
+      replace 3808%nat with (4096 - Z.to_nat TFBYTES)%nat by (vm_compute; reflexivity).
+      rewrite /phys_byte_any. iExact "Htail".
+  Qed.
+
+  (* borrow one trapframe word, at the PHYSICAL tier -- the nth syscall
+     argument is [tf_arg_idx n].  No tier crossing: [tf_words] is already
+     physical, so this is a plain [big_sepL] borrow. *)
+  Lemma tf_page_word (tfp : mword 44) (ws : list (mword 64)) (i : nat) (w : mword 64) :
+    ws !! i = Some w ->
+    tf_page tfp ws -∗
+    TsoCtx.ctx_phys_word_pointsto XI (tf_pa tfp (8 * Z.of_nat i)) (DfracOwn 1) w ∗
+    (TsoCtx.ctx_phys_word_pointsto XI (tf_pa tfp (8 * Z.of_nat i)) (DfracOwn 1) w -∗
+       tf_page tfp ws).
+  Proof using .
+    rewrite /tf_page. iIntros (Hi) "(%Hlen & Hws & Htail)".
+    iDestruct (big_sepL_lookup_acc _ _ i w Hi with "Hws") as "[$ Hback]".
+    iIntros "Hc". iSplit; [done|]. iSplitL "Hc Hback"; [rewrite /tf_words; iApply ("Hback" with "Hc") | iExact "Htail"].
+  Qed.
+
+  (* THE WRITE TWIN: borrow the cell and put back a DIFFERENT word, the page
+     re-indexed at [<[i := w']> ws].  [tf_page_word] above cannot serve -- its
+     wand demands the old value back -- and every trapframe WRITER needs this
+     one: prepare_return's four kernel slots, syscall's a0, uservec's saves.
+     The length side condition survives by [insert_length], so the page's own
+     [⌜length ws = TFWORDS⌝ ] is re-established with no arithmetic. *)
+  Lemma tf_page_word_upd (tfp : mword 44) (ws : list (mword 64)) (i : nat) (w : mword 64) :
+    ws !! i = Some w ->
+    tf_page tfp ws -∗
+    TsoCtx.ctx_phys_word_pointsto XI (tf_pa tfp (8 * Z.of_nat i)) (DfracOwn 1) w ∗
+    (∀ w' : mword 64,
+       TsoCtx.ctx_phys_word_pointsto XI (tf_pa tfp (8 * Z.of_nat i)) (DfracOwn 1) w' -∗
+       tf_page tfp (<[i := w']> ws)).
+  Proof using .
+    rewrite /tf_page. iIntros (Hi) "(%Hlen & Hws & Htail)".
+    iDestruct (big_sepL_insert_acc _ _ i w Hi with "Hws") as "[$ Hback]".
+    iIntros (w') "Hc". iSplit.
+    { iPureIntro. rewrite length_insert. exact Hlen. }
+    iSplitL "Hc Hback"; [rewrite /tf_words; iApply ("Hback" with "Hc") | iExact "Htail"].
+  Qed.
+
+  (* THE PHYSICAL<->MEM WORD BRIDGE for one trapframe slot -- the mirror of
+     [KptTree.pt_slot_phys_to_mem]/[pt_slot_mem_to_phys] for PT slots,
+     re-addressed at [tf_pa] instead of [u_pte_addr].  [pt_node_claim]
+     itself is fully generic over any identity-mapped kdata page (its own
+     [pt_page_vpn] is just [svpn_of (page_base _)]) -- the trapframe page IS
+     one (a kalloc'd page, per [tf_page_of_page_own]/[tf_page_to_page_own]
+     above), so [PtTree.pt_node_claim_from_static tfp] supplies it from the
+     same [kmap_static_claims] every other kalloc'd page uses, no new
+     per-page claim needed.  Used ONLY by the handful of KERNEL-SIDE
+     (identity-map) readers/writers that still want the mem tier --
+     prepare_return's four kernel-word writes and one epc read, the
+     syscall argument fetchers, kfork's copy loop -- composed with
+     [tf_page_word]/[tf_page_word_upd] below into
+     [tf_page_word_mem]/[tf_page_word_upd_mem].  Uservec/userret themselves
+     never need this: their own [tf_pa] cells already match [tf_words]
+     natively, so uservec's tail simply opens [usertrap_res]'s [tf_page]
+     (SpecUsertrap.usertrap_res_tf_open) straight into them and reseals
+     before handing off to usertrap -- see SpecUservec.v's header and
+     claude-notes/completed/usertrap.md. *)
+  Lemma tf_pa_aligned8 (tfp : mword 44) (i : nat) :
+    (i < 512)%nat ->
+    is_aligned_paddr (Physaddr (tf_pa tfp (8 * Z.of_nat i))) 8 = true.
+  Proof using .
+    intro Hi. unfold is_aligned_paddr. apply Z.eqb_eq.
+    rewrite uint_unsigned (tf_pa_unsigned tfp (8 * Z.of_nat i) ltac:(lia)).
+    replace (bv_unsigned tfp * 4096 + 8 * Z.of_nat i)
+      with ((bv_unsigned tfp * 512 + Z.of_nat i) * 8) by lia.
+    apply Z.rem_mul. lia.
+  Qed.
+
+  (* the facts [phys_to_mem_claim]/[mem_to_phys_claim] need of a trapframe
+     slot -- the mirror of [KptTree.u_pte_slot_facts] *)
+  Lemma tf_pa_slot_facts (tfp : mword 44) (i j : nat) :
+    node_kdata tfp -> (i < 512)%nat -> (j < 8)%nat ->
+    pa_of tfp (pa_add (tf_pa tfp (8 * Z.of_nat i)) j) = pa_add (tf_pa tfp (8 * Z.of_nat i)) j /\
+    addr_is_ram (pa_add (tf_pa tfp (8 * Z.of_nat i)) j) /\
+    (uint (pa_add (tf_pa tfp (8 * Z.of_nat i)) j) < 274877906944)%Z /\
+    svpn_of (pa_add (tf_pa tfp (8 * Z.of_nat i)) j) = pt_page_vpn tfp.
+  Proof using .
+    intros [Hklo Hkhi] Hi Hj.
+    pose proof (bv_unsigned_in_range _ tfp) as [Htlo Hthi].
+    assert (Hm : bv_modulus (MachineWord.MachineWord.Z_idx 44) = 17592186044416)
+      by (vm_compute; reflexivity).
+    rewrite Hm in Hthi.
+    assert (Hpaij : bv_unsigned (pa_add (tf_pa tfp (8 * Z.of_nat i)) j)
+                   = bv_unsigned tfp * 4096 + 8 * Z.of_nat i + Z.of_nat j).
+    { unfold pa_add. rewrite pt_add_vec_int_small.
+      - rewrite (tf_pa_unsigned tfp (8 * Z.of_nat i) ltac:(lia)). reflexivity.
+      - lia.
+      - rewrite (tf_pa_unsigned tfp (8 * Z.of_nat i) ltac:(lia)). lia. }
+    unfold node_kdata, ram_base, ram_size in Hklo, Hkhi.
+    assert (Hram : addr_is_ram (pa_add (tf_pa tfp (8 * Z.of_nat i)) j)).
+    { unfold addr_is_ram, ram_base, ram_size. rewrite uint_unsigned Hpaij. lia. }
+    assert (Hcanpa : (uint (pa_add (tf_pa tfp (8 * Z.of_nat i)) j) < 274877906944)%Z).
+    { rewrite uint_unsigned Hpaij. lia. }
+    assert (Ha0 : bv_unsigned (u_pte_addr tfp (mword_of_int 0)) = bv_unsigned tfp * 4096).
+    { rewrite (pte_addr_at_unsigned tfp (mword_of_int 0)).
+      replace (bv_unsigned (mword_of_int 0 : mword 9)) with 0 by (vm_compute; reflexivity). lia. }
+    assert (Hcana0 : (uint (u_pte_addr tfp (mword_of_int 0)) < 274877906944)%Z).
+    { rewrite uint_unsigned Ha0. lia. }
+    split; [| split; [exact Hram | split; [exact Hcanpa |]]].
+    - (* pa_of tfp (pa_add a j) = pa_add a j *)
+      apply bv_eq. unfold pa_of. rewrite zext64_concat44_12_unsigned.
+      rewrite subrange64_unsigned_11_0. change (2 ^ 12) with 4096.
+      rewrite Hpaij.
+      replace (bv_unsigned tfp * 4096 + 8 * Z.of_nat i + Z.of_nat j)
+        with ((8 * Z.of_nat i + Z.of_nat j) + bv_unsigned tfp * 4096) by lia.
+      rewrite Z_mod_plus_full.
+      rewrite (Z.mod_small (8 * Z.of_nat i + Z.of_nat j) 4096 ltac:(lia)). lia.
+    - (* svpn_of (pa_add a j) = pt_page_vpn tfp *)
+      apply bv_eq.
+      assert (Hlo1 : bv_unsigned (svpn_of (pa_add (tf_pa tfp (8 * Z.of_nat i)) j))
+                    = Z.shiftr (bv_unsigned tfp * 4096 + 8 * Z.of_nat i + Z.of_nat j) 12).
+      { rewrite (svpn_of_unsigned_lo (pa_add (tf_pa tfp (8 * Z.of_nat i)) j) Hcanpa).
+        rewrite uint_unsigned. rewrite Hpaij. reflexivity. }
+      assert (Hlo2 : bv_unsigned (pt_page_vpn tfp) = Z.shiftr (bv_unsigned tfp * 4096) 12).
+      { unfold pt_page_vpn.
+        rewrite (svpn_of_unsigned_lo (u_pte_addr tfp (mword_of_int 0)) Hcana0).
+        rewrite uint_unsigned. rewrite Ha0. reflexivity. }
+      rewrite Hlo1 Hlo2.
+      rewrite !Z.shiftr_div_pow2; [| lia | lia]. change (2 ^ 12) with 4096.
+      assert (Hsmall : (bv_unsigned tfp * 4096 + 8 * Z.of_nat i + Z.of_nat j) / 4096 = bv_unsigned tfp).
+      { rewrite <- Z.add_assoc. rewrite Z.div_add_l; [| lia].
+        rewrite (Z.div_small (8 * Z.of_nat i + Z.of_nat j) 4096 ltac:(lia)). lia. }
+      rewrite Hsmall.
+      symmetry. apply Z.div_mul. lia.
+  Qed.
+
+  Lemma tf_word_phys_to_mem (tfp : mword 44) (i : nat) (dq : dfrac) (w : mword 64) :
+    (i < 512)%nat ->
+    pt_node_claim tfp -∗
+    TsoCtx.ctx_phys_word_pointsto XI (tf_pa tfp (8 * Z.of_nat i)) dq w -∗
+    tf_pa tfp (8 * Z.of_nat i) ↦₈{dq} w.
+  Proof using .
+    iIntros (Hi) "(%Hkd & %Hpv & #Hk) Hw".
+    iApply ctx_word_pointsto_intro; [exact (tf_pa_aligned8 tfp i Hi) |].
+    iDestruct (TsoCtx.ctx_phys_word_pointsto_bytes with "Hw") as "Hbs".
+    iApply (big_sepL_impl with "Hbs").
+    iIntros "!>" (k j Hkj) "Hp".
+    apply lookup_seq in Hkj. destruct Hkj as [-> Hjlt].
+    destruct (tf_pa_slot_facts tfp i (0 + k)%nat Hkd Hi ltac:(lia)) as (Hid & Hram & Hcan & Hsvpn).
+    iAssert (kmap_at (svpn_of (pa_add (tf_pa tfp (8 * Z.of_nat i)) (0 + k))) tfp KP_rw) as "#Hk'".
+    { rewrite Hsvpn. iExact "Hk". }
+    (* A6.69 (tso-flip's shim-free proof of this lemma, taken verbatim): the
+       THIRD premise is [ktier_pin cur_ktier tfp _], not the identity
+       equation a second time; at an identity mapping
+       [RiscvPtsto.ktier_pin_of_id] is exactly that, at any tier. *)
+    iApply (TsoCtx.ctx_pointsto_of_phys _ tfp
+              (pa_add (tf_pa tfp (8 * Z.of_nat i)) (0 + k)) dq
+              (nth_byte w (0 + k)) Hid Hcan (ktier_pin_of_id _ _ _ Hid)
+              with "Hk' Hp").
+  Qed.
+
+  Lemma tf_word_mem_to_phys (tfp : mword 44) (i : nat) (dq : dfrac) (w : mword 64) :
+    (i < 512)%nat ->
+    pt_node_claim tfp -∗
+    tf_pa tfp (8 * Z.of_nat i) ↦₈{dq} w -∗
+    TsoCtx.ctx_phys_word_pointsto XI (tf_pa tfp (8 * Z.of_nat i)) dq w.
+  Proof using .
+    iIntros (Hi) "(%Hkd & %Hpv & #Hk) Hw".
+    iApply TsoCtx.ctx_phys_word_pointsto_intro;
+      [exact (tf_pa_aligned8 tfp i Hi) |].
+    iDestruct (ctx_word_pointsto_bytes with "Hw") as "Hbs".
+    iApply (big_sepL_impl with "Hbs").
+    iIntros "!>" (k j Hkj) "Hp".
+    apply lookup_seq in Hkj. destruct Hkj as [-> Hjlt].
+    destruct (tf_pa_slot_facts tfp i (0 + k)%nat Hkd Hi ltac:(lia)) as (Hid & _ & _ & Hsvpn).
+    iAssert (kmap_at (svpn_of (pa_add (tf_pa tfp (8 * Z.of_nat i)) (0 + k))) tfp KP_rw) as "#Hk'".
+    { rewrite Hsvpn. iExact "Hk". }
+    (* tso-flip's shim-free proof, taken verbatim *)
+    iApply (TsoCtx.ctx_pointsto_to_phys _ tfp
+              (pa_add (tf_pa tfp (8 * Z.of_nat i)) (0 + k)) dq
+              (nth_byte w (0 + k)) Hid with "Hk' Hp").
+  Qed.
+
+  (* THE MEM-TIER CONVENIENCE PAIR: what prepare_return/the syscall argument
+     fetchers/kfork's copy loop actually call -- [tf_page_word]/
+     [tf_page_word_upd] (native physical) composed with the bridge above,
+     so their OWN call sites are unchanged from before this file went
+     physical-native (still borrow/return a [↦₈] cell). *)
+  Lemma tf_page_word_mem (tfp : mword 44) (ws : list (mword 64)) (i : nat) (w : mword 64) :
+    (i < 512)%nat -> ws !! i = Some w ->
+    pt_node_claim tfp -∗
+    tf_page tfp ws -∗
+    tf_pa tfp (8 * Z.of_nat i) ↦₈ w ∗ (tf_pa tfp (8 * Z.of_nat i) ↦₈ w -∗ tf_page tfp ws).
+  Proof using .
+    iIntros (Hi Hlk) "#Hk Ht".
+    iDestruct (tf_page_word tfp ws i w Hlk with "Ht") as "[Hw Hback]".
+    iDestruct (tf_word_phys_to_mem tfp i (DfracOwn 1) w Hi with "Hk Hw") as "Hw".
+    iFrame "Hw". iIntros "Hw".
+    iDestruct (tf_word_mem_to_phys tfp i (DfracOwn 1) w Hi with "Hk Hw") as "Hw".
+    iApply ("Hback" with "Hw").
+  Qed.
+
+  Lemma tf_page_word_upd_mem (tfp : mword 44) (ws : list (mword 64)) (i : nat) (w : mword 64) :
+    (i < 512)%nat -> ws !! i = Some w ->
+    pt_node_claim tfp -∗
+    tf_page tfp ws -∗
+    tf_pa tfp (8 * Z.of_nat i) ↦₈ w ∗
+    (∀ w' : mword 64, tf_pa tfp (8 * Z.of_nat i) ↦₈ w' -∗ tf_page tfp (<[i := w']> ws)).
+  Proof using .
+    iIntros (Hi Hlk) "#Hk Ht".
+    iDestruct (tf_page_word_upd tfp ws i w Hlk with "Ht") as "[Hw Hback]".
+    iDestruct (tf_word_phys_to_mem tfp i (DfracOwn 1) w Hi with "Hk Hw") as "Hw".
+    iFrame "Hw". iIntros (w') "Hw".
+    iDestruct (tf_word_mem_to_phys tfp i (DfracOwn 1) w' Hi with "Hk Hw") as "Hw".
+    iApply ("Hback" with "Hw").
+  Qed.
+
+  (* STATED AT THE PHYSICAL TIER, so uservec/userret's OWN low-level
+     instruction lemmas (already physical, per [SpecUserret.tf_pa]) need no
+     crossing to touch it.  The ONE crossing at construction/destruction
+     (allocproc/freeproc, above) goes through the SAME whole-page
+     [kmap_static_claims] every other kalloc'd page already needs, not a
+     per-word one -- and the handful of kernel-side identity-map readers
+     that still want the mem tier pay it per-word, via
+     [tf_page_word_mem]/[tf_page_word_upd_mem] just above, using
+     [pt_node_claim_from_static]'s own persistent claim (no LEAF-only
+     [hw_config] opening needed at the read site: [pt_node_claim] is
+     obtained ONCE, from the same boot-time bundle, and threaded in). *)
+
+  (* =================================================================== *)
+  (* THE resource that rides alongside [cur_proc p].                      *)
+  (* =================================================================== *)
+  (* [cwd]: p->cwd holds ONE WHOLE inode reference -- [IcacheHeld.inode_held],
+     the same predicate the last [fileclose] of an FD_INODE file recovers
+     from its payload and hands to iput.  (C6b: this was [emp] while there
+     was no inode model; design/proc-struct.md's "holes to be honest about"
+     records the hole and design/fs-icache.md §3 the route out of it.)
+
+     THERE IS NO [v = zero_reg] ARM, AND THAT IS THE POINT.  A null
+     [p->cwd] is not a state this predicate describes -- it is a state in
+     which the block does not hold this conjunct at all, which is what
+     [proc_priv_nocwd] is for.  The two mechanisms are alternatives, not
+     partners: with a null arm, [proc_priv] no longer implies
+     [pv_cwd V <> 0], and every contract that reaches [iput(p->cwd)] --
+     kexit, kfork, and their syscall wrappers -- has to carry that fact as
+     a PREMISE its own callers must then supply.  Without one it is a
+     PROJECTION of the block ([proc_priv_cwd_nonzero]), free at every
+     altitude, and the construction window (allocproc's return, kfork's
+     150 bytes before the [sd a0,336(s4)], kexit's tail after [iput]) is
+     covered by the deficit block instead.
+
+     That matters beyond tidiness because of WHERE the fact would have to
+     travel: [SchedCtx.proc_slots_recast] moves SLEEPING -> RUNNABLE ->
+     RUNNING for free, and stays free only because [proc_slots] mentions
+     neither [proc_ctx]'s nor [proc_dormant]'s contents.  A [cwd <> 0]
+     conjunct anywhere near it would break exactly that; as a projection it
+     rides inside the Löb'd obligation and no recast ever looks at it. *)
+  (* AT ITS INUM (lane C1): the block ties the pointer to [pv_cwi], the
+     inum the process's cwd names, and this is the tie --
+     [IcacheHeld.inode_held_at], the same package with its inum a pure
+     conjunct.  [cwd_ref] is its ∃-form, kept for the consumers that only
+     ever wanted the reference. *)
+  Definition cwd_ref_at (v : mword 64) (z : Z) : iProp Σ := inode_held_at v z.
+  Definition cwd_ref (v : mword 64) : iProp Σ := (∃ z : Z, cwd_ref_at v z)%I.
+
+  (* The two directions, kept as NAMES so consumers do not unfold: they are
+     definitional now, but they were not, and the call sites read better
+     for saying which way they are going. *)
+  Lemma cwd_ref_at_held_at (v : mword 64) (z : Z) : cwd_ref_at v z -∗ inode_held_at v z.
+  Proof using . iIntros "$". Qed.
+
+  Lemma cwd_ref_at_of_held_at (v : mword 64) (z : Z) : inode_held_at v z -∗ cwd_ref_at v z.
+  Proof using . iIntros "$". Qed.
+
+  Lemma cwd_ref_at_held (v : mword 64) (z : Z) : cwd_ref_at v z -∗ inode_held v.
+  Proof using . rewrite /cwd_ref_at. iApply inode_held_at_held. Qed.
+
+  Lemma cwd_ref_held (v : mword 64) : cwd_ref v -∗ inode_held v.
+  Proof using . iIntros "(%z & H)". by iApply cwd_ref_at_held. Qed.
+
+  Lemma cwd_ref_of_held (v : mword 64) : inode_held v -∗ cwd_ref v.
+  Proof using . rewrite /cwd_ref /cwd_ref_at. iApply inode_held_zi. Qed.
+
+  (* ... and the projection the missing arm buys. *)
+  Lemma cwd_ref_at_nonzero (v : mword 64) (z : Z) :
+    cwd_ref_at v z -∗ ⌜v <> (zero_reg : mword 64)⌝.
+  Proof using . iIntros "H". iApply inode_held_ne_zero. by iApply cwd_ref_at_held. Qed.
+
+  Lemma cwd_ref_nonzero (v : mword 64) :
+    cwd_ref v -∗ ⌜v <> (zero_reg : mword 64)⌝.
+  Proof using . iIntros "(%z & H)". by iApply (cwd_ref_at_nonzero with "H"). Qed.
+
+  (* [p->sz] NEVER EXCEEDS MAXVA.  This is a real invariant of a live
+     process -- exec and growproc are the only writers and both bound the
+     size -- and it belongs HERE rather than in each consumer's precondition:
+     vmfault / copyin / copyout sit BELOW the [proc_priv] altitude (they take
+     the bare [p_sz] cell, not the block) and must keep taking it as a
+     premise, but every caller AT this altitude holds nothing but
+     [proc_priv], so a premise there would be one no caller could discharge.
+     [proc_priv_sz_bound] is how such a caller pays it. *)
+  (* [p->sz] BOUNDS THE MAP, and both facts are conjuncts of the block.
+     The size never exceeds TRAPFRAME ([uvm_maxsz]) -- growproc's own
+     [sz + n > TRAPFRAME] check and exec's are the only things that raise it
+     -- and NOTHING IS MAPPED AT OR ABOVE IT ([ProcPtOwn.um_below]).  The
+     second is what growproc pays uvmalloc's freshness premise out of: the
+     run [PGROUNDUP(sz) .. sz+n) is fresh in [ud_um] exactly because the
+     invariant says so, and no caller of growproc could have supplied it.
+     Neither can be a premise of a consumer for the reason in the header:
+     everything at this altitude holds nothing but [proc_priv].  It is why
+     copyin / copyout hand back [uptd_ext_sz], not [uptd_ext] -- see
+     [proc_priv_copy]. *)
+  (* THE BLOCK MINUS THE FD TABLE.  Split out because the fd table is the one
+     component a syscall may have to hold in a NON-[proc_ofiles] state (a
+     payload on loan, see [proc_ofiles_owe] above) while still handing the rest
+     of the block to a callee.  A deficit block is not [proc_priv ∗ anything] --
+     the cell of a lent descriptor names a file and [ofile_slot] then demands
+     the missing reference, so there is no frame lemma to be had -- and making
+     every [proc_priv]-taking spec generic in the deficit set would be the
+     wrong shape.  Splitting HERE costs nothing instead: the callees that must
+     be callable across a loan (piperead / pipewrite / fileread / filewrite /
+     filestat) never touch the descriptor array at all, so they take
+     [proc_priv_core] and the caller keeps its own fd-table term.  [fdalloc] is
+     the single exception, and it takes the deficit set explicitly.
+
+     No [γf]: the core is exactly the part with no file-layer content.
+
+     ---- THE LAST CONJUNCT IS [FirstTok.first_tok] ---------------------
+     proc.c's [static int first], as a resource the PROCESS carries: either
+     the exclusive boot arm (the pinned [first_addr ↦₄ 1] cell, main's
+     sixteen persistent rows, the sealed page count and fsinit's whole
+     premise pile) or the persistent steady arm ([first_addr ↦₄□ 0] beside
+     [FsReady.fs_ready]).  It lives HERE, in the block, because forkret --
+     the branch's only reader -- runs on a context a park saved, and the
+     block is the only thing a parked process still owns.  "At most one
+     process ever runs the boot arm" is then a theorem about ownership: the
+     two arms are incompatible at one address, so no second block can hold
+     the exclusive one.
+
+     WHY IT IS NOT IN [proc_priv_nocwd].  allocproc does not return a
+     process in a RUNNABLE or SLEEPING state -- kfork holds its result for
+     150 bytes before the [sd a0,336(s4)] that installs the cwd -- so a
+     contract at the deficit block must not have to PRODUCE a token.  The
+     deficit block is exactly the pre-park shape, and the token joins at the
+     same seam the working directory does ([proc_priv_split_cwd] is
+     three-way for that reason). *)
+  (* THE MEMORY CONJUNCT IS THE LAZY sz-REGION VIEW -- see
+     [ProcDefs.proc_priv_bare]'s note for why (vmfault, and hence copyin
+     and every fault-only path, preserves it). *)
+  (* ---- THE LAST CONJUNCT IS THIS INCARNATION'S GENERATION -------------
+     [ChildTok]'s KERNEL QUARTER and, beside it, the process's own
+     persistent knowledge of the payload its exit owes.  The pair is the
+     process's identity as a wait()-side resource holder:
+
+       [gen_kq] is LINEAR and there is exactly one, which is what makes
+       "the payload is paid once" a theorem: kexit spends it on the ZOMBIE
+       escrow ([ChildTok.exit_tok], parked in [ProcDefs.proc_dormant]) and
+       no second block can hold another.
+       [my_pay] is PERSISTENT and is what the process's own U-mode slot is
+       built against ([UkRun.ukn_pay]) -- the exec bridge hands it to the
+       new image's slot ([SpecKexec.exec_slot_pre]), and the exit deposit
+       is stated at it.
+
+     THE PAYLOAD IS EXISTENTIAL HERE.  A block does not get to say what its
+     process owes: the parent chose it at fork ([ChildTok.gen_set]), and
+     what a holder of the block may do with it is exactly what agreement
+     allows.  allocproc mints the pair at the trivial payload
+     ([ChildTok.gen_alloc] then [gen_split]); kfork re-chooses it before the
+     split; exec preserves it ([KexecDefs.KexecOkQ] keeps [pv_gen]). *)
+  Definition proc_priv_core (pa : mword 64) (pid : mword 32) (U : ustate) : iProp Σ :=
+    (⌜uint (pv_sz (us_V U)) <= uvm_maxsz⌝ ∗
+     ⌜um_below (pv_sz (us_V U)) (ud_um (pv_upt (us_V U)))⌝ ∗
+     p_pid pa ↦₄{DfracOwn (1/2)} pid ∗
+     proc_fields pa (DfracOwn 1) (us_V U) ∗
+     proc_ptm_at pa (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+     tf_page (ud_tfp (pv_upt (us_V U))) (pv_tf (us_V U)) ∗
+     (* ...AND WHAT THE LAZY BIT CLAIMS (lane LAZY-FLAG).  [ProcDefs.pv_lazy]
+        is "this process MAY have pages the kernel has promised and not yet
+        mapped"; at [false] it promises the projection's FILL IS EMPTY, and
+        this is where that promise lives.  Beside [um_below] because it is
+        the same kind of fact about the same two fields -- the table and the
+        break -- and because every proof that moves either already has this
+        one's facts in hand: a page fault EXTENDS the table
+        ([UserPerm.lazy_free_mono] under [ProcPtOwn.uptd_ext]), an eager
+        grow maps its run ([SpecGrowproc.growproc_ok]'s domain equation), a
+        shrink lowers the break below what it unmapped, exec's image is
+        eager, and fork's child has the parent's vpns
+        ([UserPerm.lazy_free_dom]).  Only sbrklazy's grow raises the bit,
+        and there the claim becomes vacuous.
+        OUTSIDE [ProcDefs.proc_priv_bare] on purpose: the fs chain below the
+        file layer takes the bare part and has no business with it. *)
+     ⌜pv_lazy (us_V U) = false ->
+        lazy_free (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))⌝ ∗
+     cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) ∗
+     first_tok ∗
+     (∃ Q : Z -> iProp Σ,
+        gen_kq (pv_gen (us_V U)) pa pid Q ∗ my_pay (pv_gen (us_V U)) Q) ∗
+     (* ...AND THE PROCESS'S HALF OF ITS OWN [p->xstate] CELL, whose other
+        half is <p->lock>'s ([SchedCtx.proc_pub]).  The value is
+        existential: nothing a running process does reads it, and the one
+        step that writes it -- kexit's [p->xstate = status] -- holds the
+        lock and therefore both halves.  It is HERE rather than in the
+        public payload because the ZOMBIE park keys its escrow at the
+        cell's status ([ChildTok.exit_tok]) and the park is built out of
+        this block. *)
+     (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) ∗
+     (* ---- AND THE TWO HALVES THAT SAY THIS INCARNATION IS THE CURRENT
+        ONE ([SlotGen.gen_halves_priv]) -----------------------------------
+        A QUARTER of -- slot [pa]'s current generation is [pv_gen] -- and
+        a quarter of -- this pid is registered to [pv_gen].  The other
+        THREE QUARTERS of each are in <wait_lock>'s payload
+        ([WaitInv.gen_halves]), deposited by whoever forked this process
+        (the split is uneven for [SlotGen.slot_gen_quarters]'s reason),
+        and the two meet at the reap: the reaper agrees the slot shares to
+        learn that the ZOMBIE block in its hands IS the entry its parent
+        cell names, and agrees the pid shares to learn that no other child
+        of its own carries that pid.
+          The pair is LINEAR and there is exactly one, which is what makes
+        both readings exclusive rather than historical -- [ChildTok]'s own
+        [gen_slot] / [gen_pid] are persistent and say only that this
+        generation ONCE ran in this slot at this pid.
+          BUNDLED as one conjunct rather than two, because it always moves
+        as one: the ZOMBIE park is literally this pair crossing into
+        [ProcDefs.proc_dormant]'s [SlotGen.gen_halves_dorm]. *)
+     (* THE SLOT'S EVENT COUNTER ([SlotGen.act_cnt], design
+        ni-strong-instance.md §7) at the record's [pv_ev]: the permit an
+        actor-labelled ledger append consumes, lent out by
+        [proc_priv_ev_acc].  Before the generation pair so that the
+        xstate half, this and the pair ride together as one tail. *)
+     act_cnt pa (pv_ev (us_V U)) ∗
+     gen_halves_priv pa pid (pv_gen (us_V U)))%I.
+
+  (* ...AND ITS FILE-LAYER-FREE PART, WHICH IS WHAT THE BLOCK LAYER TAKES.
+     [ProcDefs.proc_priv_bare] is this minus [cwd_ref]; the note at its
+     definition says why the sleeplock/buffer-cache chain must not be handed
+     anything that mentions an inode reference.  An [⊣⊢], so a caller splits
+     and rejoins with a rewrite -- no borrow and no closer to carry. *)
+  Lemma proc_priv_core_bare (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U ⊣⊢
+    proc_priv_bare pa pid U ∗
+    ⌜pv_lazy (us_V U) = false ->
+       lazy_free (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))⌝ ∗
+    cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) ∗
+    first_tok ∗
+    (∃ Q : Z -> iProp Σ,
+       gen_kq (pv_gen (us_V U)) pa pid Q ∗ my_pay (pv_gen (us_V U)) Q) ∗
+    (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) ∗
+    gen_halves_priv pa pid (pv_gen (us_V U)).
+  Proof using .
+    rewrite /proc_priv_core /proc_priv_bare. iSplit.
+    - iIntros "(%A & %B & Hpid & Hf & Hpt & Htfp & %C & Hc & Hft & Hgq & Hxs & Hev & Hgh)".
+      iFrame "Hc Hft Hgq Hxs Hgh Hpid Hf Hpt Htfp Hev".
+      iSplitR; [iPureIntro; split_and!; [exact A | exact B] |].
+      iPureIntro; exact C.
+    - iIntros "[(%A & %B & Hpid & Hf & Hpt & Htfp & Hev) [%C [Hc [Hft [Hgq [Hxs Hgh]]]]]]".
+      iFrame "Hpid Hf Hpt Htfp Hc Hft Hgq Hxs Hev Hgh".
+      iSplitR; [iPureIntro; exact A |].
+      iSplitR; [iPureIntro; exact B |]. iPureIntro; exact C.
+  Qed.
+
+  (* THE BORROW FORM.  Every fs callee below the file layer -- bread, bmap,
+     ilock, begin_op, ... -- asks for [proc_priv_bare], never for a fraction
+     of [p->pid]; a caller holding the full block lends the bare part for the
+     length of the call and takes it back.  Only [cwd_ref] stays behind, and
+     nothing under the file layer wants it. *)
+  Lemma proc_priv_core_bare_acc (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    proc_priv_bare pa pid U ∗ (proc_priv_bare pa pid U -∗ proc_priv_core pa pid U).
+  Proof using .
+    rewrite proc_priv_core_bare. iIntros "[Hb [%Hlz [Hc [Hft [Hgq Hxs]]]]]".
+    iSplitL "Hb"; [iExact "Hb"|]. iIntros "Hb".
+    iFrame "Hb Hc Hft Hgq Hxs". iPureIntro; exact Hlz.
+  Qed.
+
+  (* ...WITH THE CLOSER TAKING THE BARE BLOCK BACK AT ANY EVENT COUNT
+     (permit sweep L1b).  A callee that takes the bare block may lend its
+     counter on (fileclose -> pipeclose), so it comes back at a raised
+     count; the rest of the core names no count and rides along.  The same
+     at the block's altitude is [proc_priv_bare_acc_ev], and with one
+     descriptor slot out, [proc_priv_bare_ofile_ev]. *)
+  Lemma proc_priv_core_bare_ev_acc (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    proc_priv_bare pa pid U ∗
+    (∀ k : nat, proc_priv_bare pa pid (upd_usV U (upd_ev (us_V U) k)) -∗
+       proc_priv_core pa pid (upd_usV U (upd_ev (us_V U) k))).
+  Proof using .
+    rewrite proc_priv_core_bare. iIntros "[Hb [%Hlz [Hc [Hft [Hgq Hxs]]]]]".
+    iSplitL "Hb"; [iExact "Hb"|]. iIntros (k) "Hb".
+    rewrite proc_priv_core_bare.
+    destruct U as [[f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13] M].
+    iFrame "Hb Hc Hft Hgq Hxs". iPureIntro; exact Hlz.
+  Qed.
+
+  (* THE EVENT COUNT ONLY ROSE (permit sweep, design ni-strong-instance.md
+     §7): [U'] is [U] with its [pv_ev] moved to a count at least [U]'s and
+     nothing else touched.  What a block-holder's post says of a block that
+     was lent out on the permit cone and came back. *)
+  Definition ev_after (U U' : ustate) : Prop :=
+    exists k : nat, (pv_ev (us_V U) <= k)%nat /\ U' = upd_usV U (upd_ev (us_V U) k).
+
+  Lemma ev_after_refl (U : ustate) : ev_after U U.
+  Proof using . exists (pv_ev (us_V U)). split; [lia|]. destruct U as [[] M]; reflexivity. Qed.
+
+  Lemma ev_after_trans (U U' U'' : ustate) :
+    ev_after U U' -> ev_after U' U'' -> ev_after U U''.
+  Proof using .
+    intros (k1 & Hk1 & ->) (k2 & Hk2 & ->). exists k2. cbn in Hk2.
+    split; [lia|]. destruct U as [[] M]; reflexivity.
+  Qed.
+
+  Definition proc_priv (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) : iProp Σ :=
+    (proc_priv_core pa pid U ∗ proc_ofiles γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)))%I.
+
+  (* =================================================================== *)
+  (* fdalloc's SCAN, CONVERTED.                                          *)
+  (*                                                                     *)
+  (* This is the lemma the allocating dispatch arms apply.  What they     *)
+  (* hold after the call is the block at the UPDATED array and the bundle *)
+  (* at the UPDATED states -- the insert touched only the slot allocated  *)
+  (* -- so both still describe every slot BELOW it, and the scan fact the *)
+  (* call returns ([SpecFdalloc.fd_frees_below], on p->ofile's pointers)  *)
+  (* converts into [FdSlots.fd_least_closed] on the INCOMING table with   *)
+  (* nothing re-opened.                                                  *)
+  (* =================================================================== *)
+  (* the whole-array agreement at the block a caller actually holds *)
+  (* [proc_priv_parked] IS DELETED (lane OFF-LINK, L2), the top of the
+     [_parked] chain: the all-parked export existed so that the generic
+     tier's narrowed slot mints could be told "every row of this key's
+     table is parked", and under design/app-file.md SS3.5's principle the
+     generic tier pays the TAINT instead of being told anything about
+     offsets.  It had no application in the tree (OFF-HAND-7, measurement
+     1) and its supplier ([ofile_slot_parked]'s chain) is gone. *)
+
+  Lemma proc_priv_states_agree (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (sts : list fdstate) :
+    proc_priv γf pa pid U -∗ fd_frags (pv_fdg (us_V U)) sts -∗
+    ⌜forall (j : nat) (v : mword 64) (st : fdstate),
+       pv_ofile (us_V U) !! j = Some v -> sts !! j = Some st ->
+       (v = (zero_reg : mword 64) <-> st = FdClosed)⌝.
+  Proof using .
+    iIntros "[_ Hof] Hfr". iApply (proc_ofiles_states_agree with "Hof Hfr").
+  Qed.
+
+  (* STATED AT AGREEMENT BELOW [fd], not at a particular insert.  A caller
+     that allocated ONE descriptor holds the block and bundle one insert
+     past the table the scan is about; sys_pipe, which allocates TWO, holds
+     them two inserts past, and both inserts land at or above the first
+     descriptor.  So what the lemma can actually ask for is that the
+     resources it is given agree with the table below [fd] -- which both
+     callers have by [list_lookup_insert_ne] -- rather than that they be
+     any particular update of it. *)
+  Lemma proc_priv_frags_least (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (sts0 sts : list fdstate) (fs0 : list (mword 64))
+      (fd : nat) :
+    (fd < NOFILE)%nat ->
+    sts0 !! fd = Some FdClosed ->
+    (forall j : nat, (j < fd)%nat -> fs0 !! j <> Some (zero_reg : mword 64)) ->
+    (forall j : nat, (j < fd)%nat -> pv_ofile (us_V U) !! j = fs0 !! j) ->
+    (forall j : nat, (j < fd)%nat -> sts !! j = sts0 !! j) ->
+    proc_priv γf pa pid U -∗
+    fd_frags (pv_fdg (us_V U)) sts -∗
+    ⌜fd_least_closed sts0 fd⌝.
+  Proof using .
+    intros HfdN Hcl Hbelow Hfsag Hstag. iIntros "[_ Hof] Hfr".
+    iDestruct "Hof" as "[%Hflen Hofb]".
+    iDestruct (proc_ofiles_states_agree with "[Hofb] Hfr") as %Hag.
+    { iSplitR; [ iPureIntro; exact Hflen | iExact "Hofb" ]. }
+    iPureIntro. apply (fd_least_closed_intro sts0 fd Hcl).
+    intros j Hj Hc.
+    (* the slot is closed in the table the scan is about, hence in the one
+       the caller is holding -- they agree below [fd] *)
+    assert (Hjs : sts !! j = Some FdClosed) by (rewrite (Hstag j Hj); exact Hc).
+    (* ...and it is a slot of the array, which the scan walked past *)
+    assert (Hjv : is_Some (pv_ofile (us_V U) !! j))
+      by (apply lookup_lt_is_Some_2; rewrite Hflen; lia).
+    destruct Hjv as [w Hw].
+    pose proof (Hag j w FdClosed Hw Hjs) as [_ Hz].
+    (* so its cell is null -- and the scan says no cell below [fd] is *)
+    exact (Hbelow j Hj (eq_trans (eq_sym (Hfsag j Hj))
+                          (eq_trans Hw (f_equal Some (Hz eq_refl))))).
+  Qed.
+
+
+  (* ---- THE CONSTRUCTION WINDOW -------------------------------------
+     [cwd_ref] has no null arm, so a process whose [p->cwd] is still 0 does
+     not satisfy [proc_priv] -- and allocproc returns exactly such a
+     process, which kfork then holds for 150 bytes before its
+     [sd a0,336(s4)].  So the reference SPLITS OFF, the same move S4c made
+     for the fd table: a block with a deficit is not [proc_priv ∗ anything],
+     so split at the component the callee does not touch.
+
+     Note this splits only the REFERENCE, not the [p_cwd] CELL: the cell
+     stays inside [proc_fields], so [proc_dormant], [SpecFreeproc] and every
+     other consumer of [proc_fields] is untouched.  A holder of the deficit
+     block still owns the cell and writes it with
+     [proc_priv_nocwd_cwd]. *)
+  (* THE GENERATION'S PAIR IS NOT HERE, and that is what makes the deficit
+     block the PRE-FORK shape.  allocproc returns the incarnation's
+     ownership WHOLE and beside the block ([SpecAllocproc]'s post,
+     [ChildTok.gen_own] at [DfracOwn 1] and the trivial payload) precisely
+     so that the forking parent can still CHOOSE the payload
+     ([ChildTok.gen_set]) -- which is possible only at full ownership.  The
+     split into the kernel's quarter and the persistent [my_pay] happens at
+     the same store the working directory and the token join at
+     ([proc_priv_split_cwd] is six-way for that reason), which is where
+     the block becomes [proc_priv]. *)
+  Definition proc_priv_nocwd (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) : iProp Σ :=
+    (⌜uint (pv_sz (us_V U)) <= uvm_maxsz⌝ ∗
+     ⌜um_below (pv_sz (us_V U)) (ud_um (pv_upt (us_V U)))⌝ ∗
+     p_pid pa ↦₄{DfracOwn (1/2)} pid ∗
+     proc_fields pa (DfracOwn 1) (us_V U) ∗
+     proc_ptm_at pa (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+     tf_page (ud_tfp (pv_upt (us_V U))) (pv_tf (us_V U)) ∗
+     (* ...AND WHAT THE LAZY BIT CLAIMS (lane LAZY-FLAG).  [ProcDefs.pv_lazy]
+        is "this process MAY have pages the kernel has promised and not yet
+        mapped"; at [false] it promises the projection's FILL IS EMPTY, and
+        this is where that promise lives.  Beside [um_below] because it is
+        the same kind of fact about the same two fields -- the table and the
+        break -- and because every proof that moves either already has this
+        one's facts in hand: a page fault EXTENDS the table
+        ([UserPerm.lazy_free_mono] under [ProcPtOwn.uptd_ext]), an eager
+        grow maps its run ([SpecGrowproc.growproc_ok]'s domain equation), a
+        shrink lowers the break below what it unmapped, exec's image is
+        eager, and fork's child has the parent's vpns
+        ([UserPerm.lazy_free_dom]).  Only sbrklazy's grow raises the bit,
+        and there the claim becomes vacuous. *)
+     ⌜pv_lazy (us_V U) = false ->
+        lazy_free (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))⌝ ∗
+     (* the slot's event counter ([proc_priv_core]'s): it comes out of the
+        dormant block with the record, so the deficit block carries it *)
+     act_cnt pa (pv_ev (us_V U)) ∗
+     proc_ofiles γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)))%I.
+
+  (* SIX-WAY.  The deficit block is the PRE-PARK shape -- what allocproc
+     returns -- and none of the working directory, [FirstTok.first_tok],
+     the incarnation's own pair, its half of [p->xstate] or its two
+     exclusive quarters is installed yet, so all of them split off at the
+     same seam and rejoin at the same store.  The generation's pieces are
+     LAST: kfork chooses the payload and splits it ([ChildTok.gen_set],
+     [gen_split]) and splits the two exclusive ghosts
+     ([SlotGen.slot_gen_quarters], [pid_reg_quarters]) between allocproc's
+     return and this store, keeping the three quarters for the deposit it
+     makes under <wait_lock>; userinit does the same at the trivial payload
+     and drops them (init has no parent and is never reaped). *)
+  Lemma proc_priv_split_cwd (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U ⊣⊢
+    proc_priv_nocwd γf pa pid U ∗ cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) ∗
+    first_tok ∗
+    (∃ Q : Z -> iProp Σ,
+       gen_kq (pv_gen (us_V U)) pa pid Q ∗ my_pay (pv_gen (us_V U)) Q) ∗
+    (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) ∗
+    gen_halves_priv pa pid (pv_gen (us_V U)).
+  Proof using .
+    rewrite /proc_priv /proc_priv_core /proc_priv_nocwd.
+    iSplit.
+    - iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hc & Hft & Hgq & Hxs & Hev & Hgh) Ho]".
+      iFrame "Hc Hft Hgq Hxs Hgh". iSplitR; [done|]. iSplitR; [done|].
+      iFrame "Hpid Hf Hpt Htfp Hev Ho". iPureIntro; exact Hlz.
+    - iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hev & Ho) [Hc [Hft [Hgq [Hxs Hgh]]]]]".
+      iSplitR "Ho"; [|iExact "Ho"].
+      iSplitR; [done|]. iSplitR; [done|].
+      iFrame "Hpid Hf Hpt Htfp". iSplitR; [iPureIntro; exact Hlz |]. iFrame.
+  Qed.
+
+  (* ...and the same borrow one layer up, for a caller holding the WHOLE
+     block.  [proc_ofiles] and [cwd_ref] stay behind; nothing under the file
+     layer wants either. *)
+  Lemma proc_priv_bare_acc (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗
+    proc_priv_bare pa pid U ∗ (proc_priv_bare pa pid U -∗ proc_priv γf pa pid U).
+  Proof using .
+    rewrite /proc_priv proc_priv_core_bare.
+    iIntros "[[Hb [%Hlz [Hc [Hft [Hgq Hxs]]]]] Ho]".
+    iSplitL "Hb"; [iExact "Hb"|]. iIntros "Hb".
+    iFrame "Hb Hc Hft Hgq Hxs Ho". iPureIntro; exact Hlz.
+  Qed.
+
+  (* ...AND AT ANY EVENT COUNT (permit sweep L1b); see
+     [proc_priv_core_bare_ev_acc]. *)
+  Lemma proc_priv_bare_acc_ev (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗
+    proc_priv_bare pa pid U ∗
+    (∀ k : nat, proc_priv_bare pa pid (upd_usV U (upd_ev (us_V U) k)) -∗
+       proc_priv γf pa pid (upd_usV U (upd_ev (us_V U) k))).
+  Proof using .
+    iIntros "[Hc Ho]".
+    iDestruct (proc_priv_core_bare_ev_acc with "Hc") as "[$ Hback]".
+    iIntros (k) "Hb". iSplitR "Ho"; [iApply ("Hback" with "Hb") | iExact "Ho"].
+  Qed.
+
+  (* THE cwd-DEFICIT BLOCK IS THE BARE BLOCK PLUS THE FD TABLE.  Both sides
+     spell the same six conjuncts in the same order, so this is a regrouping
+     and not a transfer. *)
+  (* ...AND WHAT THE LAZY BIT CLAIMS, off the cwd-deficit block (lane
+     LAZY-FLAG).  Pure conclusion, so the caller keeps the block; this is
+     what makes the regrouping below a REGROUPING and not a loss. *)
+  Lemma proc_priv_nocwd_lazy (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_nocwd γf pa pid U -∗
+    ⌜pv_lazy (us_V U) = false ->
+       lazy_free (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))⌝.
+  Proof using . iIntros "(_ & _ & _ & _ & _ & _ & %Hlz & _)". done. Qed.
+
+  (* THE cwd-DEFICIT BLOCK IS THE BARE BLOCK PLUS THE FD TABLE, AND THE
+     LAZY BIT'S CLAIM RIDES AS A PREMISE (lane LAZY-FLAG).  The claim sits
+     in [proc_priv_core] and OUTSIDE [proc_priv_bare] -- the fs chain below
+     the file layer must not see it -- so the two sides of this regrouping
+     do not carry it equally and it cannot be dropped.  Taking it as a
+     PREMISE rather than as a third conjunct is what keeps every caller's
+     destructuring unchanged: a caller reads it off the block first
+     ([proc_priv_nocwd_lazy]), then rewrites with it in hand, and rewrites
+     BACK with the same fact.  It is pure, so holding it costs nothing. *)
+  Lemma proc_priv_nocwd_bare (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    (pv_lazy (us_V U) = false ->
+       lazy_free (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))) ->
+    proc_priv_nocwd γf pa pid U ⊣⊢
+    proc_priv_bare pa pid U ∗
+    proc_ofiles γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)).
+  Proof using .
+    intros Hlz. rewrite /proc_priv_nocwd /proc_priv_bare. iSplit.
+    - iIntros "(%A & %B & Hpid & Hf & Hpt & Htfp & %C & Hev & Ho)".
+      iFrame "Ho Hev Hpid Hf Hpt Htfp". iSplitR; [done|]. done.
+    - iIntros "[(%A & %B & Hpid & Hf & Hpt & Htfp & Hev) Ho]".
+      iFrame "Hpid Hf Hpt Htfp Hev Ho". iSplitR; [done|].
+      iSplitR; [done|]. iPureIntro; exact Hlz.
+  Qed.
+
+
+  (* ---- THE ADDRESS-SPACE SPLIT --------------------------------------
+     THE BLOCK MINUS THE PAGE TABLE.  Split out for the reason the fd
+     table and the cwd reference above were, one tier further out: the
+     one window in which a live process's block is NOT complete is user
+     execution, where the address space is INSTALLED (satp points at it,
+     [UserPtTree.user_pt_inv] owns it) rather than parked.  A kernel-side
+     residue that must survive that window therefore cannot contain
+     [proc_pt] -- holding both is [ptree_own 2 (DfracOwn 1)] and the user
+     pages claimed TWICE, i.e. an unsatisfiable precondition and a vacuous
+     lemma, which is exactly the trap the uservec boundary fell into (see
+     claude-notes/projects/uservec.md).
+
+     The two [struct proc] CELLS stay: [p->pagetable] / [p->trapframe] are
+     ordinary kernel words that merely NAME the table, and the kernel owns
+     them straight through user execution.  So does the trapframe page --
+     [tf_page] is at the tier-neutral physical tier and user mode cannot
+     reach it (its leaf has U = 0), so it is residue, not address space.
+     What leaves is [proc_pt] and nothing else. *)
+  Definition proc_priv_nopt (γf : gname) (pa : mword 64) (pid : mword 32)
+      (V : pprivate) : iProp Σ :=
+    (⌜uint (pv_sz V) <= uvm_maxsz⌝ ∗
+     ⌜um_below (pv_sz V) (ud_um (pv_upt V))⌝ ∗
+     p_pid pa ↦₄{DfracOwn (1/2)} pid ∗
+     proc_fields pa (DfracOwn 1) V ∗
+     proc_pt_cells pa (pv_upt V) ∗
+     tf_page (ud_tfp (pv_upt V)) (pv_tf V) ∗
+     (* ...AND WHAT THE LAZY BIT CLAIMS (lane LAZY-FLAG), at the same place
+        in the same order as [proc_priv_core] carries it -- this shape drops
+        the MEMORY conjunct and nothing else, and the claim is about the
+        DESCRIPTOR and the break, both of which stay. *)
+     ⌜pv_lazy V = false -> lazy_free (ud_um (pv_upt V)) (uint (pv_sz V))⌝ ∗
+     cwd_ref_at (pv_cwd V) (pv_cwi V) ∗
+     proc_ofiles γf (pv_fdg V) pa (pv_ofile V) ∗
+     first_tok ∗
+     (* the incarnation's pair, exactly as the whole block carries it
+        ([proc_priv_core]): this shape drops the MEMORY conjunct and
+        nothing else *)
+     (∃ Q : Z -> iProp Σ, gen_kq (pv_gen V) pa pid Q ∗ my_pay (pv_gen V) Q) ∗
+     (* ...and the process's half of [p->xstate] and the incarnation's two
+        halves, for the same reason *)
+     (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) ∗
+     act_cnt pa (pv_ev V) ∗
+     gen_halves_priv pa pid (pv_gen V))%I.
+
+  (* THE TRAPFRAME BOUND, off the residue's own half of the block.  Same
+     conjunct [proc_priv_sz_maxsz] reads, at the form the trap loop holds
+     across user execution (the memory conjunct has split off, so
+     [proc_priv] is not available there).  Milestone J's resume obligation
+     [UserPerm.usz_ok] is this plus [pgroundup]'s monotonicity -- see
+     [UexecApply.usz_ok_of_maxsz]. *)
+  Lemma proc_priv_nopt_sz_maxsz (γf : gname) (pa : mword 64) (pid : mword 32)
+      (V : pprivate) :
+    proc_priv_nopt γf pa pid V -∗ ⌜uint (pv_sz V) <= uvm_maxsz⌝.
+  Proof using . iIntros "(%Hszb & _)". done. Qed.
+
+  (* ...AND WHAT THE LAZY BIT CLAIMS, off the reduced block (lane KILL-PAY,
+     milestone LAZY-ROW).  [proc_priv_lazy]'s twin at the shape the trap
+     residue carries ([UsertrapRes.ut_res_bare]), and the one the U tier's
+     slot guard is discharged from: the loop holds the block across user
+     execution, so it is the party that can say the process's fill is
+     empty. *)
+  Lemma proc_priv_nopt_lazy (γf : gname) (pa : mword 64) (pid : mword 32)
+      (V : pprivate) :
+    proc_priv_nopt γf pa pid V -∗
+    ⌜pv_lazy V = false -> lazy_free (ud_um (pv_upt V)) (uint (pv_sz V))⌝.
+  Proof using . iIntros "(_ & _ & _ & _ & _ & _ & %Hlz & _)". done. Qed.
+
+  (* THE TIER SEAM.  What splits off is the LAZY view -- the block's own
+     memory conjunct, verbatim -- and NOT the mapped [proc_pt].  The
+     residue's own boundary ([UsertrapRes.ut_res_pt_close] / [_pt_open])
+     is where the mapped view comes back, because that is the one the user
+     tier speaks ([UserPtTree.user_pt_inv]); both directions of THAT
+     crossing are ∃-weakened already, so they absorb the conversion
+     ([ProcPtOwn.proc_pt_ptm_any] one way, [proc_ptm_pt] the other) without
+     any statement moving. *)
+  Lemma proc_priv_split_pt (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U ⊣⊢
+    proc_priv_nopt γf pa pid (us_V U) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U).
+  Proof using .
+    rewrite /proc_priv /proc_priv_core /proc_priv_nopt proc_ptm_at_split
+            /proc_pt_cells.
+    iSplit.
+    - iIntros "[(%Hszb & %Hbel & Hpid & Hf & ((Hc1 & Hc2) & Hpt) & Htfp & %Hlz & Hc & Hft & Hgq & Hxs) Ho]".
+      iFrame "Hpt". iSplitR; [done|]. iSplitR; [done|].
+      iFrame "Hpid Hf Hc1 Hc2 Htfp".
+      iSplitR; [iPureIntro; exact Hlz |].
+      iFrame "Hc Ho Hft Hgq Hxs".
+    - iIntros "[(%Hszb & %Hbel & Hpid & Hf & (Hc1 & Hc2) & Htfp & %Hlz & Hc & Ho & Hft & Hgq & Hxs) Hpt]".
+      iFrame "Ho". iSplitR; [done|]. iSplitR; [done|].
+      iFrame "Hpid Hf Hc1 Hc2 Hpt Htfp".
+      iSplitR; [iPureIntro; exact Hlz |].
+      iFrame "Hc Hft Hgq Hxs".
+  Qed.
+
+  (* THE TRAPFRAME BORROW at the reduced block -- same statement as
+     [UsertrapRes.proc_priv_tf_open], which is where the complete block's
+     version lives; this one is what a residue that has already given up
+     its page table opens. *)
+  Lemma proc_priv_nopt_tf_open (γf : gname) (pa : mword 64) (pid : mword 32)
+      (V : pprivate) :
+    proc_priv_nopt γf pa pid V -∗
+    ∃ ws : list (mword 64), ⌜ws = pv_tf V⌝ ∗ tf_page (ud_tfp (pv_upt V)) ws ∗
+      (∀ ws' : list (mword 64), tf_page (ud_tfp (pv_upt V)) ws' -∗
+         proc_priv_nopt γf pa pid (upd_tf V ws')).
+  Proof using .
+    iIntros "(%Hszb & %Hbel & Hpid & Hf & Hc & Htfp & %Hlz & Hcwd & Ho & Hft)".
+    iExists (pv_tf V). iSplitR; [done|]. iFrame "Htfp".
+    iIntros (ws') "Htfp".
+    (* every field [upd_tf] does not touch is equal by a single iota step;
+       name them so the goal reduces by [rewrite] rather than by a blind
+       [iFrame] match against an opaque [upd_tf V ws'] -- the same hazard
+       [proc_priv_tf_open] documents. *)
+    assert (Heq1 : pv_sz (upd_tf V ws') = pv_sz V) by reflexivity.
+    assert (Heq2 : pv_upt (upd_tf V ws') = pv_upt V) by reflexivity.
+    assert (Heq3 : pv_ofile (upd_tf V ws') = pv_ofile V) by reflexivity.
+    assert (Heq4 : pv_cwd (upd_tf V ws') = pv_cwd V) by reflexivity.
+    assert (Heq6 : pv_tf (upd_tf V ws') = ws') by reflexivity.
+    assert (Heq7 : proc_fields pa (DfracOwn 1) (upd_tf V ws')
+                   = proc_fields pa (DfracOwn 1) V) by reflexivity.
+    rewrite /proc_priv_nopt Heq1 Heq2 Heq3 Heq4 Heq6 Heq7.
+    iSplitR; [done|]. iSplitR; [done|].
+    iFrame "Hpid Hf Hc Htfp".
+    iSplitR; [iPureIntro; exact Hlz |].
+    iFrame "Hcwd Ho Hft".
+  Qed.
+
+  (* THE FOOTPRINT FIELD IS INVISIBLE HERE.  The reduced block reads
+     [pv_upt V] only through [ud_root] / [ud_tfp] / [ud_um]; [ud_data] is
+     the derived footprint ([ProcPtOwn.ud_pas]) that only the user tier
+     names.  So a residue keyed on a descriptor may be RENORMALISED
+     ([ProcPtOwn.ud_norm]) for free -- which is what lets the trap loop
+     hand the user tier a descriptor whose coverage side condition holds
+     by construction while the kernel side keeps the one it had. *)
+  Lemma proc_priv_nopt_upt_irrel (γf : gname) (pa : mword 64) (pid : mword 32)
+      (V : pprivate) (Q : uptd) :
+    ud_root (pv_upt V) = ud_root Q ->
+    ud_tfp (pv_upt V) = ud_tfp Q ->
+    ud_um (pv_upt V) = ud_um Q ->
+    proc_priv_nopt γf pa pid V ⊣⊢ proc_priv_nopt γf pa pid (upd_upt V Q).
+  Proof using .
+    intros Hr Ht Hu.
+    assert (Heq1 : pv_sz (upd_upt V Q) = pv_sz V) by reflexivity.
+    assert (Heq2 : pv_upt (upd_upt V Q) = Q) by reflexivity.
+    assert (Heq3 : pv_ofile (upd_upt V Q) = pv_ofile V) by reflexivity.
+    assert (Heq4 : pv_cwd (upd_upt V Q) = pv_cwd V) by reflexivity.
+    assert (Heq6 : pv_tf (upd_upt V Q) = pv_tf V) by reflexivity.
+    assert (Heq7 : proc_fields pa (DfracOwn 1) (upd_upt V Q)
+                   = proc_fields pa (DfracOwn 1) V) by reflexivity.
+    rewrite /proc_priv_nopt Heq1 Heq2 Heq3 Heq4 Heq6 Heq7 /proc_pt_cells.
+    rewrite -Hr -Ht -Hu. reflexivity.
+  Qed.
+
+  (* the deficit block's [p->cwd] CELL, borrowed and replaced -- what the
+     [sd] that installs a working directory needs.  [proc_priv_cwd] cannot
+     serve: it hands out the reference too, and during the window there is
+     none. *)
+  Lemma proc_priv_nocwd_cwd (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_nocwd γf pa pid U -∗
+    p_cwd pa ↦₈ pv_cwd (us_V U) ∗
+    (∀ v' : mword 64,
+       p_cwd pa ↦₈ v' -∗ proc_priv_nocwd γf pa pid (us_cwd U v')).
+  Proof using .
+    iIntros "(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Ho)".
+    rewrite /proc_fields. iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    iFrame "Hcwd". iIntros (v') "Hcwd".
+    rewrite /proc_priv_nocwd /proc_fields.
+    cbn [upd_cwd pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_cwi pv_gen pv_chg pv_lazy pv_secc].
+    iSplitR; [done|]. iSplitR; [done|]. iFrame "Hpid".
+    iSplitL "Hsz Hcwd Hnm Hsecc".
+    { iFrame "Hsz Hcwd Hnm Hsecc". iPureIntro; exact Hnl. }
+    iFrame "Hpt Htfp Ho". iPureIntro; exact Hlz.
+  Qed.
+
+  (* the cwd cell AND the pid quarter out of the deficit block, because
+     kexit needs both at once and for [proc_priv_cwd_pid]'s reason: begin_op
+     / iput / end_op each take [p_pid pa ↦₄{dq} _], while the cwd cell has
+     to stay out across all three -- from the [ld a0,336(s3)] that reads the
+     pointer iput destroys to the [sd x0,336(s3)] that clears it.  kexit
+     splits the REFERENCE off first ([proc_priv_split_cwd]) and spends it,
+     so what it holds across the call is the deficit block; this is the
+     accessor at that altitude. *)
+  Lemma proc_priv_nocwd_cwd_pid (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_nocwd γf pa pid U -∗
+    p_cwd pa ↦₈ pv_cwd (us_V U) ∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗
+    (∀ v' : mword 64,
+       p_cwd pa ↦₈ v' -∗ p_pid pa ↦₄{DfracOwn (1/4)} pid -∗
+       proc_priv_nocwd γf pa pid (us_cwd U v')).
+  Proof using .
+    iIntros "(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Ho)".
+    rewrite /proc_fields. iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    assert (Hq : (1/2)%Qp = (1/4 + 1/4)%Qp) by compute_done.
+    rewrite Hq ctx_word4_pointsto_frac_split.
+    iDestruct "Hpid" as "[Hq1 Hq2]".
+    iFrame "Hcwd Hq1". iIntros (v') "Hcwd Hq1".
+    rewrite /proc_priv_nocwd /proc_fields.
+    cbn [upd_cwd pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_cwi pv_gen pv_chg pv_lazy pv_secc].
+    iSplitR; [done|]. iSplitR; [done|].
+    rewrite Hq ctx_word4_pointsto_frac_split. iFrame "Hq1 Hq2".
+    iSplitL "Hsz Hcwd Hnm Hsecc".
+    { iFrame "Hsz Hcwd Hnm Hsecc". iPureIntro; exact Hnl. }
+    iFrame "Hpt Htfp Ho". iPureIntro; exact Hlz.
+  Qed.
+
+  (* THE DEFICIT BLOCK DOES NOT MENTION THE INUM: nothing in it ties
+     [p->cwd] to anything, so it is the same resource at every [pv_cwi].
+     This is what lets the installer (userinit, kfork's child) pick the inum
+     the reference it is about to install actually carries, and then rejoin
+     through [proc_priv_split_cwd] at that inum. *)
+  Lemma proc_priv_nocwd_cwi (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (z : Z) :
+    proc_priv_nocwd γf pa pid (us_cwi U z) = proc_priv_nocwd γf pa pid U.
+  Proof using . destruct U as [[] M]. reflexivity. Qed.
+
+  (* and the deficit block's own projections, for a holder that has not yet
+     installed a cwd.  (The [pv_cwd V <> 0] projection is NOT among them --
+     during the window it is false.) *)
+  Lemma proc_priv_nocwd_ofile_len (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_nocwd γf pa pid U -∗ ⌜length (pv_ofile (us_V U)) = NOFILE⌝.
+  Proof using . iIntros "(_ & _ & _ & _ & _ & _ & _ & _ & [%Hlen _])". done. Qed.
+
+  Lemma proc_priv_nocwd_sz_maxsz (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_nocwd γf pa pid U -∗ ⌜uint (pv_sz (us_V U)) <= uvm_maxsz⌝.
+  Proof using . iIntros "(%Hszb & _)". done. Qed.
+
+  Lemma proc_priv_nocwd_um_below (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_nocwd γf pa pid U -∗ ⌜um_below (pv_sz (us_V U)) (ud_um (pv_upt (us_V U)))⌝.
+  Proof using . iIntros "(_ & %Hbel & _)". done. Qed.
+
+  Lemma proc_priv_nocwd_pid (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_nocwd γf pa pid U -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗
+    (p_pid pa ↦₄{DfracOwn (1/4)} pid -∗ proc_priv_nocwd γf pa pid U).
+  Proof using .
+    iIntros "(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Ho)".
+    assert (Hq : (1/2)%Qp = (1/4 + 1/4)%Qp) by compute_done.
+    rewrite Hq ctx_word4_pointsto_frac_split.
+    iDestruct "Hpid" as "[Hq1 Hq2]". iFrame "Hq1".
+    iIntros "Hq1". rewrite /proc_priv_nocwd Hq ctx_word4_pointsto_frac_split.
+    iSplitR; [done|]. iSplitR; [done|].
+    iFrame "Hq1 Hq2 Hf Hpt Htfp Ho". iPureIntro; exact Hlz.
+  Qed.
+
+  Lemma proc_priv_nocwd_ofile (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd : nat) (v : mword 64) :
+    pv_ofile (us_V U) !! fd = Some v ->
+    proc_priv_nocwd γf pa pid U -∗
+    ofile_slot γf (pv_fdg (us_V U)) pa fd v ∗
+    (∀ v', ofile_slot γf (pv_fdg (us_V U)) pa fd v' -∗
+       proc_priv_nocwd γf pa pid (us_ofile U fd v')).
+  Proof using .
+    iIntros (Hfd) "(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hev & [%Hlen Ho])".
+    iDestruct (big_sepL_insert_acc with "Ho") as "[$ Hback]"; first exact Hfd.
+    iIntros (v') "Hslot". iDestruct ("Hback" $! v' with "Hslot") as "Ho".
+    rewrite /proc_priv_nocwd /proc_ofiles.
+    cbn [upd_ofile pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_lazy pv_secc pv_ev].
+    iSplitR; [iPureIntro; exact Hszb|].
+    iSplitR; [iPureIntro; exact Hbel|].
+    iFrame "Hpid Hf Hpt Htfp Hev".
+    iSplitR; [iPureIntro; exact Hlz|].
+    iFrame "Ho". iPureIntro.
+    rewrite length_insert. exact Hlen.
+  Qed.
+
+  (* the split, as an equivalence -- everything below and every landed spec
+     keeps using [proc_priv] and never sees the core *)
+  Lemma proc_priv_split (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U ⊣⊢ proc_priv_core pa pid U ∗ proc_ofiles γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)).
+  Proof using . reflexivity. Qed.
+
+  (* The core does not constrain the descriptor array, so it survives any
+     store into it unchanged.  This is what lets fdalloc hand back a core at
+     the ORIGINAL [V] while the array it returns is the updated one. *)
+  Lemma proc_priv_core_upd_ofile (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd : nat) (v : mword 64) :
+    proc_priv_core pa pid (us_ofile U fd v) ⊣⊢ proc_priv_core pa pid U.
+  Proof using .
+    rewrite /proc_priv_core.
+    by cbn [upd_ofile pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg
+            pv_cwi pv_gen pv_chg].
+  Qed.
+
+  (* BUILDING one: allocproc is the only producer, and this is exactly its
+     move -- the scalar cells and the descriptor array come out of the
+     dormant block, the page table and the trapframe page it just built.
+     The [p->sz] bound travels with the dormant block (which is where the
+     invariant keeps it); everything else is a straight repackaging.
+       The coherence conjunct is the caller's, and it costs allocproc
+     nothing: the table it just built has an EMPTY user map, and
+     [ProcPtOwn.um_below_empty] holds at any size.
+       It produces the DEFICIT block: allocproc's [p->cwd] is still 0 at this
+     point, and [cwd_ref] has no null arm, so there is no [proc_priv] to be
+     had here and there should not be.  The caller that installs a working
+     directory closes the window with [proc_priv_split_cwd]. *)
+  Lemma proc_priv_nocwd_intro (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (P : uptd) (ws : list (mword 64)) :
+    (uint (pv_sz (us_V U)) <= uvm_maxsz)%Z ->
+    um_below (pv_sz (us_V U)) (ud_um P) ->
+    (* ...AND WHAT THE LAZY BIT CLAIMS OF THE TABLE BEING INSTALLED (lane
+       LAZY-FLAG).  A producer of a block owes the block's invariant, and
+       this is the one conjunct the caller's own facts decide: allocproc
+       installs an EMPTY user map and the dormant block it came out of is at
+       [ProcDefs.pv_lazy = true], where the claim is vacuous; kexec installs
+       an EAGER image and pays it from [KexecBuilt.kexec_built]'s coverage
+       row; kfork's child pays it from the parent's, through uvmcopy's
+       domain equation ([UserPerm.lazy_free_dom]). *)
+    (pv_lazy (us_V U) = false -> lazy_free (ud_um P) (uint (pv_sz (us_V U)))) ->
+    p_pid pa ↦₄{DfracOwn (1/2)} pid -∗
+    proc_fields pa (DfracOwn 1) (us_V U) -∗
+    proc_ptm_at pa P (uint (pv_sz (us_V U))) (us_M U) -∗
+    tf_page (ud_tfp P) ws -∗
+    proc_ofiles γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)) -∗
+    (* ...and the slot's event counter, out of the dormant block with the
+       record (design ni-strong-instance.md §7) *)
+    act_cnt pa (pv_ev (us_V U)) -∗
+    proc_priv_nocwd γf pa pid (us_pt U P ws).
+  Proof using .
+    iIntros (Hsz Hbel Hlz) "Hpid Hf Hpt Htf Ho Hev".
+    rewrite /proc_priv_nocwd.
+    cbn [upd_pt pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_lazy pv_secc pv_ev].
+    iSplitR; [iPureIntro; exact Hsz|].
+    iSplitR; [iPureIntro; exact Hbel|]. iFrame "Hpid Hf Hpt Htf".
+    iSplitR; [iPureIntro; exact Hlz|]. iFrame "Ho Hev".
+  Qed.
+
+  Lemma proc_priv_intro (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (P : uptd) (ws : list (mword 64)) :
+    (uint (pv_sz (us_V U)) <= uvm_maxsz)%Z ->
+    um_below (pv_sz (us_V U)) (ud_um P) ->
+    (* ...AND WHAT THE LAZY BIT CLAIMS OF THE TABLE BEING INSTALLED (lane
+       LAZY-FLAG).  A producer of a block owes the block's invariant, and
+       this is the one conjunct the caller's own facts decide: allocproc
+       installs an EMPTY user map and the dormant block it came out of is at
+       [ProcDefs.pv_lazy = true], where the claim is vacuous; kexec installs
+       an EAGER image and pays it from [KexecBuilt.kexec_built]'s coverage
+       row; kfork's child pays it from the parent's, through uvmcopy's
+       domain equation ([UserPerm.lazy_free_dom]). *)
+    (pv_lazy (us_V U) = false -> lazy_free (ud_um P) (uint (pv_sz (us_V U)))) ->
+    p_pid pa ↦₄{DfracOwn (1/2)} pid -∗
+    proc_fields pa (DfracOwn 1) (us_V U) -∗
+    proc_ptm_at pa P (uint (pv_sz (us_V U))) (us_M U) -∗
+    tf_page (ud_tfp P) ws -∗
+    proc_ofiles γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)) -∗
+    act_cnt pa (pv_ev (us_V U)) -∗
+    cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) -∗
+    (* ...AND THE TOKEN.  [proc_priv_nocwd_intro] above has NO such premise
+       and must not: allocproc produces the deficit block, and allocproc
+       does not park a RUNNABLE or SLEEPING process. *)
+    first_tok -∗
+    (* ...AND THE INCARNATION'S PAIR, on the token's footing and at the
+       same seam: the payload is chosen and split between allocproc's
+       return and this store ([ChildTok.gen_set] then [gen_split]), so the
+       deficit block cannot carry it and the whole block cannot be built
+       without it. *)
+    (∃ Q : Z -> iProp Σ,
+       gen_kq (pv_gen (us_V U)) pa pid Q ∗ my_pay (pv_gen (us_V U)) Q) -∗
+    (* ...AND THE SLOT'S HALF OF [p->xstate], on the same footing and at the
+       same seam: it comes out of the dormant block with the row
+       ([SpecAllocproc.allocproc_post]) and joins the block here. *)
+    (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) -∗
+    (* ...AND THE INCARNATION'S TWO HALVES, at the same seam and for the
+       pair's reason: the caller holds both WHOLE from allocproc
+       ([SlotGen.slot_gen] / [pid_reg] at [DfracOwn 1]) and splits them
+       here, keeping the other halves for the deposit it makes under
+       <wait_lock> ([WaitInv.gen_halves]). *)
+    gen_halves_priv pa pid (pv_gen (us_V U)) -∗
+    proc_priv γf pa pid (us_pt U P ws).
+  Proof using .
+    iIntros (Hsz Hbel Hlz) "Hpid Hf Hpt Htf Ho Hev Hc Hft Hgq Hxs Hgh".
+    iDestruct (proc_priv_nocwd_intro γf pa pid U P ws Hsz Hbel Hlz
+                 with "Hpid Hf Hpt Htf Ho Hev") as "H".
+    iApply proc_priv_split_cwd. iFrame "H Hft Hgq Hxs Hgh".
+    by cbn [upd_pt pv_cwd pv_fdg pv_cwi pv_gen pv_chg].
+  Qed.
+
+  (* ---- projections: what callers actually use ---- *)
+
+  (* The read-only pid fraction: what [myproc()->pid] reads.
+
+     This is also exactly what SpecAcquiresleep / SpecHoldingsleep already
+     consume.  Those specs take [p_pid pj ↦₄{dq} pidv] at a UNIVERSALLY
+     QUANTIFIED [dq], so they compose with [proc_priv] unchanged, at
+     [dq := DfracOwn (1/4)] -- and they should STAY that way.  Threading the
+     whole [proc_priv] through them instead would drag [fileG]/[γf] into the
+     sleeplock layer purely to read a pid; the bare fraction is both the
+     weaker premise and the honest one. *)
+  (* THE BLOCK WITHOUT THE INCARNATION'S MARKER (design/pipe.md, "The exit
+     path").  A process that kills ITSELF founds <p->lock>'s killed row on
+     the spent arm with its marker ([SchedCtx.kill_paid_kill_two]), and
+     walks on to kexit with the rest of its block -- so kexit is stated at
+     this shape, and every other caller splits the marker off with
+     [proc_priv_unmark] and drops it (the ZOMBIE block never carried it). *)
+  Definition proc_priv_unmarked (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) : iProp Σ :=
+    (proc_priv_nocwd γf pa pid U ∗ cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) ∗
+     first_tok ∗
+     (∃ Q : Z -> iProp Σ,
+        gen_kq (pv_gen (us_V U)) pa pid Q ∗ my_pay (pv_gen (us_V U)) Q) ∗
+     (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) ∗
+     gen_halves_at pa pid (pv_gen (us_V U)))%I.
+
+  Lemma proc_priv_unmark (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U ⊣⊢
+    proc_priv_unmarked γf pa pid U ∗ ChildTok.taken_at (pv_gen (us_V U)).
+  Proof using .
+    rewrite (proc_priv_split_cwd γf pa pid U) /proc_priv_unmarked
+      /gen_halves_priv.
+    (* BUILD the bundle, do not frame it: [proc_priv_nocwd]'s core ends in a
+       4096-element big-op, and a bare [iFrame] here searches the whole goal
+       for every one of the seven conjuncts (2.1s a direction).  Every row is
+       definition-valued and already in hand, so the goal's own conjunct
+       order closes it with [iExact]. *)
+    iSplit.
+    - iIntros "(Hn & Hc & Hf & Hgq & Hxs & Hgh & Ht)".
+      iSplitR "Ht"; [| iExact "Ht"].
+      iSplitL "Hn"; [iExact "Hn" |].
+      iSplitL "Hc"; [iExact "Hc" |].
+      iSplitL "Hf"; [iExact "Hf" |].
+      iSplitL "Hgq"; [iExact "Hgq" |].
+      iSplitL "Hxs"; [iExact "Hxs" | iExact "Hgh"].
+    - iIntros "[(Hn & Hc & Hf & Hgq & Hxs & Hgh) Ht]".
+      iSplitL "Hn"; [iExact "Hn" |].
+      iSplitL "Hc"; [iExact "Hc" |].
+      iSplitL "Hf"; [iExact "Hf" |].
+      iSplitL "Hgq"; [iExact "Hgq" |].
+      iSplitL "Hxs"; [iExact "Hxs" |].
+      iSplitL "Hgh"; [iExact "Hgh" | iExact "Ht"].
+  Qed.
+
+  (* what a killed check on the marker-less block lends killed(): the quarter
+     of [p->pid] and the registration eighth, both off the pieces that are
+     still there *)
+  Lemma proc_priv_unmarked_pid (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_unmarked γf pa pid U -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗
+    (p_pid pa ↦₄{DfracOwn (1/4)} pid -∗ proc_priv_unmarked γf pa pid U).
+  Proof using .
+    iIntros "(Hn & Hrest)".
+    iDestruct (proc_priv_nocwd_pid with "Hn") as "[Hpid Hback]".
+    iSplitL "Hpid"; [iExact "Hpid" |].
+    iIntros "Hpid". iDestruct ("Hback" with "Hpid") as "Hn".
+    rewrite /proc_priv_unmarked.
+    iSplitL "Hn"; [iExact "Hn" | iExact "Hrest"].
+  Qed.
+
+  Lemma proc_priv_unmarked_reg (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv_unmarked γf pa pid U -∗
+    pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) ∗
+    (pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) -∗
+       proc_priv_unmarked γf pa pid U).
+  Proof using .
+    iIntros "(Hn & Hc & Hf & Hgq & Hxs & Hgh)".
+    iDestruct (gen_halves_at_reg with "Hgh") as "[Hr Hback]".
+    iSplitL "Hr"; [iExact "Hr" |].
+    iIntros "Hr". iDestruct ("Hback" with "Hr") as "Hgh".
+    rewrite /proc_priv_unmarked.
+    iSplitL "Hn"; [iExact "Hn" |].
+    iSplitL "Hc"; [iExact "Hc" |].
+    iSplitL "Hf"; [iExact "Hf" |].
+    iSplitL "Hgq"; [iExact "Hgq" |].
+    iSplitL "Hxs"; [iExact "Hxs" | iExact "Hgh"].
+  Qed.
+
+  Lemma proc_priv_pid (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗
+    (p_pid pa ↦₄{DfracOwn (1/4)} pid -∗ proc_priv γf pa pid U).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hrest) Ho]".
+    assert (Hq : (1/2)%Qp = (1/4 + 1/4)%Qp) by compute_done.
+    rewrite Hq ctx_word4_pointsto_frac_split.
+    iDestruct "Hpid" as "[Hq1 Hq2]". iFrame "Hq1".
+    iIntros "Hq1". rewrite /proc_priv /proc_priv_core Hq ctx_word4_pointsto_frac_split.
+    iSplitR "Ho"; [|iFrame "Ho"].
+    iSplitR; [done|]. iSplitR; [done|].
+    iSplitL "Hq1 Hq2"; [iSplitL "Hq1"; [iExact "Hq1" | iExact "Hq2"] |].
+    iExact "Hrest".
+  Qed.
+
+  (* ...AND THAT THE PID IS NOT 0, off the same block and at no cost.  A
+     LIVE process's block carries its own registration
+     ([SlotGen.gen_halves_priv]) and every registered pid is nonzero, so
+     the fact is the bundle's ([SlotGen.gen_halves_priv_nz]).
+     WHO WANTS IT: usertrap's fault arm, which calls [setkilled] on
+     [myproc()] and must tell the killed row's writer that the slot it is
+     about to re-close is a LIVE one ([SpecSetkilled], lane SELF-KILL) --
+     <p->lock>'s payload has a free arm at [p->pid = 0] and the C's own
+     guard (kkill refuses pid 0) is what keeps it at a zero flag. *)
+  Lemma proc_priv_core_pid_nz (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗ ⌜bv_unsigned pid <> 0⌝.
+  Proof using .
+    iIntros "(_ & _ & _ & _ & _ & _ & _ & _ & _ & _ & _ & _ & Hgh)".
+    iApply (gen_halves_priv_nz with "Hgh").
+  Qed.
+
+  Lemma proc_priv_pid_nz (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗ ⌜bv_unsigned pid <> 0⌝.
+  Proof using .
+    iIntros "[Hc _]". iApply (proc_priv_core_pid_nz with "Hc").
+  Qed.
+
+  (* ...AND THE REGISTRATION EIGHTH, LENT out of the same bundle
+     ([SlotGen.gen_halves_priv_reg]).  [killed()] takes it beside the pid
+     quarter and hands both back: the two say the killed row it opened is
+     THIS incarnation's, which is what makes the one-shot it relays usable
+     (lane SELF-KILL, P6; [SpecKilled]). *)
+  Lemma proc_priv_core_reg (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) ∗
+    (pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) -∗
+       proc_priv_core pa pid U).
+  Proof using .
+    iIntros "H". iEval (rewrite proc_priv_core_bare) in "H".
+    iDestruct "H" as "(Hb & %Hlz & Hc & Hft & Hgq & Hxs & Hgh)".
+    iDestruct (gen_halves_priv_reg with "Hgh") as "[Hpr Hback]".
+    iSplitL "Hpr"; [ iExact "Hpr" | ]. iIntros "Hpr".
+    rewrite proc_priv_core_bare. iFrame "Hb Hc Hft Hgq Hxs".
+    iSplitR; [ iPureIntro; exact Hlz | ]. iApply ("Hback" with "Hpr").
+  Qed.
+
+  Lemma proc_priv_reg (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗
+    pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) ∗
+    (pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) -∗
+       proc_priv γf pa pid U).
+  Proof using .
+    iIntros "[Hc Ho]".
+    iDestruct (proc_priv_core_reg with "Hc") as "[Hpr Hback]".
+    iSplitL "Hpr"; [ iExact "Hpr" | ]. iIntros "Hpr".
+    iSplitR "Ho"; [ iApply ("Hback" with "Hpr") | iExact "Ho" ].
+  Qed.
+
+  (* ...AND THE TWO TOGETHER, WHICH IS WHAT [killed()] ACTUALLY WANTS.  The
+     two borrows above do NOT compose: each closer asks for its own share
+     back and neither can be run while the other's is outstanding.  The
+     caller needs BOTH at once -- the pid quarter names the row's cell, the
+     registration eighth names its generation -- so the borrow is stated
+     once, with one closer taking both (lane SELF-KILL, P6;
+     [SpecKilled]'s premise). *)
+  Lemma proc_priv_core_pid_reg (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗
+    pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) ∗
+    (p_pid pa ↦₄{DfracOwn (1/4)} pid -∗
+     pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) -∗
+     proc_priv_core pa pid U).
+  Proof using .
+    iIntros "H". iEval (rewrite proc_priv_core_bare) in "H".
+    iDestruct "H" as "(Hb & %Hlz & Hc & Hft & Hgq & Hxs & Hgh)".
+    iDestruct (proc_priv_bare_pid with "Hb") as "[Hq Hbback]".
+    iDestruct (gen_halves_priv_reg with "Hgh") as "[Hpr Hgback]".
+    iSplitL "Hq"; [ iExact "Hq" | ].
+    iSplitL "Hpr"; [ iExact "Hpr" | ].
+    iIntros "Hq Hpr". rewrite proc_priv_core_bare.
+    iSplitL "Hbback Hq"; [ iApply ("Hbback" with "Hq") | ].
+    iSplitR; [ iPureIntro; exact Hlz | ].
+    iFrame "Hc Hft Hgq Hxs". iApply ("Hgback" with "Hpr").
+  Qed.
+
+  (* ...AND THE SLOT-GENERATION QUARTER, lent the same way (lane
+     TRAP-ROWS-3, T4(b)).  kwait's reaping tail compares it with the
+     sealed quarter [WaitInv.init_ident] carries, which is how a reaper
+     learns whether the address it is reaping at is <init>'s -- and hence
+     whether the zombie could have been an orphan at all. *)
+  (* ...AND THE BLOCK'S OWN READING OF ITS PID AT THAT GENERATION, beside
+     it: the pair the reaper needs is "the generation I am running as" and
+     "the pid that generation was given", and a block holds both -- the
+     quarter in its [SlotGen.gen_halves_priv] and the persistent
+     [ChildTok.gen_pid] off the kernel's quarter of the incarnation. *)
+  Lemma proc_priv_core_slot_gen (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    slot_gen pa (DfracOwn (1/4)) (pv_gen (us_V U)) ∗
+    gen_pid (pv_gen (us_V U)) pid ∗
+    (slot_gen pa (DfracOwn (1/4)) (pv_gen (us_V U)) -∗ proc_priv_core pa pid U).
+  Proof using .
+    iIntros "H". iEval (rewrite proc_priv_core_bare) in "H".
+    iDestruct "H" as "(Hb & %Hlz & Hc & Hft & Hgq & Hxs & Hgh)".
+    iDestruct "Hgq" as (Q) "[Hkq #Hmy]".
+    iDestruct (my_pay_kq_readings with "Hmy Hkq") as "(_ & #Hgp & Hkq)".
+    iDestruct (gen_halves_priv_sg with "Hgh") as "[Hsg Hgback]".
+    iSplitL "Hsg"; [ iExact "Hsg" | ].
+    iSplitR; [ iExact "Hgp" | ].
+    iIntros "Hsg". rewrite proc_priv_core_bare.
+    iFrame "Hb". iSplitR; [ iPureIntro; exact Hlz | ].
+    iFrame "Hc Hft Hxs". iSplitL "Hkq"; [ iExists Q; iFrame "Hkq Hmy" | ].
+    iApply ("Hgback" with "Hsg").
+  Qed.
+
+  Lemma proc_priv_slot_gen (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗
+    slot_gen pa (DfracOwn (1/4)) (pv_gen (us_V U)) ∗
+    gen_pid (pv_gen (us_V U)) pid ∗
+    (slot_gen pa (DfracOwn (1/4)) (pv_gen (us_V U)) -∗ proc_priv γf pa pid U).
+  Proof using .
+    iIntros "[Hc Ho]".
+    iDestruct (proc_priv_core_slot_gen with "Hc") as "(Hsg & #Hgp & Hback)".
+    iSplitL "Hsg"; [ iExact "Hsg" | ].
+    iSplitR; [ iExact "Hgp" | ].
+    iIntros "Hsg". iSplitR "Ho"; [ | iExact "Ho" ].
+    iApply ("Hback" with "Hsg").
+  Qed.
+
+  Lemma proc_priv_pid_reg (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗
+    pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) ∗
+    (p_pid pa ↦₄{DfracOwn (1/4)} pid -∗
+     pid_reg pid (DfracOwn qeighth) (pv_gen (us_V U)) -∗
+     proc_priv γf pa pid U).
+  Proof using .
+    iIntros "[Hc Ho]".
+    iDestruct (proc_priv_core_pid_reg with "Hc") as "(Hq & Hpr & Hback)".
+    iSplitL "Hq"; [ iExact "Hq" | ].
+    iSplitL "Hpr"; [ iExact "Hpr" | ].
+    iIntros "Hq Hpr". iSplitR "Ho"; [ | iExact "Ho" ].
+    iApply ("Hback" with "Hq Hpr").
+  Qed.
+
+  (* THE EVENT COUNTER, LENT (design ni-strong-instance.md §7).  The block
+     carries the slot's permit at its own [pv_ev] ([proc_priv_core]); a
+     holder that makes an actor-labelled append borrows it, steps it, and
+     closes the block at the new count -- [upd_ev] is a ghost write, so no
+     cell moves. *)
+  Lemma proc_priv_core_ev_acc (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗ act_cnt pa (pv_ev (us_V U)) ∗
+      (∀ k, act_cnt pa k -∗ proc_priv_core pa pid (upd_usV U (upd_ev (us_V U) k))).
+  Proof using .
+    destruct U as [[f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13] M].
+    rewrite /proc_priv_core.
+    cbn [upd_usV upd_ev us_V us_M pv_sz pv_upt pv_tf pv_ofile pv_fdg pv_cwd
+         pv_name pv_cwi pv_gen pv_chg pv_lazy pv_secc pv_ev].
+    iIntros "(%A & %B & Hpid & Hf & Hpt & Htfp & %C & Hc & Hft & Hgq & Hxs & Hev & Hgh)".
+    iFrame "Hev". iIntros (k) "Hev".
+    iFrame. iPureIntro; split_and!; assumption.
+  Qed.
+
+  Lemma proc_priv_ev_acc (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗ act_cnt pa (pv_ev (us_V U)) ∗
+      (∀ k, act_cnt pa k -∗ proc_priv γf pa pid (upd_usV U (upd_ev (us_V U) k))).
+  Proof using .
+    iIntros "[Hc Ho]".
+    iDestruct (proc_priv_core_ev_acc with "Hc") as "[Hev Hback]".
+    iFrame "Hev". iIntros (k) "Hev". iSplitR "Ho"; [iApply ("Hback" with "Hev")|].
+    destruct U as [[f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13] M]. iExact "Ho".
+  Qed.
+
+  (* THE BLOCK'S LEND (permit sweep, design ni-strong-instance.md §7): the
+     counter goes out as [SlotGen.act_lend] and the block comes back at
+     whatever count the callee returned -- at least the one it left at,
+     which is [ev_after].  What every block-holder on the permit cone does
+     around a callee that takes the lend (kexec's phases). *)
+  Lemma proc_priv_ev_lend (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗ act_lend pa (pv_ev (us_V U)) ∗
+      (∀ k1 : nat, ⌜(pv_ev (us_V U) <= k1)%nat⌝ -∗ act_lend pa k1 -∗
+         ∃ U' : ustate, ⌜ev_after U U'⌝ ∗ proc_priv γf pa pid U').
+  Proof using .
+    iIntros "H". iDestruct (proc_priv_ev_acc with "H") as "[Hc Hb]".
+    iDestruct (act_lend_borrow with "Hc") as "[Hl Hlb]".
+    iFrame "Hl". iIntros (k1 Hk1) "Hl".
+    iDestruct ("Hlb" $! k1 with "[%] Hl") as (k2) "[%Hk2 Hc]"; [exact Hk1|].
+    iExists _. iSplit; [iPureIntro; exists k2; split; [exact Hk2 | reflexivity]|].
+    iApply ("Hb" with "Hc").
+  Qed.
+
+  (* ...AND THE SLOT-GENERATION QUARTER AND THE COUNTER, LENT TOGETHER
+     (permit sweep L1b): kwait's reaping tail needs the quarter
+     ([proc_priv_slot_gen]) AND the counter it lends to freeproc at the
+     same time, and the two borrows do not compose -- each closer wants
+     the block's other half back.  One borrow, one closer, at any count. *)
+  Lemma proc_priv_slot_gen_ev_acc (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗
+    slot_gen pa (DfracOwn (1/4)) (pv_gen (us_V U)) ∗
+    gen_pid (pv_gen (us_V U)) pid ∗
+    act_cnt pa (pv_ev (us_V U)) ∗
+    (∀ k : nat, slot_gen pa (DfracOwn (1/4)) (pv_gen (us_V U)) -∗ act_cnt pa k -∗
+       proc_priv γf pa pid (upd_usV U (upd_ev (us_V U) k))).
+  Proof using .
+    destruct U as [[f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13] M].
+    rewrite /proc_priv /proc_priv_core.
+    cbn [upd_usV upd_ev us_V us_M pv_sz pv_upt pv_tf pv_ofile pv_fdg pv_cwd
+         pv_name pv_cwi pv_gen pv_chg pv_lazy pv_secc pv_ev].
+    iIntros "[(%A & %B & Hpid & Hf & Hpt & Htfp & %C & Hc & Hft & Hgq & Hxs & Hev & Hgh) Ho]".
+    iDestruct "Hgq" as (Q) "[Hkq #Hmy]".
+    iDestruct (my_pay_kq_readings with "Hmy Hkq") as "(_ & #Hgp & Hkq)".
+    iDestruct (gen_halves_priv_sg with "Hgh") as "[Hsg Hgback]".
+    iFrame "Hsg Hgp Hev". iIntros (k) "Hsg Hev".
+    iDestruct ("Hgback" with "Hsg") as "Hgh".
+    iFrame (A B C) "Hpid Hf Hpt Htfp Hc Hft Hxs Hev Hgh Ho Hkq Hmy".
+  Qed.
+
+  (* The read-only trapframe-POINTER fraction: what [p->trapframe->aN] reads
+     first.  Same discipline as [proc_priv_pid] and for the same reason --
+     argraw should take the weakest premise (a bare fraction of one cell),
+     not the whole [proc_priv] with its [fileG]/[γf] baggage. *)
+  (* a 1/4 read-share of a full word cell, in proofmode form: a goal-level
+     [rewrite] would hit every [DfracOwn 1] cell of [proc_fields] at once. *)
+  Local Lemma word_frac14 (a w : mword 64) :
+    a ↦₈ w ⊣⊢ a ↦₈{DfracOwn (1/4)} w ∗ a ↦₈{DfracOwn (3/4)} w.
+  Proof using .
+    assert (Hq : DfracOwn 1 = DfracOwn (1/4 + 3/4)) by (f_equal; compute_done).
+    rewrite {1}Hq. apply (ctx_word_pointsto_frac_split cur_ctx).
+  Qed.
+
+  Local Lemma word_split14 (a w : mword 64) :
+    a ↦₈ w -∗ a ↦₈{DfracOwn (1/4)} w ∗ a ↦₈{DfracOwn (3/4)} w.
+  Proof using . rewrite word_frac14. iIntros "$". Qed.
+
+  Local Lemma word_join14 (a w : mword 64) :
+    a ↦₈{DfracOwn (1/4)} w -∗ a ↦₈{DfracOwn (3/4)} w -∗ a ↦₈ w.
+  Proof using . rewrite word_frac14. iIntros "H1 H2". iFrame. Qed.
+
+  Lemma proc_priv_trapframe (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_trapframe pa ↦₈{DfracOwn (1/4)} page_base (ud_tfp (pv_upt (us_V U))) ∗
+    (p_trapframe pa ↦₈{DfracOwn (1/4)} page_base (ud_tfp (pv_upt (us_V U))) -∗
+       proc_priv γf pa pid U).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Hrest) Ho]".
+    rewrite /proc_ptm_at. iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iDestruct (word_split14 with "Htfc") as "[Hq1 Hq2]".
+    iSplitL "Hq1"; [iExact "Hq1"|].
+    iIntros "Hq1". rewrite /proc_priv /proc_priv_core /proc_ptm_at.
+    iDestruct (word_join14 with "Hq1 Hq2") as "Htfc".
+    iSplitR "Ho"; [|iFrame "Ho"].
+    iSplitR; [done|]. iSplitR; [done|].
+    iSplitL "Hpid"; [iExact "Hpid" |].
+    iSplitL "Hf"; [iExact "Hf" |].
+    iSplitL "Hpg Htfc Hptt";
+      [ iSplitL "Hpg"; [iExact "Hpg" |];
+        iSplitL "Htfc"; [iExact "Htfc" |]; iExact "Hptt" |].
+    iExact "Hrest".
+  Qed.
+
+  (* THE WORKING DIRECTORY, borrowed and replaced.  kexit and sys_chdir are
+     the two writers, and both do the same thing: hand the reference the cell
+     names to iput, then store a new pointer.  So the accessor gives out the
+     cell AND the reference clause together and takes back a matching pair --
+     which is what kept both callers standing when [cwd_ref] stopped being a
+     placeholder (C6b, design/fs-icache.md §3). *)
+  Lemma proc_priv_cwd (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_cwd pa ↦₈ pv_cwd (us_V U) ∗ cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) ∗
+    (∀ (v' : mword 64) (z' : Z),
+       p_cwd pa ↦₈ v' -∗ cwd_ref_at v' z' -∗
+       proc_priv γf pa pid (us_cwi (us_cwd U v') z')).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hc & Hft & Hgq & Hxs) Ho]".
+    rewrite /proc_fields. iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    iSplitL "Hcwd"; [iExact "Hcwd"|].
+    (* [iExact], not [iFrame]: the hypothesis and the goal are the same
+       FOLDED [cwd_ref _] and conversion closes it.  (This is what kept the
+       lemma standing across C6b, when the predicate gained content.) *)
+    iSplitL "Hc"; [iExact "Hc"|].
+    iIntros (v' z') "Hcwd Hc".
+    rewrite /proc_priv /proc_priv_core /proc_fields.
+    cbn [us_cwi us_cwd upd_usV us_V us_M upd_cwi upd_cwd
+         pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_cwi pv_gen pv_chg pv_lazy pv_secc].
+    iSplitR "Ho"; [| iExact "Ho"].
+    iSplitR; [done|]. iSplitR; [done|].
+    iFrame "Hpid".
+    iSplitL "Hsz Hcwd Hnm Hsecc".
+    { iFrame "Hsz Hcwd Hnm Hsecc". iPureIntro; exact Hnl. }
+    iSplitL "Hpt"; [iExact "Hpt"|].
+    iSplitL "Htfp"; [iExact "Htfp"|].
+    iSplitR; [iPureIntro; exact Hlz|].
+    iSplitL "Hc"; [iExact "Hc"|].
+    iSplitL "Hft"; [iExact "Hft"|].
+    iSplitL "Hgq"; [iExact "Hgq"|]. iExact "Hxs".
+  Qed.
+
+  (* THE WORKING DIRECTORY AND THE PID QUARTER TOGETHER, because kexit needs
+     both AT ONCE and neither single accessor will do: [begin_op], [iput] and
+     [end_op] each take [p_pid pa ↦₄{dq} _] (bread's acquiresleep records it),
+     while the cwd cell has to stay out across all three -- from the
+     [ld a0,336(s3)] that reads the pointer iput destroys to the
+     [sd x0,336(s3)] that clears it, which is the first moment [cwd_ref] can
+     be re-supplied).  Each of [proc_priv_cwd] and
+     [proc_priv_pid] consumes the whole block, so they do not nest; this is
+     their conjunction, proved once.  sys_chdir wants the same pair. *)
+  (* THE BLOCK AND THE cwd REFERENCE, TOGETHER.  This is what a syscall that
+     walks a path holds across the walk: namei/nameiparent/namex want
+     [proc_priv_bare] (they read [p->cwd] out of it) and [inode_held] on the
+     directory it names, which is what [cwd_ref] converts to.  [proc_ofiles]
+     is what stays behind.
+
+     Compare [proc_priv_cwd_pid] just below, which is the same move for a
+     caller that wanted the cwd CELL and a quarter of [p->pid] as loose rows.
+     Nothing wants either any more: the cell is in the block and the walk
+     borrows it for its one load. *)
+  Lemma proc_priv_bare_cref (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗
+    proc_priv_bare pa pid U ∗ cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) ∗
+    (proc_priv_bare pa pid U -∗ cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) -∗
+     proc_priv γf pa pid U).
+  Proof using .
+    (* one [rewrite] does both occurrences -- the hypothesis AND the one
+       under the wand -- so the give-back needs no second one. *)
+    rewrite /proc_priv proc_priv_core_bare. iIntros "[[Hb [%Hlz [Hc [Hft [Hgq Hxs]]]]] Ho]".
+    iSplitL "Hb"; [iExact "Hb"|]. iSplitL "Hc"; [iExact "Hc"|].
+    iIntros "Hb Hc". iFrame "Hb Hc Hft Hgq Hxs Ho". iPureIntro; exact Hlz.
+  Qed.
+
+  Lemma proc_priv_cwd_pid (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_cwd pa ↦₈ pv_cwd (us_V U) ∗ cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U)) ∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗
+    (∀ (v' : mword 64) (z' : Z),
+       p_cwd pa ↦₈ v' -∗ cwd_ref_at v' z' -∗ p_pid pa ↦₄{DfracOwn (1/4)} pid -∗
+       proc_priv γf pa pid (us_cwi (us_cwd U v') z')).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hc & Hft & Hgq & Hxs) Ho]".
+    rewrite /proc_fields. iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    assert (Hq : (1/2)%Qp = (1/4 + 1/4)%Qp) by compute_done.
+    rewrite Hq ctx_word4_pointsto_frac_split.
+    iDestruct "Hpid" as "[Hq1 Hq2]".
+    iSplitL "Hcwd"; [iExact "Hcwd"|].
+    (* [iExact], not [iFrame] -- see [proc_priv_cwd]. *)
+    iSplitL "Hc"; [iExact "Hc"|].
+    iSplitL "Hq1"; [iExact "Hq1"|].
+    iIntros (v' z') "Hcwd Hc Hq1".
+    rewrite /proc_priv /proc_priv_core /proc_fields.
+    cbn [us_cwi us_cwd upd_usV us_V us_M upd_cwi upd_cwd
+         pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_cwi pv_gen pv_chg pv_lazy pv_secc].
+    iSplitR "Ho"; [| iExact "Ho"].
+    iSplitR; [done|]. iSplitR; [done|].
+    rewrite Hq ctx_word4_pointsto_frac_split. iFrame "Hq1 Hq2".
+    iSplitL "Hsz Hcwd Hnm Hsecc".
+    { iFrame "Hsz Hcwd Hnm Hsecc". iPureIntro; exact Hnl. }
+    iSplitL "Hpt"; [iExact "Hpt"|].
+    iSplitL "Htfp"; [iExact "Htfp"|].
+    iSplitR; [iPureIntro; exact Hlz|].
+    iSplitL "Hc"; [iExact "Hc"|].
+    iSplitL "Hft"; [iExact "Hft"|].
+    iSplitL "Hgq"; [iExact "Hgq"|]. iExact "Hxs".
+  Qed.
+
+  (* The array's length, which a caller needs BEFORE it knows which
+     descriptor it wants: an fd below NOFILE always has a slot to look up. *)
+  (* A LIVE PROCESS HAS A NON-NULL WORKING DIRECTORY, as a projection of the
+     block rather than a conjunct anybody maintains.  This is what the
+     no-null-arm shape buys, and it is what kexit / kfork / sys_fork /
+     sys_exit used to take as a premise their callers could not discharge
+     from anything but another copy of the same premise. *)
+  Lemma proc_priv_cwd_nonzero (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗ ⌜pv_cwd (us_V U) <> (zero_reg : mword 64)⌝.
+  Proof using .
+    iIntros "[(_ & _ & _ & _ & _ & _ & _ & Hc & _) _]".
+    by iApply (cwd_ref_at_nonzero with "Hc").
+  Qed.
+
+  Lemma proc_priv_ofile_len (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗ ⌜length (pv_ofile (us_V U)) = NOFILE⌝.
+  Proof using . iIntros "[_ [%Hlen _]]". done. Qed.
+
+  (* The TRAPFRAME bound on [p->sz] -- what the uvm* layer asks of a size
+     argument, and what growproc must re-establish when it writes one. *)
+  Lemma proc_priv_sz_maxsz (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗ ⌜uint (pv_sz (us_V U)) <= uvm_maxsz⌝.
+  Proof using . iIntros "[(%Hszb & _) _]". done. Qed.
+
+  (* The MAXVA bound on [p->sz], for a caller that must hand it to vmfault /
+     copyin / copyout.  Pure conclusion, so [iDestruct ... as %H] keeps the
+     block.  A weakening of the above -- those three sit below this altitude
+     and were written against MAXVA, and nothing is gained by tightening
+     their premise. *)
+  Lemma proc_priv_sz_bound (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗ ⌜uint (pv_sz (us_V U)) <= 2 ^ 38⌝.
+  Proof using .
+    iIntros "[(%Hszb & _) _]". iPureIntro.
+    rewrite uvm_maxsz_val in Hszb. change (2 ^ 38)%Z with 274877906944%Z. lia.
+  Qed.
+
+  (* The map is below the size: what growproc hands uvmalloc as its
+     freshness premise (through [ProcPtOwn.um_below_run_fresh]). *)
+  Lemma proc_priv_um_below (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗ ⌜um_below (pv_sz (us_V U)) (ud_um (pv_upt (us_V U)))⌝.
+  Proof using . iIntros "[(_ & %Hbel & _) _]". done. Qed.
+
+  (* RAISING THE LAZY BIT IS FREE (lane LAZY-FLAG).  [ProcDefs.pv_lazy] is
+     a CLAIM and [true] claims nothing, so a block at any bit is a block at
+     [true]: the claim's premise becomes unsatisfiable and every other
+     conjunct is [pv_lazy]-blind ([ProcInv.proc_fields] does not mention the
+     field -- there is no cell behind it).  This is what lets exec's commit
+     write the bit without proving anything about the image it just built;
+     lane LAZY-FLAG's K4 replaces that write by [false] and pays for it out
+     of [KexecBuilt.kexec_built]'s coverage row. *)
+  Lemma proc_priv_lazy_true (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗ proc_priv γf pa pid (us_lazy U true).
+  Proof using .
+    destruct U as [V M]; destruct V.
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hc & Hft & Hgq & Hxs) Ho]".
+    iFrame "Hpid Hf Hpt Htfp Hc Hft Hgq Hxs Ho".
+    iSplitR; [done|]. iSplitR; [done|]. iPureIntro. discriminate.
+  Qed.
+
+  (* ...AND WHAT THE LAZY BIT CLAIMS, read off the block the same way (lane
+     LAZY-FLAG).  Pure conclusion, so a caller keeps the block; this is what
+     read(2)'s arm hands row 5 as its tie
+     ([UexecExecInst.spost_at_read_intro]). *)
+  Lemma proc_priv_lazy (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    ⌜pv_lazy (us_V U) = false ->
+       lazy_free (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))⌝.
+  Proof using . iIntros "[(_ & _ & _ & _ & _ & _ & %Hlz & _) _]". done. Qed.
+
+  (* ...and the table's well-formedness, out of the block's own
+     [ProcPtOwn.proc_ptm_at].  Row 5's other new conjunct. *)
+  Lemma proc_priv_pt_wf (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗ ⌜proc_pt_wf (pv_upt (us_V U))⌝.
+  Proof using .
+    iIntros "[(_ & _ & _ & _ & Hpt & _) _]".
+    rewrite /proc_ptm_at. iDestruct "Hpt" as "(_ & _ & Hpt)".
+    iDestruct (proc_ptm_wf with "Hpt") as "%Hwf". done.
+  Qed.
+
+  (* What a syscall-argument read needs, TOGETHER: the trapframe pointer
+     fraction and the page it names.  [proc_priv_trapframe] alone cannot
+     serve -- its wand swallows the [proc_priv] the page is still inside --
+     so the pair is one accessor.  This is argfd's premise to argint. *)
+  Lemma proc_priv_tf (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_trapframe pa ↦₈{DfracOwn (1/4)} page_base (ud_tfp (pv_upt (us_V U))) ∗
+    tf_page (ud_tfp (pv_upt (us_V U))) (pv_tf (us_V U)) ∗
+    (p_trapframe pa ↦₈{DfracOwn (1/4)} page_base (ud_tfp (pv_upt (us_V U))) -∗
+     tf_page (ud_tfp (pv_upt (us_V U))) (pv_tf (us_V U)) -∗ proc_priv γf pa pid U).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hrest) Ho]".
+    rewrite /proc_ptm_at. iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iDestruct (word_split14 with "Htfc") as "[Hq1 Hq2]".
+    iFrame "Hq1 Htfp".
+    iIntros "Hq1 Htfp". rewrite /proc_priv /proc_priv_core /proc_ptm_at.
+    iDestruct (word_join14 with "Hq1 Hq2") as "Htfc".
+    iSplitR "Ho"; [|iFrame "Ho"].
+    iSplitR; [done|]. iSplitR; [done|].
+    iSplitL "Hpid"; [iExact "Hpid" |].
+    iSplitL "Hf"; [iExact "Hf" |].
+    iSplitL "Hpg Htfc Hptt";
+      [ iSplitL "Hpg"; [iExact "Hpg" |];
+        iSplitL "Htfc"; [iExact "Htfc" |]; iExact "Hptt" |].
+    iSplitL "Htfp"; [iExact "Htfp" |].
+    iExact "Hrest".
+  Qed.
+
+  (* THE WRITE TWIN, standing to [proc_priv_tf] as [tf_page_word_upd] stands
+     to [tf_page_word]: the wand takes back a DIFFERENT [ws'], and the block
+     is rebuilt at [upd_tf V ws'].  Every trapframe WRITER needs it --
+     prepare_return's four kernel slots, kfork's copy loop, syscall's a0.
+
+     It hands the [p_trapframe] cell out WHOLE rather than at the quarter
+     [proc_priv_tf] splits off: a store's base-register load wants a fraction
+     and does not care which, and the whole cell is what the callers already
+     thread.  No length side condition is owed on the way back -- [tf_page]
+     carries [length ws = TFWORDS] itself. *)
+  Lemma proc_priv_tf_upd (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_trapframe pa ↦₈ page_base (ud_tfp (pv_upt (us_V U))) ∗
+    tf_page (ud_tfp (pv_upt (us_V U))) (pv_tf (us_V U)) ∗
+    (∀ ws' : list (mword 64),
+       p_trapframe pa ↦₈ page_base (ud_tfp (pv_upt (us_V U))) -∗
+       tf_page (ud_tfp (pv_upt (us_V U))) ws' -∗
+       proc_priv γf pa pid (us_tf U ws')).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hc & Hft & Hgq & Hxs) Ho]".
+    rewrite /proc_ptm_at. iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iFrame "Htfc Htfp".
+    iIntros (ws') "Htfc Htfp".
+    rewrite /proc_priv /proc_priv_core /proc_ptm_at.
+    cbn [upd_tf pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_lazy pv_secc].
+    iSplitR "Ho"; [| iFrame "Ho"].
+    iSplitR; [iPureIntro; exact Hszb|].
+    iSplitR; [iPureIntro; exact Hbel|].
+    iFrame "Hpid Hf Hpg Htfc Hptt Htfp Hc Hft Hgq Hxs".
+  Qed.
+
+  (* [upd_tf] at the contents it lent out is the identity -- the record eta a
+     round trip through the accessor above needs when it changed nothing. *)
+  Lemma upd_tf_id (V : pprivate) : upd_tf V (pv_tf V) = V.
+  Proof using . by destruct V. Qed.
+
+  (* =================================================================== *)
+  (* WHAT A CHANGE OF ADDRESS SPACE NEEDS -- one accessor.                *)
+  (* =================================================================== *)
+  (* copyin / copyout / uvmalloc / uvmdealloc are stated one tier DOWN, over
+     the bare [p->sz] and [p->pagetable] cells plus [ProcPtOwn.proc_pt]
+     (SpecCopyin.v, SpecUvmalloc.v), because they are also reachable from
+     callers that hold no [struct proc] block.  This is the bridge from THIS
+     altitude to that one, and it is stated at its GENERAL shape: BOTH the
+     size and the descriptor may move, which is what growproc does and what
+     [proc_priv_copy] below is the [szv := pv_sz V] instance of.
+       What the caller owes on the way back is exactly the two conjuncts of
+     the block that talk about the pair -- the size is inside the user region,
+     and the map is below the size.  What it does NOT owe is anything about
+     [ud_root] / [ud_tfp] beyond their being unchanged: that is what keeps the
+     two cells and the trapframe page described by the NEW descriptor, so the
+     block is rebuilt rather than reconstructed.  A wand that returned only
+     [proc_pt] would have swallowed the [proc_priv] the cells are still inside
+     (the [proc_priv_tf] lesson). *)
+  Lemma proc_priv_addrspace (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_sz pa ↦₈ pv_sz (us_V U) ∗
+    p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+    (* the MOVED IMAGE travels with the moved descriptor: this is the
+       ∃-weakened staging of milestone J item 1 -- the callees below this
+       seam (uvmalloc, vmfault, copyout) write user memory, so what comes
+       back is a NEW [M'], and the block is rebuilt at it. *)
+    (∀ (P' : uptd) (szv : mword 64) (M' : gmap Z (bv 8)) (lz' : bool),
+       ⌜ud_root P' = ud_root (pv_upt (us_V U))⌝ -∗
+       ⌜ud_tfp P' = ud_tfp (pv_upt (us_V U))⌝ -∗
+       ⌜uint szv <= uvm_maxsz⌝ -∗
+       ⌜um_below szv (ud_um P')⌝ -∗
+       (* ...AND WHAT THE LAZY BIT CLAIMS, RE-ESTABLISHED AT THE NEW TABLE
+          AND THE NEW BREAK (lane LAZY-FLAG, K2).  This is the one conjunct
+          of the block a caller that MOVES the address space owes: at
+          [false] the projection's fill must still be empty.  Every caller
+          has the fact in hand -- a page fault only EXTENDS the table at a
+          fixed break ([UserPerm.lazy_free_mono], which [proc_priv_copy] /
+          [proc_priv_core_copy] below discharge once for all of them), an
+          eager grow maps exactly the run that just became live
+          ([SpecGrowproc.growproc_ok]'s domain equation), a shrink lowers
+          the break below everything it unmapped, exec's image is eager
+          ([KexecBuilt.kexec_built]'s coverage row), and sbrklazy's grow
+          RAISES the bit and so owes nothing. *)
+       (* ...AT THE BIT THE BLOCK COMES BACK AT, which is the caller's to
+          NAME: sbrk's LAZY arm is the one entry that RAISES it (it moves
+          [p->sz] with the table untouched, which is exactly how a hole is
+          made), and every other caller hands back the bit it was given and
+          pays the claim out of the block's own ([proc_priv_lazy]).  The
+          field is not a cell, so naming it costs the accessor nothing. *)
+       ⌜lz' = false -> lazy_free (ud_um P') (uint szv)⌝ -∗
+       p_sz pa ↦₈ szv -∗
+       p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) -∗
+       proc_ptm P' (uint szv) M' -∗
+       proc_priv γf pa pid
+         (upd_usM (upd_usV U
+                     (upd_lazy (upd_sz (upd_upt (us_V U) P') szv) lz')) M')).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hc & Hft & Hgq & Hxs) Ho]".
+    rewrite /proc_fields /proc_ptm_at.
+    iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iFrame "Hsz Hpg Hptt".
+    iIntros (P' szv M' lz') "%Hroot %Htf %Hszb' %Hbel' %Hlz' Hsz Hpg Hptt".
+    rewrite /proc_priv /proc_priv_core /proc_fields /proc_ptm_at.
+    cbn [upd_lazy upd_sz upd_upt pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name
+         pv_fdg pv_cwi pv_gen pv_chg pv_lazy pv_secc].
+    rewrite Hroot Htf.
+    iSplitR "Ho"; [|iFrame "Ho"].
+    iSplitR; [iPureIntro; exact Hszb'|].
+    iSplitR; [iPureIntro; exact Hbel'|].
+    iFrame "Hpid".
+    iSplitL "Hsz Hcwd Hnm Hsecc".
+    { iFrame "Hsz Hcwd Hnm Hsecc". iPureIntro. exact Hnl. }
+    iFrame "Hpg Htfc Hptt Htfp".
+    iSplitR; [iPureIntro; exact Hlz' |].
+    iFrame "Hft Hgq Hxs".
+  Qed.
+
+  (* ...AND THE SAME BORROW WITH THE EVENT COUNTER LENT OUT BESIDE IT
+     (permit sweep L1a, design ni-strong-instance.md §7).  For a caller
+     that moves the address space THROUGH a callee on the permit cone
+     (growproc -> uvmalloc): the counter leaves with the cells, the callee
+     may step it, and the block is rebuilt at whatever count comes back. *)
+  Lemma proc_priv_addrspace_ev (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_sz pa ↦₈ pv_sz (us_V U) ∗
+    p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+    act_cnt pa (pv_ev (us_V U)) ∗
+    (∀ (P' : uptd) (szv : mword 64) (M' : gmap Z (bv 8)) (lz' : bool) (k' : nat),
+       ⌜ud_root P' = ud_root (pv_upt (us_V U))⌝ -∗
+       ⌜ud_tfp P' = ud_tfp (pv_upt (us_V U))⌝ -∗
+       ⌜uint szv <= uvm_maxsz⌝ -∗
+       ⌜um_below szv (ud_um P')⌝ -∗
+       ⌜lz' = false -> lazy_free (ud_um P') (uint szv)⌝ -∗
+       p_sz pa ↦₈ szv -∗
+       p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) -∗
+       proc_ptm P' (uint szv) M' -∗
+       act_cnt pa k' -∗
+       proc_priv γf pa pid
+         (upd_usM (upd_usV U
+                     (upd_ev (upd_lazy (upd_sz (upd_upt (us_V U) P') szv) lz') k')) M')).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hcwd & Hft & Hgq & Hxs & Hev & Hgh) Ho]".
+    rewrite /proc_fields /proc_ptm_at.
+    iDestruct "Hf" as "(Hsz & Hcwd' & %Hnl & Hnm & Hsecc)".
+    iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iFrame "Hsz Hpg Hptt Hev".
+    iIntros (P' szv M' lz' k') "%Hroot %Htf %Hszb' %Hbel' %Hlz' Hsz Hpg Hptt Hev".
+    rewrite /proc_priv /proc_priv_core /proc_fields /proc_ptm_at.
+    cbn [upd_ev upd_lazy upd_sz upd_upt pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name
+         pv_fdg pv_cwi pv_gen pv_chg pv_lazy pv_secc pv_ev].
+    rewrite Hroot Htf.
+    iSplitR "Ho"; [|iFrame "Ho"].
+    iSplitR; [iPureIntro; exact Hszb'|].
+    iSplitR; [iPureIntro; exact Hbel'|].
+    iFrame "Hpid".
+    iSplitL "Hsz Hcwd' Hnm Hsecc".
+    { iFrame "Hsz Hcwd' Hnm Hsecc". iPureIntro. exact Hnl. }
+    iFrame "Hpg Htfc Hptt Htfp".
+    iSplitR; [iPureIntro; exact Hlz' |].
+    iFrame "Hcwd Hft Hgq Hxs Hev Hgh".
+  Qed.
+
+  (* THE COPY INSTANCE: the size stays put and the descriptor only GREW --
+     what copyin / copyout do to a process when they fault a page in.  The
+     premise is [uptd_ext_sz], not [uptd_ext]: a bare extension would say
+     nothing about WHERE the map grew, and the block cannot be rebuilt
+     without that (see [proc_priv]).  It costs the two callees nothing --
+     vmfault only backs a page it has already checked against [p->sz], so
+     the fact was in their proofs all along. *)
+  Lemma proc_priv_copy (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_sz pa ↦₈ pv_sz (us_V U) ∗
+    p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+    (∀ (P' : uptd) (M' : gmap Z (bv 8)),
+       ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+       p_sz pa ↦₈ pv_sz (us_V U) -∗
+       p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) -∗
+       proc_ptm P' (uint (pv_sz (us_V U))) M' -∗
+       proc_priv γf pa pid (upd_usM (us_upt U P') M')).
+  Proof using .
+    iIntros "Hpv".
+    iDestruct (proc_priv_sz_maxsz with "Hpv") as "%Hszb".
+    iDestruct (proc_priv_um_below with "Hpv") as "%Hbel".
+    iDestruct (proc_priv_lazy with "Hpv") as "%Hlzq".
+    iDestruct (proc_priv_addrspace with "Hpv") as "($ & $ & $ & Hback)".
+    iIntros (P' M') "%Hext Hsz Hpg Hptt".
+    (* the bit does not move on a fault: the block comes back at the one it
+       was given, and that is an identity ([upd_lazy_sz_upt_id]) *)
+    iApply ("Hback" $! P' (pv_sz (us_V U)) M' (pv_lazy (us_V U))
+              with "[%] [%] [%] [%] [%] Hsz Hpg Hptt").
+    - exact (proj1 (uptd_ext_sz_ext _ _ _ Hext)).
+    - exact (proj1 (proj2 (uptd_ext_sz_ext _ _ _ Hext))).
+    - exact Hszb.
+    - exact (um_below_ext_sz _ _ _ Hbel Hext).
+    (* THE VMFAULT ARM, DISCHARGED ONCE FOR EVERY COPY CALLER (lane
+       LAZY-FLAG, K2): a page fault only ADDS leaves and the break does not
+       move, and [UserPerm.lazy_free] is monotone in the table's domain and
+       antitone in the break. *)
+    - intro Hf.
+      exact (lazy_free_mono (ud_um (pv_upt (us_V U))) (ud_um P')
+               (uint (pv_sz (us_V U))) (uint (pv_sz (us_V U)))
+               (proj2 (proj2 (uptd_ext_sz_ext _ _ _ Hext)))
+               (Z.le_refl _) (Hlzq Hf)).
+  Qed.
+
+  (* =================================================================== *)
+  (* THE SAME PROJECTIONS AT THE CORE'S ALTITUDE                          *)
+  (* =================================================================== *)
+  (* WHY THERE ARE TWO FAMILIES, AND WHY IT IS NOT A CROSS-PRODUCT.  A
+     [file.c] function that copies to or from user memory needs the process
+     block AND a descriptor's [file_ref] -- and those cannot be held at once,
+     because the only source for the reference is [proc_ofiles], which
+     [proc_priv_ofile] / [proc_priv_lend] BORROW out of the block
+     (design/file-table.md, "A FUNCTION THAT TAKES A DESCRIPTOR'S REFERENCE
+     MUST NOT TAKE [proc_priv]").  So fileread / filewrite / filestat and
+     their whole cone are stated over [proc_priv_core], and the syscall above
+     them splits once ([proc_priv_lend]), keeps the fd table, and hands the
+     core down.
+
+     None of those callees ever touches the descriptor array -- measured, and
+     that is what makes the move free -- so each of these is exactly its
+     [proc_priv] twin with the [proc_ofiles] conjunct absent.  The twin at the
+     block's altitude stays: every consumer that does NOT hold a reference
+     (growproc, kexit, kfork, the trapframe writers) is stated there and
+     should not be made to split.
+
+     They are stated rather than derived from the block versions for the
+     obvious reason: [proc_priv_core] cannot conjure a [proc_ofiles]. *)
+
+  Lemma proc_priv_core_pid (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗
+    (p_pid pa ↦₄{DfracOwn (1/4)} pid -∗ proc_priv_core pa pid U).
+  Proof using .
+    iIntros "(%Hszb & %Hbel & Hpid & Hrest)".
+    assert (Hq : (1/2)%Qp = (1/4 + 1/4)%Qp) by compute_done.
+    rewrite Hq ctx_word4_pointsto_frac_split.
+    iDestruct "Hpid" as "[Hq1 Hq2]". iFrame "Hq1".
+    iIntros "Hq1". rewrite /proc_priv_core Hq ctx_word4_pointsto_frac_split.
+    iSplitR; [done|]. iSplitR; [done|].
+    iSplitL "Hq1 Hq2"; [iSplitL "Hq1"; [iExact "Hq1" | iExact "Hq2"] |].
+    iExact "Hrest".
+  Qed.
+
+  Lemma proc_priv_core_sz_maxsz (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗ ⌜uint (pv_sz (us_V U)) <= uvm_maxsz⌝.
+  Proof using . iIntros "(%Hszb & _)". done. Qed.
+
+  Lemma proc_priv_core_sz_bound (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗ ⌜uint (pv_sz (us_V U)) <= 2 ^ 38⌝.
+  Proof using .
+    iIntros "(%Hszb & _)". iPureIntro.
+    rewrite uvm_maxsz_val in Hszb. change (2 ^ 38)%Z with 274877906944%Z. lia.
+  Qed.
+
+  (* ...AND WHAT THE LAZY BIT CLAIMS, at the core's altitude (lane
+     LAZY-FLAG): [proc_priv_lazy]'s twin, for the fileread / filewrite cone,
+     which is stated over the core. *)
+  Lemma proc_priv_core_lazy (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    ⌜pv_lazy (us_V U) = false ->
+       lazy_free (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))⌝.
+  Proof using . iIntros "(_ & _ & _ & _ & _ & _ & %Hlz & _)". done. Qed.
+
+  Lemma proc_priv_core_um_below (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗ ⌜um_below (pv_sz (us_V U)) (ud_um (pv_upt (us_V U)))⌝.
+  Proof using . iIntros "(_ & %Hbel & _)". done. Qed.
+
+  Lemma proc_priv_core_tf (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    p_trapframe pa ↦₈{DfracOwn (1/4)} page_base (ud_tfp (pv_upt (us_V U))) ∗
+    tf_page (ud_tfp (pv_upt (us_V U))) (pv_tf (us_V U)) ∗
+    (p_trapframe pa ↦₈{DfracOwn (1/4)} page_base (ud_tfp (pv_upt (us_V U))) -∗
+     tf_page (ud_tfp (pv_upt (us_V U))) (pv_tf (us_V U)) -∗ proc_priv_core pa pid U).
+  Proof using .
+    iIntros "(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hrest)".
+    rewrite /proc_ptm_at. iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iDestruct (word_split14 with "Htfc") as "[Hq1 Hq2]".
+    iFrame "Hq1 Htfp".
+    iIntros "Hq1 Htfp". rewrite /proc_priv_core /proc_ptm_at.
+    iDestruct (word_join14 with "Hq1 Hq2") as "Htfc".
+    iSplitR; [done|]. iSplitR; [done|].
+    iSplitL "Hpid"; [iExact "Hpid" |].
+    iSplitL "Hf"; [iExact "Hf" |].
+    iSplitL "Hpg Htfc Hptt";
+      [ iSplitL "Hpg"; [iExact "Hpg" |];
+        iSplitL "Htfc"; [iExact "Htfc" |]; iExact "Hptt" |].
+    iSplitL "Htfp"; [iExact "Htfp" |].
+    iExact "Hrest".
+  Qed.
+
+  Lemma proc_priv_core_addrspace (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    p_sz pa ↦₈ pv_sz (us_V U) ∗
+    p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+    (∀ (P' : uptd) (szv : mword 64) (M' : gmap Z (bv 8)),
+       ⌜ud_root P' = ud_root (pv_upt (us_V U))⌝ -∗
+       ⌜ud_tfp P' = ud_tfp (pv_upt (us_V U))⌝ -∗
+       ⌜uint szv <= uvm_maxsz⌝ -∗
+       ⌜um_below szv (ud_um P')⌝ -∗
+       (* ...AND WHAT THE LAZY BIT CLAIMS, RE-ESTABLISHED AT THE NEW TABLE
+          AND THE NEW BREAK (lane LAZY-FLAG, K2).  This is the one conjunct
+          of the block a caller that MOVES the address space owes: at
+          [false] the projection's fill must still be empty.  Every caller
+          has the fact in hand -- a page fault only EXTENDS the table at a
+          fixed break ([UserPerm.lazy_free_mono], which [proc_priv_copy] /
+          [proc_priv_core_copy] below discharge once for all of them), an
+          eager grow maps exactly the run that just became live
+          ([SpecGrowproc.growproc_ok]'s domain equation), a shrink lowers
+          the break below everything it unmapped, exec's image is eager
+          ([KexecBuilt.kexec_built]'s coverage row), and sbrklazy's grow
+          RAISES the bit and so owes nothing. *)
+       ⌜pv_lazy (us_V U) = false -> lazy_free (ud_um P') (uint szv)⌝ -∗
+       p_sz pa ↦₈ szv -∗
+       p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) -∗
+       proc_ptm P' (uint szv) M' -∗
+       proc_priv_core pa pid (upd_usM (upd_usV U (upd_sz (upd_upt (us_V U) P') szv)) M')).
+  Proof using .
+    iIntros "(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hc & Hft & Hgq & Hxs)".
+    rewrite /proc_fields /proc_ptm_at.
+    iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iFrame "Hsz Hpg Hptt".
+    iIntros (P' szv M') "%Hroot %Htf %Hszb' %Hbel' %Hlz' Hsz Hpg Hptt".
+    rewrite /proc_priv_core /proc_fields /proc_ptm_at.
+    cbn [upd_sz upd_upt pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_lazy pv_secc].
+    rewrite Hroot Htf.
+    iSplitR; [iPureIntro; exact Hszb'|].
+    iSplitR; [iPureIntro; exact Hbel'|].
+    iFrame "Hpid".
+    iSplitL "Hsz Hcwd Hnm Hsecc".
+    { iFrame "Hsz Hcwd Hnm Hsecc". iPureIntro. exact Hnl. }
+    iFrame "Hpg Htfc Hptt Htfp".
+    iSplitR; [iPureIntro; exact Hlz' |].
+    iFrame "Hft Hgq Hxs".
+  Qed.
+
+  Lemma proc_priv_core_copy (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    p_sz pa ↦₈ pv_sz (us_V U) ∗
+    p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+    (∀ (P' : uptd) (M' : gmap Z (bv 8)),
+       ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+       p_sz pa ↦₈ pv_sz (us_V U) -∗
+       p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) -∗
+       proc_ptm P' (uint (pv_sz (us_V U))) M' -∗
+       proc_priv_core pa pid (upd_usM (us_upt U P') M')).
+  Proof using .
+    iIntros "Hpv".
+    iDestruct (proc_priv_core_sz_maxsz with "Hpv") as "%Hszb".
+    iDestruct (proc_priv_core_um_below with "Hpv") as "%Hbel".
+    iDestruct (proc_priv_core_lazy with "Hpv") as "%Hlzq".
+    iDestruct (proc_priv_core_addrspace with "Hpv") as "($ & $ & $ & Hback)".
+    iIntros (P' M') "%Hext Hsz Hpg Hptt".
+    iApply ("Hback" $! P' (pv_sz (us_V U)) M'
+              with "[%] [%] [%] [%] [%] Hsz Hpg Hptt").
+    - exact (proj1 (uptd_ext_sz_ext _ _ _ Hext)).
+    - exact (proj1 (proj2 (uptd_ext_sz_ext _ _ _ Hext))).
+    - exact Hszb.
+    - exact (um_below_ext_sz _ _ _ Hbel Hext).
+    (* THE VMFAULT ARM, DISCHARGED ONCE FOR EVERY COPY CALLER (lane
+       LAZY-FLAG, K2): a page fault only ADDS leaves and the break does not
+       move, and [UserPerm.lazy_free] is monotone in the table's domain and
+       antitone in the break. *)
+    - intro Hf.
+      exact (lazy_free_mono (ud_um (pv_upt (us_V U))) (ud_um P')
+               (uint (pv_sz (us_V U))) (uint (pv_sz (us_V U)))
+               (proj2 (proj2 (uptd_ext_sz_ext _ _ _ Hext)))
+               (Z.le_refl _) (Hlzq Hf)).
+  Qed.
+
+  (* ...AND THE COPY INSTANCE WITH THE EVENT COUNTER LENT OUT BESIDE IT
+     (permit sweep L1b, design ni-strong-instance.md §7).  For a caller
+     that holds the block and hands its image to a copy (copyin, copyout,
+     copyinstr), which takes the counter as its lend and may step it: the
+     block is rebuilt at the grown descriptor, the image the copy left and
+     whatever count came back -- [us_upt] of the block AT that count.
+     [proc_priv_copy_ev] below is the same at the block's altitude. *)
+  Lemma proc_priv_core_copy_ev (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗
+    p_sz pa ↦₈ pv_sz (us_V U) ∗
+    p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+    act_cnt pa (pv_ev (us_V U)) ∗
+    (∀ (P' : uptd) (M' : gmap Z (bv 8)) (k' : nat),
+       ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+       p_sz pa ↦₈ pv_sz (us_V U) -∗
+       p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) -∗
+       proc_ptm P' (uint (pv_sz (us_V U))) M' -∗
+       act_cnt pa k' -∗
+       proc_priv_core pa pid (upd_usM (us_upt (upd_usV U (upd_ev (us_V U) k')) P') M')).
+  Proof using .
+    iIntros "Hpv".
+    iDestruct (proc_priv_core_lazy with "Hpv") as "%Hlzq".
+    iDestruct "Hpv" as "(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hcwd & Hft & Hgq & Hxs & Hev & Hgh)".
+    rewrite /proc_fields /proc_ptm_at.
+    iDestruct "Hf" as "(Hsz & Hcwd' & %Hnl & Hnm & Hsecc)".
+    iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iFrame "Hsz Hpg Hptt Hev".
+    iIntros (P' M' k') "%Hext Hsz Hpg Hptt Hev".
+    destruct (uptd_ext_sz_ext _ _ _ Hext) as (Hroot & Htf & Hum).
+    rewrite /proc_priv_core /proc_fields /proc_ptm_at.
+    cbn [us_upt upd_usM upd_usV upd_ev upd_upt us_V us_M pv_sz pv_upt pv_tf
+         pv_ofile pv_cwd pv_name pv_fdg pv_cwi pv_gen pv_chg pv_lazy pv_secc pv_ev].
+    rewrite Hroot Htf.
+    iSplitR; [iPureIntro; exact Hszb|].
+    iSplitR; [iPureIntro; exact (um_below_ext_sz _ _ _ Hbel Hext)|].
+    iFrame "Hpid".
+    iSplitL "Hsz Hcwd' Hnm Hsecc".
+    { iFrame "Hsz Hcwd' Hnm Hsecc". iPureIntro. exact Hnl. }
+    iFrame "Hpg Htfc Hptt Htfp".
+    iSplitR.
+    { iPureIntro. intro Hf.
+      exact (lazy_free_mono (ud_um (pv_upt (us_V U))) (ud_um P')
+               (uint (pv_sz (us_V U))) (uint (pv_sz (us_V U)))
+               Hum (Z.le_refl _) (Hlzq Hf)). }
+    iFrame "Hcwd Hft Hgq Hxs Hev Hgh".
+  Qed.
+
+  Lemma proc_priv_copy_ev (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_sz pa ↦₈ pv_sz (us_V U) ∗
+    p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+    act_cnt pa (pv_ev (us_V U)) ∗
+    (∀ (P' : uptd) (M' : gmap Z (bv 8)) (k' : nat),
+       ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+       p_sz pa ↦₈ pv_sz (us_V U) -∗
+       p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) -∗
+       proc_ptm P' (uint (pv_sz (us_V U))) M' -∗
+       act_cnt pa k' -∗
+       proc_priv γf pa pid (upd_usM (us_upt (upd_usV U (upd_ev (us_V U) k')) P') M')).
+  Proof using .
+    iIntros "[Hc Ho]".
+    iDestruct (proc_priv_core_copy_ev with "Hc") as "($ & $ & $ & $ & Hback)".
+    iIntros (P' M' k') "%Hext Hsz Hpg Hptt Hev".
+    iSplitR "Ho"; [iApply ("Hback" with "[%] Hsz Hpg Hptt Hev"); exact Hext|].
+    destruct U as [[f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13] M]. iExact "Ho".
+  Qed.
+
+  (* =================================================================== *)
+  (* THE ADDRESS-SPACE SWAP -- exec, and only exec.                       *)
+  (* =================================================================== *)
+  (* [proc_priv_addrspace] above is the GROW/SHRINK bridge: the table OBJECT
+     stays put and only its map moves, which is why it pins [ud_root] and
+     demands the same [p->pagetable] value back.  kexec REPLACES the object:
+     it builds a second table with proc_pagetable, loads the image into that,
+     and only at the commit block stores its root into [p->pagetable].  So no
+     premise about [ud_root] can be paid, and the cell comes back holding a
+     DIFFERENT page.
+       [ud_tfp] is still pinned, and that is not an artifact of the proof.
+     The trapframe PAGE genuinely does not move across an exec: proc_pagetable
+     maps whatever [p->trapframe] already holds, and [tf_page] -- the page's
+     BYTES -- is outside [proc_pt] entirely, so it survives the old table's
+     proc_freepagetable and is simply re-attached to the new descriptor.  The
+     trapframe WORDS do move (epc / sp / a1), which is what [ws'] is for.
+       Three things this lends that [proc_priv_addrspace] does not, each
+     because kexec needs it while the block is open: the [p->trapframe] CELL
+     (proc_pagetable reads it), [tf_page] (the commit block writes three of
+     its words), and the two pure conjuncts (proc_freepagetable's premises are
+     exactly those, AT THE OLD SIZE AND DESCRIPTOR, and the old size is gone
+     from the cell by the time the free happens -- the C saves it in [oldsz]
+     for the same reason). *)
+  Lemma proc_priv_newspace (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    ⌜uint (pv_sz (us_V U)) <= uvm_maxsz⌝ ∗
+    ⌜um_below (pv_sz (us_V U)) (ud_um (pv_upt (us_V U)))⌝ ∗
+    p_sz pa ↦₈ pv_sz (us_V U) ∗
+    p_pagetable pa ↦₈ page_base (ud_root (pv_upt (us_V U))) ∗
+    p_trapframe pa ↦₈ page_base (ud_tfp (pv_upt (us_V U))) ∗
+    proc_ptm (pv_upt (us_V U)) (uint (pv_sz (us_V U))) (us_M U) ∗
+    tf_page (ud_tfp (pv_upt (us_V U))) (pv_tf (us_V U)) ∗
+    (∀ (P' : uptd) (szv : mword 64) (ws' : list (mword 64))
+       (M' : gmap Z (bv 8)) (b : bool),
+       ⌜ud_tfp P' = ud_tfp (pv_upt (us_V U))⌝ -∗
+       ⌜uint szv <= uvm_maxsz⌝ -∗
+       ⌜um_below szv (ud_um P')⌝ -∗
+       (* ...AND THE LAZY BIT THE SWAP WRITES (lane LAZY-FLAG).  A swap
+          installs a NEW address space, so the old bit's claim is about a
+          table that no longer exists and cannot be carried over: the caller
+          says which bit the new block gets, and owes the claim only at
+          [false].  exec's commit passes [true] today (the premise is
+          vacuous) and [false] once [KexecBuilt.kexec_built] carries the
+          fresh image's coverage (lane LAZY-FLAG's K4); the NO-OP close --
+          exec's failure arm, which re-installs the table it was handed --
+          passes the block's own bit and pays from the block's own claim. *)
+       ⌜b = false -> lazy_free (ud_um P') (uint szv)⌝ -∗
+       p_sz pa ↦₈ szv -∗
+       p_pagetable pa ↦₈ page_base (ud_root P') -∗
+       p_trapframe pa ↦₈ page_base (ud_tfp P') -∗
+       proc_ptm P' (uint szv) M' -∗
+       tf_page (ud_tfp P') ws' -∗
+       proc_priv γf pa pid
+         (upd_usM (upd_usV U
+                     (upd_lazy (upd_sz (upd_pt (us_V U) P' ws') szv) b)) M')).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hc & Hft & Hgq & Hxs) Ho]".
+    rewrite /proc_fields /proc_ptm_at.
+    iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    iDestruct "Hpt" as "(Hpg & Htfc & Hptt)".
+    iSplitR; [iPureIntro; exact Hszb|].
+    iSplitR; [iPureIntro; exact Hbel|].
+    iFrame "Hsz Hpg Htfc Hptt Htfp".
+    iIntros (P' szv ws' M' b) "%Htf %Hszb' %Hbel' %Hlz' Hsz Hpg Htfc Hptt Htfp".
+    rewrite /proc_priv /proc_priv_core /proc_fields /proc_ptm_at.
+    cbn [upd_lazy upd_sz upd_pt pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name
+         pv_fdg pv_lazy pv_secc].
+    iSplitR "Ho"; [|iFrame "Ho"].
+    iSplitR; [iPureIntro; exact Hszb'|].
+    iSplitR; [iPureIntro; exact Hbel'|].
+    iFrame "Hpid Hpg Htfc Hptt Htfp".
+    iSplitL "Hsz Hcwd Hnm Hsecc".
+    { iFrame "Hsz Hcwd Hnm Hsecc". iPureIntro. exact Hnl. }
+    iSplitR; [iPureIntro; exact Hlz' |].
+    iFrame "Hft Hgq Hxs".
+  Qed.
+
+  (* p->name: the sixteen debug bytes, out and back.  PROMOTED HERE from
+     ProofKforkB4's [kfk_name_open], whose own comment asked for it once there
+     was a second consumer; kexec's [safestrcpy(p->name, last, 16)] is it. *)
+  (* THE MASK CELL out of the field block (upstream a083670): the one cell
+     sys_seccomp reads and writes, the syscall dispatcher reads, userinit
+     writes and kfork copies.  The block comes back at [set_secc], which
+     [us_secc] (the AND) and every raw store are instances of. *)
+  Lemma proc_fields_secc (pa : mword 64) (V : pprivate) :
+    proc_fields pa (DfracOwn 1) V -∗
+    p_secc pa ↦₈ pv_secc V ∗
+    (∀ v : mword 64, p_secc pa ↦₈ v -∗ proc_fields pa (DfracOwn 1) (set_secc V v)).
+  Proof using .
+    rewrite /proc_fields. iIntros "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    iFrame "Hsecc". iIntros (v) "Hsecc".
+    cbn [set_secc pv_sz pv_cwd pv_name pv_secc].
+    iFrame "Hsz Hcwd Hnm Hsecc". iPureIntro; exact Hnl.
+  Qed.
+
+  Lemma proc_priv_secc (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    p_secc pa ↦₈ pv_secc (us_V U) ∗
+    (∀ v : mword 64, p_secc pa ↦₈ v -∗ proc_priv γf pa pid (us_set_secc U v)).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hrest) Ho]".
+    iDestruct (proc_fields_secc with "Hf") as "[Hsecc Hf]".
+    iFrame "Hsecc". iIntros (v) "Hsecc".
+    iDestruct ("Hf" with "Hsecc") as "Hf".
+    rewrite /proc_priv /proc_priv_core.
+    iSplitR "Ho"; [| iExact "Ho"].
+    iSplitR; [iPureIntro; exact Hszb|]. iSplitR; [iPureIntro; exact Hbel|].
+    iSplitL "Hpid"; [iExact "Hpid"|]. iSplitL "Hf"; [iExact "Hf"|].
+    iExact "Hrest".
+  Qed.
+
+  Lemma proc_priv_nocwd_secc (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_nocwd γf pa pid U -∗
+    p_secc pa ↦₈ pv_secc (us_V U) ∗
+    (∀ v : mword 64, p_secc pa ↦₈ v -∗ proc_priv_nocwd γf pa pid (us_set_secc U v)).
+  Proof using .
+    iIntros "(%Hszb & %Hbel & Hpid & Hf & Hrest)".
+    iDestruct (proc_fields_secc with "Hf") as "[Hsecc Hf]".
+    iFrame "Hsecc". iIntros (v) "Hsecc".
+    iDestruct ("Hf" with "Hsecc") as "Hf".
+    rewrite /proc_priv_nocwd.
+    iSplitR; [iPureIntro; exact Hszb|]. iSplitR; [iPureIntro; exact Hbel|].
+    iSplitL "Hpid"; [iExact "Hpid"|]. iSplitL "Hf"; [iExact "Hf"|].
+    iExact "Hrest".
+  Qed.
+
+  Lemma proc_priv_name (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv γf pa pid U -∗
+    ⌜length (pv_name (us_V U)) = PNAMELEN⌝ ∗
+    pname_cells pa (DfracOwn 1) (pv_name (us_V U)) ∗
+    (∀ ns : list (bv 8), ⌜length ns = PNAMELEN⌝ -∗
+       pname_cells pa (DfracOwn 1) ns -∗
+       proc_priv γf pa pid (us_name U ns)).
+  Proof using .
+    iIntros "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hc & Hft & Hgq & Hxs) Ho]".
+    rewrite /proc_fields.
+    iDestruct "Hf" as "(Hsz & Hcwd & %Hnl & Hnm & Hsecc)".
+    iSplitR; [iPureIntro; exact Hnl|].
+    iFrame "Hnm".
+    iIntros (ns) "%Hnl' Hnm".
+    rewrite /proc_priv /proc_priv_core /proc_fields.
+    cbn [upd_name pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_lazy pv_secc].
+    iSplitR "Ho"; [|iFrame "Ho"].
+    iSplitR; [iPureIntro; exact Hszb|].
+    iSplitR; [iPureIntro; exact Hbel|].
+    iFrame "Hpid Hpt Htfp Hc Hft Hgq Hxs Hsz Hcwd Hnm Hsecc".
+    iPureIntro. exact Hnl'.
+  Qed.
+
+  (* Borrow one fd slot and hand back a (possibly different) one. *)
+  Lemma proc_priv_ofile (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd : nat) (v : mword 64) :
+    pv_ofile (us_V U) !! fd = Some v ->
+    proc_priv γf pa pid U -∗
+    ofile_slot γf (pv_fdg (us_V U)) pa fd v ∗
+    (∀ v', ofile_slot γf (pv_fdg (us_V U)) pa fd v' -∗ proc_priv γf pa pid (us_ofile U fd v')).
+  Proof using .
+    iIntros (Hfd) "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hc & Hft & Hgq & Hxs) [%Hlen Ho]]".
+    iDestruct (big_sepL_insert_acc with "Ho") as "[$ Hback]"; first exact Hfd.
+    iIntros (v') "Hslot". iDestruct ("Hback" $! v' with "Hslot") as "Ho".
+    rewrite /proc_priv /proc_priv_core /proc_ofiles.
+    cbn [upd_ofile pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg
+         pv_cwi pv_gen pv_chg].
+    iSplitR "Ho".
+    { iSplitR; [iPureIntro; exact Hszb|].
+      iSplitR; [iPureIntro; exact Hbel|].
+      iFrame "Hpid Hf Hpt Htfp Hc Hft Hgq Hxs". }
+    iFrame "Ho". iPureIntro. rewrite length_insert. exact Hlen.
+  Qed.
+
+  (* Borrow one fd slot AND the pid quarter at once.  A closer of a
+     descriptor needs both simultaneously -- the reference to give fileclose,
+     and the pid cell fileclose's file-system arm threads down to bread's
+     acquiresleep -- and neither of the one-at-a-time accessors can be open
+     while the other is, since each swallows the whole block.  kexit's fd loop
+     is the consumer. *)
+  Lemma proc_priv_pid_ofile (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd : nat) (v : mword 64) :
+    pv_ofile (us_V U) !! fd = Some v ->
+    proc_priv γf pa pid U -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} pid ∗ ofile_slot γf (pv_fdg (us_V U)) pa fd v ∗
+    (∀ v', p_pid pa ↦₄{DfracOwn (1/4)} pid -∗ ofile_slot γf (pv_fdg (us_V U)) pa fd v' -∗
+           proc_priv γf pa pid (us_ofile U fd v')).
+  Proof using .
+    iIntros (Hfd) "[(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & Hc & Hft & Hgq & Hxs) [%Hlen Ho]]".
+    assert (Hq : (1/2)%Qp = (1/4 + 1/4)%Qp) by compute_done.
+    rewrite Hq ctx_word4_pointsto_frac_split.
+    iDestruct "Hpid" as "[Hq1 Hq2]". iFrame "Hq1".
+    iDestruct (big_sepL_insert_acc with "Ho") as "[$ Hback]"; first exact Hfd.
+    iIntros (v') "Hq1 Hslot". iDestruct ("Hback" $! v' with "Hslot") as "Ho".
+    rewrite /proc_priv /proc_priv_core /proc_ofiles.
+    cbn [upd_ofile pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg
+         pv_cwi pv_gen pv_chg].
+    iSplitR "Ho".
+    { iSplitR; [iPureIntro; exact Hszb|].
+      iSplitR; [iPureIntro; exact Hbel|].
+      rewrite Hq ctx_word4_pointsto_frac_split.
+      iFrame "Hq1 Hq2 Hf Hpt Htfp Hc Hft Hgq Hxs". }
+    iFrame "Ho". iPureIntro. rewrite length_insert. exact Hlen.
+  Qed.
+
+  (* THE SAME PAIRING, AT THE BLOCK.  A closer of one of its own descriptors
+     -- sys_close, kexit, sys_pipe on its rollback arm -- hands fileclose the
+     descriptor AND the process block, because fileclose reaches bread and
+     acquiresleep, which take [proc_priv_bare] now rather than a quarter of
+     [p->pid].  [cwd_ref] is what stays behind, and no closer needs it. *)
+  Lemma proc_priv_bare_ofile (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd : nat) (v : mword 64) :
+    pv_ofile (us_V U) !! fd = Some v ->
+    proc_priv γf pa pid U -∗
+    proc_priv_bare pa pid U ∗ ofile_slot γf (pv_fdg (us_V U)) pa fd v ∗
+    (∀ v', proc_priv_bare pa pid U -∗ ofile_slot γf (pv_fdg (us_V U)) pa fd v' -∗
+           proc_priv γf pa pid (us_ofile U fd v')).
+  Proof using .
+    iIntros (Hfd) "[Hcore [%Hlen Ho]]".
+    rewrite proc_priv_core_bare. iDestruct "Hcore" as "[Hb Hc]".
+    iFrame "Hb".
+    iDestruct (big_sepL_insert_acc with "Ho") as "[$ Hback]"; first exact Hfd.
+    iIntros (v') "Hb Hslot". iDestruct ("Hback" $! v' with "Hslot") as "Ho".
+    rewrite /proc_priv /proc_ofiles.
+    cbn [upd_ofile pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_lazy pv_secc].
+    iSplitR "Ho".
+    { rewrite proc_priv_core_bare /proc_priv_bare.
+      cbn [upd_ofile pv_sz pv_upt pv_tf pv_ofile pv_cwd pv_name pv_fdg pv_lazy pv_secc].
+      iFrame "Hb Hc". }
+    iFrame "Ho". iPureIntro. rewrite length_insert. exact Hlen.
+  Qed.
+
+  (* ...AND AT ANY EVENT COUNT (permit sweep L1b): fileclose lends the bare
+     block's counter to pipeclose, so the block comes back at a raised count
+     and the descriptor array is rebuilt around it. *)
+  Lemma proc_priv_bare_ofile_ev (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd : nat) (v : mword 64) :
+    pv_ofile (us_V U) !! fd = Some v ->
+    proc_priv γf pa pid U -∗
+    proc_priv_bare pa pid U ∗ ofile_slot γf (pv_fdg (us_V U)) pa fd v ∗
+    (∀ (v' : mword 64) (k : nat),
+       proc_priv_bare pa pid (upd_usV U (upd_ev (us_V U) k)) -∗
+       ofile_slot γf (pv_fdg (us_V U)) pa fd v' -∗
+       proc_priv γf pa pid (us_ofile (upd_usV U (upd_ev (us_V U) k)) fd v')).
+  Proof using .
+    iIntros (Hfd) "[Hcore [%Hlen Ho]]".
+    iDestruct (proc_priv_core_bare_ev_acc with "Hcore") as "[$ Hcback]".
+    iDestruct (big_sepL_insert_acc with "Ho") as "[$ Hback]"; first exact Hfd.
+    iIntros (v' k) "Hb Hslot". iDestruct ("Hback" $! v' with "Hslot") as "Ho".
+    rewrite /proc_priv /proc_ofiles.
+    iSplitR "Ho"; [iApply ("Hcback" with "Hb") |].
+    iSplit; [iPureIntro; cbn; rewrite length_insert; exact Hlen | iExact "Ho"].
+  Qed.
+
+  (* ---- the two ends of a LOAN, at the block's altitude ----
+     What a syscall that must carry one of its own descriptors' references in
+     a register actually does: take the block apart, lend the payload, and keep
+     the core to hand on to a callee.  sys_dup is the worked example. *)
+  Lemma proc_priv_lend (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd : nat) (v : mword 64) :
+    pv_ofile (us_V U) !! fd = Some v ->
+    v <> (zero_reg : mword 64) ->
+    proc_priv γf pa pid U -∗
+    ∃ (k : nat) (q : Qp) (st : fdstate),
+      ⌜v = fnode k /\ (k < NFILE)%nat /\ st <> FdClosed⌝ ∗
+      file_ref γf k q st ∗ fd_st_auth (pv_fdg (us_V U)) fd st ∗
+      proc_priv_core pa pid U ∗
+      proc_ofiles_owe γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)) {[fd]}.
+  Proof using .
+    iIntros (Hfd Hnz) "[Hcore Ho]".
+    rewrite -(proc_ofiles_owe_empty γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U))).
+    iDestruct (proc_ofiles_lend _ _ _ _ ∅ fd v ltac:(set_solver) Hfd Hnz with "Ho")
+      as (k q st) "[%Hk [Href [Hst Ho]]]".
+    iExists k, q, st. iFrame "Href Hst Hcore".
+    rewrite (union_empty_r_L {[fd]}). iFrame "Ho". iPureIntro. exact Hk.
+  Qed.
+
+  (* ... and putting the block back together once every loan is settled. *)
+  Lemma proc_priv_join (γf : gname) (pa : mword 64) (pid : mword 32) (U : ustate) :
+    proc_priv_core pa pid U -∗ proc_ofiles_owe γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)) ∅ -∗
+    proc_priv γf pa pid U.
+  Proof using .
+    iIntros "Hcore Ho". rewrite proc_ofiles_owe_empty. iFrame "Hcore Ho".
+  Qed.
+
+  (* THE CALLER-OF-FDALLOC one-liner.  A caller that already holds the
+     reference (sys_open after filealloc, sys_pipe after pipealloc) settles the
+     deficit fdalloc opened the moment it returns, and is back to holding a
+     plain [proc_priv] -- so nothing downstream of the call sees the split.
+     sys_dup is the caller that CANNOT do this: its reference is still inside
+     the source descriptor at that point, and only [filedup] can make a second
+     one. *)
+  Lemma proc_priv_settle (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd k : nat) (q : Qp) (stf st st' : fdstate) :
+    (fd < NOFILE)%nat ->
+    length (pv_ofile (us_V U)) = NOFILE ->
+    (k < NFILE)%nat ->
+    stf <> FdClosed ->
+    proc_priv_core pa pid U -∗
+    proc_ofiles_owe γf (pv_fdg (us_V U)) pa (pv_ofile (upd_ofile (us_V U) fd (fnode k))) ({[fd]} ∪ ∅) -∗
+    file_ref γf k q stf -∗
+    fd_st_auth (pv_fdg (us_V U)) fd st -∗ fd_st (pv_fdg (us_V U)) fd st' ==∗
+    proc_priv γf pa pid (us_ofile U fd (fnode k)) ∗
+    fd_st (pv_fdg (us_V U)) fd stf.
+  Proof using .
+    iIntros (Hfd Hlen Hk Hty) "Hcore Ho Href Ha Hfr".
+    assert (Hlk : pv_ofile (upd_ofile (us_V U) fd (fnode k)) !! fd = Some (fnode k)).
+    { cbn [upd_ofile pv_ofile pv_fdg]. apply list_lookup_insert_eq. rewrite Hlen. exact Hfd. }
+    (* THE ONE GHOST STEP OF AN OPEN: the descriptor fdalloc made non-null is
+       now OPEN, at the type of the file being installed.  Both halves are
+       required, which is why this accessor -- and so sys_open / sys_pipe /
+       sys_dup -- takes the fragment. *)
+    iMod (fd_st_move _ fd st st' stf with "Ha Hfr") as "[Ha $]".
+    iDestruct (proc_ofiles_repay _ _ _ _ ∅ fd k q stf ltac:(set_solver) Hlk Hk Hty
+                 with "Ho Href Ha") as "Ho".
+    iModIntro.
+    iApply (proc_priv_join γf pa pid (us_ofile U fd (fnode k)) with "[Hcore] Ho").
+    rewrite proc_priv_core_upd_ofile. iExact "Hcore".
+  Qed.
+
+  (* READ one fd slot's cell and put it straight back.  What a SCAN of the
+     array wants (fdalloc's loop): it only needs to know whether the stored
+     pointer is null, and touching the payload disjunction per iteration would
+     put a case split inside a loop invariant for no reason. *)
+  Lemma proc_priv_ofile_read (γf : gname) (pa : mword 64) (pid : mword 32)
+      (U : ustate) (fd : nat) (v : mword 64) :
+    pv_ofile (us_V U) !! fd = Some v ->
+    proc_priv γf pa pid U -∗
+    p_ofile pa fd ↦₈ v ∗ (p_ofile pa fd ↦₈ v -∗ proc_priv γf pa pid U).
+  Proof using .
+    iIntros (Hfd) "Hpv".
+    iDestruct (proc_priv_ofile _ _ _ _ fd v Hfd with "Hpv") as "[[Hc Hval] Hback]".
+    iFrame "Hc". iIntros "Hc".
+    iDestruct ("Hback" $! v with "[Hc Hval]") as "Hpv"; [rewrite /ofile_slot; iFrame "Hc Hval"|].
+    rewrite (us_ofile_id _ _ _ Hfd). iExact "Hpv".
+  Qed.
+
+  (* The whole point of the fractional pid: another core reading p->pid under
+     p->lock agrees with what the running thread believes. *)
+  Lemma proc_priv_pid_agree (γf : gname) (pa : mword 64) (pid pid' : mword 32)
+      (U : ustate) (dq : dfrac) :
+    proc_priv γf pa pid U -∗ p_pid pa ↦₄{dq} pid' -∗ ⌜pid = pid'⌝.
+  Proof using .
+    iIntros "[(_ & _ & Hpid & _) _] Hother".
+    iApply (ctx_word4_pointsto_agree with "Hpid Hother").
+  Qed.
+
+  (* The two halves of [p->pid], joined and split ([RiscvPtsto]'s
+     [ctx_word4_pointsto_half] is the 1/2 + 1/2 split itself).  allocproc and
+     freeproc are the two functions that hold ALL the pieces -- the
+     invariant's permanent quarter out of [SchedCtx.proc_pub], the dormant
+     block's half, and <pid_lock>'s quarter -- and so the two that may WRITE
+     the cell.  Joining first tells them the pieces agree, which is what
+     [ctx_word4_pointsto_agree] is for; splitting after the store is what
+     hands each piece back to its owner. *)
+  (* THREE-WAY since upstream ded23f2 (the pid scan): the slot lock's
+     quarter ([SchedCtx.proc_pub]), the travelling half, and <pid_lock>'s
+     quarter ([SchedCtx.pid_lock_share]) -- in that argument order.  Both
+     writers (allocproc's [p->pid = pid], freeproc's [p->pid = 0]) hold all
+     three, which is what makes the store provable at all. *)
+  Lemma p_pid_frac3 : (1 : Qp) = (1/4 + (1/2 + 1/4))%Qp.
+  Proof using . compute_done. Qed.
+
+  Lemma p_pid_join3 (pa : mword 64) (p1 p2 p3 : mword 32) :
+    p_pid pa ↦₄{DfracOwn (1/4)} p1 -∗ p_pid pa ↦₄{DfracOwn (1/2)} p2 -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} p3 -∗
+    ⌜p1 = p2 /\ p2 = p3⌝ ∗ p_pid pa ↦₄ p1.
+  Proof using .
+    iIntros "H1 H2 H3".
+    iDestruct (ctx_word4_pointsto_agree with "H1 H2") as %<-.
+    iDestruct (ctx_word4_pointsto_agree with "H1 H3") as %<-.
+    iSplit; [done|].
+    assert (Hd : DfracOwn 1 = DfracOwn (1/4 + (1/2 + 1/4))%Qp) by (rewrite -p_pid_frac3; reflexivity).
+    rewrite Hd !ctx_word4_pointsto_frac_split. iFrame.
+  Qed.
+
+  Lemma p_pid_split3 (pa : mword 64) (v : mword 32) :
+    p_pid pa ↦₄ v -∗
+    p_pid pa ↦₄{DfracOwn (1/4)} v ∗ p_pid pa ↦₄{DfracOwn (1/2)} v ∗
+    p_pid pa ↦₄{DfracOwn (1/4)} v.
+  Proof using .
+    assert (Hd : DfracOwn 1 = DfracOwn (1/4 + (1/2 + 1/4))%Qp) by (rewrite -p_pid_frac3; reflexivity).
+    rewrite Hd !ctx_word4_pointsto_frac_split. iIntros "$".
+  Qed.
+
+  (* =================================================================== *)
+  (* The DORMANT shape: what the lock invariant holds at UNUSED/ZOMBIE.   *)
+  (* =================================================================== *)
+  (* kexit() nulls every ofile[fd] and sets cwd = 0 BEFORE the process goes
+     ZOMBIE, and freeproc() only zeroes more.  So the dormant bundle never
+     owes a file reference or an inode reference -- it is raw cells plus one
+     fact, and [γf] does not appear.  It is deliberately NOT indexed by [st]:
+     freeproc's other zeroing (pid/sz/pagetable/trapframe = 0) has no
+     consumer (freeproc branches on [if (p->trapframe)] at runtime and
+     allocproc overwrites without reading), and stating it would cost an
+     obligation on every release AND break [proc_dormant]'s symmetry between
+     UNUSED and ZOMBIE. *)
+  (* [pid] is existential here rather than an index: the invariant's OWN half
+     of the cell is always resident (SchedCtx's [proc_pub]), and two halves of
+     the same points-to agree for free, so indexing would only duplicate a
+     fact [ctx_word4_pointsto_agree] already gives.  Keeping [st] and [pid] both
+     out makes [proc_slots] a function of the state alone, which is what makes
+     [proc_slots_recast] hold in BOTH directions within a guard class. *)
+  (* ------------------------------------------------------------------- *)
+  (* THE SAME BLOCK WITHOUT ITS CONTEXT CELLS.                            *)
+  (*                                                                      *)
+  (* A thread parking FOREVER -- kexit, at ZOMBIE -- owes the dormant      *)
+  (* block to its lock's [inv_dormant] slot, but it cannot hand over the   *)
+  (* fourteen context cells with it: it is about to swtch, and swtch SAVES *)
+  (* into exactly those cells.  So the crossing carries the block minus    *)
+  (* the context ([SchedCtx.park_pay]) and the scheduler -- which is       *)
+  (* handed the parked record itself, by its own swtch -- puts the two     *)
+  (* back together ([SchedCtx.proc_slots_park_gen], where the record is    *)
+  (* FORGOTTEN down to its cells: nothing ever resumes a zombie).          *)
+  (*                                                                      *)
+  (* Splitting here, rather than making the payload carry a rebuild wand,  *)
+  (* is what keeps [proc_dormant] the ONE shape procinit / allocproc /     *)
+  (* freeproc see.                                                        *)
+  (* ------------------------------------------------------------------- *)
+  (* The UNUSED block WITHOUT its fd-slot units: what procinit is handed for
+     each process before the supply is distributed.  Nothing in procinit
+     touches these cells (the BSS is already zero); the units are the one
+     thing boot has to route, and [proc_dormant_seal] is that step.  Fixed at
+     UNUSED -- procinit produces no ZOMBIEs -- so the two address-space cells
+     are the zeroed pair. *)
+  (* THE PID CELL IS ZERO, and that is a fact about the IMAGE: [struct proc]
+     is .bss, so the carve hands this cell out pinned
+     ([BootCarveMain.boot_proc_slot], with [BootCarve.boot_cran_cell4_bss]).
+     It is here because the UNUSED dormant block owes it
+     ([SlotGen.gen_halves_dorm]) and this is the shape the block is sealed
+     from: the pid register's domain fact ([SlotGen.pid_reg_dom]) survives
+     allocproc's [p->pid = pid] only because the cell it overwrites held 0,
+     and 0 is registered to nothing. *)
+  Definition proc_dormant_nofd (pa : mword 64) : iProp Σ :=
+    (∃ (V : pprivate) (pid : mword 32),
+       ⌜pv_ofile V = replicate NOFILE (zero_reg : mword 64) /\
+        pv_cwd V = (zero_reg : mword 64) /\
+        uint (pv_sz V) <= uvm_maxsz /\ bv_unsigned pid = 0 /\
+        (* ...and the lazy bit, the dormant block's own (lane LAZY-FLAG,
+           K2) -- see [ProcDefs.proc_dormant] *)
+        pv_lazy V = true⌝ ∗
+       p_pid pa ↦₄{DfracOwn (1/2)} pid ∗
+       proc_fields pa (DfracOwn 1) V ∗
+       ofile_cells pa (pv_ofile V) ∗
+       (* ...AND THE SLOT'S HALF OF [p->xstate].  The carve produces the
+          whole cell and cuts it here: <p->lock>'s half goes into
+          [SchedCtx.proc_pub] and this one rides the slot, because the
+          ZOMBIE park keys its escrow at what the cell reads
+          ([ProcDefs.proc_dormant]). *)
+       (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) ∗
+       own_ctx (p_context pa) ∗
+       p_pagetable pa ↦₈ (zero_reg : mword 64) ∗
+       p_trapframe pa ↦₈ (zero_reg : mword 64))%I.
+
+  (* THE STACK ENTERS HERE.  [kstack_free] is the one thing in the block
+     that is neither a [struct proc] cell nor a ghost unit, and boot is the
+     only party that ever mints one ([KstackOwn.kstack_bank], out of
+     kvminit's 64 pages and kvminithart's 64 claims): every later producer
+     of a dormant slot (freeproc, kexit) passes on the one it was given. *)
+  (* ...AND SO DOES THE BIO ALLOWANCE, for the same reason and by the same
+     route: three units per slot, minted once at boot out of [BSLOTS] and
+     passed on by every later producer of a dormant slot.  See
+     [ProcDefs.proc_dormant]'s note for why the slot rather than the process
+     owns them while it is dormant. *)
+  (* ...AND THE SLOT'S CHILDREN ROW ENTERS HERE TOO, on exactly [kstack_
+     free]'s footing and by the same route: boot is the only party that can
+     mint one ([WaitInv.children_res_alloc], NPROC of them at [∅], because
+     the authority is <wait_lock>'s and nothing running can reach it before
+     it has sealed its residue), and every later producer of a dormant slot
+     passes on the one it was given.  The row arrives at a name of its own
+     and the SEAL is what writes that name into the block ([upd_chg]): the
+     [pv_chg] the .bss carve left is junk, exactly as [pv_fdg] is until
+     [proc_dormant_unused] chooses one. *)
+  (* ...AND SO DOES THE SLOT'S GENERATION WHOLE ([SlotGen.slot_gen]), by the
+     row's route and for its reason: boot is the only party that can mint
+     one ([WaitInv.children_res_alloc], NPROC of them), and it arrives at a
+     name of its own which the SEAL writes into the block ([upd_gen]) --
+     the [pv_gen] the .bss carve left is junk until then, exactly as
+     [pv_chg] is. *)
+  (* ...AND SO DOES THE SLOT'S EVENT COUNTER ([SlotGen.act_cnt], design
+     ni-strong-instance.md §7), by the generation's route: boot mints NPROC
+     of them at 0 ([WaitInv.children_res_alloc]) and the SEAL writes the
+     count into the block ([upd_ev]) -- the [pv_ev] the .bss carve left is
+     junk until then. *)
+  Lemma proc_dormant_seal (pa : mword 64) (γ0 g : gname) :
+    proc_dormant_nofd pa -∗ fd_slots (NOFILE + FDSPARE) -∗
+    iref_slots (1 + IREFSPARE) -∗ bslots 3 -∗ kstack_free pa -∗
+    ch_frag γ0 pa ∅ -∗ slot_gen pa (DfracOwn 1) g -∗ act_cnt pa 0 -∗
+    proc_dormant pa UNUSED.
+  Proof using .
+    iIntros "(%V & %pid & [%Hof [%Hcwd [%Hsz [%Hpid0 %Hlz]]]] & Hpid & Hf & Ho & Hxs & Hctx & Hpg & Htf) Hs Hir Hbs Hkst Hch Hsg Hev".
+    iDestruct (fd_slots_split with "Hs") as "[Hs Hsp]".
+    iExists (upd_ev (upd_gen (upd_chg V γ0) g) 0), pid.
+    cbn [upd_ev upd_chg upd_gen pv_sz pv_upt pv_tf pv_ofile pv_fdg pv_cwd pv_name pv_cwi pv_gen pv_chg pv_lazy pv_secc pv_ev].
+    (* BOTH [st]-keyed disjuncts take their [else] branch, and the row's has
+       to be reduced before it can be framed. *)
+    rewrite bool_decide_eq_false_2; [| vm_compute; discriminate].
+    iDestruct "Hxs" as (xsv) "Hxc".
+    iAssert (∃ v : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} v ∗ emp)%I
+      with "[Hxc]" as "Hxsrow"; [ iExists xsv; iFrame "Hxc" |].
+    iAssert (gen_halves_dorm pa pid g UNUSED) with "[Hsg]" as "Hgh".
+    { rewrite /gen_halves_dorm bool_decide_eq_false_2; [| vm_compute; discriminate].
+      iSplitR; [iPureIntro; exact Hpid0 | iExact "Hsg"]. }
+    iFrame "Hpid Hf Ho Hsp Hir Hbs Hkst Hch Hev Hgh Hxsrow Hctx".
+    iSplit; [done|].
+    iSplitL "Hs".
+    { iApply fd_slots_to_any. by rewrite Hof length_replicate. }
+    iFrame "Hpg Htf".
+  Qed.
+
+  (* THE BLOCK WITH ITS UNITS ROUTED BUT ITS STACK NOT YET DEPOSITED.
+     procinit carries this rather than a sealed [proc_dormant], and it has
+     to: the deposit needs [is_kstack], the PERSISTENT [p->kstack]
+     agreement, and procinit is the function that WRITES that cell -- the
+     full cell and a discarded one cannot coexist, so a block sealed before
+     the store would be unsatisfiable, not merely premature.  The seal
+     happens at the one point where the cell has been written and persisted
+     ([SpecProcinit.procs_inv_alloc]'s pass 3). *)
+  (* THE CHILDREN ROW IS NOT HERE, and that is deliberate: procinit is what
+     produces this shape ([SpecProcinit.proc_ready]) and procinit cannot
+     make a row -- the authority is <wait_lock>'s.  The row joins at the
+     same step the stack does ([proc_dormant_prestk_seal]), which is the
+     caller's, and the caller is main. *)
+  Definition proc_dormant_prestk (pa : mword 64) : iProp Σ :=
+    (proc_dormant_nofd pa ∗ fd_slots (NOFILE + FDSPARE) ∗
+     iref_slots (1 + IREFSPARE) ∗ bslots 3)%I.
+
+  Lemma proc_dormant_prestk_intro (pa : mword 64) :
+    proc_dormant_nofd pa -∗ fd_slots (NOFILE + FDSPARE) -∗
+    iref_slots (1 + IREFSPARE) -∗ bslots 3 -∗ proc_dormant_prestk pa.
+  Proof using . iIntros "H Hs Hir Hbs". iFrame "H Hs Hir Hbs". Qed.
+
+  Lemma proc_dormant_prestk_seal (pa : mword 64) (γ0 g : gname) :
+    proc_dormant_prestk pa -∗ kstack_free pa -∗ ch_frag γ0 pa ∅ -∗
+    slot_gen pa (DfracOwn 1) g -∗ act_cnt pa 0 -∗
+    proc_dormant pa UNUSED.
+  Proof using .
+    iIntros "(Hd & Hs & Hir & Hbs) Hkst Hch Hsg Hev".
+    iApply (proc_dormant_seal with "Hd Hs Hir Hbs Hkst Hch Hsg Hev").
+  Qed.
+
+  (* allocproc's move: it finds an UNUSED slot, so the two address-space
+     cells are zero and it must BUILD the table itself (kalloc a trapframe,
+     proc_pagetable) -- which is exactly what allocproc's C does.  The
+     null-ofile fact is what discharges every [ofile_slot]'s left disjunct
+     with no [file_ref] to conjure from nowhere. *)
+  (* The allowance comes out too, and separately: it is not part of the
+     private field block, it is what the RUNNING THREAD carries beside
+     [proc_priv] (FdSlots.v's [FDSPARE] note). *)
+  (* IT IS AN UPDATE, and that is where the fd-state ghost is BORN: the
+     process about to run in this slot gets a name nothing has ever seen,
+     and NOFILE closed descriptors under it ([FdSlots.fd_st_alloc]).  The
+     dormant block carried no such name -- a slot between processes has no
+     descriptors -- so [V]'s own [pv_fdg] is junk here and is replaced.
+     See FdSlots.v's header for why the name must not be per-SLOT: proc
+     slots are recycled, and a fragment minted for the process that used to
+     live here must say nothing about the one that is about to. *)
+  Lemma proc_dormant_unused (γf : gname) (pa : mword 64) :
+    proc_dormant pa UNUSED ==∗
+    own_ctx (p_context pa) ∗
+    p_pagetable pa ↦₈ (zero_reg : mword 64) ∗
+    p_trapframe pa ↦₈ (zero_reg : mword 64) ∗
+    fd_slots FDSPARE ∗
+    (* the CWD'S UNIT and the iref allowance come out together and stay
+       OUTSIDE the private block, for [FDSPARE]'s reason: every [proc_priv]
+       accessor is borrow-and-return and its wand swallows the block, so a
+       syscall holding its allowance inside could not then pass the block to
+       a callee.  The [1] is what kfork spends on [idup]. *)
+    iref_slots (1 + IREFSPARE) ∗
+    (* ...AND THE BIO ALLOWANCE, out with them and for the same reason.  This
+       is the hand-over: the slot owned three units while it was dormant,
+       and from here they are the RUNNING THREAD's, beside [proc_priv] --
+       which is where [UsertrapRes.ut_own_nopt] already carries them.  kexit
+       is what puts them back ([SchedCtx.park_pay ZOMBIE]). *)
+    bslots 3 ∗
+    (* THE SLOT'S KERNEL STACK, out with the block: it is what the caller
+       eventually parks in the fresh process's context record
+       ([SpecForkretParkPaid.forkret_park_pkg]), and the reason a slot owns
+       one at all. *)
+    kstack_free pa ∗
+    (* ...AND THE SLOT'S HALF OF [p->xstate], out with them: the process
+       that takes this slot carries it in its block until it exits
+       ([proc_priv_core]), and freeproc gives it back. *)
+    (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv) ∗
+    ∃ (V : pprivate) (pid : mword 32),
+      (* THE PID CELL IS STILL ZERO, and allocproc spends it at the pid
+         section's [ghost_map_insert]: the cell its [p->pid = pid] store
+         overwrites is registered to nothing, which is what keeps
+         <pid_lock>'s domain fact ([SlotGen.pid_reg_dom]) true across the
+         store. *)
+      ⌜pv_ofile V = replicate NOFILE (zero_reg : mword 64) /\
+       pv_cwd V = (zero_reg : mword 64) /\
+       uint (pv_sz V) <= uvm_maxsz /\ bv_unsigned pid = 0 /\
+       (* ...and the lazy bit, out with the block: allocproc installs an
+          EMPTY user map and this is what makes the block invariant's claim
+          vacuous there (lane LAZY-FLAG, K2) *)
+       pv_lazy V = true⌝ ∗
+      p_pid pa ↦₄{DfracOwn (1/2)} pid ∗
+      proc_fields pa (DfracOwn 1) V ∗ proc_ofiles γf (pv_fdg V) pa (pv_ofile V) ∗
+      (* THE SLOT'S CHILDREN ROW, out with the block and EMPTY -- the one
+         piece of the block that is NOT minted here.  The authority is
+         <wait_lock>'s, so nothing outside that lock can make a row: this
+         is the row boot put in the slot, at the name the block records
+         ([ProcDefs.pv_chg]), and freeproc puts it back. *)
+      ch_frag (pv_chg V) pa ∅ ∗
+      (* ...AND THE SLOT'S GENERATION, WHOLE.  Nobody else holds a piece --
+         an UNUSED slot's incarnation is over -- which is exactly what lets
+         allocproc re-key it to the incarnation it is about to mint
+         ([SlotGen.slot_gen_update], at no authority).  It is at the block's
+         own [pv_gen], which is junk here and is replaced by the same step.
+         freeproc puts a whole back. *)
+      slot_gen pa (DfracOwn 1) (pv_gen V) ∗
+      (* ...AND THE SLOT'S EVENT COUNTER, at the block's own [pv_ev]
+         (design ni-strong-instance.md §7): allocproc puts it into the
+         process's block at the same count ([proc_priv_nocwd_intro]). *)
+      act_cnt pa (pv_ev V) ∗
+      (* THE FRAGMENT BUNDLE, out with the block and BESIDE it -- inside the
+         existential because it is keyed on the [pv_fdg] this step just
+         chose.  It travels with [fd_slots FDSPARE] from here to
+         [UsertrapRes.ut_own] and is what every later fd operation spends. *)
+      (* AT [fdt0], NOT [fd_frags_any].  This step proves the value one line
+         below and used to existentially forget it here; a forked child's
+         descriptors were unstateable as a direct consequence. *)
+      fd_frags (pv_fdg V) fdt0.
+  Proof using .
+    iIntros "(%V & %pid & [%Hof [%Hcwd [%Hsz %Hlz]]] & Hpid & Hf & Ho & Hs & Hsp & Hir & Hbs & Hkst & Hch & Hev & Hgh & Hxs & Hctx & Haddr)".
+    rewrite bool_decide_eq_false_2; [| vm_compute; discriminate].
+    iDestruct "Haddr" as "[Hpg Htf]".
+    iDestruct "Hxs" as (xsv) "[Hxc _]".
+    (* the UNUSED arm of the block's generation pieces: the pure zero and
+       the whole ([SlotGen.gen_halves_dorm]) *)
+    rewrite /gen_halves_dorm bool_decide_eq_false_2; [| vm_compute; discriminate].
+    iDestruct "Hgh" as "[%Hpid0 Hsg]".
+    iMod (fd_st_alloc NOFILE) as (γd) "Hst".
+    iDestruct (fd_st_both_split γd NOFILE with "Hst") as "[Hauth Hfrag]".
+    iDestruct (fd_frags_of_closed γd with "Hfrag") as "Hfrag".
+    iModIntro. iFrame "Hctx Hpg Htf Hsp Hir Hbs Hkst".
+    iSplitL "Hxc"; [ iExists xsv; iExact "Hxc" |].
+    iExists (upd_fdg V γd), pid.
+    cbn [upd_fdg pv_sz pv_upt pv_tf pv_ofile pv_fdg pv_cwd pv_name pv_cwi pv_gen pv_chg pv_ev].
+    iSplit; [done|]. iFrame "Hpid Hf Hch Hsg Hev".
+    iSplitR "Hfrag"; [| rewrite /fdt0; iExact "Hfrag"].
+    iDestruct (fd_st_closed_to_any γd (replicate NOFILE (zero_reg : mword 64))
+                 with "[Hauth]") as "Hst"; [by rewrite length_replicate|].
+    rewrite /proc_ofiles /ofile_cells Hof length_replicate. iSplit; [done|].
+    iAssert ([∗ list] fd ↦ v ∈ replicate NOFILE (zero_reg : mword 64),
+               (p_ofile pa fd ↦₈ v ∗ fd_slot ∗ fd_st_auth γd fd FdClosed))%I
+      with "[Ho Hs Hst]" as "Ho".
+    (* the WAND form -- see [FileInv.ftable_res_boot] for the measurement;
+       this file is ON THE CRITICAL PATH, so the seconds are chain seconds. *)
+    { iApply (big_sepL_sep_2 with "Ho [Hs Hst]").
+      iApply (big_sepL_sep_2 with "Hs Hst"). }
+    iApply (big_sepL_impl with "Ho"). iIntros "!>" (fd v Hv) "(Hcell & Hslot & Hst)".
+    apply lookup_replicate in Hv as [-> _]. iFrame "Hcell". iLeft. by iFrame.
+  Qed.
+
+  (* ... and back, at ALL-NULL descriptors: the shape [proc_dormant] parks.
+     freeproc's precondition is the dormant block SPLIT (its two
+     address-space cells have to be independently optional), so a caller
+     that took the block apart with [proc_dormant_unused] and now wants to
+     hand freeproc the rest needs this direction.  allocproc's two failure
+     tails are the first consumers. *)
+  (* AND THIS IS WHERE THE fd-STATE AUTHORITY DIES.  Every descriptor is
+     closed, so every slot's authority is at [FdClosed]; they are simply
+     DROPPED.  Nothing gives them back and nothing may: the name belonged to
+     the incarnation that is ending, and the next process to take this slot
+     mints its own ([proc_dormant_unused]).  The FRAGMENT bundle dies the
+     same way, wherever its holder happens to be -- kexit drops it with the
+     rest of the trap round's residue, which is why this lemma does not
+     mention it. *)
+  Lemma proc_ofiles_null_split (γf γd : gname) (pa : mword 64) (fs : list (mword 64)) :
+    fs = replicate NOFILE (zero_reg : mword 64) ->
+    proc_ofiles γf γd pa fs -∗
+    ofile_cells pa fs ∗ ([∗ list] _ ∈ fs, fd_slot).
+  Proof using .
+    intros Hfs. rewrite /proc_ofiles /ofile_cells.
+    iIntros "[_ Ho]".
+    iAssert ([∗ list] fd ↦ v ∈ fs, (p_ofile pa fd ↦₈ v ∗ fd_slot))%I
+      with "[Ho]" as "Ho".
+    { iApply (big_sepL_impl with "Ho"). iIntros "!>" (fd v Hv) "Hs".
+      rewrite Hfs in Hv. apply lookup_replicate in Hv as [-> _].
+      iDestruct (ofile_slot_null γf γd pa fd with "Hs") as "($ & $ & _)". }
+    rewrite big_sepL_sep. iDestruct "Ho" as "[$ Hs]".
+    iApply (big_sepL_mono with "Hs"). iIntros (fd v _) "$".
+  Qed.
+
+  (* KEXIT'S MOVE, and the one producer of a ZOMBIE block: a process that has
+     closed every descriptor and dropped its cwd has reduced its private
+     block to the dormant shape.  Everything the ZOMBIE slot owns is already
+     inside [proc_priv] -- the scalar cells, the emptied descriptor array with
+     the units it took back from fileclose, the user page table and the
+     trapframe page wait()/freeproc will reclaim -- except the allowance,
+     which travels BESIDE [proc_priv] (FdSlots.v's [FDSPARE] note), and the
+     context, which is the swtch's.  So this is a repackaging, not a
+     construction, and nothing about the process has to be re-established.
+
+     IT TAKES THE DEFICIT BLOCK, and that is forced rather than convenient:
+     a ZOMBIE's [p->cwd] is 0, so it holds no [cwd_ref] and a [proc_priv] at
+     this [V] does not exist.  kexit arrives in exactly that state -- it has
+     already spent its reference on [iput] -- so the premise is the one it
+     can actually pay. *)
+  (* [Q'] IS THE DEPOSIT'S OWN PAYLOAD, not the block's.  What the exiting
+     process pays at the trap boundary is stated at the predicate IT can
+     name ([ChildTok.my_pay], which its slot was built against); the block's
+     quarter names the same one, but only up to the saved predicate's later,
+     and the escrow is what carries both so that nothing here has to strip
+     it ([ChildTok.exit_tok]). *)
+  Lemma proc_priv_to_dormant_zombie (γf : gname) (pa : mword 64)
+      (pid : mword 32) (U : ustate) (Q' : Z -> iProp Σ) (xsv : mword 32) :
+    pv_ofile (us_V U) = replicate NOFILE (zero_reg : mword 64) ->
+    pv_cwd (us_V U) = (zero_reg : mword 64) ->
+    proc_priv_nocwd γf pa pid U -∗
+    (* AND THE INCARNATION'S PAIR, which the deficit block does not carry
+       ([proc_priv_split_cwd] is what splits it off): the KERNEL'S QUARTER
+       is what the escrow below is built out of, and the [my_pay] beside it
+       is the block's own copy, which nothing here reads -- the deposit's
+       is what the payload is paid at. *)
+    (∃ Q0 : Z -> iProp Σ,
+       gen_kq (pv_gen (us_V U)) pa pid Q0 ∗ my_pay (pv_gen (us_V U)) Q0) -∗
+    fd_slots FDSPARE -∗
+    iref_slots (1 + IREFSPARE) -∗
+    (* AND THE BIO ALLOWANCE BACK.  THIS IS THE RECLAIM, and without it the
+       supply would drain: a dormant slot owns three units, allocproc hands
+       them to the process, and nothing but this reassembly ever returns
+       them.  Three per slot against [BSLOTS = 1024] leaves no slack for
+       leaking one set per exit -- after BSLOTS/3 exits no recycled slot
+       could be allocated again.  kexit still holds its three here (every
+       borrow below it is stated to give one back: [SpecBread] in,
+       [SpecBrelse] out), so the donation costs it nothing. *)
+    bslots 3 -∗
+    (* AND THE STACK BACK.  A zombie owns its kernel stack exactly as an
+       unused slot does -- that is what makes freeproc's ZOMBIE -> UNUSED
+       step a pass-through, and it is the whole reason the exit path has to
+       reassemble the page (SpecKexit.v's park). *)
+    kstack_free pa -∗
+    (* THE SLOT'S CHILDREN ROW, AT [∅].  A ZOMBIE block carries the row of
+       the slot it is parking, and this is the only route a row ever takes
+       into one: the process holds it off its trap residue
+       ([UsertrapRes.ut_own]) all the way down kexit -- which EMPTIES it
+       under the <wait_lock> it is holding at the store, moving its
+       children to <init>'s orphans ([WaitInv.orphans_own]), before it
+       parks.  So a zombie's row is empty, exactly as an unused slot's
+       is. *)
+    ch_frag (pv_chg (us_V U)) pa ∅ -∗
+    (* AND THE SLOT'S HALF OF [p->xstate], at the status the caller just
+       stored: the escrow below is keyed at what this half reads, which is
+       what ties the payload to the word wait() copies out. *)
+    p_xstate pa ↦₄{DfracOwn (1/2)} xsv -∗
+    (* AND THE EXIT DEPOSIT, which is what the ZOMBIE arm is for.  The
+       process's own knowledge of its payload and the payload PAID at that
+       same status: the trap route brought both down
+       ([UexecRet.uexec_pay_dep]), and together with the block's own
+       quarter they are the escrow the reaping parent redeems. *)
+    my_pay (pv_gen (us_V U)) Q' -∗
+    Q' (xstate_val xsv) -∗
+    (* AND THE INCARNATION'S TWO HALVES, which the deficit block does not
+       carry either: a ZOMBIE block holds exactly what its process's block
+       held ([ProcInv.proc_priv_core]), and this is the only route they
+       take into one.  The reaper reunites them with the deposit its own
+       parent cell's entry carries ([WaitInv.gen_halves]) and hands the
+       wholes to freeproc. *)
+    (* ...WITHOUT THE ONE-SHOT MARKER (lane SELF-KILL, P6): a dying process
+       spends [ChildTok.taken_at] into <p->lock>'s killed row, so what
+       crosses into the ZOMBIE block is the TOKEN-FREE core and
+       [SlotGen.gen_halves_dorm]'s ZOMBIE arm is stated at exactly that. *)
+    gen_halves_at pa pid (pv_gen (us_V U)) -∗
+    proc_dormant_noctx pa ZOMBIE.
+  Proof using .
+    iIntros (Hof Hcwd) "(%Hszb & %Hbel & Hpid & Hf & Hpt & Htfp & %Hlz & Hev & Ho) Hgq Hsp Hir Hbs Hkst Hrow Hxs #Hmy HQ Hgh".
+    iDestruct (proc_ofiles_null_split γf (pv_fdg (us_V U)) pa (pv_ofile (us_V U)) Hof with "Ho") as "[Ho Hs]".
+    iDestruct "Hgq" as (Q) "[Hkq _]".
+    iAssert (gen_halves_dorm pa pid (pv_gen (us_V U)) ZOMBIE) with "[Hgh]" as "Hghd".
+    { rewrite /gen_halves_dorm bool_decide_eq_true_2; [| reflexivity].
+      iExact "Hgh". }
+    (* THE PARK RAISES THE LAZY BIT (lane LAZY-FLAG, K2).  A dormant block
+       is at [ProcDefs.pv_lazy = true] -- the state where the block
+       invariant's claim is vacuous -- and raising it is free, because the
+       field is not a cell: nothing of [struct proc] changes, and the claim
+       at [true] promises nothing. *)
+    iExists (upd_lazy (us_V U) true), pid.
+    cbn [upd_lazy pv_sz pv_upt pv_tf pv_ofile pv_fdg pv_cwd pv_name pv_cwi
+         pv_gen pv_chg pv_lazy pv_secc pv_ev].
+    iSplit; [by iPureIntro|].
+    iFrame "Hpid Hf Ho Hs Hsp Hir Hbs Hkst Hrow Hev Hghd".
+    iSplitL "Hxs Hkq HQ".
+    { iExists xsv. iFrame "Hxs".
+      rewrite bool_decide_eq_true_2; [| reflexivity].
+      iApply (exit_tok_intro with "Hkq Hmy HQ"). }
+    rewrite bool_decide_eq_true_2; [| reflexivity].
+    iSplitR; [iPureIntro; exact Hbel|].
+    iSplitL "Hpt"; [iApply (proc_ptm_at_forget with "Hpt")|].
+    iExact "Htfp".
+  Qed.
+
+  (* =================================================================== *)
+  (* The saved-context save area AS BYTES.                                *)
+  (* =================================================================== *)
+  (* allocproc does [memset(&p->context, 0, sizeof(p->context))], and memset
+     is stated over a BYTE buffer while [SwtchCtx.ctx_cells] is fourteen
+     [↦₈] cells.  These three lemmas are that conversion.  It has to be an
+     ACCESSOR rather than two independent directions: the eight bytes of a
+     word no longer carry the word's 8-alignment, so the rebuild's side
+     condition must be captured before the split (the
+     [word_pointsto_split4] discipline, and [ByteBuf.bb_word_acc] is the
+     one-cell instance this is built from). *)
+
+  (* [ctx_cells] in the uniform [pa_add]-indexed form every byte lemma is
+     stated at. *)
+  Local Lemma ctx_cells_at_run (c : mword 64) (o : nat) (vs : list (mword 64)) :
+    ctx_cells_at c (8 * Z.of_nat o) vs ⊣⊢
+    [∗ list] i ↦ v ∈ vs, pa_add c (8 * (o + i))%nat ↦₈ v.
+  Proof using .
+    revert o. induction vs as [|v vs IH]; intro o.
+    - by rewrite big_sepL_nil.
+    - rewrite big_sepL_cons /=.
+      assert (Ha : pa_add c (8 * (o + 0))%nat = add_vec c (mword_of_int (8 * Z.of_nat o))).
+      { unfold pa_add, add_vec_int. apply bv_eq.
+        rewrite !add_vec64_unsigned !moi64_unsigned.
+        rewrite !bv_wrap_add_idemp_r. f_equal. lia. }
+      rewrite Ha.
+      replace (8 * Z.of_nat o + 8)%Z with (8 * Z.of_nat (S o))%Z by lia.
+      rewrite (IH (S o)).
+      apply bi.sep_proper; [reflexivity|].
+      apply big_sepL_proper. intros i x _.
+      by replace (S o + i)%nat with (o + S i)%nat by lia.
+  Qed.
+
+  Lemma ctx_cells_run (c : mword 64) (vs : list (mword 64)) :
+    ctx_cells c vs ⊣⊢ [∗ list] i ↦ v ∈ vs, pa_add c (8 * i)%nat ↦₈ v.
+  Proof using .
+    rewrite /ctx_cells.
+    replace 0%Z with (8 * Z.of_nat 0)%Z by lia.
+    rewrite (ctx_cells_at_run c 0 vs).
+    apply big_sepL_proper. intros i x _. by rewrite Nat.add_0_l.
+  Qed.
+
+  (* a run of word cells, borrowed as an anonymous byte window and rebuilt at
+     whatever the bytes now hold. *)
+  Lemma wcells_bytes_acc (a : mword 64) (ws : list (mword 64)) :
+    ([∗ list] i ↦ w ∈ ws, pa_add a (8 * i)%nat ↦₈ w) ⊢
+    ([∗ list] j ∈ seq 0 (8 * length ws), byte_any (pa_add a j)) ∗
+    (∀ g : nat -> bv 8,
+       ([∗ list] j ∈ seq 0 (8 * length ws), pa_add a j ↦ₘ g j) -∗
+       ∃ ws' : list (mword 64), ⌜length ws' = length ws⌝ ∗
+         [∗ list] i ↦ w ∈ ws', pa_add a (8 * i)%nat ↦₈ w).
+  Proof using .
+    clear GEN. (* unused; else Rocq counts it as used (asks for Proof using … GEN) *)
+    assert (Hshift : forall (b : mword 64) (l : list (mword 64)),
+      ([∗ list] i ↦ x ∈ l, pa_add b (8 * S i)%nat ↦₈ x)
+      ⊣⊢ ([∗ list] i ↦ x ∈ l, pa_add (pa_add b 8) (8 * i)%nat ↦₈ x)).
+    { intros b l. apply big_sepL_proper. intros i x _.
+      rewrite InstrBytes.pa_add_add. replace (8 * S i)%nat with (8 + 8 * i)%nat by lia.
+      reflexivity. }
+    revert a. induction ws as [|w ws IH]; intro a.
+    - iIntros "_". cbn [length]. rewrite Nat.mul_0_r !big_sepL_nil.
+      iSplit; [done|]. iIntros (g) "_". iExists []. by iSplit.
+    - cbn [length]. replace (8 * S (length ws))%nat with (8 + 8 * length ws)%nat by lia.
+      rewrite big_sepL_cons Nat.mul_0_r RiscvExtras.pa_add_0 (Hshift a ws).
+      iIntros "[Hh Ht]".
+      iDestruct (bb_word_acc a w with "Hh") as "[Hhb Hhback]".
+      iDestruct (IH (pa_add a 8) with "Ht") as "[Htb Htback]".
+      rewrite (bwin_split a 0 8 (8 * length ws)) Nat.add_0_l.
+      iSplitL "Hhb Htb".
+      { iSplitL "Hhb"; [iApply (bwin_named_any with "Hhb")|].
+        rewrite (bwin_rebase a 8 (8 * length ws)). iExact "Htb". }
+      iIntros (g) "Hg".
+      rewrite (bb_split a 8 (8 * length ws) g).
+      iDestruct "Hg" as "[Hg0 Hg1]".
+      iDestruct ("Hhback" $! g with "Hg0") as (w') "[_ Hw']".
+      iDestruct ("Htback" $! (fun j => g (8 + j)%nat) with "Hg1") as (ws') "[%Hlen Hws']".
+      iExists (w' :: ws'). iSplit; [iPureIntro; cbn; lia|].
+      rewrite big_sepL_cons Nat.mul_0_r RiscvExtras.pa_add_0.
+      rewrite (Hshift a ws'). iFrame "Hw' Hws'".
+  Qed.
+
+  (* the instance allocproc uses: the whole 112-byte save area. *)
+  Lemma own_ctx_bytes (c : mword 64) :
+    own_ctx c ⊢
+    ([∗ list] j ∈ seq 0 112, byte_any (pa_add c j)) ∗
+    (∀ g : nat -> bv 8,
+       ([∗ list] j ∈ seq 0 112, pa_add c j ↦ₘ g j) -∗
+       ∃ ws : list (mword 64), ⌜length ws = 14%nat⌝ ∗
+         [∗ list] i ↦ w ∈ ws, pa_add c (8 * i)%nat ↦₈ w).
+  Proof using .
+    iIntros "(%vs & %Hlen & Hvs)".
+    rewrite ctx_cells_run.
+    iDestruct (wcells_bytes_acc c vs with "Hvs") as "[Hb Hback]".
+    rewrite Hlen. iFrame "Hb".
+    iIntros (g) "Hg". iApply ("Hback" $! g with "Hg").
+  Qed.
+
+  (* the two context slots allocproc writes after the memset, in the address
+     form the two [sd rd,off(s1)] produce. *)
+  Lemma p_ctx_slot0 (pa : mword 64) : pa_add (p_context pa) 0 = p_context pa.
+  Proof using . apply RiscvExtras.pa_add_0. Qed.
+
+  Lemma p_ctx_slot1 (pa : mword 64) :
+    pa_add (p_context pa) 8 = add_vec pa (mword_of_int 104).
+  Proof using .
+    unfold pa_add, add_vec_int, p_context, context_off. apply bv_eq.
+    rewrite !add_vec64_unsigned !moi64_unsigned.
+    rewrite !bv_wrap_add_idemp_r !bv_wrap_add_idemp_l. f_equal. lia.
+  Qed.
+
+  (* =================================================================== *)
+  (* kstack: write-once at procinit, hence persistent.                    *)
+  (* =================================================================== *)
+End ProcInv.
+
+
+(* [proc_ptm_at]'s instance lives HERE, upstream of every consumer (it was
+   in EnvMorph.v, which is registered after FsReady and so is invisible to
+   this file's own day-one instances -- r25 pass 1). *)
+Section ProcPtMorph.
+  Context `{!riscvGS Σ}.
+
+  (* [proc_ptm_at] is [proc_pt_at]'s lazy twin: the same two [↦₈] cells,
+     then the page-table frame and the LAZY user memory -- which is
+     [umem_own] under three pure facts, so it closes on
+     [ProcPtOwn.umem_own_morph] and [PtTreeMorph.pt_frame_at_morph]. *)
+  (* the descriptor's two page-table cells ([p_pagetable], [p_trapframe]) *)
+  Global Instance proc_pt_cells_morph (pa : SailStdpp.Values.mword 64) (P : uptd) :
+    CtxMorph (λ ξ : CtxId, (proc_pt_cells (XI := ξ) pa P : iProp Σ)).
+  Proof using . rewrite /proc_pt_cells. ctx_morph_solve. Qed.
+
+  Global Instance proc_ptm_at_morph (pa : SailStdpp.Values.mword 64)
+      (P : uptd) (sz : Z) (M : gmap Z (bv 8)) :
+    CtxMorph (λ ξ : CtxId, (proc_ptm_at (XI := ξ) pa P sz M : iProp Σ)).
+  Proof using .
+    rewrite /proc_ptm_at /proc_ptm /UserPtTree.umem_lazy. ctx_morph_solve.
+  Qed.
+End ProcPtMorph.
+
+(* ==================================================================== *)
+(*  DAY-ONE INSTANCE SKELETONS (r25 shapes; rule 0, plan §9 items 16/17). *)
+(*  L8's second deposit moves the child's private block into its twin     *)
+(*  context; every context-indexed row of it is stated here with the      *)
+(*  context as an argument so a row that cannot cross is a type error.    *)
+(*  [cwd_ref] is [inode_held], whose instance the floors law gives         *)
+(*  (IcacheRef); [first_tok]'s is FirstTok's; the file rows' are           *)
+(*  FileInvDefs's.  Proofs are lane work, listed in the Admitted inventory. *)
+(* ==================================================================== *)
+Section ProcPrivMorph.
+  Context `{!riscvGS Σ}.
+  Context `{ !fileG Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ}.
+  Context `{GEN : GenId}.
+
+  (* NAME THE TWO LEAVES.  Reached through [ctx_morph_solve]'s [apply _]
+     fallback, [CtxMorph (λ ξ, proc_fields …)] costs 1.4s a site -- the name
+     is transparent, so the structural candidates match through it by delta
+     and the search re-derives all fifteen fields instead of taking the
+     instance in [ProcDefs].  An Ltac profile put 99.5% of this file's three
+     [ctx_morph_solve] sentences in that one leaf (and 0.15s more in
+     [proc_pt_cells]); named, the walk is free. *)
+  Local Ltac pi_ctx_morph :=
+    repeat (lazymatch goal with
+            | |- CtxMorph (λ _, proc_fields _ _ _) =>
+                apply ProcDefs.proc_fields_morph
+            | |- CtxMorph (λ _, proc_pt_cells _ _) =>
+                apply proc_pt_cells_morph
+            | |- _ => ctx_morph_step
+            end);
+    first [apply _ | apply first_tok_morph].
+
+  Global Instance ofile_slot_morph γf γd pa fd v :
+    CtxMorph (λ ξ : CtxId, ofile_slot (XI := ξ) γf γd pa fd v).
+  Proof using . rewrite /ofile_slot. pi_ctx_morph. Qed.
+  Global Instance proc_ofiles_morph γf γd pa fs :
+    CtxMorph (λ ξ : CtxId, proc_ofiles (XI := ξ) γf γd pa fs).
+  Proof using . rewrite /proc_ofiles. pi_ctx_morph. Qed.
+  Global Instance proc_priv_core_morph pa pid U :
+    CtxMorph (λ ξ : CtxId, proc_priv_core (XI := ξ) pa pid U).
+  Proof using . rewrite /proc_priv_core. pi_ctx_morph. Qed.
+  Global Instance proc_priv_morph γf pa pid U :
+    CtxMorph (λ ξ : CtxId, proc_priv (XI := ξ) γf pa pid U).
+  Proof using . rewrite /proc_priv. pi_ctx_morph. Qed.
+  (* the deficit block and the working-directory reference, for the party
+     that carries the block SPLIT: [ParkCap.park_child]'s boot mode, whose
+     third row is these two beside [FirstTok.first_boot]. *)
+  Global Instance proc_priv_nocwd_morph γf pa pid U :
+    CtxMorph (λ ξ : CtxId, proc_priv_nocwd (XI := ξ) γf pa pid U).
+  Proof using . rewrite /proc_priv_nocwd. pi_ctx_morph. Qed.
+  Global Instance cwd_ref_at_morph v z :
+    CtxMorph (λ ξ : CtxId, cwd_ref_at (XI := ξ) v z).
+  Proof using . rewrite /cwd_ref_at. apply _. Qed.
+  Global Instance proc_priv_nopt_morph γf pa pid V :
+    CtxMorph (λ ξ : CtxId, proc_priv_nopt (XI := ξ) γf pa pid V).
+  Proof using . rewrite /proc_priv_nopt. pi_ctx_morph. Qed.
+End ProcPrivMorph.
+
+(* ====================================================================== *)
+(* THE PRIVATE BLOCK'S TRANSPORT OBLIGATION (tso-port M3 / absorb).        *)
+(*                                                                         *)
+(* This is [ProofForkretPark.forkret_park_paid]'s SIXTH deposit row, and    *)
+(* the last one to close.  §0.15′ measured the chain down to its first      *)
+(* failure -- [proc_priv] -> [proc_priv_core] -> [FirstTok.first_tok] ->    *)
+(* [FsReady.fs_ready] -> [BioInv.bio_ctx] -> [buf_escrow], an [inv] over a  *)
+(* ξ-indexed body, which no transport can cross.  With the escrow a PARKED  *)
+(* RECORD that row is closed, and the rest of the walk is structural:       *)
+(* [ofile_slot]'s disjunction (whence [TsoCtx.ctx_morph_or], the instance   *)
+(* this tranche adds) and one [big_sepL] over the fd array, both applied AS *)
+(* TERMS.                                                                   *)
+(*                                                                         *)
+(* OUTSIDE the section, because each instance quantifies the context the    *)
+(* section fixes.                                                           *)
+(* ====================================================================== *)

@@ -1,0 +1,113 @@
+(* SpecUvmdealloc.v -- the public interface of Uvmdealloc, stated
+   independently of its proof.
+
+     uint64 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz) {
+       if (newsz >= oldsz) return oldsz;
+       if (PGROUNDUP(newsz) < PGROUNDUP(oldsz)) {
+         int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+         uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+       }
+       return newsz;
+     }
+
+   STATED AT THE MEMORY-INDEXED [proc_ptm] ALTITUDE, and at that one only,
+   over uvmunmap's contract: the user map loses the run of
+   [uvmd_np oldsz newsz] vpns starting at PGROUNDUP(newsz), their pages go
+   back to kalloc, and the process's view loses exactly those bytes
+   ([umem_del]).  The ∃-[M] corollary this file used to carry beside it is
+   gone -- every caller names the image it hands in.
+
+   ONE POSTCONDITION, TWO ARMS.  The two C branches differ only in what they
+   RETURN; both leave the table at [uptd_del_run P (svpn_of (pgroundup
+   newsz)) (uvmd_np oldsz newsz)], because [uvmd_np] is [Z.to_nat] of a
+   quotient that is 0 or negative exactly when the code skips the unmap
+   (newsz >= oldsz, or the two page-rounded sizes coincide).  So the
+   descriptor is named once and only the return value is a disjunction.  The
+   [proc_pt_data_irrel] lemma is what lets a caller collapse a zero-length
+   run back to its own [P].
+
+   [uvm_maxsz] is TRAPFRAME (ProcPtOwn.v): the [+ 4096 <=] premises are what
+   put every touched page strictly below it, which is uvmunmap's range
+   premise. *)
+From Stdlib Require Import Eqdep_dec ZArith Lia List.
+From stdpp Require Import gmap list list_monad bitvector.definitions bitvector.tactics.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import excl.
+From iris.base_logic.lib Require Import gen_heap invariants ghost_var ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.Base SailStdpp.Operators_mwords SailStdpp.Values.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import RiscvPtsto RiscvLang.
+Require Import RiscvExtras.
+Require Import InstrBytes KernelText.
+Require Import LockRank.
+Require Import RegFile WpNext.
+Require Import CalleeSaved.
+Require Import IntrDefs.
+Require Import CpuOwn.
+Require Import KvmSpec.
+Require Import UserPtTree.
+Require Import ProcPtOwn.
+From Kernel Require KernelSyms.
+Require Import SlotGen.   (* [act_lend]: the permit sweep, L2 *)
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Import Defs.
+Require Import CtxIdDefs.
+
+
+(* ===================================================================== *)
+(*  THE MEMORY-INDEXED CONTRACT.                                          *)
+(* ===================================================================== *)
+(* uvmunmap's, lifted through the one call: the run of vas that stops
+   being live leaves the view, and the size the process is left at is the
+   value uvmdealloc returns ([uvmd_rsz] -- the new size when it really
+   shrank, the old one otherwise).  On the two arms where the C code
+   unmaps nothing, [uvmd_np] is 0 and [umem_del M _ 0] is [M], so one
+   postcondition covers all three, exactly as at the [proc_pt] altitude. *)
+Definition wp_uvmdealloc_mem_sconf_body `{!riscvGS Σ, !xv6G Σ, !wchG Σ, !bioslotG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (mm : regfile)
+    (P : uptd) (M : gmap Z (bv 8)) (K : nat) (eb : bool) (p : mword 64)
+    (b : bool) (lks : gset string) (k : nat) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.uvmdealloc in
+  let oldsz := mm !!! Regidx (mword_of_int 11) in
+  let newsz := mm !!! Regidx (mword_of_int 12) in
+  let ret_tgt := ret_pc (mm !!! Regidx (mword_of_int 1)) in
+  (26 <= K)%nat ->
+  mm !!! Regidx (mword_of_int 10) = page_base P.(ud_root) ->
+  (uint oldsz <= uvm_maxsz)%Z ->
+  locks_below lks "kmem" ->
+  sie_cap_gpr KT1 mm K b p -∗
+  cpu_own 0%nat eb p b lks -∗
+  kernel_text -∗
+  pc_is pcE -∗
+  proc_ptm P (uint oldsz) M -∗
+  kalloc_env γa None -∗
+  (* THE LEND (permit sweep L2): the caller's event counter, for the
+     allocator the callee reaches *)
+  act_lend p k -∗
+  wp_next b p (fun (CID : CpuId) =>
+    ∀ (mr : regfile),
+    sie_cap_gpr KT1 mr K b p -∗
+    cpu_own 0%nat eb p b lks -∗
+    (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend p k') -∗
+    pc_is ret_tgt -∗
+    ⌜callee_saved mm mr⌝ -∗
+    ⌜ ((uint newsz >= uint oldsz)%Z /\
+        mr !!! Regidx (mword_of_int 10) = oldsz)
+      \/ ((uint newsz < uint oldsz)%Z /\
+          mr !!! Regidx (mword_of_int 10) = newsz) ⌝ -∗
+    proc_ptm (uptd_del_run P (svpn_of (pgroundup newsz)) (uvmd_np oldsz newsz))
+             (uint (uvmd_rsz oldsz newsz))
+             (umem_del M (uint (pgroundup newsz))
+                (4096 * uvmd_np oldsz newsz)) -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type UVMDEALLOC.
+  Parameter wp_uvmdealloc_mem_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !wchG Σ, !bioslotG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (mm : regfile)
+      (P : uptd) (M : gmap Z (bv 8)) (K : nat) (eb : bool) (p : mword 64)
+      (b : bool) (lks : gset string) (k : nat),
+      wp_uvmdealloc_mem_sconf_body γa mm P M K eb p b lks k.
+End UVMDEALLOC.

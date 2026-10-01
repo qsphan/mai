@@ -1,0 +1,205 @@
+(* SpecPiperead.v -- the public interface of piperead, stated independently
+   of its proof.  Requires only the definitional layer -- never a whole-function
+   proof file -- so every function proof can be checked in parallel.
+
+     int piperead(struct pipe *pi, uint64 addr, int n);
+
+   piperead copies up to [n] bytes out of the pipe to user address [addr],
+   sleeping on [&pi->nread] while the pipe is empty and the write end is
+   still open, and returns the number it copied -- or -1 if the process was
+   killed while it waited, or if the very first copyout failed.
+   @ KernelSyms.piperead = 0x80004596, ~80 instructions, a 96-byte frame;
+   ra/s0..s5 saved in the prologue, s6..s8 SHRINK-WRAPPED onto the paths
+   that need them.
+
+   THE MIRROR of SpecPipewrite.v -- read its header for the altitude story
+   (the pipe at the reference tier, the process at the [proc_priv] tier,
+   [pipe_rw_ret], and why noff is pinned at 0).  The one asymmetry worth
+   noting: piperead can return 0 where pipewrite would sleep again -- a
+   closed write end ends the wait -- and its -1-on-copyout-failure arm only
+   fires when NOTHING was copied yet (i == 0); a partial success returns
+   the partial count, exactly like pipewrite.  [pipe_rw_ret] covers both
+   readings, and the spec deliberately does not distinguish them: which one
+   happens is decided by concurrent writers.
+
+   Design & worklist: claude-notes/projects/pipe-rw.md. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import LockRank.
+Require Import ProcGeom CpuOwn.
+Require Import UserPtTree.
+Require Import KvmSpec.
+Require Import ProcPtOwn.
+Require Import FdSlots FileInvDefs ProcInv.
+Require Import PipeInvDefs.
+Require Import ChildTok.   (* [kill_shot]: the -1-by-kill exit's evidence *)
+Require Import SchedCtx.
+Require Export SwtchCtx.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import CtxIdDefs.
+Import Defs.
+Local Open Scope Z_scope.
+
+
+(* piperead's own frame is 12 slots; the deepest callee is copyout at 52
+   (14-slot frame / walkaddr 10 / walk 8 / vmfault 38 / memmove 2); sleep
+   wants 22, wakeup 18, killed 14, myproc/acquire/release 10.
+
+   12 + 52 = 64, YET THIS IS 62, AND THAT IS NOT A ROUNDING ERROR.  Unlike
+   either_copyout's, piperead's copyout call does not sit on the bare frame:
+   it is inside the trap reserve, so the budget the call site actually has is
+   [trap_res true + (av - 12)] = [78 + (av - 12)], and 62 clears 52 with room
+   to spare.  Raising this to 64 would over-charge every caller for slots the
+   call site never needs.  (Consequence for the proof: the [52 <= ...] premise
+   no longer falls to a bare [lia] -- [trap_res true] has to be reduced first,
+   `assert (trap_res true = 90%nat) as -> by reflexivity; lia`.)  *)
+Notation piperead_stack := (62%nat) (only parsing).
+Definition wp_piperead_sconf_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γf : gname) 
+    (γs : list gname) (j : nat) (γlp : gname)
+    (γl : gname) (γp : pipe_names) (w : bool) (q : Qp)
+    (m : regfile) (av : nat) (eb : bool)
+    (pid : mword 32) (U : ustate) (n : Z) (b : bool) (lks : gset string)
+    (* THE CALLER'S CURSOR AND OBSERVATION FAMILIES over the pipe's byte
+       queue (design/pipe.md, "The byte queue"; [PipeQueue.pipe_rchain]):
+       [Q acc] is what the caller knows having taken [acc] out of the pipe,
+       [Qe acc s] what it asks to be told if the loop stops there because
+       the ring ran dry, at the ghost state [s] of that instant -- an
+       end-of-file when nothing was delivered ([pst_eof s]). *)
+    (Q : list (bv 8) -> iProp Σ) (Qe : list (bv 8) -> pipe_st -> iProp Σ) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.piperead in
+  let pj := proc_addr j in
+  let pi := m !!! Regidx (mword_of_int 10 : mword 5) in
+  (* a1 = addr, the user destination the bytes are copied to *)
+  let addr := m !!! Regidx (mword_of_int 11 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* the process running here is proc j (sleep/killed's linkage) *)
+  (j < NPROC)%nat ->
+  γs !! j = Some γlp ->
+  length γs = NPROC ->
+  (* a2 is the int argument [n] *)
+  m !!! Regidx (mword_of_int 12 : mword 5) = (mword_of_int n : mword 64) ->
+  (- 2 ^ 31 <= n < 2 ^ 31)%Z ->
+  (piperead_stack <= av)%nat ->
+  (* PARKING PREMISE (hart-generic scheduler protocol): the saved base enable
+     is [true].  Everything below sleeps, and a parking thread must hand the
+     trap CSRs across the crossing -- at level 0 with an enabled base the
+     pushing acquire produces exactly that set.  See SpecSched.v. *)
+  eb = true ->
+  (* THE END IS THE READ END (lane PIPE-RO, design/app-pipe.md SS4.3w's
+     purchase 5 -- the MIRROR of [SpecPipewrite]'s [w = true], which lane
+     PQ-FLAG landed and whose reader-side twin it then measured as
+     unbuyable).  piperead dequeues through the caller's own
+     [PipeQueue.pipe_rlink] and stops on its [PipeQueue.pipe_rolink], both
+     of which fire only at [ps_ro s = true]; piperead itself never loads
+     [pi->readopen], so the fact is the CALLER'S to give and the only thing
+     that gives it is a share of the READ end -- with which
+     [PipeInvDefs.pipe_endstate_holder] reads [readopen <> 0] off the lock's
+     payload at every round.  Not a restriction on the code: fileread
+     reaches this call only on [f->readable <> 0], and a pipe file's two
+     ends are COMPLEMENTARY ([FileInvDefs.fdpipe_ends], the conjunct this
+     lane published on [fdstate_ok]'s pipe arm), so a readable pipe file's
+     [FileInvDefs.fc_wbool] is exactly this [false]
+     ([FileInvDefs.fdstate_ok_pipe_rd], [FileInvDefs.fc_wbool_zero]). *)
+  w = false ->
+  (* piperead acquires the pipe lock (7); killed/sleep_prepare/sleep/wakeup all
+     sit at "proc" (11), strictly higher, so this ONE premise covers the cone. *)
+  locks_below lks "pipe" ->
+  sie_cap_gpr KT1 m av b pj -∗
+  (* noff = 0: sleep demands the pipe lock be the ONLY lock held *)
+  cpu_own 0%nat eb pj b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  (* the pipe, and a share of one end -- the whole credential *)
+  is_pipe γl γp pi -∗
+  pipe_ref γp w q -∗
+  (* THE BYTE QUEUE'S PAYMENT: one link per byte the caller may take, each
+     told the byte it dequeues -- or the taint.  A link fires at the [sw]
+     of [nread++]; the observation fires where the copy loop breaks on an
+     empty ring. *)
+  pipe_rpay (pn_queue γp) Q Qe (Z.to_nat n) -∗
+  (* the process block (copyout's tier is reached via proc_priv_copy) *)
+  proc_priv_core pj pid U -∗
+  kalloc_env γa None -∗
+  (* the running-thread bundle (SpecSleep.v) *)
+  procs_inv γs -∗
+  wp_next b pj (fun (CID : CpuId) =>
+  (* THE IMAGE MOVES, AND THE MOVE IS A WINDOW.  piperead's only write to
+     user memory is its copy loop's one-byte-per-round copyout, walking
+     [addr] upwards, so the block comes back at the image it went in at WITH
+     THE RUN [addr .. addr+d) WRITTEN and nothing else touched.  A caller
+     reads its own untouched bytes back with
+     [UserPtTree.umem_wr_lookup_out].
+
+     WHAT STAYS EXISTENTIAL IS THE BYTES, NOT A LENGTH AND NOT AN IMAGE.
+     [d] is how far the loop got, and it IS pinned to the return value: the
+     copy is one byte per round, and a failing one-byte copyout moves
+     nothing (SpecCopyout's strict prefix), so the loop breaks having
+     written exactly what it returns.  [bs] is what came out of
+     the pipe, which no contract at this tier can name: the ring's contents
+     are the existential half of [PipeInvDefs]'s invariant and the loop sleeps
+     inside the read. *)
+  ∀ (mf : regfile) (P' : uptd) (d : nat) (bs : nat -> bv 8) (k' : nat),
+      ⌜callee_saved m mf⌝ -∗
+      ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+      ⌜(Z.of_nat d <= Z.max 0 n)%Z⌝ -∗
+      ⌜pipe_rw_ret n (mf !!! Regidx (mword_of_int 10 : mword 5))⌝ -∗
+      (* ...AND THE RUN IS AS LONG AS THE RETURN VALUE SAYS.  The copy loop
+         moves ONE byte per round and a failing one-byte copyout moves none
+         ([SpecCopyout.copyout_wrote]'s strict prefix), so the loop breaks
+         having written exactly the count it goes on to return -- or -1,
+         which the C only produces when the very first round failed and so
+         nothing was written at all. *)
+      ⌜ (mf !!! Regidx (mword_of_int 10 : mword 5)
+           = (mword_of_int (-1) : mword 64) /\ d = 0%nat)
+        \/ mf !!! Regidx (mword_of_int 10 : mword 5)
+           = (mword_of_int (Z.of_nat d) : mword 64) ⌝ -∗
+      (* THE EVENT COUNTER (permit sweep L1b): the copy loop lends the block's counter to copyout, which may step it,
+         so the block comes back at a count at least the one it left at *)
+      ⌜(pv_ev (us_V U) <= k')%nat⌝ -∗
+      sie_cap_gpr KT1 mf av b pj -∗
+      cpu_own 0%nat eb pj b lks -∗
+      pc_is ret_tgt -∗
+      pipe_ref γp w q -∗
+      (* THE QUEUE'S POST ([PipeQueue.pipe_rpost]): the chain at the
+         dequeued bytes, which the window [bs] holds (a byte is dequeued
+         only once its copy-out succeeded, so the dequeued bytes ARE the
+         delivered ones), and the stop's reason -- request met, ring
+         observed empty (an end-of-file if nothing came), copy-out fault at
+         the entry table, or the kill shot WITH THE KILLER'S TAINT -- or
+         the taint with the payment back.  The kill arm's taint is read off
+         <p->lock>'s killed row by a caller that still holds its own
+         incarnation's marker (lane KILL-TAINT, [PipeKillMark]); the marker
+         refutes the row's spent arm, so the flag was set by a third party,
+         who paid it. *)
+      pipe_rpost (pv_upt (us_V U)) (pn_queue γp) addr Q Qe (kill_shot (pv_gen (us_V U)) ∗ app_taint)%I
+        (Z.to_nat n) d bs (mf !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      proc_priv_core pj pid
+        (upd_usM (us_upt (upd_usV U (upd_ev (us_V U) k')) P') (umem_wr (us_M U) addr d bs)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type PIPEREAD.
+  Parameter wp_piperead_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γf : gname) (γs : list gname) (j : nat) (γlp : gname)
+      (γl : gname) (γp : pipe_names) (w : bool) (q : Qp)
+      (m : regfile) (av : nat) (eb : bool)
+      (pid : mword 32) (U : ustate) (n : Z) (b : bool) (lks : gset string)
+      (Q : list (bv 8) -> iProp Σ) (Qe : list (bv 8) -> pipe_st -> iProp Σ),
+      wp_piperead_sconf_body γa γf γs j γlp γl γp w q m av eb pid U n b lks Q Qe.
+End PIPEREAD.

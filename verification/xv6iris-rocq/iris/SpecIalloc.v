@@ -1,0 +1,560 @@
+(* SpecIalloc.v -- the public interface of ialloc, stated independently of
+   its proof.  Requires only the definitional layer -- never a whole-function
+   proof file -- so every function proof can be checked in parallel.
+
+     struct inode* ialloc(uint dev, short type) {
+       int inum;
+       struct buf *bp;
+       struct dinode *dip;
+
+       for(inum = 1; inum < sb.ninodes; inum++){
+         bp = bread(dev, IBLOCK(inum, sb));
+         dip = (struct dinode * )bp->data + inum % IPB;
+         if(dip->type == 0){          // a free inode
+           memset(dip, 0, sizeof of a dinode);
+           dip->type = type;
+           log_write(bp);             // mark it allocated on the disk
+           brelse(bp);
+           return iget(dev, inum);
+         }
+         brelse(bp);
+       }
+       printf("ialloc: no inodes\n");
+       return 0;
+     }
+
+   188 bytes, an EIGHT-slot frame.  Registers, off CodeIalloc.v:
+   [s5 = dev], [s6 = type], [s2 = inum], [s4 = &sb], [s1 = bp], [s3 = dip].
+
+
+   ---- THE CLAIM TAKES NO REGION RESOURCE AND PAYS NONE BACK (§16) -------
+
+   This is the whole point of fs-icache.md §16, and it is what makes [create]
+   statable.  ialloc's [log_write] at +0x9a retags the claimed inum's ghost
+   fragment -- but ialloc holds NEITHER the itable spinlock nor any entry's
+   sleeplock at that moment, so no caller could hand it the fragment and no
+   caller could take it back.  What actually serialises two concurrent
+   iallocs in xv6 is THE BUFFER (§16.2): [bread] returns the dinode block
+   under its sleeplock and the loser's [bread] returns it with the type
+   already set.
+
+   Since N5b the model says exactly that.  A free inum's fragment lives in
+   the REGION invariant ([InodeRegion.ireg_slot]'s first arm), the claim is
+   [InodeRegion.ireg_claim_au] -- an atomic update with NO resource premise
+   at all, plugged straight into [SpecLogWrite.wp_log_write_au]'s fupd
+   premise at [Efs := ⊤ ∖ ↑iregN] and [Φfsb := True] -- and the retagged
+   fragment STAYS in the region, at the [InodeRegion.fresh_shape] arm which
+   IS §16.4's claim box.  The first [ilock] of the new inode withdraws it
+   there ([InodeRegion.ireg_withdraw], ProofIlock's third fill case).
+
+   So [ireg_inv] rides as the PERSISTENT premise it is, and there is no
+   [dinode_at], no [imark] and no [ipool] anywhere in this contract.
+
+   ---- WHAT THE CALLER GETS: iget's POSTCONDITION, VERBATIM --------------
+
+   ialloc's last act is [return iget(dev, inum)] at +0xaa, so the success
+   arm's payout is [SpecIget]'s: a slot [kslot < NINODE], a fraction [q],
+   [a0 = ientry kslot], and ONE [IcacheRef.inode_ref kslot q icfg_dev inum].
+   The inum is existential -- the scan finds it -- and its region bound
+   [bv_unsigned inum < 16 * icfg_nib] travels with it, which is what lets a
+   caller rebuild [IcacheHeld.inode_held] outright.  Until rank 1c the device
+   and the inode count were THREADED and the caller had to bring
+   [dev = icfg_dev] / [nib = icfg_nib]; there is one file system and one
+   device, so both are read off the class now and the two ties are gone.
+
+   The claimed record is named too, as [ialloc_fresh ty] -- nonzero type,
+   zero size, thirteen zero address words, and NOTHING ELSE, because the
+   memset+[sh] pair writes nothing else.  In particular NLINK STAYS 0 until
+   the caller's own [iupdate]; that is [InodeRegion.fresh_shape]'s exact
+   content and it is all ilock's fill needs to build [InodeLock.inode_ok]
+   out of nothing.  The fact is stated for documentation and for [create]'s
+   benefit; it is not a resource, and it says nothing about the region's
+   state at RETURN time -- by then another hart may already have locked the
+   new inode.
+
+   ---- THE THREE GEOMETRY PREMISES --------------------------------------
+
+   [1 < ninodes] kills the [bgeu a5,a4] at +0x12, the EMPTY-REGION exit that
+   jumps to the printk WITHOUT having pushed s1..s6 -- balloc's [0 < size]
+   premise, at the same instruction offset, killing the same arm for the
+   same reason (a second epilogue shape, not a second behaviour).
+
+   [ninodes <= 16 * nib] is the SUPERBLOCK-TO-REGION tie, and it is the
+   premise that did not exist before this contract: the scan's bound comes
+   out of [sb.ninodes] while both [ireg_claim_au] and [iget] want
+   [bv_unsigned inum < 16 * nib].  It belongs to the boot layer (SpecFsinit
+   is where the superblock cells are born, N5a's ledger) and is threaded
+   here, not discharged.
+
+   [ninodes < 2 ^ 31] is what makes the [lw]-then-[bltu] comparison at
+   +0x5a..+0x62 numeric: the loaded word is sign-extended into a 64-bit
+   register and compared UNSIGNED against the likewise sign-extended
+   [addiw a5,s2,0].
+
+   ialloc SLEEPS (bread), so it threads the full running-process bundle
+   exactly as SpecIupdate.v / SpecBalloc.v do, and takes the parking
+   premise.  It enters and returns at noff 0.                             *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import KernelDataInv.
+Require Import SpecPrintk.
+Require Import FdSlots.
+Require Import ProcGeom.
+Require Export SwtchCtx.
+Require Import CpuOwn.
+Require Import SchedCtx.
+Require Import ProcDefs.  (* [proc_priv_bare] *)
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import FsBlocks LogInv.
+Require Import DinodeEnc.
+Require Import InodeInv.
+Require Import InodeRegion.
+Require Import AppCfg.       (* [appcfg]: the era's application record, bound beside [icfg] (app-instances.md round A) *)
+Require Import IrefSlots.
+Require Import IcacheRef.
+Require Import IcacheInv.
+Require Import IcacheEscrow.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Import Defs.
+Require Import TsoCtx.
+
+Local Open Scope Z_scope.
+
+(* ialloc's own frame is 64 bytes (8 slots) -- [c.addi16sp sp,-64] at +0x00,
+   with ra/s0/s1/s2/s3/s4/s5/s6 pushed at 56/48/40/32/24/16/8/0.  Its
+   deepest callees are bread and iget, both at 62 (each one frame over
+   panic_stack = 56); printk on the out-of-inodes path wants 52, brelse 26,
+   log_write 18, memset 2. *)
+Notation K_ialloc := (70%nat) (only parsing).
+(* THE RECORD THE CLAIM WRITES.  [memset(dip, 0, 64)] at +0x90 followed by
+   [sh s6,0(s3)] at +0x94 -- the type halfword and nothing else.  Stated as
+   a named constructor rather than inline so that [create]'s own contract,
+   and ilock's fill, can name the same term. *)
+Definition ialloc_fresh (ty : mword 16) : dinode :=
+  MkDinode ty (bv_0 16) (bv_0 16) (bv_0 16) (bv_0 32)
+           (replicate 13 (bv_0 32)).
+
+Lemma ialloc_fresh_type (ty : mword 16) : di_type (ialloc_fresh ty) = ty.
+Proof. reflexivity. Qed.
+
+Lemma ialloc_fresh_shape (ty : mword 16) :
+  bv_unsigned ty <> 0 -> fresh_shape (ialloc_fresh ty).
+Proof.
+  intros Hty. rewrite /fresh_shape /ialloc_fresh /=.
+  (* the fourth conjunct is [memset(dip,0,64)]'s own zero: [ialloc_fresh]
+     builds the record with [bv_0 16] at [nlink] (design §20.18 ruling 1) *)
+  split_and!; [exact Hty | reflexivity | reflexivity | reflexivity].
+Qed.
+
+Lemma ialloc_fresh_wf (ty : mword 16) : dinode_wf (ialloc_fresh ty).
+Proof. rewrite /dinode_wf /ialloc_fresh /=. reflexivity. Qed.
+
+Definition wp_ialloc_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ,
+      ICFG : icfg, APP : appcfg Σ, FSC : fscfg, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γs : list gname) (j : nat) (γl : gname)          (* the running process *)
+  (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+ (ty : mword 16)
+    (u : nat)
+    (pidv : mword 32) (dq dqs dqn : dfrac)
+    (m : regfile) (K : nat) (eb : bool)
+    (b : bool) (lks : gset string) (Upr : ustate)
+    (t : nat) (qt : Qp) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.ialloc in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (K_ialloc <= K)%nat ->
+  (* bread's / log_write's block-number arithmetic, and the log's own
+     storage *)
+  log_geom_ok fsc_cov fsc_logst ->
+  0 <= icfg_ist ->
+  (* EVERY inum the region covers lives in a covered HOME block: bread's
+     premise and log_write's, for the inum the scan happens to stop at.
+     The scan cannot know it in advance, so the premise is the quantified
+     one ([InodeInv.ireg_blocks_ok]). *)
+  ireg_blocks_ok icfg_ist icfg_nib fsc_cov fsc_logst ->
+  (* THE THREE GEOMETRY PREMISES -- see the header *)
+  1 < fsc_ninodes ->
+  fsc_ninodes <= 16 * Z.of_nat icfg_nib ->
+  fsc_ninodes < 2 ^ 31 ->
+  (* the type actually installs an ALLOCATED record; [fresh_shape] and
+     therefore the whole claim need it, and every caller passes a literal *)
+  bv_unsigned ty <> 0 ->
+  (* ...AND IT IS ONE OF THE FOUR (durable-disk 2b-inode-3).  The claim box
+     ialloc installs is a record whose type came out of nowhere, and the
+     inode region's (L5) -- [FsStateInode.inode_local]'s [inl_type], which
+     the fill has to pay at that box -- cannot be re-established from the
+     type-0 record it replaces.  So the enumeration travels with the [ty]
+     argument, from the three syscalls that write a literal.  It implies
+     the clause above; both are kept so that no existing discharge
+     moves. *)
+  InodeRegion.ireg_ty_ok (ialloc_fresh ty) ->
+  (* THE NO-INODES ARM'S CALLEE, as a hypothesis and not a functor *)
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  (* a0 = dev, a1 = type: the RV64 ABI's sign extension, and [sh s6,0(s3)]
+     at +0x94 stores exactly the low sixteen bits of a1 *)
+  m !!! Regidx (mword_of_int 10 : mword 5) = (sign_extend' 64 icfg_dev : mword 64) ->
+  m !!! Regidx (mword_of_int 11 : mword 5) = (sign_extend' 64 ty : mword 64) ->
+  (* PARKING PREMISE (hart-generic scheduler protocol) -- bread sleeps *)
+  eb = true ->
+  (* ialloc's cone: bread/brelse ("bcache", 4), log_write ("log", 3), iget
+     ("itable", 2, on the tail claim), printk ("pr", 14, the no-inodes
+     arm) -- "itable" is the lowest, so one premise there covers the
+     whole cone via [locks_below_mono]. *)
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m K b pj -∗
+  cpu_own 0 eb pj b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  (* the general printk path's two PERSISTENT credentials *)
+  kernel_data -∗
+  printk_env fsc_printk fsc_uart fsc_disk -∗
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  (* the two superblock fields, read and handed straight back *)
+  sb_ninodes ↦₄{dqn} (mword_of_int fsc_ninodes : mword 32) -∗
+  sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+  (* THE INODE REGION -- persistent, and the ONLY region resource in this
+     contract.  The claim is [InodeRegion.ireg_claim_au] and it takes
+     nothing; see the header. *)
+  ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  (* ...AND THE SEALED REGIME (iclaim-ledger.md §3.2, RULING B).  §2.4's
+     claim-pin clause makes [ireg_slot]'s [c = Some] arm exhibit
+     [IcacheRefDefs.ireg_open], so [InodeRegion.ireg_claim_au] -- the one mover
+     that mints a [c] -- takes it, and ialloc is the one function that runs
+     that mover.  It is PERSISTENT (a [ity_shot] at the boot one-shot), so
+     it is borrowed and never spent, and its production is the boot chain's:
+     fsinit returns [ireg_boot], [IcacheRefDefs.ity_shoot] seals it once in
+     forkret's first branch, and every syscall's ambient [sysc_fs_env]
+     carries the result down this channel.  §3.2's termination clause: the
+     chain ends at [LinkForkretNF.wp_forkret_nf_ax], an EXISTING accepted
+     IOU -- no new axiom, and a premise pulls nothing into
+     [Print Assumptions] at the gate targets. *)
+  ireg_open -∗
+  (* the caller's own pid cell (bread's acquiresleep records it) *)
+  proc_priv_bare pj pidv Upr -∗
+  (* the running-thread bundle and the disk fabric *)
+  procs_inv γs -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  (* TWO slot units: bread's reference is held across log_write, which wants
+     one of its own; brelse gives it back *)
+  bslots 2 -∗
+  (* ---- THE ICACHE, exactly as iget takes it ---- *)
+  is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst icfg_nib icfg_dev -∗
+  itable_inv -∗
+  ic_escrows fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst -∗
+  (* ONE ledger unit for the tail iget; RETURNED on the no-inodes arm *)
+  iref_slot -∗
+  (* THIS OPERATION'S RESERVATION: the one log_write the claim runs *)
+  log_op icfg_log (S u) -∗
+  (* THE CLAIMING TRANSACTION'S SHARE (durable-disk C-5, [FsCollect.v]'s
+     residue (E)).  ialloc's claim leaves a CLAIM BOX -- a [fresh_shape]
+     record on the region's IN arm -- standing until create's own [ilock]
+     fills it, and the commit's collection can read no bundle at such an
+     inum.  The window is inside ONE transaction, and this share is what
+     proves it: [InodeRegion.ireg_claim_au] parks it in the slot and
+     [ireg_withdraw] hands it back at the fill, at this very [(t, qt)] --
+     which is why the receipt names them.  Returned UNSPENT on the
+     no-inodes arm, where no box is created. *)
+  t ↪[ln_tx icfg_log]{#qt} tt -∗
+  (* THE CROSSING IS THE LITERAL [true], NOT [b].  This function can SLEEP
+     (its bread / ilock / bwrite does), and a park moves the hart with
+     interrupts off, so the crossing has nothing to do with SIE -- the
+     porting guide's "a PARKING function's [wp_next] index is [true]
+     UNCONDITIONALLY".  Spelled [b] the two coincide at the only instance
+     the [eb = true] premise admits, which is why this went unnoticed; once
+     [eb = false] is reachable the [b] form would promise the caller it
+     comes back on the hart it called from, which a park makes false. *)
+  wp_next true pj (fun (CID : CpuId) =>
+  ∀ (mf : regfile) (alloc : bool) (kslot : nat) (q : Qp) (inum : mword 32)
+    (dn' : dinode),
+      ⌜callee_saved m mf⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      pc_is ret_tgt -∗
+      sb_ninodes ↦₄{dqn} (mword_of_int fsc_ninodes : mword 32) -∗
+      sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+      proc_priv_bare pj pidv Upr -∗
+      bslots 2 -∗
+      (if alloc
+       then (* SUCCESS: iget's postcondition verbatim, at the claimed inum *)
+         ⌜mf !!! Regidx (mword_of_int 10 : mword 5) = ientry kslot
+          /\ (kslot < NINODE)%nat
+          /\ 0 < bv_unsigned inum < fsc_ninodes
+          /\ bv_unsigned inum < 16 * Z.of_nat icfg_nib
+          (* what the claim WROTE: [ialloc_fresh ty], the weakest record a
+             claim can promise and exactly what ilock's fill needs *)
+          /\ dn' = ialloc_fresh ty
+          /\ di_type dn' = ty
+          /\ fresh_shape dn'⌝ ∗
+         (* THE RECEIPT, AS ONE ROW (SIMP-2): [inode_claimed ty] IS the
+            reference, its minted provenance unit at the CLAIM flavour, and
+            the [c] column's exclusive fragment -- the three rows this post
+            used to spell separately, and the only three that never travel
+            apart.
+
+            Why the claim flavour.  ialloc's iget is the one call in the
+            tree that presents [IgetLic.ClaimL], so the reference it returns
+            is the claimant's own reference into its own claim box; the
+            flavour is what keeps (R3) -- "no plainly-licenced reference to
+            a claim box" -- true (RULING C', iclaim-ledger.md §5''''').
+
+            Why the [c] fragment is exposed at all: it is the ONLY licence a
+            fresh claim box has (ClaimL, §2.6's fourth row), and create's
+            [ilock(ip)] spends it at [InodeRegion.ireg_withdraw], whose
+            ClaimK arm CONVERTS the pair [iclaim ∗ runit_claim] into the
+            plain unit the child reference carries from the fill onward --
+            which is also what retires [c] so that [ireg_freeze_au] can
+            refute a standing claim at all.
+
+            create's fill presents the package to ilock in ONE destruct, by
+            [InodeRegion.inode_claimed_to_ClaimK]: what sits beside the
+            surviving reference IS [ireg_wd_lic (ClaimK ty)], the licence
+            [wp_ilock_sconf]'s ClaimK arm asks for. *)
+         inode_claimed ty kslot q icfg_dev inum t qt ∗
+         log_op icfg_log u
+       else (* NO INODES: a0 = 0, the ledger unit back, nothing spent -- and
+               no claim box, so the transaction's share comes straight back *)
+         ⌜mf !!! Regidx (mword_of_int 10 : mword 5)
+          = (mword_of_int 0 : mword 64)⌝ ∗
+         iref_slot ∗
+         t ↪[ln_tx icfg_log]{#qt} tt ∗
+         log_op icfg_log (S u)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* ---- THE CREDITED (SET-FORM) TWIN, fs-sysfile S5i, retrofit 5 of five ----
+
+   [CreateBudget]'s arm theorems consume [ia_spend = 1] against a
+   [LogInv.log_opS], and create threads ONE op-wide set across ialloc +
+   iupdate x3 + dirlink x4.  [wp_ialloc_sconf] below is the set-FORGETTING
+   instance of this, derived, so no existing caller moves.
+
+   THERE IS NO ABSORPTION CREDIT HERE, and that is a fact about ialloc and
+   not an omission: the block it logs is [IBLOCK inum inodestart] at the
+   inum THE SCAN CHOSE, so no caller can know it in advance and no caller
+   can have logged it.  fs-sysfile S5a's retrofit table says exactly this
+   ("the inum is the scan's, so no credit is possible and the spend is
+   unconditional"), which is why the growth is stated as the determinate
+   union rather than as a [Sb ⊆ Sb'] inequality -- create needs the
+   MEMBERSHIP afterwards, to credit its own [iupdate(ip)] and the iupdate
+   inside every [dirlink] on [ip].                                        *)
+Definition wp_ialloc_gen_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ,
+      ICFG : icfg, APP : appcfg Σ, FSC : fscfg, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γs : list gname) (j : nat) (γl : gname)          (* the running process *)
+  (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+ (ty : mword 16)
+    (u : nat) (Sb : gset Z)
+    (pidv : mword 32) (dq dqs dqn : dfrac)
+    (m : regfile) (K : nat) (eb : bool)
+    (b : bool) (lks : gset string) (Upr : ustate)
+    (t : nat) (qt : Qp) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.ialloc in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (K_ialloc <= K)%nat ->
+  (* bread's / log_write's block-number arithmetic, and the log's own
+     storage *)
+  log_geom_ok fsc_cov fsc_logst ->
+  0 <= icfg_ist ->
+  (* EVERY inum the region covers lives in a covered HOME block: bread's
+     premise and log_write's, for the inum the scan happens to stop at.
+     The scan cannot know it in advance, so the premise is the quantified
+     one ([InodeInv.ireg_blocks_ok]). *)
+  ireg_blocks_ok icfg_ist icfg_nib fsc_cov fsc_logst ->
+  (* THE THREE GEOMETRY PREMISES -- see the header *)
+  1 < fsc_ninodes ->
+  fsc_ninodes <= 16 * Z.of_nat icfg_nib ->
+  fsc_ninodes < 2 ^ 31 ->
+  (* the type actually installs an ALLOCATED record; [fresh_shape] and
+     therefore the whole claim need it, and every caller passes a literal *)
+  bv_unsigned ty <> 0 ->
+  (* ...AND IT IS ONE OF THE FOUR (durable-disk 2b-inode-3).  The claim box
+     ialloc installs is a record whose type came out of nowhere, and the
+     inode region's (L5) -- [FsStateInode.inode_local]'s [inl_type], which
+     the fill has to pay at that box -- cannot be re-established from the
+     type-0 record it replaces.  So the enumeration travels with the [ty]
+     argument, from the three syscalls that write a literal.  It implies
+     the clause above; both are kept so that no existing discharge
+     moves. *)
+  InodeRegion.ireg_ty_ok (ialloc_fresh ty) ->
+  (* THE NO-INODES ARM'S CALLEE, as a hypothesis and not a functor *)
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  (* a0 = dev, a1 = type: the RV64 ABI's sign extension, and [sh s6,0(s3)]
+     at +0x94 stores exactly the low sixteen bits of a1 *)
+  m !!! Regidx (mword_of_int 10 : mword 5) = (sign_extend' 64 icfg_dev : mword 64) ->
+  m !!! Regidx (mword_of_int 11 : mword 5) = (sign_extend' 64 ty : mword 64) ->
+  (* PARKING PREMISE (hart-generic scheduler protocol) -- bread sleeps *)
+  eb = true ->
+  (* ialloc's cone: bread/brelse ("bcache", 4), log_write ("log", 3), iget
+     ("itable", 2, on the tail claim), printk ("pr", 14, the no-inodes
+     arm) -- "itable" is the lowest, so one premise there covers the
+     whole cone via [locks_below_mono]. *)
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m K b pj -∗
+  cpu_own 0 eb pj b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  (* the general printk path's two PERSISTENT credentials *)
+  kernel_data -∗
+  printk_env fsc_printk fsc_uart fsc_disk -∗
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  (* the two superblock fields, read and handed straight back *)
+  sb_ninodes ↦₄{dqn} (mword_of_int fsc_ninodes : mword 32) -∗
+  sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+  (* THE INODE REGION -- persistent, and the ONLY region resource in this
+     contract.  The claim is [InodeRegion.ireg_claim_au] and it takes
+     nothing; see the header. *)
+  ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  (* ...AND THE SEALED REGIME (iclaim-ledger.md §3.2, RULING B).  §2.4's
+     claim-pin clause makes [ireg_slot]'s [c = Some] arm exhibit
+     [IcacheRefDefs.ireg_open], so [InodeRegion.ireg_claim_au] -- the one mover
+     that mints a [c] -- takes it, and ialloc is the one function that runs
+     that mover.  It is PERSISTENT (a [ity_shot] at the boot one-shot), so
+     it is borrowed and never spent, and its production is the boot chain's:
+     fsinit returns [ireg_boot], [IcacheRefDefs.ity_shoot] seals it once in
+     forkret's first branch, and every syscall's ambient [sysc_fs_env]
+     carries the result down this channel.  §3.2's termination clause: the
+     chain ends at [LinkForkretNF.wp_forkret_nf_ax], an EXISTING accepted
+     IOU -- no new axiom, and a premise pulls nothing into
+     [Print Assumptions] at the gate targets. *)
+  ireg_open -∗
+  (* the caller's own pid cell (bread's acquiresleep records it) *)
+  proc_priv_bare pj pidv Upr -∗
+  (* the running-thread bundle and the disk fabric *)
+  procs_inv γs -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  (* TWO slot units: bread's reference is held across log_write, which wants
+     one of its own; brelse gives it back *)
+  bslots 2 -∗
+  (* ---- THE ICACHE, exactly as iget takes it ---- *)
+  is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst icfg_nib icfg_dev -∗
+  itable_inv -∗
+  ic_escrows fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst -∗
+  (* ONE ledger unit for the tail iget; RETURNED on the no-inodes arm *)
+  iref_slot -∗
+  (* THIS OPERATION'S RESERVATION, IN SET FORM: the one log_write the claim
+     runs.  The claimed inum is the SCAN's, so no caller can ever credit the
+     block it logs -- the spend is UNCONDITIONAL, which is why this form
+     carries no boolean where [wp_iupdate_cred] carries [cru]
+     ([CreateBudget.ia_spend] is the literal 1). *)
+  log_opS icfg_log (S u) Sb -∗
+  (* THE CLAIMING TRANSACTION'S SHARE (durable-disk C-5, [FsCollect.v]'s
+     residue (E)).  ialloc's claim leaves a CLAIM BOX -- a [fresh_shape]
+     record on the region's IN arm -- standing until create's own [ilock]
+     fills it, and the commit's collection can read no bundle at such an
+     inum.  The window is inside ONE transaction, and this share is what
+     proves it: [InodeRegion.ireg_claim_au] parks it in the slot and
+     [ireg_withdraw] hands it back at the fill, at this very [(t, qt)] --
+     which is why the receipt names them.  Returned UNSPENT on the
+     no-inodes arm, where no box is created. *)
+  t ↪[ln_tx icfg_log]{#qt} tt -∗
+  (* THE CROSSING IS THE LITERAL [true], NOT [b].  This function can SLEEP
+     (its bread / ilock / bwrite does), and a park moves the hart with
+     interrupts off, so the crossing has nothing to do with SIE -- the
+     porting guide's "a PARKING function's [wp_next] index is [true]
+     UNCONDITIONALLY".  Spelled [b] the two coincide at the only instance
+     the [eb = true] premise admits, which is why this went unnoticed; once
+     [eb = false] is reachable the [b] form would promise the caller it
+     comes back on the hart it called from, which a park makes false. *)
+  wp_next true pj (fun (CID : CpuId) =>
+  ∀ (mf : regfile) (alloc : bool) (kslot : nat) (q : Qp) (inum : mword 32)
+    (dn' : dinode),
+      ⌜callee_saved m mf⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      pc_is ret_tgt -∗
+      sb_ninodes ↦₄{dqn} (mword_of_int fsc_ninodes : mword 32) -∗
+      sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+      proc_priv_bare pj pidv Upr -∗
+      bslots 2 -∗
+      (if alloc
+       then (* SUCCESS: iget's postcondition verbatim, at the claimed inum *)
+         ⌜mf !!! Regidx (mword_of_int 10 : mword 5) = ientry kslot
+          /\ (kslot < NINODE)%nat
+          /\ 0 < bv_unsigned inum < fsc_ninodes
+          /\ bv_unsigned inum < 16 * Z.of_nat icfg_nib
+          (* what the claim WROTE: [ialloc_fresh ty], the weakest record a
+             claim can promise and exactly what ilock's fill needs *)
+          /\ dn' = ialloc_fresh ty
+          /\ di_type dn' = ty
+          /\ fresh_shape dn'⌝ ∗
+         (* THE RECEIPT, AS ONE ROW -- see the sconf twin above (SIMP-2;
+            §2.4 / IIIb step 4). *)
+         inode_claimed ty kslot q icfg_dev inum t qt ∗
+         (* THE SET GROWTH IS DETERMINATE, exactly as [wp_iupdate_gen]'s is:
+            ialloc logs the claimed inum's HOME BLOCK and nothing else. *)
+         log_opS icfg_log u (Sb ∪ {[IBLOCK inum icfg_ist]})
+       else (* NO INODES: a0 = 0, the ledger unit back, nothing spent -- and
+               no claim box, so the transaction's share comes straight back *)
+         ⌜mf !!! Regidx (mword_of_int 10 : mword 5)
+          = (mword_of_int 0 : mword 64)⌝ ∗
+         iref_slot ∗
+         t ↪[ln_tx icfg_log]{#qt} tt ∗
+         log_opS icfg_log (S u) Sb) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type IALLOC.
+  (* the CREDITED core (fs-sysfile S5i); [wp_ialloc_sconf] is derived from
+     it inside [ProofIalloc], so this is a strengthening and no consumer of
+     the sconf form moves. *)
+  Parameter wp_ialloc_gen :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ,
+             ICFG : icfg, APP : appcfg Σ, FSC : fscfg, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γs : list gname) (j : nat) (γl : gname)
+      (pd pav pu : mword 64)
+ (ty : mword 16)
+      (u : nat) (Sb : gset Z)
+      (pidv : mword 32) (dq dqs dqn : dfrac)
+      (m : regfile) (K : nat) (eb : bool)
+      (b : bool) (lks : gset string) (Upr : ustate)
+      (t : nat) (qt : Qp),
+      wp_ialloc_gen_body γs j γl pd pav pu
+ ty u Sb
+                         pidv dq dqs dqn m K eb b lks Upr t qt.
+
+  Parameter wp_ialloc_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ,
+             ICFG : icfg, APP : appcfg Σ, FSC : fscfg, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γs : list gname) (j : nat) (γl : gname)
+      (pd pav pu : mword 64)
+ (ty : mword 16)
+      (u : nat)
+      (pidv : mword 32) (dq dqs dqn : dfrac)
+      (m : regfile) (K : nat) (eb : bool)
+      (b : bool) (lks : gset string) (Upr : ustate)
+      (t : nat) (qt : Qp),
+      wp_ialloc_sconf_body γs j γl pd pav pu
+ ty u
+                           pidv dq dqs dqn m K eb b lks Upr t qt.
+End IALLOC.

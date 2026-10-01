@@ -1,0 +1,353 @@
+(* SpecRelease.v -- the public interface of Release, stated independently of its
+   proof.  Requires only the definitional layer -- never a whole-function proof
+   file -- so every function proof can be checked in parallel.
+
+   The [locked γl cpu_id] token is the whole precondition on the lock side: it
+   says this hart holds the lock AND pins [lk->cpu] at this hart's [struct cpu]
+   (which is what makes release's own [holding(lk)] check return 1).  Both lock
+   words live in the invariant, so no cell is threaded.
+
+   THREE statements, ONE proof.  Release's last store to the lock word is the
+   moment -- the only moment -- at which the lock's storage can change hands:
+   the state ghost is back at [None] and the two words and [R] are all in hand
+   together, so whether the invariant closes again or is destroyed has to be
+   decided right there.  [wp_release_gen_sconf_body] takes that decision as a
+   parameter (a [lock_finisher], WpLock.v) and hands its output [Out] back to
+   the caller; [RELEASE] and [RELEASE_CANCEL] below are its two instances:
+
+     RELEASE         -- the static kernel lock: no credential, no disposal,
+                        nothing comes back out.  Verbatim what the thirteen
+                        ordinary consumers were written against.
+     RELEASE_CANCEL  -- the kalloc'd object's lock: release RECLAIMS the
+                        lock's own two words along with whatever the caller
+                        makes of [R], which is what lets pipeclose [kfree]
+                        the page. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import RegFile WpNext.
+Require Import InstrBytes.
+Require Import MinstretInv.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import CpuOwn.
+Require Import WpLock.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Import Defs.
+
+
+(* The generic form.  release opens the lock invariant at four instructions
+   and presents, at each, the very token it is already holding -- [locked] for
+   the first three and [locked_pre] for the word clear.  That is not a
+   convenience: by the time release runs, the object's last REFERENCE has
+   necessarily gone home, and the lock is all its closer has left.  So what
+   the caller owes is a refutation of the dead state [Dc] from each token.
+
+   The finisher's mask is the step engine's [⊤ ∖ ↑minstretN]: the choice is
+   made INSIDE the atomic store, so no other hart can see the window in which
+   the lock is free but its storage already spoken for. *)
+Definition wp_release_gen_sconf_body `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (R : CtxId → iProp Σ) (Dc Out : iProp Σ) (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.release in
+  let lk0 := m !!! Regidx (mword_of_int 10 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* the arm on the way OUT: at n = 0 the level fully unwinds, so pop_off's
+     re-enable flip fires and the live SIE mode becomes exactly the saved
+     base [eb]; at any deeper n it stays disabled -- see
+     [CpuOwn.cpu_own]/[IntrDefs.intr_count]/[intr_count_dec], which pins the
+     ghost eighth at '0' unconditionally for every [S _] level. *)
+  let outb := match n with O => eb | S _ => false end in
+  add_vec lk0 (sign_extend' 64 (mword_of_int 0 : mword 12)) = lka ->
+  (10 <= av)%nat ->
+  (⊢ locked γl cpu_id -∗ Dc -∗ False) ->
+  (⊢ locked_pre γl cpu_id -∗ Dc -∗ False) ->
+  (* holding the lock forces the level to be at least 1, hence interrupts
+     disabled on entry -- this is not a choice, it is what [cpu_own (S n)]
+     already means *)
+  (* [trap_res outb + av], NOT [av] -- and [av] here is the EXIT usable count.
+     release ends in pop_off, which at [n = 0] with an enabled base RE-ENABLES
+     interrupts, and re-enabling must PUT THE TRAP RESERVE BACK.  The carve is
+     conserved across the flip (entry [trap_res false + (trap_res outb + av)] =
+     [trap_res outb + av], exit [trap_res outb + av]), so this is a pure
+     re-indexing of the same stack ownership; the reserve is paid out of the
+     caller's usable slots -- precisely the ones acquire's push_off freed for
+     it.  Naming the ENTRY index as the sum is what makes the acquire/release
+     pair compose SYNTACTICALLY and kills the [kv_frame_slots <= av] side
+     condition: acquire handed the caller [trap_res b + av], [cpu_own] forces
+     [b = outb] ([CpuOwn.cpu_own_eb_agree]), so the caller's index is ALREADY of
+     this shape.  At [outb = false] (a nested critical section) the index is
+     [trap_res false + av], DEFINITIONALLY [av], so those callers are untouched.
+     [10 <= av] does not move: release's own 10-slot frame comes out of the
+     entry count [trap_res outb + av >= av]. *)
+  sie_cap_gpr kt m (trap_res outb + av)%nat false p -∗
+  kernel_text -∗ pc_is pcE -∗
+  lock_openable γl lka s R Dc -∗
+  locked γl cpu_id -∗
+  (* the deposit, AT THE CALLER'S OWN CONTEXT (tso-port M3) *)
+  R cur_ctx -∗
+  lock_finisher γl lka s R Dc Out (⊤ ∖ ↑minstretN) -∗
+  cpu_own (S n) eb p false lks -∗
+  arm_pay kt n eb p -∗
+  wp_next outb p (fun (CID : CpuId) =>
+    ∀ mr,
+    Out -∗
+    sie_cap_gpr kt mr av outb p -∗
+    pc_is ret_tgt -∗
+    ⌜ callee_saved m mr ⌝ -∗
+    cpu_own n eb p outb (lks ∖ {[s]}) -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* THE GENERIC FORM WITH THE PAYLOAD CLOSED OVER: the same contract with a
+   finisher whose prelude needs only the running token and the lock's parked
+   context ([WpLock.lock_finisher_pay]).  The proof is this one; the tier
+   above is its corollary (ProofRelease.v). *)
+Definition wp_release_gen_pay_sconf_body `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (R : CtxId → iProp Σ) (Dc Out : iProp Σ) (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.release in
+  let lk0 := m !!! Regidx (mword_of_int 10 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* the arm on the way OUT: at n = 0 the level fully unwinds, so pop_off's
+     re-enable flip fires and the live SIE mode becomes exactly the saved
+     base [eb]; at any deeper n it stays disabled -- see
+     [CpuOwn.cpu_own]/[IntrDefs.intr_count]/[intr_count_dec], which pins the
+     ghost eighth at '0' unconditionally for every [S _] level. *)
+  let outb := match n with O => eb | S _ => false end in
+  add_vec lk0 (sign_extend' 64 (mword_of_int 0 : mword 12)) = lka ->
+  (10 <= av)%nat ->
+  (⊢ locked γl cpu_id -∗ Dc -∗ False) ->
+  (⊢ locked_pre γl cpu_id -∗ Dc -∗ False) ->
+  (* holding the lock forces the level to be at least 1, hence interrupts
+     disabled on entry -- this is not a choice, it is what [cpu_own (S n)]
+     already means *)
+  (* [trap_res outb + av], NOT [av] -- and [av] here is the EXIT usable count.
+     release ends in pop_off, which at [n = 0] with an enabled base RE-ENABLES
+     interrupts, and re-enabling must PUT THE TRAP RESERVE BACK.  The carve is
+     conserved across the flip (entry [trap_res false + (trap_res outb + av)] =
+     [trap_res outb + av], exit [trap_res outb + av]), so this is a pure
+     re-indexing of the same stack ownership; the reserve is paid out of the
+     caller's usable slots -- precisely the ones acquire's push_off freed for
+     it.  Naming the ENTRY index as the sum is what makes the acquire/release
+     pair compose SYNTACTICALLY and kills the [kv_frame_slots <= av] side
+     condition: acquire handed the caller [trap_res b + av], [cpu_own] forces
+     [b = outb] ([CpuOwn.cpu_own_eb_agree]), so the caller's index is ALREADY of
+     this shape.  At [outb = false] (a nested critical section) the index is
+     [trap_res false + av], DEFINITIONALLY [av], so those callers are untouched.
+     [10 <= av] does not move: release's own 10-slot frame comes out of the
+     entry count [trap_res outb + av >= av]. *)
+  sie_cap_gpr kt m (trap_res outb + av)%nat false p -∗
+  kernel_text -∗ pc_is pcE -∗
+  lock_openable γl lka s R Dc -∗
+  locked γl cpu_id -∗
+  (* the finisher has closed over its payload; [wp_release_gen_sconf_body]
+     above is the special case with the payload at the caller's own context *)
+  lock_finisher_pay γl lka s R Dc Out (⊤ ∖ ↑minstretN) -∗
+  cpu_own (S n) eb p false lks -∗
+  arm_pay kt n eb p -∗
+  wp_next outb p (fun (CID : CpuId) =>
+    ∀ mr,
+    Out -∗
+    sie_cap_gpr kt mr av outb p -∗
+    pc_is ret_tgt -∗
+    ⌜ callee_saved m mr ⌝ -∗
+    cpu_own n eb p outb (lks ∖ {[s]}) -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Definition wp_release_sconf_body `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (R : CtxId → iProp Σ) (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.release in
+  let lk0 := m !!! Regidx (mword_of_int 10 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* see [wp_release_gen_sconf_body] for why this is the exit arm *)
+  let outb := match n with O => eb | S _ => false end in
+  add_vec lk0 (sign_extend' 64 (mword_of_int 0 : mword 12)) = lka ->
+  (10 <= av)%nat ->
+  (* [trap_res outb + av], NOT [av] -- and [av] here is the EXIT usable count.
+     release ends in pop_off, which at [n = 0] with an enabled base RE-ENABLES
+     interrupts, and re-enabling must PUT THE TRAP RESERVE BACK.  The carve is
+     conserved across the flip (entry [trap_res false + (trap_res outb + av)] =
+     [trap_res outb + av], exit [trap_res outb + av]), so this is a pure
+     re-indexing of the same stack ownership; the reserve is paid out of the
+     caller's usable slots -- precisely the ones acquire's push_off freed for
+     it.  Naming the ENTRY index as the sum is what makes the acquire/release
+     pair compose SYNTACTICALLY and kills the [kv_frame_slots <= av] side
+     condition: acquire handed the caller [trap_res b + av], [cpu_own] forces
+     [b = outb] ([CpuOwn.cpu_own_eb_agree]), so the caller's index is ALREADY of
+     this shape.  At [outb = false] (a nested critical section) the index is
+     [trap_res false + av], DEFINITIONALLY [av], so those callers are untouched.
+     [10 <= av] does not move: release's own 10-slot frame comes out of the
+     entry count [trap_res outb + av >= av]. *)
+  sie_cap_gpr kt m (trap_res outb + av)%nat false p -∗
+  kernel_text -∗ pc_is pcE -∗
+  is_lock γl lka s R -∗
+  locked γl cpu_id -∗
+  (* the deposit, AT THE CALLER'S OWN CONTEXT (tso-port M3) *)
+  R cur_ctx -∗
+  cpu_own (S n) eb p false lks -∗
+  arm_pay kt n eb p -∗
+  wp_next outb p (fun (CID : CpuId) =>
+    ∀ mr,
+    sie_cap_gpr kt mr av outb p -∗
+    pc_is ret_tgt -∗
+    ⌜ callee_saved m mr ⌝ -∗
+    cpu_own n eb p outb (lks ∖ {[s]}) -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* THE HOOKED INSTANCE: the caller hands its payload in an UNFINISHED shape
+   [Rin] and a hook that finishes it at the lock's stamped context
+   ([WpLock.lock_ctx_hook]).  [wp_release_sconf_body] is the identity hook.
+   The other instance is the floor fold ([WpLock.lock_hook_llb]): a payload
+   row [ctx_floor ξ tl] above the releaser's view can only be minted on the
+   hartless record, so the caller presents the receipt [llb tl] and the
+   fold, and the hook raises the stamp and completes the row. *)
+Definition wp_release_hook_sconf_body `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (Rin R : CtxId → iProp Σ) (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.release in
+  let lk0 := m !!! Regidx (mword_of_int 10 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* see [wp_release_gen_sconf_body] for why this is the exit arm *)
+  let outb := match n with O => eb | S _ => false end in
+  add_vec lk0 (sign_extend' 64 (mword_of_int 0 : mword 12)) = lka ->
+  (10 <= av)%nat ->
+  (* [trap_res outb + av], NOT [av] -- and [av] here is the EXIT usable count.
+     release ends in pop_off, which at [n = 0] with an enabled base RE-ENABLES
+     interrupts, and re-enabling must PUT THE TRAP RESERVE BACK.  The carve is
+     conserved across the flip (entry [trap_res false + (trap_res outb + av)] =
+     [trap_res outb + av], exit [trap_res outb + av]), so this is a pure
+     re-indexing of the same stack ownership; the reserve is paid out of the
+     caller's usable slots -- precisely the ones acquire's push_off freed for
+     it.  Naming the ENTRY index as the sum is what makes the acquire/release
+     pair compose SYNTACTICALLY and kills the [kv_frame_slots <= av] side
+     condition: acquire handed the caller [trap_res b + av], [cpu_own] forces
+     [b = outb] ([CpuOwn.cpu_own_eb_agree]), so the caller's index is ALREADY of
+     this shape.  At [outb = false] (a nested critical section) the index is
+     [trap_res false + av], DEFINITIONALLY [av], so those callers are untouched.
+     [10 <= av] does not move: release's own 10-slot frame comes out of the
+     entry count [trap_res outb + av >= av]. *)
+  sie_cap_gpr kt m (trap_res outb + av)%nat false p -∗
+  kernel_text -∗ pc_is pcE -∗
+  is_lock γl lka s R -∗
+  locked γl cpu_id -∗
+  (* the payload at the caller's own context, unfinished, and the hook that
+     finishes it at the lock's stamped context *)
+  Rin cur_ctx -∗
+  lock_ctx_hook R Rin -∗
+  cpu_own (S n) eb p false lks -∗
+  arm_pay kt n eb p -∗
+  wp_next outb p (fun (CID : CpuId) =>
+    ∀ mr,
+    sie_cap_gpr kt mr av outb p -∗
+    pc_is ret_tgt -∗
+    ⌜ callee_saved m mr ⌝ -∗
+    cpu_own n eb p outb (lks ∖ {[s]}) -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* The cancelling instance: release DESTROYS the lock at its word clear and
+   walks off with the storage.  The caller brings the dead state [D] it wants
+   the invariant to degenerate into, refutations of it from the two holder
+   tokens, and a wand that BUILDS [D] out of the lock's own spent state
+   fragment plus whatever it finds in [R].
+
+   That indirection is not decoration: for a multiply-owned object the last
+   closer has necessarily already surrendered part of the certificate INTO
+   [R] (the other end closed before it did), and [R] must be handed in intact
+   because release's word clear reassembles the invariant on the branch it
+   does not take.  So the certificate can only be completed inside the
+   finisher, with [R] in hand.  See PipeInv.pipe_res_dead. *)
+Definition wp_release_cancel_sconf_body `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (R : CtxId → iProp Σ) (D Out : iProp Σ) (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.release in
+  let lk0 := m !!! Regidx (mword_of_int 10 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* see [wp_release_gen_sconf_body] for why this is the exit arm *)
+  let outb := match n with O => eb | S _ => false end in
+  add_vec lk0 (sign_extend' 64 (mword_of_int 0 : mword 12)) = lka ->
+  (10 <= av)%nat ->
+  (⊢ locked γl cpu_id -∗ D -∗ False) ->
+  (⊢ locked_pre γl cpu_id -∗ D -∗ False) ->
+  (* [trap_res outb + av], NOT [av] -- and [av] here is the EXIT usable count.
+     release ends in pop_off, which at [n = 0] with an enabled base RE-ENABLES
+     interrupts, and re-enabling must PUT THE TRAP RESERVE BACK.  The carve is
+     conserved across the flip (entry [trap_res false + (trap_res outb + av)] =
+     [trap_res outb + av], exit [trap_res outb + av]), so this is a pure
+     re-indexing of the same stack ownership; the reserve is paid out of the
+     caller's usable slots -- precisely the ones acquire's push_off freed for
+     it.  Naming the ENTRY index as the sum is what makes the acquire/release
+     pair compose SYNTACTICALLY and kills the [kv_frame_slots <= av] side
+     condition: acquire handed the caller [trap_res b + av], [cpu_own] forces
+     [b = outb] ([CpuOwn.cpu_own_eb_agree]), so the caller's index is ALREADY of
+     this shape.  At [outb = false] (a nested critical section) the index is
+     [trap_res false + av], DEFINITIONALLY [av], so those callers are untouched.
+     [10 <= av] does not move: release's own 10-slot frame comes out of the
+     entry count [trap_res outb + av >= av]. *)
+  sie_cap_gpr kt m (trap_res outb + av)%nat false p -∗
+  kernel_text -∗ pc_is pcE -∗
+  lock_openable γl lka s R D -∗
+  locked γl cpu_id -∗
+  (* the deposit, AT THE CALLER'S OWN CONTEXT (tso-port M3) *)
+  R cur_ctx -∗
+  (* the licence to destroy, cashed inside the store; the destroyer takes
+     the payload back at its own context too *)
+  (lock_frag γl None -∗ R cur_ctx ==∗ D ∗ Out) -∗
+  cpu_own (S n) eb p false lks -∗
+  arm_pay kt n eb p -∗
+  wp_next outb p (fun (CID : CpuId) =>
+    ∀ mr,
+    WpLock.lock_word_fresh lka -∗
+    WpLock.lk_cpu_ready lka -∗
+    Out -∗
+    sie_cap_gpr kt mr av outb p -∗
+    pc_is ret_tgt -∗
+    ⌜ callee_saved m mr ⌝ -∗
+    cpu_own n eb p outb (lks ∖ {[s]}) -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type RELEASE_GEN.
+  (* the PAY tier takes no transport class: the payload never moves in the
+     release proof itself -- every move is inside the finisher's prelude,
+     which carries whatever class it needs. *)
+  Parameter wp_release_gen_pay_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (R : CtxId → iProp Σ) (Dc Out : iProp Σ) (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string),
+      wp_release_gen_pay_sconf_body kt γl lka s R Dc Out m n eb p av lks.
+  Parameter wp_release_gen_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (R : CtxId → iProp Σ) `{!CtxMorph R} (Dc Out : iProp Σ) (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string),
+      wp_release_gen_sconf_body kt γl lka s R Dc Out m n eb p av lks.
+End RELEASE_GEN.
+
+(* THE LOCK-ADDRESS PREMISE, PROVED AT VARIABLES.  Every caller of the two
+   hooks below discharges [add_vec lk0 (sign_extend' 64 0) = lka] out of an
+   equation [lk0 = lka] it already has, and spelling that inline as
+   [ltac:(rewrite H; reflexivity)] in the [iApply]'s argument column costs
+   2.3s of a 2.4s sentence: the [rewrite] is 1.1s (the a0 cell sits under a
+   [set] register-map tower, so keyed matching walks it) and the
+   [reflexivity] another 1.1s of bitvector conversion -- measured at
+   [ProofIdup]'s site.  Here there is no tower and nothing to convert, so
+   each of the six sites becomes one application.  (optimization.md: a side
+   condition that is the same at every call site belongs in a lemma proved
+   where the context is empty.) *)
+Lemma release_lka_of_eq (a b : SailStdpp.Values.mword 64) :
+  a = b ->
+  add_vec a (sign_extend' 64 (mword_of_int 0 : mword 12)) = b.
+Proof. intros ->. apply bv_add_0_r. vm_compute. reflexivity. Qed.
+
+Module Type RELEASE.
+  Parameter wp_release_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (R : CtxId → iProp Σ) `{!CtxMorph R} (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string),
+      wp_release_sconf_body kt γl lka s R m n eb p av lks.
+  Parameter wp_release_hook_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (Rin R : CtxId → iProp Σ) `{!CtxMorph Rin} (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string),
+      wp_release_hook_sconf_body kt γl lka s Rin R m n eb p av lks.
+End RELEASE.
+
+Module Type RELEASE_CANCEL.
+  Parameter wp_release_cancel_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt : ktier) (γl : gname) (lka : mword 64) (s : string) (R : CtxId → iProp Σ) `{!CtxMorph R} (D Out : iProp Σ) (m : regfile) (n : nat) (eb : bool) (p : mword 64) (av : nat) (lks : gset string),
+      wp_release_cancel_sconf_body kt γl lka s R D Out m n eb p av lks.
+End RELEASE_CANCEL.

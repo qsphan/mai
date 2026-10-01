@@ -1,0 +1,2695 @@
+(* ProofMain.v -- the whole-function WP for xv6's main(), BOOT-HART arm.
+
+     volatile static int started = 0;
+     void main() {
+       if (cpuid() == 0) {
+         consoleinit(); printkinit();
+         printk("\n"); printk("xv6 kernel is booting\n"); printk("\n");
+         kinit(); kvminit(); kvminithart(); procinit();
+         trapinit(); trapinithart(); plicinit(); plicinithart();
+         binit(); iinit(); fileinit(); virtio_disk_init(); userinit();
+         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+         started = 1;
+       } else { ... }
+       scheduler();
+     }
+
+   A sealed functor over the eighteen callee interfaces plus KERNELVEC (whose
+   handler contract is what turns trapinithart's [stvec ↦ᵣ kernelvec] into the
+   [intr_res] scheduler wants).  main NEVER RETURNS, so there is no
+   epilogue, no [callee_saved] obligation and no register to restore -- the only
+   register fact the proof threads across the sixteen calls is
+   [tp = cid_word], which every callee in the kalloc/lock cone requires.
+
+   STRUCTURE.  One [Local Lemma] per call block, each concluding at the next
+   offset, chained by [wp_main_boot_sconf]:
+
+     mn_boot_entry  0x00 -> 0x42   frame push, jal cpuid, beqz TAKEN
+     mn_grp_printk  0x42 -> 0x6e   consoleinit printkinit printk x3
+                                   + the [pr] newlock and the printk_env
+                                     assembly
+     mn_grp_kvm     0x6e -> 0x7e   kinit kvminit kvminithart procinit
+                                   + kalloc_env, THE TABLE PUBLICATION
+                                     (persist root, kvm_M_mint,
+                                      kpt_inv_alloc), procs_inv_alloc
+     mn_grp_trap    0x7e -> 0x8e   trapinit trapinithart plicinit plicinithart
+                                   + intr_inv_alloc_off
+     mn_grp_fs      0x8e -> 0xa2   binit iinit fileinit virtio_disk_init
+                                     userinit
+                                   + disk_res_boot, the vdisk newlock
+     mn_grp_started 0xa2 -> (join) fence, started = 1, j 0x3e, jal scheduler
+
+   Everything a group does not touch stays in the caller's context: the group
+   lemmas' conclusion is a bare [WP Loop {{Φ}}], so the top-level proof keeps
+   [trap_csrs], [started_inv], the deposit wand and the persistent ambient
+   facts across all of them.  Resources nothing consumes (the cons/tx_lock/
+   tickslock/bcache/itable/ftable [lk_fresh]s, binit/iinit's outputs,
+   userinit's [initproc] cell, the leftover pages, the frame slots) are simply
+   DROPPED -- Iris is affine. *)
+From Stdlib Require Import Eqdep_dec ZArith Lia List Ascii String.
+From stdpp Require Import gmap list list_numbers finite bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import dfrac excl.
+From iris.base_logic.lib Require Import gen_heap invariants ghost_var ghost_map own.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import RiscvModelBytes RiscvPtsto RiscvLang.
+Require Import RiscvFetchExec MinstretInv MemAccessGen.
+Require Import RegFile HartTp WpNext WpMmodeLeafBase InstrBytes.
+Require Import KptPt.
+Require Import RiscvExtras.
+Require Import StackOwn.
+Require Import KernelText KernelDataInv.
+Require Import IntrDefs.
+Require Import WireInv.   (* [wire_inv] *)
+Require Import InitBoot.  (* [init_boot_bundle] -- forwarded to userinit *)
+Require Import UsertrapRes.   (* [devintr_caps_any] *)
+Require Import WpSconfAlu WpSconfMem WpSconfCtl WpSconfBtype WpSmodeIntr.
+Require Import WpLock.
+Require Import KallocInv KvmSpec PageGeom.
+(* the shared kernel page table: main's OWN publication assembly spends
+   [kpt_unset] + [kmap_auth kmap_M0] here ([WpKvminithart.kvm_M_mint],
+   [KptShare.kpt_inv_alloc], [KvmMap.kvm_bridge]) and the deposit wand
+   carries the resulting [kpt_inv] / 65 claims / persistent root cell *)
+Require Import KptGhost KptShare KptExecMap KvmMap.
+(* K1 of the KSTACK campaign: the boot-arm mint of the 64 kernel stacks *)
+Require Import KstackOwn.
+Require Import PtreeType.
+Require Import WpKvminithart.
+Require Import ProcGeom CpuOwn SchedCtx FdSlots.
+Require Import FileInvDefs.
+Require Import FileInv.   (* [ftable_res_boot]: the open-file table, minted *)
+Require Import BcacheInv SleepLock.
+Require Import DevModel VirtioModel DiskPtsto WpUart.
+Require Import VirtioQueue VirtioProto DiskInv DiskBoot.
+Require Import PrintkFmt.
+Require Import StartedInv.
+Require Import SpecCpuid SpecConsoleinit SpecPrintkinit SpecPrintk.
+Require Import SpecKinit SpecKvminit SpecKvminithart SpecProcinit.
+Require Import SpecTrapinit SpecTrapinithart SpecPlicinit SpecPlicinithart.
+Require Import PidLock.
+(* [ROOTDEV] / [icfg_dev] / [icfg_nib], for the two config ties main threads *)
+Require Import SpecPanic.
+(* [K_allocproc] -- userinit's page premise is stated at allocproc's own
+   strict bound, not at a round number *)
+Require Import SpecAllocproc.
+(* THE FILE SYSTEM'S BOOT-ERA MINT AND THE INODE CACHE (fs-cfg-boot.md
+   stage (e)).  [FsCfgBoot] carries the two boot kits and their opening
+   lemmas, [IcacheBoot] the [icache_boot_at] fupd this file now runs at
+   main+0x92 plus [ientry_raw] / [inode_lock_is_ientry_lock], and the other
+   four the four persistent rows it produces.  IMPORTED BEFORE [SpecIinit]
+   on purpose: [NINODE] below must stay [SpecIinit]'s, which is what
+   [main_globals_raw] and iinit's own postcondition are stated at
+   ([IcacheRefDefs.NINODE] is convertible with it, and every crossing is a
+   conversion the [icache_boot_at] application does itself). *)
+Require Import FsCfgKits.
+(* [FirstTok.first_fsinit] and the two pure producers: stage (f)'s transport
+   site is main+0x9e (fs-cfg-boot.md (f-3)). *)
+Require Import LogDefs LogInv.
+Require Import FsReady FirstTok.
+Require Import WpLockAt.   (* [newlock_at] / [lock_free_tok] *)
+Require Import BioInitAt.  (* [bio_init_at] / [bio_free_tok] / [buf_raw] *)
+Require Import IcacheBoot IcacheEscrow InodeInv.
+Require Import IcacheRefDefs.
+Require Import IrefSlots FsCfg FsBlocks.
+Require Import SpecBinit SpecIinit SpecFileinit SpecVirtioDiskInit.
+Require Import ObsTrace.   (* [mobs] / [ohist_le_none]: the receive side's anchor *)
+Require Import SpecUserinit SpecScheduler SpecKernelvec SpecFreerange.
+Require Import SpecDevintr SpecClockintr TicksInv.
+Require Import KMap.
+Require Import UartTxInv.
+Require Import UartsFields.   (* [uarts_pinned] / [uart_f_lock]: the `struct uart uarts[2]` geometry *)
+Require Import SpecUartPutc.  (* [uart_base_word]: the VA-tier `uarts[i].base` snapshot *)
+Require Import SpecPrputc.    (* [prputc_env] / [prputc_env_of]: printk's UART1 credential *)
+Require Import ConsoleInv SpecConsoleintr.
+Require Import SpecMain.
+Require Import CodeMain.
+Require Import KernelRvcDecode.
+From Kernel Require KernelSyms.
+Require Import WaitInv.   (* [parents_res] / [wait_res] -- what main finally brings wait_lock up over *)
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Require Import TsoGhost.
+Require Import KptPublish.   (* [dset_auth]: the started barrier's index authority (A6.132) *)
+Require Import SieCapCtx.   (* [sie_cap_gpr_own_ctx_acc]: the creators' borrow *)
+Local Open Scope Z_scope.
+Require Import TsoCtx.
+Import Defs.
+
+Set Printing Depth 40.
+Local Strategy 1000 [pa_stk].
+
+(* ===================================================================== *)
+(* The two format strings main passes to printk, and the addresses the     *)
+(* auipc/addi pairs resolve to.  Both live in .rodata just above etext.    *)
+(* Hoisted as NAMED pure lemmas (never inline [ltac:] arguments to         *)
+(* [kernel_data_string] -- claude-notes/optimization.md).                  *)
+(* ===================================================================== *)
+Definition mn_nl : string := String (Ascii.ascii_of_nat 10) EmptyString.
+Definition mn_boot : string := ("xv6 kernel is booting" ++ mn_nl)%string.
+Definition mn_nl_addr : Z := 0x80007080.
+Definition mn_boot_addr : Z := 0x80007088.
+
+Lemma mn_nl_bytes : forall j b, cstring_bytes mn_nl !! j = Some b ->
+  KernelData.kernel_data !! (mn_nl_addr + Z.of_nat j)%Z = Some b.
+Proof.
+  intros j b Hj.
+  do 2 (destruct j as [|j];
+        [vm_compute in Hj; injection Hj as <-; vm_compute; reflexivity |]);
+  vm_compute in Hj; discriminate.
+Qed.
+
+Lemma mn_boot_bytes : forall j b, cstring_bytes mn_boot !! j = Some b ->
+  KernelData.kernel_data !! (mn_boot_addr + Z.of_nat j)%Z = Some b.
+Proof.
+  intros j b Hj.
+  do 23 (destruct j as [|j];
+         [vm_compute in Hj; injection Hj as <-; vm_compute; reflexivity |]);
+  vm_compute in Hj; discriminate.
+Qed.
+
+Lemma mn_nl_fmt : pk_kinds mn_nl = [] /\ nonul mn_nl = true /\
+                  (Z.of_nat (String.length mn_nl) < 2147483645)%Z.
+Proof. split_and!; [vm_compute; reflexivity | vm_compute; reflexivity | vm_compute; reflexivity]. Qed.
+
+Lemma mn_boot_fmt : pk_kinds mn_boot = [] /\ nonul mn_boot = true /\
+                    (Z.of_nat (String.length mn_boot) < 2147483645)%Z.
+Proof. split_and!; [vm_compute; reflexivity | vm_compute; reflexivity | vm_compute; reflexivity]. Qed.
+
+(* clean-context (mword-free) nat arithmetic, so [lia] never sees a bv *)
+(* the third conjunct is the SCHEDULER's, and it is what [K_main] is sized by:
+   the loop-head enable funds [kv_frame_slots] out of what main hands it. *)
+Lemma mn_bounds (K : nat) : (K_main <= K)%nat ->
+  (2 <= K)%nat /\ (K_userinit <= K - 2)%nat /\ (kv_frame_slots + 22 <= K - 2)%nat.
+Proof. lia. Qed.
+
+(* ===================================================================== *)
+Require Import UserFd.   (* [ufdG] -- the class a minted user slot needs *)
+Require Import OffBox.   (* [off_rows] / [off_rows_dep] / [off_rows_to_dep] -- the inode's off rows (items 35/36) *)
+Module MainProof
+  (Cpuid : CPUID) (Consoleinit : CONSOLEINIT) (Printkinit : PRINTKINIT)
+  (PrintkGen : PRINTK_GEN) (Kinit : KINIT) (Kvminit : KVMINIT)
+  (Kvminithart : KVMINITHART) (Procinit : PROCINIT) (Trapinit : TRAPINIT)
+  (Trapinithart : TRAPINITHART) (Plicinit : PLICINIT)
+  (Plicinithart : PLICINITHART) (Binit : BINIT) (Iinit : IINIT)
+  (Fileinit : FILEINIT) (VirtioDiskInit : VIRTIODISKINIT)
+  (Userinit : USERINIT) (Scheduler : SCHEDULER) (Kernelvec : KERNELVEC)
+  : MAIN.
+
+Section ProofMain.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{!ufdG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Ltac reg_neq :=
+    lazymatch goal with
+    | |- ?a <> ?b => tryif unify a b then fail else (vm_compute; discriminate)
+    end.
+
+  (* [hw_config] + [minstret_inv], both persistent, out of the ambient
+     bundle -- what [Kernelvec.kernelvec_handler_spec] consumes. *)
+  Local Lemma mn_dup_hw {kt : ktier} m avail b p :
+    sie_cap_gpr kt m avail b p -∗ hw_config ∗ minstret_inv ∗ sie_cap_gpr kt m avail b p.
+  Proof using .
+    iIntros "Hcg".
+    iDestruct (sie_cap_gpr_split with "Hcg") as "(Hhs & Hsc & Hsie & Hgpr)".
+    iEval (rewrite /sconf) in "Hsc".
+    iDestruct "Hsc" as "(#Hhw & #Hmin & Hrest)".
+    iSplitR; [iExact "Hhw"|]. iSplitR; [iExact "Hmin"|].
+    iApply (sie_cap_gpr_join with "Hhs [Hrest] Hsie Hgpr").
+    rewrite /sconf. iSplitR; [iExact "Hhw"|].
+    iSplitR; [iExact "Hmin" | iExact "Hrest"].
+  Qed.
+
+  (* ------------------------------------------------------------------ *)
+  (* [VirtioDiskInit]'s contract still carries a RAW-MAP tp premise       *)
+  (* ([m !!! Regidx Rtp = cid_word]) that the rest of the sweep has shed, *)
+  (* and [SpecMain] hands main no tp fact about its entry map -- so there *)
+  (* is nothing left to thread to it.  It is satisfiable regardless: the  *)
+  (* PINNED map trivially has it ([rget_tp]), and re-pointing the bundle  *)
+  (* at [tp_pin m] changes nothing observable, since [tp_pin] is          *)
+  (* idempotent and never touches sp.  Same move ProofCopyin /            *)
+  (* ProofCopyout make for vmfault's identical leftover premise.          *)
+  (* ------------------------------------------------------------------ *)
+  Local Lemma mn_pin_sie_cap_gpr {kt : ktier} (M : regfile) (avail : nat) (bb : bool)
+      (pp : mword 64) :
+    sie_cap_gpr kt M avail bb pp -∗ sie_cap_gpr kt (tp_pin M) avail bb pp.
+  Proof using .
+    rewrite /sie_cap_gpr /sie_cap (tp_pin_sp M).
+    assert (Htp2 : tp_pin (tp_pin M) = tp_pin M)
+      by (apply tp_pin_id; exact (rget_tp M)).
+    rewrite Htp2. iIntros "$".
+  Qed.
+
+  Local Lemma mn_tp_pin_ne (M : regfile) (k : mword 5) :
+    Regidx k <> Regidx Rtp -> tp_pin M !!! Regidx k = M !!! Regidx k.
+  Proof using . exact (rget_ne M k). Qed.
+
+  (* =================================================================== *)
+  (* 0x00 .. 0x14 -- the frame push, [jal cpuid], and the [beqz a0] that  *)
+  (* the boot premise [cid_word = 0] makes TAKEN into the boot arm.       *)
+  (* =================================================================== *)
+  Local Lemma mn_boot_entry 
+      (m : regfile) (K : nat) (p0 : mword 64) :
+    cid_word = (zero_reg : mword 64) ->
+    (K_main <= K)%nat ->
+    sie_cap_gpr KT0 m K false p0 -∗ kernel_text -∗
+    pc_is (mword_of_int KernelSyms.main : mword 64) -∗
+    ( ∀ m1 : regfile,
+        sie_cap_gpr KT0 m1 (K - 2)%nat false p0 -∗
+        pc_is (mword_of_int (KernelSyms.main + 0x42) : mword 64) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hcid HK.
+    pose proof (mn_bounds K HK) as (Hc2 & Hn50 & Hnsched).
+    iIntros "Hcg #Htext Hpc Hcont".
+    (* frame-cell address facts (2-slot frame: ra @ slot 1, s0 @ slot 2) *)
+    assert (Hpush : add_vec (m !!! Regidx csp_rs1)
+              (sign_extend' 64 (sign_extend' 12 (mword_of_int 48 : mword 6)))
+              = pa_stk (m !!! Regidx csp_rs1) 2).
+    { unfold pa_stk, add_vec_int. apply f_equal. apply bv_eq; vm_compute; reflexivity. }
+    assert (Hb1 : add_vec (add_vec (m !!! Regidx csp_rs1)
+              (sign_extend' 64 (sign_extend' 12 (mword_of_int 48 : mword 6))))
+              (zero_extend' 64 (concat_vec (mword_of_int 1 : mword 6) ('b"000")))
+              = pa_stk (m !!! Regidx csp_rs1) 1).
+    { unfold pa_stk, add_vec_int. rewrite !pa_stk_off2.
+      f_equal; try (apply bv_eq; vm_compute; reflexivity). }
+    assert (Hb2 : add_vec (add_vec (m !!! Regidx csp_rs1)
+              (sign_extend' 64 (sign_extend' 12 (mword_of_int 48 : mword 6))))
+              (zero_extend' 64 (concat_vec (mword_of_int 0 : mword 6) ('b"000")))
+              = pa_stk (m !!! Regidx csp_rs1) 2).
+    { unfold pa_stk, add_vec_int. rewrite !pa_stk_off2.
+      f_equal; try (apply bv_eq; vm_compute; reflexivity). }
+    (* +0x00 addi sp,sp,-16 *)
+    iApply (wp_caddi_sp_push_s_sconf (mword_of_int KernelSyms.main) (mword_of_int 48 : mword 6)
+              m K 2 false Hc2 Hpush with "Hcg Hpc []").
+    { iApply (mni_00 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hframe Hpc".
+    pose (W1 := <[Regidx csp_rs1 := regval_into_reg
+        (add_vec (m !!! Regidx csp_rs1)
+           (sign_extend' 64 (sign_extend' 12 (mword_of_int 48 : mword 6))))]> m).
+    iEval (rewrite (stack_own_slots (KTR := KT0)); cbn [seq]) in "Hframe".
+    iDestruct "Hframe" as "(S1 & S2 & _)".
+    iDestruct "S1" as (v1) "Hc1". iDestruct "S2" as (v2) "Hc2".
+    assert (HspW1 : W1 !!! Regidx csp_rs1 = add_vec (m !!! Regidx csp_rs1)
+              (sign_extend' 64 (sign_extend' 12 (mword_of_int 48 : mword 6))))
+      by (rewrite /W1 upd_eq; reflexivity).
+    assert (Hp02 : add_vec_int (mword_of_int KernelSyms.main : mword 64) 2
+                   = mword_of_int (KernelSyms.main + 0x02)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp02) in "Hpc".
+    (* +0x02 sd ra,8(sp) *)
+    iApply (wp_csdsp_s_sconf (mword_of_int (KernelSyms.main + 0x02)) (mword_of_int 1 : mword 6)
+              (mword_of_int 1 : mword 5) W1 (K - 2)%nat v1 false
+              with "Hcg Hpc [] [Hc1]").
+    { iApply (mni_02 with "Htext"). }
+    { iEval (rewrite HspW1 Hb1). iExact "Hc1". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc Hc1".
+    assert (Hp04 : add_vec_int (mword_of_int (KernelSyms.main + 0x02) : mword 64) 2
+                   = mword_of_int (KernelSyms.main + 0x04)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp04) in "Hpc".
+    (* +0x04 sd s0,0(sp) *)
+    iApply (wp_csdsp_s_sconf (mword_of_int (KernelSyms.main + 0x04)) (mword_of_int 0 : mword 6)
+              (mword_of_int 8 : mword 5) W1 (K - 2)%nat v2 false
+              with "Hcg Hpc [] [Hc2]").
+    { iApply (mni_04 with "Htext"). }
+    { iEval (rewrite HspW1 Hb2). iExact "Hc2". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc Hc2".
+    assert (Hp06 : add_vec_int (mword_of_int (KernelSyms.main + 0x04) : mword 64) 2
+                   = mword_of_int (KernelSyms.main + 0x06)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp06) in "Hpc".
+    (* +0x06 addi s0,sp,16 *)
+    iApply (wp_caddi4spn_s_sconf (mword_of_int (KernelSyms.main + 0x06))
+              (Cregidx (mword_of_int 0)) (mword_of_int 4 : mword 8) (mword_of_int 8 : mword 5)
+              W1 (K - 2)%nat false ltac:(vm_compute; reflexivity)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_06 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (W2 := <[Regidx (mword_of_int 8 : mword 5) := regval_into_reg
+        (add_vec (W1 !!! Regidx csp_rs1)
+           (sign_extend' 64 (caddi4spn_imm (mword_of_int 4 : mword 8))))]> W1).
+    assert (Hp08 : add_vec_int (mword_of_int (KernelSyms.main + 0x06) : mword 64) 2
+                   = mword_of_int (KernelSyms.main + 0x08)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp08) in "Hpc".
+    (* +0x08 jal cpuid *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x08)) (mword_of_int 1 : mword 5)
+              (mword_of_int 2686 : mword 21) W2 (K - 2)%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_08 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (W3 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x08) : mword 64) 4)]> W2).
+    assert (Htgtcp : add_vec (mword_of_int (KernelSyms.main + 0x08) : mword 64)
+              (sign_extend' 64 (mword_of_int 2686 : mword 21))
+              = (mword_of_int KernelSyms.cpuid : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtcp) in "Hpc".
+    iApply (Cpuid.wp_cpuid_sconf KT0 W3 (K - 2)%nat p0 ltac:(lia) with "Hcg Htext Hpc").
+    iIntros (m4) "Hcg Hpc %Hcp".
+    destruct Hcp as (Hcpcs & Hcpa0).
+    assert (Hretcp : ret_pc (W3 !!! Regidx (mword_of_int 1 : mword 5))
+                     = (mword_of_int (KernelSyms.main + 0x0c) : mword 64)).
+    { rewrite /W3 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretcp) in "Hpc".
+    (* cpuid() returns [cpuid_ret (rget W3 tp)] = this hart's id, and on the
+       boot hart that is 0 -- so the [beqz] below is TAKEN. *)
+    assert (Hm4a0 : m4 !!! Regidx (mword_of_int 10 : mword 5) = (zero_reg : mword 64)).
+    { rewrite Hcpa0 (rget_tp W3) cpuid_ret_cid. exact Hcid. }
+    (* +0x0c auipc a4,0x9 *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.main + 0x0c)) (mword_of_int 14 : mword 5)
+              (mword_of_int 9 : mword 20) m4 (K - 2)%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_0c with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (W5 := <[Regidx (mword_of_int 14 : mword 5) := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.main + 0x0c) : mword 64)
+           (auipc_off (mword_of_int 9 : mword 20)))]> m4).
+    assert (Hp10 : add_vec_int (mword_of_int (KernelSyms.main + 0x0c) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0x10)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp10) in "Hpc".
+    (* +0x10 addi a4,a4,1094 : a4 := &started (unused on the boot arm) *)
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.main + 0x10)) (mword_of_int 14 : mword 5)
+              (mword_of_int 14 : mword 5) (mword_of_int 1158 : mword 12) W5 (K - 2)%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_10 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (W6 := <[Regidx (mword_of_int 14 : mword 5) := regval_into_reg
+        (add_vec (rget W5 (mword_of_int 14 : mword 5))
+           (sign_extend' 64 (mword_of_int 1158 : mword 12)))]> W5).
+    assert (Hp14 : add_vec_int (mword_of_int (KernelSyms.main + 0x10) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0x14)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp14) in "Hpc".
+    assert (HW6a0 : eq_vec (rget W6 (mword_of_int 10 : mword 5)) zero_reg = true).
+    { rgne. rewrite /W6 upd_ne; [| reg_neq]. rewrite /W5 upd_ne; [| reg_neq].
+      rewrite Hm4a0. vm_compute. reflexivity. }
+    (* +0x14 beqz a0,+0x2e -- TAKEN, into the boot arm at 0x42 *)
+    iApply (wp_cbeqz_taken_s_sconf (mword_of_int (KernelSyms.main + 0x14))
+              (mword_of_int 23 : mword 8) (Cregidx (mword_of_int 2))
+              (mword_of_int 10 : mword 5) W6 (K - 2)%nat false
+              creg_c2 ltac:(vm_compute; discriminate) HW6a0
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_14 with "Htext"). }
+    iApply wp_next_off_intro.
+    iApply bi.later_intro. iIntros "Hcg Hpc".
+    assert (Htgtb : add_vec (mword_of_int (KernelSyms.main + 0x14) : mword 64)
+              (sign_extend' 64 (sign_extend' 13
+                 (concat_vec (mword_of_int 23 : mword 8) ('b"0"))))
+              = (mword_of_int (KernelSyms.main + 0x42) : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtb) in "Hpc".
+    iApply ("Hcont" $! W6 with "Hcg Hpc").
+  Qed.
+
+  (* =================================================================== *)
+  (* 0x42 .. 0x6a -- consoleinit(); printkinit(); printk x3, and the TWO   *)
+  (* ghost steps in between: the [pr] lock -- which now protects NOTHING   *)
+  (* ([SpecPrintk.pr_res] is [emp]; d80e61c5 moved the transmitter to   *)
+  (* [tx_lock], which uartputc_sync takes for itself) -- and [printk_env]. *)
+  (* The panic-flag invariant is gone with the flags themselves.           *)
+  (* =================================================================== *)
+  Local Lemma mn_grp_printk 
+      (γd : uart_names) (γv : disk_names) (cn : cons_names)
+      (m : regfile) (n : nat) (p0 : mword 64) (l0 : list (bv 8)) (b0 : bool)
+      (k0 : nat) (hl0 : option (list mobs))
+      (* THE SECOND PORT (bump 163d39b).  [uartinit] runs [uartinitone] at
+         BOTH elements of [uarts[]], so port 1's whole ghost row travels
+         through this group -- and printk's own credential is at [Uart1]
+         now, so the group's [newlock] on that port's [tx_lock] is what
+         [SpecPrputc.prputc_env] is built from. *)
+      (γd1 : uart_names) (l1 : list (bv 8)) (b1 : bool)
+      (k1 : nat) (hl1 : option (list mobs)) :
+    (K_userinit <= n)%nat ->
+    (* ...AND NEITHER TRANSMITTER HAS BEEN USED (relax-d2, lane K1): what
+       makes uartinit's FCR FIFO-clear accountable at the boundary.  The two
+       anchors start at [None] for the same reason: nothing has been popped
+       when this group runs, so a flush that moves the anchor is the ONLY
+       way it can be anywhere else. *)
+    l0 = [] -> l1 = [] -> hl0 = None -> hl1 = None ->
+    (* the ring's names carry the RECEIVE side's, which is where the
+       high-water mark's two halves live *)
+    cn_uart cn = γd ->
+    (* ...and its names record THIS era (lane seccomp S2k, the follow-up) *)
+    cn_era cn = Datatypes.S gen_id ->
+    (* ...AND THE RING IS THE ERA'S OWN.  [SpecFileread.console_ready_app]
+       -- what the read syscall's arm opens -- is stated at the AMBIENT
+       [fsc_cons], and this tie is [FsCfgBoot.fs_boot_supply]'s: the boot
+       chain mints the ring's names and the era's config reuses them. *)
+    fsc_cons = cn ->
+    sie_cap_gpr KT0 m n false p0 -∗
+    kernel_text -∗ kernel_data -∗ dev_inv γd γv -∗
+    pc_is (mword_of_int (KernelSyms.main + 0x42) : mword 64) -∗
+    cpu_ctx_free -∗
+    cpu_own 0 false p0 false ∅ -∗
+    lk_raw (mword_of_int KernelSyms.cons) -∗
+    (* THE TWO transmit spinlocks' raw fields, on their way to uartinit.
+       [tx_lock] left the symbol table at 163d39b: the lock is the field
+       [uarts[i].tx_lock] ([UartsFields.uart_f_lock]) and there is one per
+       port, both initialised by [uartinit]'s two [uartinitone] calls. *)
+    lk_raw (UartTxInv.a_tx_lock_at Uart0) -∗
+    lk_raw (UartTxInv.a_tx_lock_at Uart1) -∗
+    lk_raw (mword_of_int KernelSyms.pr) -∗
+    (* the "pr" lock's ghost, at the AMBIENT [fsc_printk] -- kit 1's first
+       early peel (fs-cfg-boot.md stage (e), row (P3)).  [FsReady.fs_ready]
+       spells [printk_env] at that field, so the gname cannot be an
+       existential this group invents. *)
+    fs_kit_printk _ _ -∗
+    (∃ r w : mword 64, devsw_console_read ↦₈ r ∗ devsw_console_write ↦₈ w) -∗
+    ConsoleInv.devsw_rest -∗
+    (* the console RING, which this group locks up behind cons.lock *)
+    cons_res cn -∗
+    (* ...AND THE CLEAN TOKEN, which the [newlock] below spends on the ring's
+       CREDENTIAL ESCROW ([ConsoleInv.cons_cred_inv]): the ring is born with
+       nobody having read behind the reader token's back, and the escrow is
+       what a tokenless read pays into.  It rides in [is_conslock] beside
+       the lock handle, which is why it is minted HERE. *)
+    cons_clean_tok cn -∗
+    uart_tx_own γd l0 -∗ uart_sent γd l0 -∗ uart_out_lb γd l0 -∗
+    uart_rx_tok γd k0 hl0 -∗
+    (* the ring's partner half of the receive side's HIGH-WATER MARK, parked
+       in the PLIC payload beside the token by the deposit below *)
+    uart_rx_hi γd (1/2) None -∗
+    (* ...AND THE LOG'S HIGH-WATER HALF (lane CONS-IO), parked in the SAME
+       payload: [WpUart.uart_rx_writer] is the pop token, the ring's mark
+       and this.  Its partner is inside the port's invariant, and it is
+       what licenses consoleintr's one log append per accepted byte. *)
+    uart_log_hi γd (1/2) None -∗
+    (* the consoleintr arm's half, parked in the same payload (redesign R2) *)
+    uart_arm γd (1/2) None -∗
+    uart_dlab_is γd (DfracOwn (1/2)) b0 -∗
+    (* ==================== THE SECOND PORT (bump 163d39b) ==================
+       [plic_inv γd γd1] CONCRETELY, because this group runs BOTH receive-token
+       deposits and the second one is at [γd1] -- [dev_inv]'s own PLIC conjunct
+       ∃-packs the name, which is all a claim/complete client needs and not
+       enough to name a slot.  [uarts_pinned] and the four `.data` words are
+       the immutable image facts every [WriteReg] inside [uartinitone] loads
+       its MMIO base from; the port's own five ghosts are the console's row
+       verbatim, because [uartinitone] is ONE contract run at two ports.
+       ==================================================================== *)
+    plic_inv γd γd1 -∗
+    uarts_pinned -∗
+    uart_inv Uart1 γd1 -∗
+    uart_base_word Uart0 -∗ uart_rx_word Uart0 -∗
+    uart_base_word Uart1 -∗ uart_rx_word Uart1 -∗
+    uart_tx_own γd1 l1 -∗ uart_sent γd1 l1 -∗ uart_out_lb γd1 l1 -∗
+    uart_rx_tok γd1 k1 hl1 -∗
+    (* port 1 has NO consumer, so this half never moves: it is parked in the
+       PLIC payload at [None], where [ohist_le None _] is free. *)
+    uart_rx_hi γd1 (1/2) None -∗
+    uart_log_hi γd1 (1/2) None -∗
+    uart_arm γd1 (1/2) None -∗
+    uart_dlab_is γd1 (DfracOwn (1/2)) b1 -∗
+    (* THE ECHO'S JUSTIFICATION (lane OUT-FUPD, F3), the last member of
+       [console_caps] this group assembles and the only one main cannot
+       build: it is the APPLICATION's claim about its own input, threaded
+       here from the boot record. *)
+    cons_echo_shift -∗
+    (* NO [γpr] BINDER ANY MORE (fs-cfg-boot.md (f-3)): the "pr" lock is
+       allocated at the AMBIENT [fsc_printk] since debt (E), so the group's
+       product is spelled, and stage (f) needs it spelled -- an existential
+       γ could never be shown equal to [FirstTok.first_boot_persist]'s third
+       row.  Every caller instantiated it at [fsc_printk] already. *)
+    ( ∀ (m' : regfile),
+        sie_cap_gpr KT0 m' n false p0 -∗
+        pc_is (mword_of_int (KernelSyms.main + 0x6e) : mword 64) -∗
+        cpu_ctx_free -∗
+        cpu_own 0 false p0 false ∅ -∗
+        printk_env fsc_printk γd γv -∗
+        console_caps γd -∗
+        (* THE SECOND PORT'S ROW OF [SpecDevintr.devintr_caps], assembled
+           here because this is where its last member is MINTED: the deposit
+           of port 1's receive token turns that port's PLIC slot over to its
+           one-shot [uart_inited γd1].  The other three members are premises
+           of this group. *)
+        uart1_caps γd -∗
+        (* THE CONSOLE BUNDLE.  This group is where both halves exist at
+           once: consoleinit hands back the filled [devsw_table] and the
+           [newlock] below mints the [is_conslock].  [console_caps] closes
+           over its own gname existentially, so the pairing has to happen
+           HERE, while the name is still concrete. *)
+        SpecFileread.console_ready_app -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hn Hl0 Hl1 Hhl0 Hhl1 Hcnu Hcne Hconsq.
+    iIntros "Hcg #Htext #Hkdata #Hdev Hpc Hfree Hcpu Hlcons Hltx0 Hltx1 Hlpr".
+    iIntros "Hkprintk Hdevsw Hrest Hring Hclean Htx Hsent Hlb Htok Hhi Hlgh Harm Hdlab".
+    iIntros "#Hplic #Hpinned #Huinv1 #Hubw0 #Hurw0 #Hubw1 #Hurw1".
+    iIntros "Htx1 Hsent1 Hlb1 Htok1 Hhi1 Hlgh1 Harm1 Hdlab1 #Hecho Hcont".
+    iPoseProof (dev_inv_uart with "Hdev") as "#Huinv".
+    iPoseProof (kernel_data_string mn_nl_addr mn_nl
+                  (mword_of_int mn_nl_addr) eq_refl
+                  ltac:(unfold text_end, mn_nl_addr; lia)
+                  ltac:(vm_compute; discriminate) mn_nl_bytes
+                  with "Hkdata") as "#Hsnl".
+    iPoseProof (kernel_data_string mn_boot_addr mn_boot
+                  (mword_of_int mn_boot_addr) eq_refl
+                  ltac:(unfold text_end, mn_boot_addr; lia)
+                  ltac:(vm_compute; discriminate) mn_boot_bytes
+                  with "Hkdata") as "#Hsbt".
+    pose proof mn_nl_fmt as (Hknl & Hnnl & Hlnl).
+    pose proof mn_boot_fmt as (Hkbt & Hnbt & Hlbt).
+    iDestruct "Hlcons" as (vcl vcn vcc) "(Hcw & Hcn & Hcc)".
+    (* [Hltx0]/[Hltx1] are NOT unpacked: they go to consoleinit whole, and
+       come back whole as the two [lk_fresh]es. *)
+    iDestruct "Hlpr" as (vpl vpn vpc) "(Hpw & Hpn & Hpc2)".
+    iDestruct "Hdevsw" as (dr0 dw0) "(Hdr & Hdw)".
+    (* ---- +0x42 jal consoleinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x42)) (mword_of_int 1 : mword 5)
+              (mword_of_int 2094372 : mword 21) m n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_42 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (C0 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x42) : mword 64) 4)]> m).
+    assert (Htgtci : add_vec (mword_of_int (KernelSyms.main + 0x42) : mword 64)
+              (sign_extend' 64 (mword_of_int 2094372 : mword 21))
+              = (mword_of_int KernelSyms.consoleinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtci) in "Hpc".
+    (* ALL THREE CONSOLE-SIDE LOCKS ARE BROUGHT UP HERE.  consoleinit runs
+       [initlock(&cons.lock,"cons")] itself and, through uartinit's two
+       [uartinitone] calls, [initlock(&uarts[i].tx_lock,"uart<i>")] -- so
+       [Hlcons]'s three fields come back as [Hclw]/[Hclnm]/[Hclcpu] and the
+       two [lk_raw]s as [Hlkfresh0]/[Hlkfresh1], which are exactly
+       [WpLock.newlock]'s premises.  The three [newlock]s are taken twenty
+       lines below, once [printkinit] has returned; the first two are
+       [SpecConsoleintr.console_caps] and the third is the transmit lock
+       [SpecPrputc.prputc_env] -- printk's own credential -- is built from. *)
+    iApply (Consoleinit.wp_consoleinit_sconf γd C0 n l0 b0 k0 hl0
+              γd1 l1 b1 k1 hl1
+              vcl vcn vcc dr0 dw0 p0 ltac:(lia) Hl0 Hl1
+              with "Hcg Htext Hkdata Hpc Huinv Htx Hlb Hsent Htok Hdlab
+                    Hubw0 Hurw0 Hubw1 Hurw1
+                    Huinv1 Htx1 Hlb1 Hsent1 Htok1 Hdlab1
+                    Hcw Hcn Hcc Hltx0 Hltx1 Hdr Hdw Hrest").
+    iIntros (mc) "Hcg Hpc %Hcsci Htx Hsent Htok #Hdoff Hclw #Hclnm Hclcpu
+                  Hlkfresh0 Htx1 Hsent1 Htok1 #Hdoff1 Hlkfresh1 #Htbl".
+    (* ===== THE TWO DEPOSITS, ONE PER PORT.  uartinit's FCR flush is done at
+       both, so neither receive token has any further boot-chain business:
+       park each in the PLIC invariant, which mints the persistent
+       [uart_inited] every later enable write and every reader of a tagged
+       byte holds -- and, at port 1, the last member of
+       [SpecDevintr.uart1_caps].  They run HERE, between consoleinit and
+       plicinit, which is why the invariant's pre-deposit arm can say the
+       UART is enabled nowhere; plicinithart is what enables source 12 and it
+       runs strictly later, so no claim can return 12 before this point.
+       BOTH go through the CONCRETE [plic_inv γd γd1]: the slot the deposit
+       moves is keyed by the port's own bundle, and [dev_inv]'s ∃-packed PLIC
+       conjunct cannot name the second one. ===== *)
+    (* WHAT UARTINIT'S FCR CLEAR DISCARDED (relax-d2, lane K1): each port's
+       token comes back with it, and it is exactly what the deposit's
+       [uart_log_at] arm asks for -- the log is empty here, so the mark can
+       only be the anchor if the clear moved nothing. *)
+    iDestruct "Htok" as (ktok hltok) "[Htok %Hfl0]".
+    iDestruct "Htok1" as (ktok1 hltok1) "[Htok1 %Hfl1]".
+    assert (Hlat0 : uart_log_at Uart0 None hltok).
+    { cbn [uart_log_at]. destruct Hfl0 as [-> | Hf].
+      - rewrite Hhl0. by left.
+      - right. split; [reflexivity | exact Hf]. }
+    iApply fupd_wp.
+    iMod (uart_rx_tok_deposit ⊤ γd γd1 Uart0 ktok hltok None None
+            ltac:(solve_ndisj) (ohist_le_none hltok) Hlat0
+            with "Hplic Htok Hhi Hlgh Harm") as "#Hinit".
+    iMod (uart_rx_tok_deposit ⊤ γd γd1 Uart1 ktok1 hltok1 None None
+            ltac:(solve_ndisj) (ohist_le_none hltok1) (ohist_le_none hltok1)
+            with "Hplic Htok1 Hhi1 Hlgh1 Harm1") as "#Hinit1".
+    (* [plic_unames γd γd1 Uart0] IS [γd] and [... Uart1] IS [γd1], by iota on
+       the port; normalising the two one-shots here keeps every later
+       [iFrame] a syntactic match rather than a conversion. *)
+    iEval (cbn [plic_unames]) in "Hinit".
+    iEval (cbn [plic_unames]) in "Hinit1".
+    iModIntro.
+    assert (Hretci : ret_pc (C0 !!! Regidx (mword_of_int 1 : mword 5) : mword 64)
+                     = (mword_of_int (KernelSyms.main + 0x46) : mword 64)).
+    { rewrite /C0 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretci) in "Hpc".
+    (* ---- +0x46 jal printkinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x46)) (mword_of_int 1 : mword 5)
+              (mword_of_int 2095454 : mword 21) mc n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_46 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (C1 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x46) : mword 64) 4)]> mc).
+    assert (Htgtpi : add_vec (mword_of_int (KernelSyms.main + 0x46) : mword 64)
+              (sign_extend' 64 (mword_of_int 2095454 : mword 21))
+              = (mword_of_int KernelSyms.printkinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtpi) in "Hpc".
+    iApply (Printkinit.wp_printkinit_sconf C1 n vpl vpn vpc false p0 ltac:(lia)
+              with "Hcg Htext Hkdata Hpc Hpw Hpn Hpc2").
+    iApply wp_next_off_intro.
+    iIntros (mp) "Hcg Hpc %Hcspi Hprw #Hprnm Hprcpu".
+    assert (Hretpi : ret_pc (C1 !!! Regidx (mword_of_int 1 : mword 5) : mword 64)
+                     = (mword_of_int (KernelSyms.main + 0x4a) : mword 64)).
+    { rewrite /C1 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretpi) in "Hpc".
+    (* ---- the ghost steps: three [newlock]s and [printk_env] ----
+
+       PR.LOCK'S [newlock] IS PAID FOR WITH NOTHING.  [SpecPrintk.pr_res]
+       is [emp]: d80e61c5 put uartputc_sync's THR write under [tx_lock], so
+       the transmitter belongs to [UartTxInv.tx_res] and pr.lock is left
+       serializing format walks, which has no separation-logic content.  That
+       is what frees the [uart_tx_own] this block hands to tx_lock's
+       [newlock] instead. *)
+    iApply fupd_wp.
+    (* promote once, so both [console_caps] and [printk_env] below can reuse
+       the same persistent witness instead of re-deriving it. *)
+    iDestruct "Hsent" as "#Hsent".
+    (* [newlock_at] at [fsc_printk], not [newlock] with a fresh γ *)
+    rewrite /fs_kit_printk.
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (newlock_at ⊤ fsc_printk (mword_of_int KernelSyms.pr) "pr"%string <{ pr_res γd }> with "Hkprintk Hprnm Hrun Hprw Hprcpu []") as "[Hrun #Hprlk]".
+    { rewrite /pr_res. done. }
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    (* ---- THE OTHER THREE [newlock]s, and this is the point of the group.
+       consoleinit has just run [initlock] on cons.lock and, through
+       uartinit's two [uartinitone] calls, on BOTH [uarts[i].tx_lock]; all
+       three come back as [WpLock.newlock]'s raw material, and every
+       RESOURCE is in hand -- the ring out of [main_globals_raw], and each
+       port's transmitter token straight back from consoleinit (d80e61c5
+       left [pr_res] empty, so nothing else wants either).  cons.lock and
+       port 0's are [SpecConsoleintr.console_caps], which the kernelvec
+       handler contract closes over ([SpecDevintr.devintr_caps]) because
+       devintr -> uartintr -> consoleintr takes both.
+
+       PORT 1's IS PRINTK'S OWN.  At 163d39b printk/printint/printptr/panic
+       print through [prputc] on the SECOND UART, so the credential their
+       cone consumes is [SpecPrputc.prputc_env] -- that port's invariant,
+       that port's transmit lock (with its frozen DLAB inside
+       [is_txlock_at]) and the `.data` word its MMIO base is loaded from --
+       and none of it is the console's.  [printk_env] is that plus the "pr"
+       lock, so this is the one site in the tree where the second port's
+       lock is founded.
+
+       THE TWO RANKS ARE EQUAL ON PURPOSE ([LockRank.v]: "uart0" and "uart1"
+       are both 17), so [locks_below {["uart0"]} "uart1"] is FALSE and a
+       hart may not hold one port's transmit lock while taking the other's.
+       That is the intended discipline, not a gap. ---- *)
+    iDestruct "Hlkfresh0" as "(Htxw & #Htxnm & Htxcpu)".
+    iDestruct "Hlkfresh1" as "(Htxw1 & #Htxnm1 & Htxcpu1)".
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (newlock ⊤ (UartTxInv.a_tx_lock_at Uart0)
+            (UartTxInv.uart_lock_name Uart0) <{ tx_res γd }>
+            with "Htxnm Hrun Htxw Htxcpu [Htx]") as "[Hrun Htxi0]".
+    { iApply (tx_res_intro γd l0 with "Htx"). }
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Htxi0" as (γtx) "#Htxinv".
+    (* [is_txlock]'s two halves are exactly [Htxinv]/[Hdoff] -- the same pair
+       [console_caps] below folds inline -- so mint it once here and feed
+       both consumers (LinkPrintk.v needs the witness to invoke the real
+       [SpecPrintk.wp_printk_sconf]). *)
+    iPoseProof (is_txlock_intro γtx γd with "Htxinv Hdoff") as "#Htxl".
+    (* ---- AND THE SECOND PORT'S, at [uarts + 56] under the name "uart1",
+       paid for with THAT port's transmitter token and its frozen DLAB --
+       both of which [uartinit] handed back through consoleinit. ---- *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (newlock ⊤ (UartTxInv.a_tx_lock_at Uart1)
+            (UartTxInv.uart_lock_name Uart1) <{ tx_res γd1 }>
+            with "Htxnm1 Hrun Htxw1 Htxcpu1 [Htx1]") as "[Hrun Htxi1]".
+    { iApply (tx_res_intro γd1 l1 with "Htx1"). }
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Htxi1" as (γtx1) "#Htxinv1".
+    iPoseProof (is_txlock_at_intro Uart1 γtx1 γd1 with "Htxinv1 Hdoff1")
+      as "#Htxl1".
+    iAssert (printk_env fsc_printk γd γv) as "#Hpenv".
+    { rewrite /printk_env /pr_lock. iSplitR; [iExact "Hprlk"|].
+      iApply (SpecPrputc.prputc_env_of γtx1 γd1 with "Huinv1 Htxl1 Hubw1"). }
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (newlock ⊤ a_cons "cons"%string (cons_res_at cn)
+            with "Hclnm Hrun Hclw Hclcpu Hring") as "[Hrun Hcl0]".
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Hcl0" as (γcl) "#Hconslk0".
+    (* THE CREDENTIAL ESCROW, bought with the clean token
+       ([ConsoleInv.cons_cred_inv_alloc]) and folded into [is_conslock]
+       beside the handle.  [Wd] is [AppInv.app_rdcred]: the credential a
+       process that answers for nothing runs on ([app_sup]) OR this era's
+       wild credential ([RiscvPtsto.riscv_wild (S gen_id)], the one a
+       program under a syscall mask holds), which is what the kernel
+       charges a console read taken without the reader token.  The
+       interrupt path's [console_caps] takes the RAW handle instead -- it
+       stores bytes, it does not read them. *)
+    iMod (ConsoleInv.cons_cred_inv_alloc cn AppInv.app_rdcred ⊤ with "Hclean")
+      as "#Hcred".
+    iPoseProof (ConsoleInv.is_conslock_intro cn AppInv.app_rdcred γcl
+                  with "Hconslk0 Hcred") as "#Hconslk".
+    iAssert (console_caps γd) as "#Hccaps".
+    { rewrite /console_caps. iExists γtx, γcl, cn.
+      iSplitR; [iExact "Htxl" |].
+      iSplitR; [iExact "Hconslk0" |].
+      iSplitR; [iPureIntro; exact Hcnu |].
+      iSplitR; [iPureIntro; exact Hcne |].
+      iSplitR; [iExact "Hecho" |].
+      (* THE ARRAY'S FOUR `.data` WORDS, at the VA tier, as one row
+         ([SpecUartPutc.uarts_words]).  The driver LOADS both fields of the
+         element it is given since 163d39b instead of spelling them as
+         constants -- the base for consputc's THR store and uartwrite's, the
+         hook word for uartintr's `if (u->rx)` guard -- and BOTH ports'
+         travel here because this bundle is the interrupt path's only
+         context-relative carrier (see [SpecUartPutc.uarts_words]).
+         [BootShared]'s supply mints them beside [uarts_pinned], and this is
+         the only place they are CONSUMED. *)
+      iSplitR; [iExact "Hinit" |].
+      iApply (uarts_words_intro with "Hubw0 Hurw0 Hubw1 Hurw1"). }
+    (* ---- THE SECOND PORT'S ROW OF [devintr_caps], complete only now: its
+       third member is the one-shot the deposit above just minted at [γd1],
+       and its last is the DLAB freeze uartinit handed back.  The other two
+       are this group's premises.  The physical [uarts_pinned] is NOT a
+       member any more -- uartintr consumes the `.data` words at the VA tier
+       and nothing crosses from the raw form -- and the VA-tier words did
+       NOT take its place here: they are context-relative and this bundle
+       must stay ξ-free, so they ride [console_caps] above, at BOTH ports.
+       ---- *)
+    iAssert (uart1_caps γd) as "#Hu1caps".
+    { rewrite /uart1_caps. iExists γd1.
+      iFrame "Huinv1 Hplic Hinit1 Hdoff1". }
+    (* THE CONSOLE BUNDLE, and this is the only point at which it can be
+       built: [Hconslk] is [is_conslock γcl] with γcl still concrete, and
+       [Htbl] is the table consoleinit filled twenty instructions ago.
+       [console_caps] closes over γcl on the next line, so pairing them
+       afterwards would have nothing to pair. *)
+    iAssert (SpecFileread.console_ready_app) as "#Hcready".
+    { rewrite /SpecFileread.console_ready_app Hconsq.
+      iSplitR; last iSplitR; last (iPureIntro; exact Hcne).
+      - iExists γcl. rewrite /ConsoleInv.console_inv.
+        iSplitR; [iExact "Hconslk" | iExact "Htbl"].
+      (* ...AND THE CONSOLE PORT'S OWN INVARIANT (lane CONS-IO, milestone
+         B, ruling F6).  THIS is the one place the ring's names and the
+         UART's are both concrete -- [Hcnu : cn_uart cn = γd] is this
+         function's own premise -- so the read path never has to thread the
+         tie. *)
+      - rewrite Hcnu. iApply (WpUart.dev_inv_uart with "Hdev"). }
+    iModIntro.
+    (* ---- +0x4a auipc a0,0x6 / +0x4e addi a0,a0,476 : a0 := &"\n" ---- *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.main + 0x4a)) (mword_of_int 10 : mword 5)
+              (mword_of_int 6 : mword 20) mp n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_4a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (A1 := <[Regidx (mword_of_int 10 : mword 5) := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.main + 0x4a) : mword 64)
+           (auipc_off (mword_of_int 6 : mword 20)))]> mp).
+    assert (Hp4e : add_vec_int (mword_of_int (KernelSyms.main + 0x4a) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0x4e)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp4e) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.main + 0x4e)) (mword_of_int 10 : mword 5)
+              (mword_of_int 10 : mword 5) (mword_of_int 360 : mword 12) A1 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_4e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (A2 := <[Regidx (mword_of_int 10 : mword 5) := regval_into_reg
+        (add_vec (rget A1 (mword_of_int 10 : mword 5))
+           (sign_extend' 64 (mword_of_int 360 : mword 12)))]> A1).
+    assert (HA2a0 : A2 !!! Regidx (mword_of_int 10 : mword 5)
+                    = (mword_of_int mn_nl_addr : mword 64)).
+    { rewrite /A2 upd_eq. rgne. rewrite /A1 upd_eq /mn_nl_addr.
+      apply bv_eq; vm_compute; reflexivity. }
+    assert (Hp52 : add_vec_int (mword_of_int (KernelSyms.main + 0x4e) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0x52)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp52) in "Hpc".
+    (* ---- +0x52 jal printk ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x52)) (mword_of_int 1 : mword 5)
+              (mword_of_int 2094598 : mword 21) A2 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_52 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (A3 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x52) : mword 64) 4)]> A2).
+    assert (Htgtpk : add_vec (mword_of_int (KernelSyms.main + 0x52) : mword 64)
+              (sign_extend' 64 (mword_of_int 2094598 : mword 21))
+              = (mword_of_int KernelSyms.printk : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtpk) in "Hpc".
+    assert (HA3a0 : A3 !!! Regidx (mword_of_int 10 : mword 5)
+                    = (mword_of_int mn_nl_addr : mword 64))
+      by (rewrite /A3 upd_ne; [exact HA2a0 | reg_neq]).
+    iApply (PrintkGen.wp_printk_gen_sconf KT0 fsc_printk γd γv A3 n false p0
+              mn_nl [] false ∅ ltac:(lia) Hlnl Hnnl ltac:(rewrite Hknl; reflexivity)
+              ltac:(cbn [length]; lia) (locks_below_empty "pr")
+              with "Hcg Htext Hkdata Hpc Hcpu Hpenv [] [//]").
+    all: try lkbelow.
+    { rewrite HA3a0. iExact "Hsnl". }
+    iApply wp_next_off_intro.
+    iIntros (mk1) "Hcg Hpc %Hcsk1 Hcpu _ _".
+    assert (Hretpk1 : ret_pc (A3 !!! Regidx (mword_of_int 1 : mword 5))
+                      = (mword_of_int (KernelSyms.main + 0x56) : mword 64)).
+    { rewrite /A3 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretpk1) in "Hpc".
+    destruct Hcsk1 as (Hcsk1 & _).
+    (* ---- +0x56 / +0x5a : a0 := &"xv6 kernel is booting\n" ---- *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.main + 0x56)) (mword_of_int 10 : mword 5)
+              (mword_of_int 6 : mword 20) mk1 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_56 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (B1 := <[Regidx (mword_of_int 10 : mword 5) := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.main + 0x56) : mword 64)
+           (auipc_off (mword_of_int 6 : mword 20)))]> mk1).
+    assert (Hp5a : add_vec_int (mword_of_int (KernelSyms.main + 0x56) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0x5a)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp5a) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.main + 0x5a)) (mword_of_int 10 : mword 5)
+              (mword_of_int 10 : mword 5) (mword_of_int 356 : mword 12) B1 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_5a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (B2 := <[Regidx (mword_of_int 10 : mword 5) := regval_into_reg
+        (add_vec (rget B1 (mword_of_int 10 : mword 5))
+           (sign_extend' 64 (mword_of_int 356 : mword 12)))]> B1).
+    assert (HB2a0 : B2 !!! Regidx (mword_of_int 10 : mword 5)
+                    = (mword_of_int mn_boot_addr : mword 64)).
+    { rewrite /B2 upd_eq. rgne. rewrite /B1 upd_eq /mn_boot_addr.
+      apply bv_eq; vm_compute; reflexivity. }
+    assert (Hp5e : add_vec_int (mword_of_int (KernelSyms.main + 0x5a) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0x5e)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp5e) in "Hpc".
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x5e)) (mword_of_int 1 : mword 5)
+              (mword_of_int 2094586 : mword 21) B2 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_5e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (B3 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x5e) : mword 64) 4)]> B2).
+    assert (Htgtpk2 : add_vec (mword_of_int (KernelSyms.main + 0x5e) : mword 64)
+              (sign_extend' 64 (mword_of_int 2094586 : mword 21))
+              = (mword_of_int KernelSyms.printk : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtpk2) in "Hpc".
+    assert (HB3a0 : B3 !!! Regidx (mword_of_int 10 : mword 5)
+                    = (mword_of_int mn_boot_addr : mword 64))
+      by (rewrite /B3 upd_ne; [exact HB2a0 | reg_neq]).
+    iApply (PrintkGen.wp_printk_gen_sconf KT0 fsc_printk γd γv B3 n false p0
+              mn_boot [] false ∅ ltac:(lia) Hlbt Hnbt ltac:(rewrite Hkbt; reflexivity)
+              ltac:(cbn [length]; lia) (locks_below_empty "pr")
+              with "Hcg Htext Hkdata Hpc Hcpu Hpenv [] [//]").
+    all: try lkbelow.
+    { rewrite HB3a0. iExact "Hsbt". }
+    iApply wp_next_off_intro.
+    iIntros (mk2) "Hcg Hpc %Hcsk2 Hcpu _ _".
+    assert (Hretpk2 : ret_pc (B3 !!! Regidx (mword_of_int 1 : mword 5))
+                      = (mword_of_int (KernelSyms.main + 0x62) : mword 64)).
+    { rewrite /B3 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretpk2) in "Hpc".
+    destruct Hcsk2 as (Hcsk2 & _).
+    (* ---- +0x62 / +0x66 / +0x6a : the third printk("\n") ---- *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.main + 0x62)) (mword_of_int 10 : mword 5)
+              (mword_of_int 6 : mword 20) mk2 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_62 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (D1 := <[Regidx (mword_of_int 10 : mword 5) := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.main + 0x62) : mword 64)
+           (auipc_off (mword_of_int 6 : mword 20)))]> mk2).
+    assert (Hp66 : add_vec_int (mword_of_int (KernelSyms.main + 0x62) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0x66)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp66) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.main + 0x66)) (mword_of_int 10 : mword 5)
+              (mword_of_int 10 : mword 5) (mword_of_int 336 : mword 12) D1 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_66 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (D2 := <[Regidx (mword_of_int 10 : mword 5) := regval_into_reg
+        (add_vec (rget D1 (mword_of_int 10 : mword 5))
+           (sign_extend' 64 (mword_of_int 336 : mword 12)))]> D1).
+    assert (HD2a0 : D2 !!! Regidx (mword_of_int 10 : mword 5)
+                    = (mword_of_int mn_nl_addr : mword 64)).
+    { rewrite /D2 upd_eq. rgne. rewrite /D1 upd_eq /mn_nl_addr.
+      apply bv_eq; vm_compute; reflexivity. }
+    assert (Hp6a : add_vec_int (mword_of_int (KernelSyms.main + 0x66) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0x6a)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hp6a) in "Hpc".
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x6a)) (mword_of_int 1 : mword 5)
+              (mword_of_int 2094574 : mword 21) D2 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_6a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (D3 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x6a) : mword 64) 4)]> D2).
+    assert (Htgtpk3 : add_vec (mword_of_int (KernelSyms.main + 0x6a) : mword 64)
+              (sign_extend' 64 (mword_of_int 2094574 : mword 21))
+              = (mword_of_int KernelSyms.printk : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtpk3) in "Hpc".
+    assert (HD3a0 : D3 !!! Regidx (mword_of_int 10 : mword 5)
+                    = (mword_of_int mn_nl_addr : mword 64))
+      by (rewrite /D3 upd_ne; [exact HD2a0 | reg_neq]).
+    iApply (PrintkGen.wp_printk_gen_sconf KT0 fsc_printk γd γv D3 n false p0
+              mn_nl [] false ∅ ltac:(lia) Hlnl Hnnl ltac:(rewrite Hknl; reflexivity)
+              ltac:(cbn [length]; lia) (locks_below_empty "pr")
+              with "Hcg Htext Hkdata Hpc Hcpu Hpenv [] [//]").
+    all: try lkbelow.
+    { rewrite HD3a0. iExact "Hsnl". }
+    iApply wp_next_off_intro.
+    iIntros (mk3) "Hcg Hpc %Hcsk3 Hcpu _ _".
+    assert (Hretpk3 : ret_pc (D3 !!! Regidx (mword_of_int 1 : mword 5))
+                      = (mword_of_int (KernelSyms.main + 0x6e) : mword 64)).
+    { rewrite /D3 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretpk3) in "Hpc".
+    destruct Hcsk3 as (Hcsk3 & _).
+    iApply ("Hcont" $! mk3 with "Hcg Hpc Hfree Hcpu Hpenv Hccaps Hu1caps Hcready").
+  Qed.
+
+  (* =================================================================== *)
+  (* 0x6e .. 0x7a -- kinit(); kvminit(); kvminithart(); procinit(), with   *)
+  (* the [kalloc_env] and [procs_inv] assemblies, and -- between kvminit    *)
+  (* and kvminithart -- THE TABLE PUBLICATION: the one-way door that        *)
+  (* persists the root cell, mints the 65 kernel-mapping claims out of the  *)
+  (* [kmap_auth kmap_M0] boot token, and allocates the shared [kpt_inv] out *)
+  (* of kvminit's exclusive tree + the [kpt_unset] one-shot.  It lives HERE *)
+  (* (boot-hart-only, once) so that kvminithart's own contract is           *)
+  (* hart-generic: it takes only the persistent [kpt_inv] + root cell.      *)
+  (* =================================================================== *)
+  Local Lemma mn_grp_kvm 
+      (m : regfile) (n : nat) (p0 : mword 64)
+      (ps : list (mword 64)) (s1entry phystop : mword 64)
+      (tlbvec0 : vec (option TLB_Entry) (2 ^ 6)) :
+    (K_userinit <= n)%nat ->
+    phystop = (mword_of_int 0x88000000 : mword 64) ->
+    (* [kmem_lo] IS the dumped `end` symbol -- see [SpecMain]'s premise *)
+    s1entry = add_vec (and_vec (add_vec (mword_of_int kmem_lo : mword 64)
+                        (mword_of_int 4095 : mword 64)) negPGSIZEv) PGSIZEv ->
+    prun phystop s1entry ps ->
+    (K_kvmmake + 64 + 3 < length ps)%nat ->
+    hart_agent cpu_id = 0%nat ->
+    (* main has no current proc: the kernel page table's boot lend
+       (permit sweep L2) *)
+    p0 = (zero_reg : mword 64) ->
+    sie_cap_gpr KT0 m n false p0 -∗
+    kernel_text -∗ kernel_data -∗
+    pc_is (mword_of_int (KernelSyms.main + 0x6e) : mword 64) -∗
+    cpu_ctx_free -∗
+    cpu_own 0 false p0 false ∅ -∗
+    lk_raw (mword_of_int KernelSyms.kmem) -∗
+    (* the "kmem" lock's ghost and the free-list count at genesis, at the
+       AMBIENT [fsc_kalloc] / [fsc_kpages] -- kit 1's second early peel and
+       fs-cfg-boot.md's debt (E).  [SpecKinit] now FILLS these three rather
+       than minting a pair of its own, because [FsReady.fs_ready] has to
+       spell the allocator's lock and its sealed count. *)
+    fs_kit_kalloc _ _ -∗
+    (mword_of_int (KernelSyms.kmem + 24) : mword 64) ↦₈ (mword_of_int 0 : mword 64) -∗
+    ([∗ list] p ∈ ps, page_own p) -∗
+    (∃ kpt0 : mword 64,
+       (mword_of_int KernelSyms.kernel_pagetable : mword 64) ↦₈ kpt0) -∗
+    strans_pending -∗ tlb ↦ᵣ tlbvec0 -∗ kpt_unset -∗
+    (* A6.71 / A6.70 finding 1: the pin bound's one-shot, minted at
+       adequacy beside [kpt_unset] and spent in the SAME publication
+       assembly ([KptShare.kpt_inv_alloc] takes both). *)
+    kptb_unset -∗
+    kmap_auth kmap_M0 -∗
+    lk_raw pid_lock_addr -∗ lk_raw wait_lock_addr -∗
+    (* ...AND WHAT wait_lock IS OVER, so that this group can bring it UP the
+       way it brings the nextpid lock up two assemblies below.  procinit
+       hands back [lk_fresh wait_lock_addr "wait_lock"]; [WaitInv.parents_res]
+       is the NPROC [p_parent] cells, carved by [BootCarveMain]'s slot
+       family and routed here through [main_globals_raw].  The lock's OTHER
+       half, the children sets, has no cells to come out of: it is minted in
+       the boot fupd at the canonical name and arrives on the row below. *)
+    WaitInv.parents_res -∗
+    (* THE CHILDREN MAP AND ITS NPROC ROWS ([WaitInv.children_boot]).  The
+       authority pairs with the cells above for <wait_lock>'s payload; row
+       [i] goes into slot [i]'s dormant block at the proc-table assembly
+       ([SpecProcinit.procs_inv_alloc]), which is where a slot's row lives
+       until allocproc hands it to the process it creates. *)
+    WaitInv.children_boot_rows -∗
+    (* [PidLock.nextpid_res] itself: the .data word procinit's
+       [initlock(&pid_lock,"nextpid")] brings under its lock, AT THE PINNED
+       VALUE the loader left -- the payload's [1 <= v <= PIDMAX] is founded
+       here.  It is NOT .bss and it is not [kernel_data]'s -- see
+       [SpecMain]'s own row and [KernelDataInv]'s header. *)
+    (alp_nextpid ↦₄ (mword_of_int 1 : mword 32)) -∗
+    ([∗ list] i ∈ seq 0 NPROC, proc_raw (proc_addr i)) -∗
+    ([∗ list] i ∈ seq 0 NPROC,
+       (∃ ch : mword 64, p_chan (proc_addr i) ↦₈ ch) ∗ proc_pub (proc_addr i)) -∗
+    (* <pid_lock>'s quarter of every pid cell: the second half of
+       [PidLock.nextpid_res], sealed with the .data word two assemblies down *)
+    ([∗ list] i ∈ seq 0 NPROC,
+       pid_lock_share (proc_addr i) (mword_of_int 0 : mword 32)) -∗
+    fd_slots (NPROC * (NOFILE + FDSPARE)) -∗
+    iref_slots (NPROC * (1 + IREFSPARE)) -∗
+    (* the bio allowance for every slot, three units each, routed to procinit
+       with the other two supplies.  [3 * NPROC = 192] out of
+       [BioDefs.BSLOTS = 1024]; the rest stays with main for the file
+       system's own boot ([FirstTok.first_fsinit]'s 35). *)
+    bslots (NPROC * 3) -∗
+    ([∗ list] i ∈ seq 0 NPROC, hart_full i (0%fin : CPU)) -∗
+    ([∗ list] i ∈ seq 0 NPROC, pstate_full i UNUSED) -∗
+    (* NO [∀ γa]: the allocator's lock gname is the AMBIENT [fsc_kalloc]
+       from [kinit] on (debt (E)), and userinit's contract now states its
+       kalloc regime there so that its post-allocproc SEAL can be the boot
+       token's own allocator row.  A quantified [γa] could never be shown
+       equal to the ambient one. *)
+    ( ∀ (γp γw : gname) (γs : list gname) (m' : regfile)
+        (root : mword 44) (pas : nat -> mword 44),
+        sie_cap_gpr KT1 m' n false p0 -∗
+        pc_is (mword_of_int (KernelSyms.main + 0x7e) : mword 64) -∗
+        cpu_ctx_free -∗
+        cpu_own 0 false p0 false ∅ -∗
+        kalloc_env_at fsc_kalloc fsc_kpages (avail_sub (Some (length ps)) K_kvmmake) -∗
+        (* ...AND THE SAME LOCK, SPELLED (fs-cfg-boot.md (f-3), row 16 of
+           [FirstTok.first_boot_persist]).  [kalloc_env] hides the page
+           gname behind an [∃ γk], and a consumer that names the pair
+           itself -- [FsReady.fs_ready] does -- can never tie its own name
+           to a hidden one.  Since debt (E), [SpecKinit] FILLS the ambient
+           [fsc_kalloc]/[fsc_kpages] rather than minting a pair of its own,
+           so this row costs nothing: it is [kinit]'s own persistent
+           postcondition, forwarded instead of being sealed inside the
+           bundle one line up. *)
+        is_lock fsc_kalloc (mword_of_int KernelSyms.kmem) "kmem"%string
+          (λ ξ : CtxId, kmem_res (XIk := ξ) fsc_kpages (mword_of_int (KernelSyms.kmem + 24))) -∗
+        procs_inv γs -∗
+        (* THE nextpid LOCK, built here out of procinit's [lk_fresh] and the
+           cell above.  Persistent.  allocproc takes it, so kfork, sys_fork
+           and -- at its real contract -- userinit all do. *)
+        is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+        (* THE wait_lock, built the same way and for the first time.  Every
+           consumer in the tree takes it -- kexit, kwait, reparent, the
+           syscall environment -- and nothing has ever built one; see
+           projects/forkret-park.md E3. *)
+        is_lock γw wait_lock_addr "wait_lock"%string (wait_res_at) -∗
+        (* the KPT receipt kvminithart minted, on its way to [trap_csrs] *)
+        kpt_on cpu_id -∗
+        (∃ v : mword 64, stvec ↦ᵣ v) -∗
+        (* what kvminithart published about the kernel page table: all
+           PERSISTENT, and exactly what the [started] deposit carries.
+           A6.138: the creds travel too -- mn_grp_started needs the BOUND
+           (and its llb) to tie the deposit to the flag's position. *)
+        kpt_inv root -∗
+        KptShare.kpt_creds -∗
+        (mword_of_int KernelSyms.kernel_pagetable : mword 64) ↦₈□
+          (zero_extend' 64 (concat_vec root (zeros' 12 : mword 12))) -∗
+        kmap_at tramp_vpn tramp_ppn KP_rx -∗
+        ([∗ list] i ∈ seq 0 64, kmap_at (kstack_vpn i) (pas i) KP_rw) -∗
+        (* THE TICK COUNTER'S MIRROR, at 0, off [children_boot_rows]
+           (design ni-ticks-ledger.md D1): passed through untouched to
+           [mn_grp_trap], which raises it to the cell's boot value and
+           seals it into <tickslock> beside the cell. *)
+        tick_cnt 0 -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hn Hphystop Hs1 Hprun Hlen H0cid Hp0.
+    subst phystop s1entry.
+    iIntros "Hcg #Htext #Hkdata Hpc Hfree Hcpu Hlkmem Hkkalloc Hkmem24 Hpages Hkpt".
+    iIntros "Hsbit Htlb Hunset Hbunset Hkauth Hlpid Hlwait Hwres Hchb Hnpid Hprocs Hppub Hpshare Hfds Hirs Hbss Hparks Hpst Hcont".
+    (* THE ORPHAN VAR IS THE MIDDLE ONE ([WaitInv.children_boot]): the boot
+       fupd mints it at [∅] beside the map's authority, and it goes into
+       <wait_lock>'s payload with the children half. *)
+    iDestruct "Hchb" as "[Hchres [Horph [Hpreg [Hpled [Htk [Hzled Hchrows]]]]]]".
+    iDestruct "Hlkmem" as (vkl vkn vkc) "(Hkw & Hkn & Hkc)".
+    iDestruct "Hkpt" as (kpt0) "Hkpt".
+    (* ---- +0x6e jal kinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x6e)) (mword_of_int 1 : mword 5)
+              (mword_of_int 2096142 : mword 21) m n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_6e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (V1 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x6e) : mword 64) 4)]> m).
+    assert (Htgtki : add_vec (mword_of_int (KernelSyms.main + 0x6e) : mword 64)
+              (sign_extend' 64 (mword_of_int 2096142 : mword 21))
+              = (mword_of_int KernelSyms.kinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtki) in "Hpc".
+    iDestruct (fs_kit_kalloc_open with "Hkkalloc")
+      as "(Hkmfree & Hkmav & Hkmcnt)".
+    iApply (Kinit.wp_kinit_sconf fsc_kalloc fsc_kpages V1 ps n 0%nat false p0
+              vkl vkn vkc
+              false ∅ ltac:(lia) eq_refl Hprun (locks_below_empty _)
+              with "Hcg Hcpu Htext Hkdata Hpc Hkw Hkn Hkc Hkmem24 Hpages
+                    Hkmfree Hkmav Hkmcnt").
+    all: try lkbelow.
+    iApply wp_next_off_intro.
+    iIntros (mki) "Hcg Hcpu Hpc %Hcski #Hkmem Havail".
+    assert (Hretki : ret_pc (V1 !!! Regidx (mword_of_int 1 : mword 5) : mword 64)
+                     = (mword_of_int (KernelSyms.main + 0x72) : mword 64)).
+    { rewrite /V1 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretki) in "Hpc".
+    (* ---- ASSEMBLY 1: the allocator bundle, WITH THE PAIR NAMED ----
+       [KvmSpec.kalloc_env_at] rather than [kalloc_env]: main is the only
+       place the free-list pair has a name, and the counted chain below --
+       kvminit, procinit, userinit, allocproc -- has to carry it as far as
+       userinit's seal, which is what mints [FirstTok.first_tok]'s allocator
+       row.  The [∃ γk] version loses it here and nothing recovers it. *)
+    iAssert (kalloc_env_at fsc_kalloc fsc_kpages (Some (length ps)))
+      with "[Havail]" as "Hkenv".
+    { iApply (kalloc_env_at_intro with "Hkmem Havail"). }
+    (* ---- +0x72 jal kvminit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x72)) (mword_of_int 1 : mword 5)
+              (mword_of_int 734 : mword 21) mki n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_72 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (V2 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x72) : mword 64) 4)]> mki).
+    assert (Htgtkv : add_vec (mword_of_int (KernelSyms.main + 0x72) : mword 64)
+              (sign_extend' 64 (mword_of_int 734 : mword 21))
+              = (mword_of_int KernelSyms.kvminit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtkv) in "Hpc".
+    iApply (Kvminit.wp_kvminit_sconf fsc_kalloc fsc_kpages V2 0%nat n false p0
+              (Some (length ps)) kpt0 false ∅ eq_refl ltac:(lia)
+              ltac:(exists (length ps); split; [reflexivity | lia]) Hp0
+              with "Hcg Hcpu Htext Hpc Hkpt Hkenv").
+    all: try lkbelow.
+    iApply wp_next_off_intro.
+    iIntros (mkv t pas) "Hcg Hcpu Hpc Htree Hkpt %Hrep %Hnodes Hkenv %Hcskv %Hpasok Hkstacks".
+    assert (Hretkv : ret_pc (V2 !!! Regidx (mword_of_int 1))
+                     = (mword_of_int (KernelSyms.main + 0x76) : mword 64)).
+    { rewrite /V2 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretkv) in "Hpc".
+    (* ---- THE PUBLICATION: the one-way door that shares the kernel table.
+       Persist the root cell kvminit wrote, mint the 65 claims out of the
+       boot auth, and allocate [kpt_inv] out of kvminit's exclusive tree +
+       the one-shot -- so kvminithart below (and on every secondary hart)
+       needs only the persistent [kpt_inv] + root cell. ---- *)
+    iApply fupd_wp.
+    iMod (ctx_word_pointsto_persist with "Hkpt") as "#Hkptp".
+    iMod (kvm_M_mint pas with "Hkauth") as "(Hauth & #Htramp & #Hkstx)".
+    (* ---- K1 -- THE MINT (claude-notes/projects/sp-migration.md).  The 64
+       claims just minted, against the 64 identity-mapped pages kvminit
+       handed out, ARE the 64 process kernel stacks owned at their KSTACK
+       virtual addresses -- at KT1, the tree's first real KT1 facts.  This
+       is the one point in the tree where both halves are in hand.
+       The bank travels to the [procs_inv] assembly below, where each slot's
+       page is carved to [KSTACK_AV] and deposited in its dormant block
+       ([SpecProcinit.procs_inv_alloc]) -- so a process's kernel stack comes
+       from HERE for the rest of the system's life. ---- *)
+    iDestruct (kstack_bank_intro pas kalloc_junk Hpasok with "Hkstx Hkstacks") as "Hbank".
+    (* A6.135 §5: the invariant is NOT allocated here -- there is no interp
+       under a bare [fupd_wp].  The tree, the map auth and the two one-shots
+       ride into kvminithart's ESTABLISHMENT HOOK, which runs against the
+       live interp at the `csrw satp` write node and publishes every slot
+       byte at its own stamp ([KptPublish.kptree_publish_boot] -- no drain,
+       no log top), allocates [kpt_inv], and mints hart 0's boot
+       credentials ([kpt_creds_intro_boot] -- no view receipt). *)
+    iModIntro.
+    (* ---- +0x76 jal kvminithart ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x76)) (mword_of_int 1 : mword 5)
+              (mword_of_int 62 : mword 21) mkv n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_76 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (V3 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x76) : mword 64) 4)]> mkv).
+    assert (Htgtkh : add_vec (mword_of_int (KernelSyms.main + 0x76) : mword 64)
+              (sign_extend' 64 (mword_of_int 62 : mword 21))
+              = (mword_of_int KernelSyms.kvminithart : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtkh) in "Hpc".
+    iApply (Kvminithart.wp_kvminithart_sconf V3 0%nat n (pt_base t) tlbvec0 p0
+              (PtTree.ptree_own_at (PtTree.UTier cur_ctx) 2 (DfracOwn 1) t ∗ kmap_auth (kvm_M pas) ∗
+               kpt_unset ∗ kptb_unset)%I
+              (kpt_inv (pt_base t) ∗ KptShare.kpt_creds)%I
+              eq_refl ltac:(lia)
+              with "Hcg Hsbit Htext Hpc Htlb Hkptp []
+                    [Htree Hauth Hunset Hbunset]").
+    { (* THE ESTABLISHMENT *)
+      iIntros (g) "Hgh Hint Hctx (Htree & Hauth & Hunset & Hbunset)".
+      iMod (KptPublish.kptree_publish_boot g cur_ctx 2 t H0cid
+              with "Hgh Hint Hctx Htree")
+        as "(Hgh & Hint & Hctx & Ht & #Hllb)".
+      iMod (KptShare.kpt_inv_alloc (pt_base t) (length g.(glog)) t
+              (kvm_M pas) ⊤
+              (kvm_bridge pas t (pt_base t) Hpasok eq_refl Hrep)
+              with "Ht Hauth Hllb Hunset Hbunset")
+        as "(#Hkinv & #Hlbt & #Hbd)".
+      iDestruct (KptShare.kpt_creds_intro_boot _ H0cid with "Hbd Hllb")
+        as "#Hcreds".
+      iModIntro. iFrame "Hgh Hint Hctx".
+      iSplitR; [iExact "Hkinv" |]. iSplitR; [iExact "Hcreds" |].
+      iSplitR; [iExact "Hkinv" | iExact "Hcreds"]. }
+    { iFrame "Htree Hauth Hunset Hbunset". }
+    (* kvminithart's KPT RECEIPT, kept rather than dropped: it is a member of
+       [trap_csrs] now (IntrDefs §6b -- interrupts enabled implies the kernel
+       table is installed), so the boot chain must carry it to the fold in
+       [wp_main_boot_sconf].  Named [Hkptr] -- [Hkpt] in this lemma is the
+       [kernel_pagetable] CELL, a different thing. *)
+    iIntros (mkh) "Hcg Hpc %Hcskh #Hkptr Hstvec HQk".
+    iDestruct "HQk" as "(#Hkinv & #Hcreds)".
+    (* ---- THE BOOT SEAM: kvminithart has installed the kernel table, so
+       this hart's regime moves KT0 -> KT1.  [sie_cap_gpr_ktier_up] carries
+       the capability across, weakening its (static, boot-stack) frame
+       through [StackOwn.stack_ktier_mono] and re-minting the tier witness
+       from the receipt.  Everything below this line is post-boot. ---- *)
+    iDestruct (sie_cap_gpr_ktier_up KT0 KT1 with "Hcg Hkptr") as "Hcg".
+    assert (Hretkh : ret_pc (V3 !!! Regidx (mword_of_int 1))
+                     = (mword_of_int (KernelSyms.main + 0x7a) : mword 64)).
+    { rewrite /V3 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretkh) in "Hpc".
+    (* ---- +0x7a jal procinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x7a)) (mword_of_int 1 : mword 5)
+              (mword_of_int 2390 : mword 21) mkh n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_7a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (V4 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x7a) : mword 64) 4)]> mkh).
+    assert (Htgtpr : add_vec (mword_of_int (KernelSyms.main + 0x7a) : mword 64)
+              (sign_extend' 64 (mword_of_int 2390 : mword 21))
+              = (mword_of_int KernelSyms.procinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtpr) in "Hpc".
+    iApply (Procinit.wp_procinit_sconf V4 n false p0 ltac:(lia)
+              with "Hcg Htext Hkdata Hpc Hlpid Hlwait Hprocs Hfds Hirs Hbss").
+    iApply wp_next_off_intro.
+    iIntros (mpr) "Hcg Hpc %Hcspr Hlpidf Hlwaitf Hready".
+    assert (Hretpr : ret_pc (V4 !!! Regidx (mword_of_int 1 : mword 5) : mword 64)
+                     = (mword_of_int (KernelSyms.main + 0x7e) : mword 64)).
+    { rewrite /V4 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretpr) in "Hpc".
+    (* ---- ASSEMBLY 2: the 64 proc locks -> procs_inv ---- *)
+    iApply fupd_wp.
+    iDestruct (big_sepL_sep_2
+                 (fun _ i => proc_ready i)
+                 (fun _ i => ((∃ ch : mword 64, p_chan (proc_addr i) ↦₈ ch) ∗
+                              proc_pub (proc_addr i))%I)
+                 (seq 0 NPROC) with "Hready Hppub") as "Hin".
+    iDestruct (big_sepL_sep_2
+                 (fun _ i => (proc_ready i ∗
+                              ((∃ ch : mword 64, p_chan (proc_addr i) ↦₈ ch) ∗
+                               proc_pub (proc_addr i)))%I)
+                 (fun _ i => hart_full i (0%fin : CPU))
+                 (seq 0 NPROC) with "Hin Hparks") as "Hin".
+    iDestruct (big_sepL_sep_2
+                 (fun _ i => ((proc_ready i ∗
+                               ((∃ ch : mword 64, p_chan (proc_addr i) ↦₈ ch) ∗
+                                proc_pub (proc_addr i))) ∗ hart_full i (0%fin : CPU))%I)
+                 (fun _ i => pstate_full i UNUSED)
+                 (seq 0 NPROC) with "Hin Hpst") as "Hin".
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    (* THE SLOT ROWS GO IN HERE: [WaitInv.children_boot]'s big-op, one row
+       per slot, deposited into slot [i]'s dormant block by pass 3.  From
+       there allocproc hands a slot's row to the process it creates and
+       freeproc gives it back -- nothing else can make one, because the
+       authority is <wait_lock>'s. *)
+    iMod (procs_inv_alloc ⊤ with "Hin Hchrows Hbank Hrun") as "[Hrun Hpi0]".
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Hpi0" as (γs) "#Hpinv".
+    (* ---- ASSEMBLY 2b: the nextpid LOCK.  procinit's [lk_fresh] plus the
+           .data cell IS [WpLock.newlock]'s premise list at
+           [PidLock.nextpid_res], and the result is what allocproc --
+           hence kfork, sys_fork and userinit -- takes.  It could not be
+           built before the boot chain stopped persisting the image's two
+           writable .data words; see [KernelDataInv]'s header. ---- *)
+    iDestruct (lk_fresh_pieces pid_lock_addr "nextpid"%string with "Hlpidf")
+      as "(#Hpnm & Hpw & Hpc0)".
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (newlock ⊤ alp_pid_lock "nextpid"%string nextpid_res_at
+            with "Hpnm Hrun Hpw Hpc0 [Hnpid Hpshare Hpreg Hpled]") as "[Hrun Hpid0]".
+    (* the payload's [1 <= nextpid <= PIDMAX] is FOUNDED here: the .data
+       word arrives at the pinned value the loader left ([BootShared]'s
+       carve), so the invariant the scan keeps has an inhabitant. *)
+    { rewrite /nextpid_res_at /pid_lock_share. iSplitL "Hnpid".
+      { iExists (mword_of_int 1 : mword 32). iFrame "Hnpid".
+        assert (Hv : bv_unsigned (mword_of_int 1 : mword 32) = 1)
+          by (vm_compute; reflexivity).
+        iSplitR; [ iPureIntro; rewrite Hv; unfold PIDMAX; lia | ].
+        (* ...AND THE BOOT ERA'S FIRST MARK (lane TRAP-ROWS-4, B1b): the
+           .data word IS the 1 the loader left, which is what makes
+           <init>'s pid the literal 1. *)
+        iLeft. iPureIntro. exact Hv. }
+      (* THE PID REGISTER ENTERS THE PAYLOAD HERE, empty: nothing has been
+         handed out, and the .bss carve pinned every pid cell at 0, so the
+         domain fact holds vacuously ([SlotGen.pid_reg_dom_empty]). *)
+      iExists (replicate NPROC (mword_of_int 0 : mword 32)),
+              (∅ : gmap Z gname).
+      (* ...AND THE PID LEDGER BESIDE IT, at the empty history, whose live
+         set is the empty register's domain ([PidLock.pid_ledger_empty]). *)
+      iDestruct (pid_ledger_empty with "Hpled") as "Hpled".
+      iFrame "Hpreg Hpled". iSplitR.
+      { iPureIntro. split; [apply length_replicate | apply pid_reg_dom_empty]. }
+      iSplitL.
+      { iDestruct (pid_shares_gather NPROC 0 (mword_of_int 0 : mword 32)
+                     with "Hpshare") as "Hpshare".
+        iApply (big_sepL_mono with "Hpshare"). iIntros (i v _) "Hs". iExact "Hs". }
+      (* ...AND THE BOOT ERA'S SECOND MARK (lane TRAP-ROWS-4, B1b): the
+         .bss carve pinned every pid cell at 0, so no slot holds pid 1 and
+         the first <allocpid> takes its first candidate with no retry. *)
+      iLeft. iPureIntro.
+      apply Forall_lookup. intros i q Hi.
+      apply lookup_replicate in Hi as [-> _].
+      vm_compute. discriminate. }
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Hpid0" as (γp) "#Hpidlock".
+    (* ---- ASSEMBLY 2c: the wait_lock, and it is the SAME move.  procinit
+           initialises the lock's three words exactly as it does pid_lock's;
+           what was missing until [BootCarveMain] stopped dropping the
+           [p_parent] cells was a resource for it to be over. ---- *)
+    iDestruct (lk_fresh_pieces wait_lock_addr "wait_lock"%string with "Hlwaitf")
+      as "(#Hwnm & Hww & Hwc0)".
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    (* THE PAYLOAD IS THE PAIR: the parent cells the carve handed main and
+       the children authority the boot fupd minted.  The map's name is
+       CANONICAL ([Xv6Cameras.wch_name]) -- a row of it has to be spellable
+       in [ProcDefs.proc_dormant] -- so nothing travels with the lock's own
+       gname any more. *)
+    (* ...and the zombie ledger's authority, at the empty history (design
+       ni-zombie-ledger.md D2), off [children_boot_rows] *)
+    iDestruct (WaitInv.wait_res_alloc with "Hwres Hchres Horph Hzled") as "Hwres".
+    iMod (newlock ⊤ wait_lock_addr "wait_lock"%string (wait_res_at)
+            with "Hwnm Hrun Hww Hwc0 Hwres") as "[Hrun Hwl0]".
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Hwl0" as (γw) "#Hwaitlock".
+    iModIntro.
+    iApply ("Hcont" $! γp γw γs mpr (pt_base t) pas
+              with "Hcg Hpc Hfree Hcpu Hkenv Hkmem Hpinv Hpidlock Hwaitlock
+                    Hkptr Hstvec Hkinv Hcreds Hkptp Htramp Hkstx Htk").
+  Qed.
+
+  (* =================================================================== *)
+  (* 0x7e .. 0x8a -- trapinit(); trapinithart(); plicinit();              *)
+  (* plicinithart(), plus [intr_inv_alloc_off] over kernelvec.            *)
+  (* =================================================================== *)
+  Local Lemma mn_grp_trap 
+      (γd : uart_names) (γv : disk_names) (m : regfile) (n : nat)
+      (p0 : mword 64) :
+    (K_userinit <= n)%nat ->
+    cid_word = (zero_reg : mword 64) ->
+    sie_cap_gpr KT1 m n false p0 -∗
+    kernel_text -∗ kernel_data -∗ dev_inv γd γv -∗
+    pc_is (mword_of_int (KernelSyms.main + 0x7e) : mword 64) -∗
+    lk_raw (mword_of_int KernelSyms.tickslock) -∗
+    (* the tick counter, so this group can bring tickslock UP: trapinit
+       initialises the lock's words and this is the resource it protects. *)
+    (∃ t : mword 32, a_ticks ↦₄ t) -∗
+    (* ...and its mirror at 0 ([mn_grp_kvm]'s pass-through): raised to the
+       cell's value here, the payload's tie founded (ni-ticks-ledger.md D2) *)
+    tick_cnt 0 -∗
+    (∃ v : mword 64, stvec ↦ᵣ v) -∗
+    ghost_var_frac sie_gname (1/4) ('b"0" : mword 1) -∗
+    (* IT HANDS OUT THE WRITTEN CELL AND THE GHOST QUARTER, NOT [intr_res],
+       and that is an ORDERING fact about main rather than a preference: the
+       handler contract closes over [devintr_caps] (SpecKernelvec.v), whose
+       disk lock does not exist until virtio_disk_init -- three groups further
+       on.  So the two pieces ride raw to the chain's tail, which is where
+       [intr_res] is folded and where [trap_csrs_raw] was already waiting to
+       be completed. *)
+    ( ∀ (m' : regfile) (γtl : gname),
+        sie_cap_gpr KT1 m' n false p0 -∗
+        pc_is (mword_of_int (KernelSyms.main + 0x8e) : mword 64) -∗
+        is_tickslock γtl -∗
+        stvec ↦ᵣ (mword_of_int KernelSyms.kernelvec : mword 64) -∗
+        ghost_var_frac sie_gname (1/4) ('b"0" : mword 1) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hn Hcid.
+    (* [cid_word] is a [Definition] over [cpu_id]; naming the delta-expanded
+       form once is what lets [rget_tp]'s output be rewritten below. *)
+    assert (Hcidz : cid_word_of cpu_id = (zero_reg : mword 64)) by exact Hcid.
+    iIntros "Hcg #Htext #Hkdata #Hdev Hpc Hltick Hticks Htk Hstvec Hq Hcont".
+    (* [dev_inv]'s PLIC conjunct ∃-PACKS the second port's names (WpUart.v:
+       that is what keeps the bundle at arity 2).  plicinit/plicinithart only
+       borrow [plic_frag], so the witness is all they need and this group
+       never has to know which bundle it is. *)
+    iDestruct (dev_inv_plic with "Hdev") as (γp1) "#Hpinv".
+    iDestruct "Hltick" as (vtl vtn vtc) "(Htw & Htn & Htc)".
+    (* ---- +0x7e jal trapinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x7e)) (mword_of_int 1 : mword 5)
+              (mword_of_int 5568 : mword 21) m n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_7e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (T1 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x7e) : mword 64) 4)]> m).
+    assert (Htgtti : add_vec (mword_of_int (KernelSyms.main + 0x7e) : mword 64)
+              (sign_extend' 64 (mword_of_int 5568 : mword 21))
+              = (mword_of_int KernelSyms.trapinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtti) in "Hpc".
+    iApply (Trapinit.wp_trapinit_sconf T1 n vtl vtn vtc false p0 ltac:(lia)
+              with "Hcg Htext Hkdata Hpc Htw Htn Htc").
+    iApply wp_next_off_intro.
+    iIntros (mt) "Hcg Hpc %Hcsti Htw2 #Htn2 Htc2".
+    (* ---- tickslock comes UP here: trapinit left its words initialised, and
+           the resource it protects is the [ticks] counter.  This is what the
+           handler contract's [tick_keeper] conjunct wants from the TICK hart
+           (hart 0); a secondary discharges it by its left arm instead. ---- *)
+    iDestruct "Hticks" as (t0) "Hticks".
+    (* a fupd in front of a [mWP (Loop)] goal: the tree's idiom is to peel it
+       with [fupd_wp] first (ProofIupdate.v records the same). *)
+    iApply fupd_wp.
+    (* THE MIRROR IS RAISED TO THE CELL'S BOOT VALUE (design
+       ni-ticks-ledger.md D2): the cell arrives at an existential [t0], and
+       the count [bv_unsigned t0] ties to it trivially (it is below 2^32). *)
+    iMod (tick_cnt_raise 0 (Z.to_nat (bv_unsigned t0)) ltac:(lia) with "Htk") as "Htk".
+    assert (Htie0 : ticks_tie t0 (Z.to_nat (bv_unsigned t0))).
+    { rewrite /ticks_tie. pose proof (bv_unsigned_in_range _ t0) as Hr.
+      unfold bv_modulus in Hr.
+      rewrite Z2Nat.id; [| lia]. rewrite Z.mod_small; [reflexivity |].
+      change (2 ^ 32) with (2 ^ Z.of_N 32). exact Hr. }
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (newlock ⊤ (mword_of_int KernelSyms.tickslock : mword 64) "time"%string ticks_res_at with "Htn2 Hrun Htw2 Htc2 [Hticks Htk]") as "[Hrun Htl0]".
+    { iApply (ticks_res_intro t0 (Z.to_nat (bv_unsigned t0)) Htie0 with "Hticks Htk"). }
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Htl0" as (γtl) "#Htl".
+    iModIntro.
+    assert (Hretti : ret_pc (T1 !!! Regidx (mword_of_int 1 : mword 5) : mword 64)
+                     = (mword_of_int (KernelSyms.main + 0x82) : mword 64)).
+    { rewrite /T1 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretti) in "Hpc".
+    (* ---- +0x82 jal trapinithart ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x82)) (mword_of_int 1 : mword 5)
+              (mword_of_int 5600 : mword 21) mt n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_82 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (T2 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x82) : mword 64) 4)]> mt).
+    assert (Htgtth : add_vec (mword_of_int (KernelSyms.main + 0x82) : mword 64)
+              (sign_extend' 64 (mword_of_int 5600 : mword 21))
+              = (mword_of_int KernelSyms.trapinithart : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtth) in "Hpc".
+    iDestruct "Hstvec" as (tv0) "Hstvec".
+    iApply (Trapinithart.wp_trapinithart_sconf T2 n tv0 p0 ltac:(lia)
+              with "Hcg Htext Hpc Hstvec").
+    iIntros (mth) "Hcg Hpc %Hcsth Hstvec".
+    assert (Hretth : ret_pc (T2 !!! Regidx (mword_of_int 1))
+                     = (mword_of_int (KernelSyms.main + 0x86) : mword 64)).
+    { rewrite /T2 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretth) in "Hpc".
+    (* trapinithart has written kernelvec into stvec; the cell and the SIE
+       ghost's spare quarter ride on to the chain's tail, where the handler
+       contract's credentials are finally all in hand. *)
+    (* ---- +0x86 jal plicinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x86)) (mword_of_int 1 : mword 5)
+              (mword_of_int 18394 : mword 21) mth n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_86 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (T3 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x86) : mword 64) 4)]> mth).
+    assert (Htgtpl : add_vec (mword_of_int (KernelSyms.main + 0x86) : mword 64)
+              (sign_extend' 64 (mword_of_int 18394 : mword 21))
+              = (mword_of_int KernelSyms.plicinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtpl) in "Hpc".
+    iApply (Plicinit.wp_plicinit_sconf γd γp1 T3 n p0 ltac:(lia)
+              with "Hcg Htext Hpc Hpinv").
+    iApply wp_next_off_intro.
+    iIntros (mpl) "Hcg Hpc %Hcspl".
+    destruct Hcspl as (Hcspl & _).
+    assert (Hretpl : ret_pc (T3 !!! Regidx (mword_of_int 1 : mword 5))
+                     = (mword_of_int (KernelSyms.main + 0x8a) : mword 64)).
+    { rewrite /T3 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretpl) in "Hpc".
+    (* ---- +0x8a jal plicinithart ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x8a)) (mword_of_int 1 : mword 5)
+              (mword_of_int 18418 : mword 21) mpl n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_8a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (T4 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x8a) : mword 64) 4)]> mpl).
+    assert (Htgtph : add_vec (mword_of_int (KernelSyms.main + 0x8a) : mword 64)
+              (sign_extend' 64 (mword_of_int 18418 : mword 21))
+              = (mword_of_int KernelSyms.plicinithart : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtph) in "Hpc".
+    (* plicinithart indexes the PLIC banks by [rget _ tp], which IS this
+       hart's id -- no map-side tp fact to thread. *)
+    assert (Hdc : (bv_unsigned (rget T4 (mword_of_int 4 : mword 5))
+                   < Z.of_nat dev_ncpu)%Z).
+    { rewrite (rget_tp T4) Hcidz. vm_compute. reflexivity. }
+    iApply (Plicinithart.wp_plicinithart_sconf γd γv T4 n p0 Hdc ltac:(lia)
+              with "Hcg Htext Hpc Hdev").
+    iIntros (mph) "Hcg Hpc %Hcsph".
+    destruct Hcsph as (Hcsph & _).
+    assert (Hretph : ret_pc (T4 !!! Regidx (mword_of_int 1 : mword 5))
+                     = (mword_of_int (KernelSyms.main + 0x8e) : mword 64)).
+    { rewrite /T4 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretph) in "Hpc".
+    iApply ("Hcont" $! mph γtl with "Hcg Hpc Htl Hstvec Hq").
+  Qed.
+
+  (* =================================================================== *)
+  (* 0x8e .. 0x9e -- binit(); iinit(); fileinit(); virtio_disk_init();     *)
+  (* userinit(), plus [DiskBoot.disk_res_boot] and the vdisk [newlock].    *)
+  (* =================================================================== *)
+  Local Lemma mn_grp_fs 
+      (γp : gname) (γs : list gname) (γv : disk_names) (γd : uart_names)
+      (γw γtl : gname)
+      (m : regfile) (n : nat) (p0 : mword 64)
+      (ps : list (mword 64)) (c0 : virtio_cfg) (free0 : nat -> bv 8)
+      (* kit 2's era data.  It used to be carried as two OPAQUE parameters
+         ([Pimg]/[Rspent]); stage (f) needs the kit at the spelling
+         [FirstTok.first_fsinit] binds, so the image and the superblock come
+         in by name and the spent set is written out. *)
+      (dk : Z -> bv 8) (sb : FsImg.fs_sb) (nib : nat)
+      (Pb : Z -> list (bv 8)) (Rspent : gset Z) :
+    (K_userinit <= n)%nat ->
+    (K_kvmmake + 64 + 3 < length ps)%nat ->
+    virtio_live c0 = false ->
+    (* the two configuration ties, out of [FsCfgBoot.fs_boot_supply]; this
+       group forwards them to userinit's namei corner *)
+    icfg_dev = ROOTDEV ->
+    (0 < icfg_nib)%nat ->
+    (* ...and the coverage set's own corner, at the ambient field:
+       [BioInitAt.bio_init_at]'s [0 ∉ bv_cov V] premise, which is
+       [FsBoot.fs_cov_in_0] off [fs_boot_image_wf] threaded down like
+       [0 < nib].  It is true because binit leaves all thirty buffers
+       claiming blockno 0, so block 0 cannot be a client block. *)
+    (0 : Z) ∉ fsc_cov ->
+    (* ...and stage (f)'s two pure rows: the kit's [nib] IS the ambient one
+       (so the era's kit is at the ambient region width), and
+       [SpecFsinit]'s (a)/(a')/(a'')/(g)/(g'') block, which
+       [FirstTok.first_fsinit_pures_of_snap] produced at main's top. *)
+    icfg_nib = nib ->
+    first_fsinit_pures dk sb Pb ->
+    fsc_uart = γd ->
+    fsc_disk = γv ->
+    fs_geom_ok ->
+    (* main has no current proc: userinit's boot lend (permit sweep L1a) *)
+    p0 = (zero_reg : mword 64) ->
+    sie_cap_gpr KT1 m n false p0 -∗
+    kernel_text -∗ kernel_data -∗ dev_inv γd γv -∗
+    (* ---- THE PARK ROWS, forwarded to userinit at +0x9e (forkret-park.md
+       §3 E3): the wire invariant and the trampoline claim (persistent
+       world the parked closure captures), the console capability and
+       readiness, the ticks lock and the wait lock.  This group reads none
+       of them; together with the disk lock, the geometry and the file
+       table it builds below they are the first process's trap-loop
+       environment minus the file system. ---- *)
+    wire_inv -∗
+    (* ...and THE FIRST PROCESS'S EXEC BUNDLE beside them
+       ([InitBoot.init_boot_bundle]): this group does not read it either,
+       and userinit's park hands it to forkret's boot arm *)
+    init_boot_bundle (bv_unsigned InodeInv.ROOTINO) ProcDefs.secc_all fdt0 -∗
+    (* ...AND THE CONSOLE'S READER TOKEN beside it (app-echo.md, "SH-LINE
+       RULING", R3): the bundle is a wand from it, this group does not read
+       it either, and userinit stages it at the park for forkret's boot arm.
+       It is the boot supply's own ([SpecMain]'s [cons_reader cn 0]), which
+       main no longer drops. *)
+    ConsoleInv.cons_reader fsc_cons 0%nat -∗
+    kmap_at tramp_vpn tramp_ppn KP_rx -∗
+    console_caps γd -∗
+    (* ...and the SECOND PORT's row beside it (bump 163d39b): the park's
+       [UsertrapRes.devintr_caps_any] gained it when devintr gained the
+       [irq == UART1_IRQ] arm, and this group makes no part of it --
+       [mn_grp_printk] does, at its second deposit. *)
+    uart1_caps γd -∗
+    SpecFileread.console_ready_app -∗
+    is_tickslock γtl -∗
+    is_lock γw wait_lock_addr "wait_lock"%string (wait_res_at) -∗
+    (* ---- ...AND ITS FOUR FORWARDED PERSISTENT ROWS.  [printk_env] is
+       [mn_grp_printk]'s product and the kmem [is_lock] is [mn_grp_kvm]'s;
+       [gen_cert] and [FsCrash.fs_crash_seam] come down the boot chain from
+       [SystemAdequacy] (see [SpecMain]'s rows).  None of them is READ by
+       this group -- they are parked in the boot token at +0x9e. ---- *)
+    printk_env fsc_printk fsc_uart fsc_disk -∗
+    is_lock fsc_kalloc (mword_of_int KernelSyms.kmem) "kmem"%string
+      (λ ξ : CtxId, kmem_res (XIk := ξ) fsc_kpages (mword_of_int (KernelSyms.kmem + 24))) -∗
+    gen_cert -∗
+    crash_inv -∗
+    FsCrash.fs_crash_seam fsc_cov fsc_logst -∗
+    flive_own ((● ∅) : fliveUR) -∗
+    (* r25 (item 24/33): the off boxes' per-inode-slot set authorities, minted
+       empty at the era mint and put into the icache slots' payloads here *)
+    ([∗ list] k ∈ seq 0 IcacheRefDefs.NINODE, OffBox.off_set_auth OffBox.off_cfg k ∅) -∗
+    (* ---- `static int first = 1', PINNED (fs-cfg-boot.md (f-2)).  One of
+       the image's two writable initialized .data words, carved at
+       [BootShared]'s boot data run and threaded pinned-not-existential the
+       whole way down.  This group neither reads nor writes it: it hands it
+       to userinit at +0x9e, which stages it at the park for forkret's
+       [if (first)] arm. ---- *)
+    first_addr ↦₄ (mword_of_int 1 : mword 32) -∗
+    (* iget's "iget: no inodes" arm, reached through userinit's namei *)
+    panic_env -∗
+    pc_is (mword_of_int (KernelSyms.main + 0x8e) : mword 64) -∗
+    cpu_ctx_free -∗
+    cpu_own 0 false p0 false ∅ -∗
+    procs_inv γs -∗
+    (* THE COUNTED PROC REGIME, carried to the userinit call site at +0x9e.
+       [SpecUserinit.wp_userinit_sconf_body] -- userinit's REAL contract,
+       which [ProofUserinit.v] proves -- takes [procs_avail (Some (S k))] and
+       is what refutes allocproc's empty-table arm.  The WEAK contract this
+       group actually applies ([SpecUserinit.USERINIT]) does not take it, so
+       it is dropped at the call below; swapping the two contracts is then a
+       local edit.  See claude-notes/projects/main-boot.md §G3. *)
+    procs_avail_at (Some NPROC) true -∗
+    (* NO CHILDREN ROWS HERE.  They were deposited into the slots' dormant
+       blocks two groups back, at [SpecProcinit.procs_inv_alloc]'s third
+       pass, and userinit takes none: the row the first process is parked
+       with is the one allocproc hands it out of its slot. *)
+    (* ...and the [nextpid] lock, for the same reason and to the same place:
+       userinit's real contract takes it (allocproc's own premise), the weak
+       one does not.  Persistent, so carrying it costs a frame. *)
+    is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+    kalloc_env_at fsc_kalloc fsc_kpages (avail_sub (Some (length ps)) K_kvmmake) -∗
+    lk_raw bcache_addr -∗
+    ([∗ list] k ∈ seq 0 NBUF, sl_raw (buf_lock (bnode k))) -∗
+    ([∗ list] k ∈ seq 0 NBUF, blink_raw (bnode k)) -∗
+    blink_raw bhead -∗
+    (* ---- THE BUFFER CACHE'S BOOT MATERIAL (fs-cfg-boot.md stage (f)) ----
+       the thirty zeroed [struct buf] payload rows, out of
+       [BootShared.boot_bss_carve] via [main_globals_raw] -- row (P2) of
+       [fs_kit_icache]'s header.  binit writes only the link pair and the
+       sleeplock, so this row crosses the +0x8e call untouched and
+       [BioInitAt.bio_init_at] joins it to binit's postcondition and kit 1's
+       [bio_free_tok] / [pool_blk] rows at the return. *)
+    ([∗ list] k ∈ seq 0 NBUF, buf_raw k) -∗
+    lk_raw itable_addr -∗
+    ([∗ list] i ∈ seq 0 NINODE, sl_raw (inode_lock i)) -∗
+    (* ---- THE INODE CACHE'S BOOT MATERIAL (fs-cfg-boot.md stage (e)) ----
+       [fs_kit_icache] is the era fupd's GHOST half -- the empty-table count
+       authority, the liveness pool, the fifty sleeplock ghost pairs, THE
+       STOCKED INODE POOL, the itable lock's free token and the three escrow
+       families.  Its physical counterpart is iinit's postcondition plus the
+       fifty [ientry_raw]s below (row (P1) of the kit's header), and
+       [IcacheBoot.icache_boot_at] joins the two at main+0x92.
+
+       [iref_slots_auth] is row (P4): minted by [IrefSlots.iref_slots_alloc]
+       inside [BootShared.boot_shared_alloc], not by the era fupd.
+
+       [fs_kit_fsinit_ghost] is NOT spent here.  This group takes [ireg_inv]
+       out of it (persistent -- [FsCfgBoot.fs_kit_fsinit_ghost_ireg], the
+       fourth of userinit's rows) and DROPS the rest at the userinit call;
+       stage (f) is what deposits it into [FirstTok.first_tok]'s widened
+       left disjunct so that forkret's [fsinit] can spend it. *)
+    fs_kit_icache_rest _ _ -∗
+    fs_kit_fsinit_ghost _ _ _ (FsCrash.fs_blocks dk) Rspent Pb
+      (FsCrash.hdr_wset (FsCrash.fs_blocks dk) fsc_logst) -∗
+    (* ---- ROWS (A)/(B)/(C) OF [FirstTok.first_fsinit] (fs-cfg-boot.md
+       (f-2)): the 32 raw [&sb] bytes and the whole [struct log], both
+       carved in [BootShared.boot_bss_carve] for the first time at this
+       stage; the era's log mirror variable; and one iref-slot unit.  This
+       group neither reads nor spends any of them -- they are joined to
+       kit 2 at the transport site below, at main+0x9e. ---- *)
+    main_sb_raw -∗
+    main_log_raw -∗
+    log_mirror_born (FsCrash.mirror_of (FsCrash.fs_blocks dk)) -∗
+    iref_slots 2 -∗
+    iref_slots_auth -∗
+    ([∗ list] k ∈ seq 0 NINODE, ientry_raw k) -∗
+    lk_raw (mword_of_int KernelSyms.ftable) -∗
+    (* THE OPEN-FILE TABLE'S HUNDRED ENTRIES, and the two ghost rows a FREE
+       table costs beside them -- [SpecMain.main_globals_raw]'s three new
+       rows.  They become [FileInv.ftable_res] at the [newlock] right after
+       fileinit; see there. *)
+    ([∗ list] k ∈ seq 0 NFILE, fentry_raw k) -∗
+    iref_slots NFILE -∗
+    fd_slots_auth -∗
+    lk_raw disk_lock -∗
+    (∃ pd pav pu : mword 64,
+       disk_desc ↦₈ pd ∗ disk_avail ↦₈ pav ∗ disk_used ↦₈ pu) -∗
+    ([∗ list] j ∈ seq 0 8, (pa_add disk_free j) ↦ₘ free0 j) -∗
+    d_used_idx ↦₂ wrap16 0%nat -∗
+    ([∗ list] i ∈ seq 0 8, disk_slot_raw i) -∗
+    ([∗ map] i ↦ st ∈ gset_to_gmap HInactive (set_seq 0 8 : gset nat),
+       i ↪[dn_head γv] st) -∗
+    (* ...the CLAIM MAP's authority, empty (nothing has been published)... *)
+    ghost_map_auth_frac (dn_claim γv) 1 (∅ : gmap nat dclaim) -∗
+    disk_done_lb γv 0%nat -∗
+    disk_cfg_is γv (DfracOwn (1/2)) c0 -∗
+    (∃ v0 : mword 64, (mword_of_int KernelSyms.initproc : mword 64) ↦₈ v0) -∗
+    (* ...AND <INIT>'S SAVED-PID CELL, WHOLE (lane TRAP-ROWS-3/4, T4(b)).
+       It comes off [WaitInv.children_boot] at ProofMain's top level rather
+       than through procinit's assembly, because the party that writes it
+       is userinit -- which this group calls, at +0x9e -- and no group
+       between the two has anything to do with it. *)
+    SlotGen.init_pid_tok (mword_of_int 0 : mword 32) -∗
+    ( ∀ (γk : gname) (pd pav pu : mword 64) (m' : regfile),
+        sie_cap_gpr KT1 m' n false p0 -∗
+        pc_is (mword_of_int (KernelSyms.main + 0xa2) : mword 64) -∗
+        cpu_ctx_free -∗
+        cpu_own 0 false p0 false ∅ -∗
+        is_lock γk d_lock "virtio_disk"%string (disk_res_at γv pd pav pu) -∗
+        disk_geom γv pd pav pu -∗
+        (* ...AND THE OPEN-FILE TABLE'S LOCK, which is fileinit's output plus
+           the resource the carve now hands over.  The two gnames are this
+           group's own choice and nothing above it constrains them. *)
+        (∃ γft γf : gname, is_ftable γft γf) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using ufdG0.
+    intros Hn Hlen Hlive Hdevq Hnibq Hcov0 Hnibeq Hpures
+           Huartq Hdiskq Hgeomok Hp0.
+    iIntros "Hcg #Htext #Hkdata #Hdev #Hwire Hbundle Hrdtok #Htramp #Hccaps #Hu1caps #Hcready #Htl #Hwaitlk
+             #Hpenv #Hkmem #Hcert #Hcinv #Hseam Hfolauth Hoffa Hfirst
+             #Hpanic Hpc Hfree Hcpu #Hpinv Hpavail #Hlpidlk Hkenv".
+    iIntros "Hlbc Hbufl Hbufn Hbhead Hbpay Hlit Hinl Hkit1 Hkit2
+             Hsbb Hlogr Hmir Hirslot Hirauth Hient Hlft Hfents Hirfile Hfdauth
+             Hldisk".
+    iIntros "Hdiskptr Hdiskfree Hdusedidx Hdslots Hclaim Hcmauth #Hdone Hcfg Hinitproc Hipt Hcont".
+    iPoseProof (dev_inv_disk with "Hdev") as "#Hdinv".
+    iDestruct "Hlbc" as (vbl vbn vbc) "(Hbw & Hbn & Hbc)".
+    iDestruct "Hlit" as (vil vin vic) "(Hiw & Hin & Hic)".
+    iDestruct "Hlft" as (vfl vfn vfc) "(Hfw & Hfn & Hfc)".
+    iDestruct "Hldisk" as (vdl vdn vdc) "(Hdw & Hdn & Hdc)".
+    iDestruct "Hdiskptr" as (pd0 pav0 pu0) "(Hdd0 & Hda0 & Hdu0)".
+    iDestruct "Hinitproc" as (iv0) "Hinitproc".
+    (* KIT 1 IS OPENED AT THE TOP OF THE GROUP, not at the inode-cache
+       interlude: its [bio_free_tok] / [pool_blk] rows are spent at +0x8e's
+       return (the FIRST of the two ghost interludes below) and the rest at
+       +0x92's, so one open serves both. *)
+    iDestruct (fs_kit_icache_rest_open with "Hkit1") as
+      "(Hiref & Hlivef & Histmp & Hislg & Hipool & Hpkey & Hxkey & Hitfree & Hictok & Hicmid & Hicid &
+        Hbiotok & Hblkpool & Hdllk & Hhpn & Htkey & Hckey & Hicbox)".
+    (* the two allocator-budget facts, in the closed form the callees ask for *)
+    assert (Hnb3 : exists nb, avail_sub (Some (length ps)) K_kvmmake = Some nb
+                              /\ (3 <= nb)%nat).
+    { exists (length ps - K_kvmmake)%nat. split; [apply avail_sub_Some | lia]. }
+    assert (Hnb8 : exists nb,
+              avail_sub (avail_sub (Some (length ps)) K_kvmmake) 3 = Some nb
+              /\ (K_allocproc < nb)%nat).
+    { exists (length ps - K_kvmmake - 3)%nat.
+      rewrite !avail_sub_Some. split; [reflexivity | lia]. }
+    (* ---- +0x8e jal binit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x8e)) (mword_of_int 1 : mword 5)
+              (mword_of_int 7364 : mword 21) m n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_8e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (F1 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x8e) : mword 64) 4)]> m).
+    assert (Htgtbi : add_vec (mword_of_int (KernelSyms.main + 0x8e) : mword 64)
+              (sign_extend' 64 (mword_of_int 7364 : mword 21))
+              = (mword_of_int KernelSyms.binit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtbi) in "Hpc".
+    iApply (Binit.wp_binit_sconf F1 n vbl vbn vbc false p0 ltac:(lia)
+              with "Hcg Htext Hkdata Hpc Hbw Hbn Hbc Hbufl Hbufn Hbhead").
+    iApply wp_next_off_intro.
+    iIntros (mbi) "Hcg Hpc %Hcsbi Hbclk #Hbcnm Hbccpu Hbfresh Hblru".
+    assert (Hretbi : ret_pc (F1 !!! Regidx (mword_of_int 1 : mword 5))
+                     = (mword_of_int (KernelSyms.main + 0x92) : mword 64)).
+    { rewrite /F1 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretbi) in "Hpc".
+    (* =================================================================== *)
+    (* GHOST INTERLUDE, BETWEEN +0x8e's RETURN AND +0x92: THE BUFFER CACHE. *)
+    (*                                                                     *)
+    (* [BioInitAt.bio_init_at] joins binit's postcondition (the zeroed      *)
+    (* bcache spinlock, the thirty [sl_fresh]es and the built LRU list) to  *)
+    (* the thirty [buf_raw] payload rows main carried across the call, and  *)
+    (* to kit 1's two bio rows -- [bio_free_tok fsc_bio] (the free state of *)
+    (* the record the era fupd PUBLISHED, which is why this is [_at] and    *)
+    (* not [bio_init]: [fsc_bio] is an ambient field and cannot be an       *)
+    (* existential) and the covered range's [pool_blk] bundle.             *)
+    (*                                                                     *)
+    (* It runs HERE, at the earliest possible seam, because everything      *)
+    (* after it wants [bio_ctx] persistent in the context and because       *)
+    (* nothing between +0x92 and +0x9e touches a buffer.  Same idiom as the *)
+    (* inode-cache interlude at the next seam.                             *)
+    (* =================================================================== *)
+    (* THE RUNNING TOKEN IS BORROWED HERE.  Every escrow is a PARKED RECORD  *)
+    (* now, so its initial content is [TsoCtx.ctx_deposit]ed into the        *)
+    (* freshly minted context that record carries -- and a deposit runs at   *)
+    (* the depositor's own authority.  The token rides in [sie_cap]'s fourth *)
+    (* conjunct ([SieCapCtx.sie_cap_gpr_own_ctx_acc]) and goes straight back.*)
+    iApply fupd_wp.
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (bio_init_at fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) ⊤
+            Hcov0
+            with "Hrun Hbiotok Hbclk Hbcnm Hbccpu Hbfresh Hbpay Hblru Hblkpool")
+      as "(Hrun & #Hbioctx & Hbslots)".
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iModIntro.
+    (* ---- +0x92 jal iinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x92)) (mword_of_int 1 : mword 5)
+              (mword_of_int 8726 : mword 21) mbi n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_92 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (F2 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x92) : mword 64) 4)]> mbi).
+    assert (Htgtii : add_vec (mword_of_int (KernelSyms.main + 0x92) : mword 64)
+              (sign_extend' 64 (mword_of_int 8726 : mword 21))
+              = (mword_of_int KernelSyms.iinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtii) in "Hpc".
+    iApply (Iinit.wp_iinit_sconf F2 n vil vin vic false p0 ltac:(lia)
+              with "Hcg Htext Hkdata Hpc Hiw Hin Hic Hinl").
+    iApply wp_next_off_intro.
+    iIntros (mii) "Hcg Hpc %Hcsii Hitw #Hitnm Hitcpu Hslf".
+    assert (Hretii : ret_pc (F2 !!! Regidx (mword_of_int 1 : mword 5))
+                     = (mword_of_int (KernelSyms.main + 0x96) : mword 64)).
+    { rewrite /F2 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretii) in "Hpc".
+    (* =================================================================== *)
+    (* GHOST INTERLUDE, BETWEEN +0x92's RETURN AND +0x96: THE INODE CACHE.  *)
+    (*                                                                     *)
+    (* [IcacheBoot.icache_boot_at] joins iinit's postcondition (the zeroed  *)
+    (* itable spinlock and the fifty [sl_fresh]es) to the era fupd's ghost  *)
+    (* half ([FsCfgBoot.fs_kit_icache]) and the fifty [ientry_raw]s, and    *)
+    (* returns the four persistent rows userinit's [namei("/")] takes.      *)
+    (* This is what discharged [LinkNameiRootBoot]'s Axiom                  *)
+    (* (claude-notes/projects/fs-cfg-boot.md, stage (e)).                   *)
+    (*                                                                     *)
+    (* IT RUNS HERE AND NOT LATER because nothing between +0x92 and +0x9e   *)
+    (* touches the itable, and running it here keeps the four rows in the   *)
+    (* context across fileinit and virtio_disk_init at no cost (they are    *)
+    (* persistent).  Same idiom as the [disk_res_boot] + [newlock] step at  *)
+    (* +0x9a's return below: [iApply fupd_wp] at mask ⊤, then [iModIntro].  *)
+    (* =================================================================== *)
+    iApply fupd_wp.
+    (* [ireg_inv] is persistent, so taking it out does not spend kit 2 *)
+    iDestruct (fs_kit_fsinit_ghost_ireg with "Hkit2") as "[#Hireg Hkit2]".
+    (* ...and so is kit 2's row (D), the BLOCK BITMAP'S INVARIANT: since the
+       bitmap became [BitmapInv.bitmap_inv] it is persistent too, and
+       [FirstTok.first_boot_persist] now names it beside [ireg_inv]. *)
+    iDestruct (fs_kit_fsinit_ghost_bitmap with "Hkit2") as "[#Hbminv Hkit2]".
+    (* iinit's fifty sleeplocks are at [SpecIinit.inode_lock]; the cache
+       addresses them as [i_lock (ientry k)].  ONE conversion, and it is
+       [IcacheBoot]'s own lemma. *)
+    iAssert ([∗ list] k ∈ seq 0 NINODE,
+               sl_fresh (i_lock (ientry k)) "inode"%string)%I
+      with "[Hslf]" as "Hslf".
+    { iApply (big_sepL_mono with "Hslf"). intros i k _.
+      (* [IcacheBoot] states the bridge over the raw literals, deliberately
+         (its own note: [SpecIinit]'s [NINODE] would shadow [IcacheRef]'s),
+         so the two constants have to be unfolded for [rewrite] to see the
+         [acur] application. *)
+      rewrite /inode_lock /inode_lock_base /inode_stride.
+      rewrite inode_lock_is_ientry_lock. iIntros "H"; iExact "H". }
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (icache_boot_at ⊤ fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov
+            fsc_logst icfg_nib icfg_dev
+            with "Hiref Hlivef Hislg Hitw Hitnm Hitcpu Hslf Hient Hirauth
+                  Histmp Hipool Hpkey Hxkey Hitfree Hictok Hicmid Hicid Hhpn Htkey
+                  Hckey Hicbox Hoffa Hrun")
+      as "(Hrun & #Hitl & #Hitinv & #Hesc & Hicsl)".
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iModIntro.
+    (* ---- +0x96 jal fileinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x96)) (mword_of_int 1 : mword 5)
+              (mword_of_int 12854 : mword 21) mii n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_96 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (F3 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x96) : mword 64) 4)]> mii).
+    assert (Htgtfi : add_vec (mword_of_int (KernelSyms.main + 0x96) : mword 64)
+              (sign_extend' 64 (mword_of_int 12854 : mword 21))
+              = (mword_of_int KernelSyms.fileinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtfi) in "Hpc".
+    iApply (Fileinit.wp_fileinit_sconf F3 n vfl vfn vfc false p0 ltac:(lia)
+              with "Hcg Htext Hkdata Hpc Hfw Hfn Hfc").
+    iApply wp_next_off_intro.
+    (* ---- FILEINIT'S THREE OUTPUTS BECOME THE ftable LOCK, and this is the
+       last of the eleven spinlocks to get one.  They ARE [WpLock.newlock]'s
+       premise list minus the resource, and [SpecFileinit.v]'s header says
+       as much: "Whether the lock then becomes an [is_lock] over the open-file
+       table is the caller's ghost step, not fileinit's".  main could not take
+       that step until now for one reason: [FileInv.ftable_res] wants the
+       ftable's own [file[NFILE]] array, and the .bss walk cut straight from
+       [ftable+24] to <disk> and dropped all 4000 bytes of it -- exactly as it
+       used to drop the [p_parent] cells the wait_lock needed.  With
+       [BootCarveMain.boot_file_entries] carving them the mint is one lemma
+       and the lock is one line, and [is_ftable] -- which the syscall
+       environment, kfork, kexit and every sys_open path take, and which
+       nothing in the tree could build -- exists. ---- *)
+    iIntros (mfi) "Hcg Hpc %Hcsfi Hftw Hftnm Hftc".
+    iApply fupd_wp.
+    iMod (ftable_res_boot ⊤ with "Hfolauth Hfents Hfdauth Hirfile") as (γf) "Hfres".
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (newlock ⊤ (mword_of_int KernelSyms.ftable : mword 64) "ftable"%string (ftable_res_at γf) with "Hftnm Hrun Hftw Hftc Hfres") as "[Hrun Hft0]".
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Hft0" as (γft) "#Hftable".
+    iModIntro.
+    (* [is_ftable γft γf] is [Hftable] at [ftable_addr]'s spelling *)
+    iAssert (is_ftable γft γf) as "#Hftable'".
+    { rewrite /is_ftable /ftable_addr. iExact "Hftable". }
+    assert (Hretfi : ret_pc (F3 !!! Regidx (mword_of_int 1 : mword 5) : mword 64)
+                     = (mword_of_int (KernelSyms.main + 0x9a) : mword 64)).
+    { rewrite /F3 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretfi) in "Hpc".
+    (* ---- +0x9a jal virtio_disk_init ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x9a)) (mword_of_int 1 : mword 5)
+              (mword_of_int 18644 : mword 21) mfi n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_9a with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (F4 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x9a) : mword 64) 4)]> mfi).
+    assert (Htgtvd : add_vec (mword_of_int (KernelSyms.main + 0x9a) : mword 64)
+              (sign_extend' 64 (mword_of_int 18644 : mword 21))
+              = (mword_of_int KernelSyms.virtio_disk_init : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtvd) in "Hpc".
+    (* the pinned-map re-point [mn_pin_sie_cap_gpr] exists for: virtio_disk_init
+       is the ONE callee left demanding a raw-map tp fact. *)
+    iDestruct (mn_pin_sie_cap_gpr with "Hcg") as "Hcg".
+    iApply (VirtioDiskInit.wp_virtio_disk_init_sconf γv fsc_kalloc fsc_kpages (tp_pin F4) n false p0
+              (avail_sub (Some (length ps)) K_kvmmake) c0
+              vdl vdn vdc pd0 pav0 pu0 free0 ∅ ltac:(lia)
+              Hnb3 (rget_tp F4) Hlive
+              with "Hcg Hcpu Htext Hkdata Hpc Hkenv Hdinv Hcfg
+                    Hdw Hdn Hdc Hdd0 Hda0 Hdu0 Hdiskfree").
+    all: try lkbelow.
+    rewrite /vdi_post.
+    iIntros (mvd pd pav pu) "Hcg Hcpu Hpc %Hcsvd %Hpvd %Hpva %Hpvu Hkenv".
+    iIntros "Hpub Hrdat Hstg #Hdcfg Hdescpg Havpg Hdd Hda Hdu Hdfree Hdlkw Hdlnm Hdcpu Havh Hfloors Hringh".
+    iDestruct "Hfloors" as (t0 t1) "(Hfl & Hflr & #Hfl0 & #Hfl1)".
+    assert (Hretvd : ret_pc (tp_pin F4 !!! Regidx (mword_of_int 1 : mword 5) : mword 64)
+                     = (mword_of_int (KernelSyms.main + 0x9e) : mword 64)).
+    { rewrite (mn_tp_pin_ne F4 (mword_of_int 1 : mword 5) ltac:(reg_neq)).
+      rewrite /F4 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretvd) in "Hpc".
+    (* ---- ASSEMBLY 3: the disk's geometry, its lock resource, and the lock. *)
+    assert (Hal : virtio_pages_aligned (virtio_init_cfg pd pav pu))
+      by (apply init_cfg_pages_aligned_of_valid; assumption).
+    assert (Hedd : disk_desc = (d_desc_ptr : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    assert (Heda : disk_avail = (d_avail_ptr : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    assert (Hedu : disk_used = (d_used_ptr : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    assert (Heldk : disk_lock = (d_lock : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hedd) in "Hdd".
+    iEval (rewrite Heda) in "Hda".
+    iEval (rewrite Hedu) in "Hdu".
+    iEval (rewrite Heldk) in "Hdlkw".
+    iEval (rewrite Heldk) in "Hdlnm".
+    iEval (rewrite Heldk) in "Hdcpu".
+    iApply fupd_wp.
+    iMod (ctx_word_pointsto_persist with "Hdd") as "#Hddp".
+    iMod (ctx_word_pointsto_persist with "Hda") as "#Hdap".
+    iMod (ctx_word_pointsto_persist with "Hdu") as "#Hdup".
+    iAssert (disk_geom γv pd pav pu) as "#Hgeom".
+    { rewrite /disk_geom.
+      iSplitR; [iExact "Hddp"|]. iSplitR; [iExact "Hdap"|].
+      iSplitR; [iExact "Hdup"|]. iSplitR; [iPureIntro; exact Hal|].
+      iSplitR; [iExact "Hdcfg"|].
+      iSplitR; [iPureIntro; intros j Hj;
+                apply page_in_range_addr_is_kdata; [exact Hpvd | exact Hj]|].
+      iSplitR; [iPureIntro; intros j Hj;
+                apply page_in_range_addr_is_kdata; [exact Hpva | exact Hj]|].
+      iPureIntro; intros j Hj;
+        apply page_in_range_addr_is_kdata; [exact Hpvu | exact Hj]. }
+    iPoseProof (disk_res_boot γv pd pav pu t0 t1 Hal
+                  with "Hpub Hrdat Hstg Hdescpg Hdfree Hdusedidx Hdslots Hdone Hclaim Hcmauth
+                        Havh Hfl Hflr Hfl0 Hfl1 Hringh")
+      as "HRdisk".
+    (* [newlock_at], NOT [newlock] (fs-cfg-boot.md stage (e), row (P3)): the
+       lock's gname is the AMBIENT [fsc_dlock], minted by
+       [FsCfgBoot.fs_cfg_alloc] in the era fupd, because
+       [FsReady.fs_ready]'s disk conjunct is stated at it -- an existential
+       γ chosen here could never be shown equal to the field.  The free
+       token [Hdllk] is kit 1's row; everything else is what the old
+       [newlock] took, in the same order. *)
+    (* A6.69: the honest creator deposit (A6.66) wants the running token;
+       this proof holds the kernel bundle, so it borrows its own and puts
+       it straight back ([SieCapCtx.sie_cap_gpr_own_ctx_acc]). *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    iMod (newlock_at ⊤ fsc_dlock d_lock "virtio_disk"%string (disk_res_at γv pd pav pu)
+            with "Hdllk Hdlnm Hrun Hdlkw Hdcpu HRdisk") as "[Hrun #Hdlock]".
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iModIntro.
+    (* ---- +0x9e jal userinit ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x9e)) (mword_of_int 1 : mword 5)
+              (mword_of_int 3346 : mword 21) mvd n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_9e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (F5 := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x9e) : mword 64) 4)]> mvd).
+    assert (Htgtui : add_vec (mword_of_int (KernelSyms.main + 0x9e) : mword 64)
+              (sign_extend' 64 (mword_of_int 3346 : mword 21))
+              = (mword_of_int KernelSyms.userinit : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtui) in "Hpc".
+    (* ---- THE REAL CONTRACT ([SpecUserinit], proven in [ProofUserinit.v]).
+           [Hpavail] and [Hlpidlk] are what it takes over the axiom that used
+           to stand here: the counted proc regime refutes allocproc's
+           empty-table arm, which userinit does not test, and the [nextpid]
+           lock is allocproc's own premise.  The counted PAGE budget goes in
+           as [K_allocproc < nb] rather than a round number, and the two
+           config ties ride down to namei's root corner. ---- *)
+    (* one slot is all userinit needs, and NPROC of them is what boot minted *)
+    iDestruct (procs_avail_le_at NPROC 1 true ltac:(unfold NPROC; lia)
+                 with "Hpavail") as "Hpavail".
+    (* ================================================================= *)
+    (* STAGE (f)'S TRANSPORT SITE, AT main+0x9e.                          *)
+    (*                                                                    *)
+    (* [FirstTok.first_fsinit] IS ASSEMBLED HERE, out of the six things    *)
+    (* that reach this point and nothing else: kit 2 (ten ghost rows, the  *)
+    (* era fupd's), rows (A) -- the 32 raw [&sb] bytes and the whole       *)
+    (* [struct log], carved in [BootShared] at this stage -- row (B), the  *)
+    (* era's log mirror variable, and row (C), one iref-slot unit plus 35  *)
+    (* of the [bslots] [bio_init_at] produced at +0x8e.  The two pure      *)
+    (* blocks ride with it: [first_fsinit_pures] came down as a premise,   *)
+    (* and the kit's spent set / byte view are EXISTENTIAL in the bundle    *)
+    (* since durable-disk lane E-himg, so nothing has to be re-spelled.     *)
+    (*                                                                    *)
+    (* BOTH BUNDLES NOW LEAVE THIS GROUP, beside the pinned `first` cell:  *)
+    (* they are the three deposit premises [SpecUserinit] grew at (f-5),   *)
+    (* and userinit carries them to its [forkret_park] call, which is the  *)
+    (* one site that can stage them for forkret.  Nothing is spent here    *)
+    (* and nothing is dropped here any more.                               *)
+    (* ================================================================= *)
+    iAssert first_fsinit with "[Hkit2 Hsbb Hlogr Hmir Hirslot Hbslots]"
+      as "Hfsinit".
+    { rewrite /first_fsinit.
+      iDestruct "Hsbb" as (sb_old) "Hsbb".
+      iDestruct "Hlogr" as (vlock v_start v_dev v_nc v_n vname vcpu)
+        "(Hlw & Hln & Hlc & Hlst & Hldv & Hlout & Hlcmt & Hlnc & Hln2 & Hlblk)".
+      (* 35 of the [BSLOTS_FS] slots [bio_init_at] returned.  The proc
+         layer's [BSLOTS_PROC] never passed through here at all: it was split
+         off at the mint ([BioDefs.bslots_alloc]) and routed to procinit
+         through [main_globals_raw], because a slot has to own its three
+         before allocproc can hand them to a process. *)
+      assert (Hsl : BSLOTS_FS = (((LOGBLOCKS + 2) + 2 + 1) + (BSLOTS_FS - 35))%nat)
+        by (unfold BSLOTS_FS, LOGBLOCKS; lia).
+      iEval (rewrite Hsl bslots_op) in "Hbslots".
+      iDestruct "Hbslots" as "[Hbsl _]".
+      iExists dk, sb, Rspent, Pb, vlock, v_start, v_dev, v_nc, v_n, vname,
+              vcpu, sb_old.
+      iFrame "Hkit2 Hsbb Hlw Hln Hlc Hlst Hldv Hlout Hlcmt Hlnc Hln2 Hlblk
+              Hmir Hirslot Hbsl".
+      iPureIntro. exact Hpures. }
+    (* ---- AND THE PERSISTENT HALF, [FirstTok.first_boot_persist]: all
+       SIXTEEN rows, every one of them in hand between +0x8e and +0x9e.
+       Eleven are this group's own products or its persistent premises
+       ([kernel_text], [kernel_data], [bio_ctx] from +0x8e, [dev_inv], the
+       disk pair from +0x9a, the four inode-cache rows from +0x92,
+       [ireg_inv] off kit 2, and [⌜fs_geom_ok⌝]); the other five were
+       FORWARDED here rather than re-derived -- [printk_env] and its pure
+       contract are [mn_grp_printk]'s, the kmem [is_lock] is
+       [mn_grp_kvm]'s, and [gen_cert] / [FsCrash.fs_crash_seam] come down
+       the boot chain from [SystemAdequacy].  fs-cfg-boot.md (f-3) is the
+       two-column ledger this discharges. ---- *)
+    (* the fifty inode sleeplock handles are persistent; [icache_boot_at]
+       hands them over spatially, so move them once. *)
+    iDestruct "Hicsl" as "#Hicsl".
+    iAssert (dev_inv fsc_uart fsc_disk) as "#Hdevc".
+    { rewrite Huartq Hdiskq. iExact "Hdev". }
+    iAssert (∃ pd' pav' pu' : mword 64,
+               disk_geom fsc_disk pd' pav' pu' ∗
+               is_lock fsc_dlock d_lock "virtio_disk"%string
+                       (disk_res_at fsc_disk pd' pav' pu'))%I as "#Hdpair".
+    { rewrite Hdiskq. iExists pd, pav, pu. iFrame "Hgeom Hdlock". }
+    (* THE DEVICE COMPLEMENT the park wants, at the ambient names: every
+       member is in hand here and none is assumed. *)
+    iAssert (devintr_caps_any fsc_uart fsc_disk fsc_dlock γtl γs pd pav pu)
+      as "#Hdcaps".
+    { rewrite /devintr_caps_any Huartq Hdiskq.
+      iFrame "Hdev Hccaps Hgeom Hdlock Htl Hpinv Hu1caps". }
+    iAssert first_boot_persist as "#Hpersist".
+    { rewrite /first_boot_persist /ic_sleeplocks.
+      (* SEVENTEEN ROWS, ONE [iSplitR] EACH, NOT ONE [iFrame] -- and the
+         difference was 67 s of this file (claude-notes/optimization.md
+         "WHEN EVERY CONJUNCT IS DEFINITION-VALUED ... build the WHOLE
+         bundle").  Every row here is definition-valued -- [printk_env],
+         [bio_ctx], an [is_lock] over [disk_res], [is_itable2],
+         [ic_escrows], the fifty-fold [ic_sleeplocks] big-op, [bitmap_inv],
+         an [is_lock] over [kmem_res] -- so a named [iFrame] pays a
+         CONVERSION for each (name x remaining conjunct) attempt, and there
+         is no single big conjunct to split off first.  Peeled in the
+         bundle's own order each row is one syntactic check. *)
+      iSplitR; [iExact "Htext"|].
+      iSplitR; [iExact "Hkdata"|].
+      iSplitR; [iExact "Hpenv"|].
+      iSplitR; [iExact "Hbioctx"|].
+      iSplitR; [iExact "Hseam"|].
+      iSplitR; [iExact "Hcert"|].
+      iSplitR; [iExact "Hdevc"|].
+      iSplitR; [iExact "Hdpair"|].
+      iSplitR; [iExact "Hitl"|].
+      iSplitR; [iExact "Hitinv"|].
+      iSplitR; [iExact "Hesc"|].
+      iSplitR; [iExact "Hicsl"|].
+      iSplitR; [iExact "Hireg"|].
+      iSplitR; [iExact "Hbminv"|].
+      iSplitR; [iExact "Hkmem"|].
+      iSplitR; [iExact "Hcinv"|].
+      iPureIntro; exact Hgeomok. }
+    (* BOTH BUNDLES GO TO USERINIT (fs-cfg-boot.md (f-5)), beside the pinned
+       `first` cell: userinit is the one function that PARKS, and forkret --
+       the token's only consumer -- runs on the context that park saves.
+       They are not spent there either; the staging site is the
+       [forkret_park] call, and [ProofUserinit]'s loud D1 block is the
+       handoff.  What main no longer does is DROP them. *)
+    iApply (Userinit.wp_userinit_sconf γp γs γft γf γw γtl pd pav pu F5 n false p0
+              (avail_sub (avail_sub (Some (length ps)) K_kvmmake) 3)
+              0%nat iv0 false ∅
+              ltac:(lia) Hnb8 Hdevq Hnibq Hp0
+              with "Hcg Hcpu Htext Hkdata Hpc Hpanic Hitl Hitinv Hesc Hireg
+                    Hfirst Hpersist Hfsinit
+                    Hpinv Hlpidlk Hdcaps Hwaitlk Hftable' Hcready Hwire Hbundle Hrdtok Htramp Hkenv
+                    Hpavail Hinitproc Hipt").
+    all: try lkbelow.
+    iApply wp_next_off_intro.
+    iIntros (mui) "Hcg Hpc %Hcsui Hcpu _ _ _".
+    destruct Hcsui as (Hcsui & _).
+    assert (Hretui : ret_pc (F5 !!! Regidx (mword_of_int 1 : mword 5))
+                     = (mword_of_int (KernelSyms.main + 0xa2) : mword 64)).
+    { rewrite /F5 upd_eq. unfold ret_pc. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hretui) in "Hpc".
+    iApply ("Hcont" $! fsc_dlock pd pav pu mui
+              with "Hcg Hpc Hfree Hcpu Hdlock Hgeom []").
+    iExists γft, γf. iExact "Hftable'".
+  Qed.
+
+  (* =================================================================== *)
+  (* 0xa2 .. 0xb0 then the join at 0x3e -- the release fence, the         *)
+  (* [started = 1] deposit, and [jal scheduler] (which never returns).    *)
+  (* =================================================================== *)
+  Local Lemma mn_grp_started 
+      (γpr γk γa : gname) (γs : list gname)
+      (γd : uart_names) (γv : disk_names)
+      (m : regfile) (n : nat) (p0 : mword 64) (pd pav pu : mword 64)
+      (root : mword 44) (pas : nat -> mword 44)
+      (γi : gname) (ξd : CtxId) (P : nat -> CtxId -> iProp Σ)
+      `{!∀ pos ξ, Persistent (P pos ξ)} `{!∀ pos, CtxMorph (P pos)} :
+    (* the scheduler this block tail-calls enables interrupts at its loop head
+       and must fund [kv_frame_slots] there; see [SpecScheduler]. *)
+    (kv_frame_slots + 22 <= n)%nat ->
+    p0 = zero_reg ->
+    cid_word = zero_reg ->
+    sie_cap_gpr KT1 m n false p0 -∗
+    kernel_text -∗
+    pc_is (mword_of_int (KernelSyms.main + 0xa2) : mword 64) -∗
+    cpu_ctx_free -∗
+    cpu_own 0 false p0 false ∅ -∗
+    trap_csrs KT1 -∗
+    started_inv γi ξd P -∗ started_prim γi -∗
+    □ (∀ (pos : nat)
+         (γpr' : gname) (γs' : list gname) (γk' : gname) (pd' pav' pu' : mword 64)
+         (root' : mword 44) (pas' : nat -> mword 44),
+         printk_env γpr' γd γv -∗
+         procs_inv γs' -∗
+         console_caps γd -∗
+         (* THE SECOND PORT'S ROW (bump 163d39b), in the position
+            [SpecMainSecondary.main_deposit] carries it: the boot chain
+            discharges this wand into that deposit, and no hart but this one
+            can make the row -- its fourth member is minted by main's own
+            second receive-token deposit. *)
+         uart1_caps γd -∗
+         is_lock γk' d_lock "virtio_disk"%string (disk_res_at γv pd' pav' pu') -∗
+         disk_geom γv pd' pav' pu' -∗
+         kpt_inv root' -∗
+         (mword_of_int KernelSyms.kernel_pagetable : mword 64) ↦₈□
+           (zero_extend' 64 (concat_vec root' (zeros' 12 : mword 12))) -∗
+         kmap_at tramp_vpn tramp_ppn KP_rx -∗
+         ([∗ list] i ∈ seq 0 64, kmap_at (kstack_vpn i) (pas' i) KP_rw) -∗
+         (∃ B : nat, KptGhost.kpt_bound B ∗ ⌜(B <= pos)%nat⌝) -∗
+         P pos cur_ctx) -∗
+    KptShare.kpt_creds -∗
+    printk_env γpr γd γv -∗
+    procs_inv γs -∗
+    console_caps γd -∗
+    uart1_caps γd -∗
+    is_lock γk d_lock "virtio_disk"%string (disk_res_at γv pd pav pu) -∗
+    disk_geom γv pd pav pu -∗
+    kpt_inv root -∗
+    (mword_of_int KernelSyms.kernel_pagetable : mword 64) ↦₈□
+      (zero_extend' 64 (concat_vec root (zeros' 12 : mword 12))) -∗
+    kmap_at tramp_vpn tramp_ppn KP_rx -∗
+    ([∗ list] i ∈ seq 0 64, kmap_at (kstack_vpn i) (pas i) KP_rw) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hn Hp0 Hcid.
+    iIntros "Hcg #Htext Hpc Hfree Hcpu Htcsr #Hsinv Hprim #Hwand #Hcreds".
+    iIntros "#Hpenv #Hpinv #Hccaps #Hu1caps #Hdlock #Hgeom #Hkinv #Hkptp #Htramp #Hkstx".
+    (* A6.138: the deposit is POSITION-GENERIC -- the builder fires at the
+       flag store's own position, where [B ≤ pos] is the bound-below-flag
+       tie the secondaries' credentials need. *)
+    iDestruct "Hcreds" as (Bk) "[#Hbd #Hbc]".
+    iDestruct (CtxValues.cv_boot_cred_llb with "Hbc") as "#HllbB".
+    iAssert (□ (∀ pos : nat, ⌜(Bk <= pos)%nat⌝ -∗ P pos cur_ctx))%I as "#HPmk".
+    { iIntros "!>" (pos) "%Hpos".
+      iApply ("Hwand" $! pos γpr γs γk pd pav pu root pas
+                with "Hpenv Hpinv Hccaps Hu1caps Hdlock Hgeom Hkinv Hkptp Htramp Hkstx
+                      [ ]").
+      iExists Bk. iFrame "Hbd". by iPureIntro. }
+    (* The release sequence.  Note the shape: the address is materialized
+       BEFORE the barrier and the store is the compressed [c.sw], so the
+       fence separates the whole deposit from the store alone -- and it is
+       [rw,w], not [rw,rw]: nothing after it reads. *)
+    (* ---- +0xa2 auipc a5,0x9 : start materializing &started ---- *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.main + 0xa2)) (mword_of_int 15 : mword 5)
+              (mword_of_int 9 : mword 20) m n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_a2 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (S1 := <[Regidx (mword_of_int 15 : mword 5) := regval_into_reg
+        (add_vec (mword_of_int (KernelSyms.main + 0xa2) : mword 64)
+           (auipc_off (mword_of_int 9 : mword 20)))]> m).
+    assert (Hpa6 : add_vec_int (mword_of_int (KernelSyms.main + 0xa2) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0xa6)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpa6) in "Hpc".
+    (* ---- +0xa6 addi a5,a5,944 : a5 := &started ---- *)
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.main + 0xa6)) (mword_of_int 15 : mword 5)
+              (mword_of_int 15 : mword 5) (mword_of_int 1008 : mword 12) S1 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (mni_a6 with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (S2 := <[Regidx (mword_of_int 15 : mword 5) := regval_into_reg
+        (add_vec (rget S1 (mword_of_int 15 : mword 5))
+           (sign_extend' 64 (mword_of_int 1008 : mword 12)))]> S1).
+    assert (Hpaa : add_vec_int (mword_of_int (KernelSyms.main + 0xa6) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0xaa)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpaa) in "Hpc".
+    (* ---- +0xaa li a4,1 ---- *)
+    iApply (wp_cli_s_sconf (mword_of_int (KernelSyms.main + 0xaa)) (mword_of_int 14 : mword 5)
+              (mword_of_int 1 : mword 6) (mword_of_int 1 : mword 64) S2 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(apply bv_eq; vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_aa with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (S3 := <[Regidx (mword_of_int 14 : mword 5) :=
+        regval_into_reg (mword_of_int 1 : mword 64)]> S2).
+    assert (Hpac : add_vec_int (mword_of_int (KernelSyms.main + 0xaa) : mword 64) 2
+                   = mword_of_int (KernelSyms.main + 0xac)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpac) in "Hpc".
+    (* ---- +0xac fence rw,w : the release barrier ---- *)
+    iApply (wp_fence_gen_s_sconf (mword_of_int (KernelSyms.main + 0xac))
+              (mword_of_int 0 : mword 4) (mword_of_int 3 : mword 4)
+              (mword_of_int 1 : mword 4) (Regidx (mword_of_int 0))
+              (Regidx (mword_of_int 0)) S3 n false with "Hcg Hpc []").
+    { iApply (mni_ac with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    assert (Hpb0 : add_vec_int (mword_of_int (KernelSyms.main + 0xac) : mword 64) 4
+                   = mword_of_int (KernelSyms.main + 0xb0)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpb0) in "Hpc".
+    assert (Hsa : add_vec (rget S3 (mword_of_int 15 : mword 5))
+                    (sign_extend' 64 (mword_of_int 0 : mword 12)) = started_addr).
+    { rgne. rewrite /S3 upd_ne; [| reg_neq]. rewrite /S2 upd_eq. rgne.
+      rewrite /S1 upd_eq /started_addr. apply bv_eq; vm_compute; reflexivity. }
+    assert (HS3a4 : rget S3 (mword_of_int 14 : mword 5)
+                    = (mword_of_int 1 : mword 64)).
+    { rgne. rewrite /S3 upd_eq. reflexivity. }
+    assert (Hsvst : trunc32 (rget S3 (mword_of_int 14 : mword 5)) = started_set).
+    { rewrite HS3a4 /trunc32 /started_set. apply bv_eq; vm_compute; reflexivity. }
+    (* ---- +0xb0 sw a4,0(a5) : started = 1, paying [P] into the escrow ---- *)
+    (* THE ADDRESS CLAIM the per-node store asks for (MemClaim.wordw_claim):
+       per node the access TRANSLATES before it writes, so the window's
+       mapping is needed BEFORE the atomic update is opened.  The claim is
+       persistent and says nothing about the VALUE, so one peek-open of the
+       started invariant delivers it and puts the body straight back. *)
+    iApply fupd_wp.
+    iMod (started_inv_claim ⊤ γi ξd P ltac:(solve_ndisj) with "Hsinv") as "#Hstcl".
+    iModIntro.
+    (* THE RELEASE STORE (A6.132): the datum-form leaf, whose obligation
+       runs [started_store_obl] -- the plain window becomes the armed one
+       at the store's own index, the deposit context is stamped there and
+       the ownership rows go into the invariant's armed disjunct. *)
+    iApply (wp_store_s_sconf_au_dat (kt := KT1) (ktd := KT0) 4 true (mword_of_int (KernelSyms.main + 0xb0))
+              (mword_of_int 14 : mword 5) (mword_of_int 15 : mword 5)
+              (mword_of_int 0 : mword 12) S3 n
+              (trunc32 (rget S3 (mword_of_int 14 : mword 5))) True%I
+              ((⊤ ∖ ↑minstretN) ∖ ↑startedN) false
+              (started_win_plain ∗ dset_auth γi (1/2) ∅ ∗ ctx_stamped ξd 0 ∗
+               started_prim γi ∗
+               (llb loglen_name Bk ∗
+                □ (∀ pos : nat, ⌜(Bk <= pos)%nat⌝ -∗ P pos cur_ctx)))%I
+              (started_right γi ξd P)
+              ltac:(lia) ltac:(lia) ltac:(unfold vmem_width; lia) ltac:(exists 1024; reflexivity)
+              ltac:(vm_compute; reflexivity) exec_write_ram_plain_4
+              (store_ext_4 (rget S3 (mword_of_int 14 : mword 5)))
+              ltac:(solve_ndisj)
+              ltac:(cbv zeta; rewrite Hsa Hsvst;
+                    exact (started_store_obl γi ξd P Bk p0 Hcid))
+              with "Hcg Hpc [] [] [Hprim]").
+    { iApply (mni_b0 with "Htext"). }
+    { rewrite Hsa. iExact "Hstcl". }
+    { iApply (started_store_open (⊤ ∖ ↑minstretN) γi ξd P Bk ltac:(solve_ndisj)
+                with "Hsinv Hprim [ ]").
+      iFrame "HllbB HPmk". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc _".
+    iEval (change (if true then 2%Z else 4%Z) with 2%Z) in "Hpc".
+    assert (Hpb2 : add_vec_int (mword_of_int (KernelSyms.main + 0xb0) : mword 64) 2
+                   = mword_of_int (KernelSyms.main + 0xb2)) by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpb2) in "Hpc".
+    (* ---- +0xb2 j 0x3e : back to the join the secondary arm also reaches ---- *)
+    iApply (wp_cj_s_sconf (mword_of_int (KernelSyms.main + 0xb2))
+              (sign_extend' 21 (concat_vec (mword_of_int 1990 : mword 11) ('b"0")))
+              S3 n false ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_b2 with "Htext"). }
+    iApply wp_next_off_intro.
+    iApply bi.later_intro. iIntros "Hcg Hpc".
+    assert (Htgtj : add_vec (mword_of_int (KernelSyms.main + 0xb2) : mword 64)
+              (sign_extend' 64 (sign_extend' 21
+                 (concat_vec (mword_of_int 1990 : mword 11) ('b"0"))))
+              = (mword_of_int (KernelSyms.main + 0x3e) : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtj) in "Hpc".
+    (* ---- +0x3e jal scheduler : main's exit; scheduler never returns ---- *)
+    iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.main + 0x3e)) (mword_of_int 1 : mword 5)
+              (mword_of_int 3884 : mword 21) S3 n false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+    { iApply (mni_3e with "Htext"). }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc".
+    pose (SS := <[Regidx (mword_of_int 1 : mword 5) := regval_into_reg
+        (add_vec_int (mword_of_int (KernelSyms.main + 0x3e) : mword 64) 4)]> S3).
+    assert (Htgtsc : add_vec (mword_of_int (KernelSyms.main + 0x3e) : mword 64)
+              (sign_extend' 64 (mword_of_int 3884 : mword 21))
+              = (mword_of_int KernelSyms.scheduler : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Htgtsc) in "Hpc".
+    iApply (Scheduler.wp_scheduler_sconf γs SS n p0 Hp0 ltac:(lia)
+              with "Hcg Hfree Hcpu Htext Hpc Hpinv Htcsr").
+  Qed.
+
+  (* =================================================================== *)
+  (* THE CONTRACT.                                                        *)
+  (* =================================================================== *)
+  Lemma wp_main_boot_sconf 
+      (m : regfile) (K : nat) (p0 : mword 64)
+      (ps : list (mword 64)) (s1entry phystop : mword 64)
+      (γd : uart_names) (γv : disk_names) (cn : cons_names)
+      (l0 : list (bv 8)) (b0 : bool) (c0 : virtio_cfg)
+      (γd1 : uart_names) (l1 : list (bv 8)) (b1 : bool)
+      (dk : Z -> bv 8) (sb : FsImg.fs_sb) (nib : nat) (cov : gset Z)
+      (ndisk : nat)
+      (S : FsState.fs_state_rec) (Pb : Z -> list (bv 8)) (Rspent : gset Z)
+      (tlbvec0 : vec (option TLB_Entry) (2 ^ 6))
+      (γi : gname) (ξd : CtxId) (P : nat -> CtxId -> iProp Σ)
+      `{!∀ pos ξ, Persistent (P pos ξ)} `{!∀ pos, CtxMorph (P pos)}
+    : wp_main_boot_sconf_body m K p0 ps s1entry phystop
+        γd γv cn l0 b0 c0 γd1 l1 b1 dk sb nib cov ndisk S Pb Rspent tlbvec0 γi ξd P.
+  Proof using ufdG0.
+    cbv beta delta [wp_main_boot_sconf_body].
+    intros pcE Hcid HK Hl0 Hl1 Hphystop Hs1 Hprun Hlen Hlive Hcnu Hcne Hsnap Hp0.
+    (* THE SNAPSHOT HYPOTHESIS, READ HERE (fs-cfg-boot.md stage (f);
+       durable-disk lane E-himg).  Two of its rows are main's own ([0 < nib]
+       for userinit's namei corner, [0 ∉ cov] for [bio_init_at]); the rest
+       are what [FirstTok.fs_geom_ok_of_snap] and
+       [FirstTok.first_fsinit_pures_of_snap] consume at +0x9e. *)
+    destruct Hsnap as (Hsbeq & Hinibeq & Hsnok & HlPb & Hihwf & Hiagr &
+                       Hislot & Hicovin & Hilogsub).
+    pose proof (FsDurSnap.sk_bytes Hsnok) as Hsnb.
+    assert (Hcov0 : (0 : Z) ∉ cov) by exact (FsBoot.fs_cov_in_0 _ _ Hicovin).
+    (* the region is nonempty: [nib] IS [ninodes/16 + 1] and the state's own
+       superblock has [ROOTINO < ninodes] ([FsDurSnap.sk_sbok]) *)
+    assert (Hnib0 : (0 < nib)%nat).
+    { pose proof (FsImg.sbo_ninodes _ (FsDurSnap.sk_sbok Hsnb)) as Hni.
+      unfold FsImg.ROOTINO in Hni.
+      assert (Hdv : 0 <= FsImg.sb_ninodes (FsState.fss_sb S) / 16)
+        by (apply Z.div_pos; lia).
+      rewrite Hsbeq in Hinibeq. lia. }
+    pose proof (mn_bounds K HK) as (Hc2 & Hn50 & Hnsched).
+    iIntros "Hcg Hfree Hcpu Hq #Htext #Hkdata Hpc #Hsinv Hprim #Hwand #Hecho Hlocks Hglobals".
+    iIntros "Hfirst Hnpid".
+    iIntros "Hparks Hpst Hpavail Hchb Hfs Hmir Hirslot Hirauth #Hcert #Hcinv #Hseam".
+    (* <INIT>'S SAVED-PID CELL COMES OFF THE BOOT ROW HERE (lane
+       TRAP-ROWS-3/4, T4(b)) and goes to the assembly that CALLS userinit
+       ([mn_grp_fs], main+0x9e); the three columns below it are procinit's
+       ([mn_grp_kvm]).  Split at the top rather than threaded group to
+       group -- [SpecMain.wp_main_sconf_body]'s premise stays one row. *)
+    iDestruct (WaitInv.children_boot_split with "Hchb") as "[Hipt Hchb]".
+    iIntros "#Hdev #Hwire Hbundle Htx Hsent Hlb Htok Hhi Hlgh Harm Hdlab".
+    (* ---- THE SECOND PORT'S THIRTEEN ROWS (bump 163d39b), all of them out
+       of [BootShared.boot_shared_alloc] and none derivable below the boot
+       chain: UART1's own invariant, the PLIC's at the two CONCRETE bundles
+       (main needs the name for its second deposit -- [dev_inv]'s conjunct
+       ∃-packs it), the four immutable `.data` words at the VA tier, and
+       port 1's ghost row, which is the console's verbatim because
+       [uartinitone] is ONE contract run at two ports. ---- *)
+    iIntros "#Huinv1 #Hplic #Hpinned #Hubw0 #Hurw0 #Hubw1 #Hurw1".
+    iIntros "Htx1 Hsent1 Hlb1 Htok1 Hhi1 Hlgh1 Harm1 Hdlab1".
+    iIntros "Hcfg Hclaim Hcmauth #Hdone #Htimc Hhart Hunset Hbunset Hkauth Hpages".
+    iDestruct "Hlocks" as "(Hlcons & Hltx0 & Hltx1 & Hlpr & Hlkmem & Hlpid & Hlwait &
+                            Hltick & Hlbc & Hlit & Hlft & Hldisk)".
+    (* THE [tx_busy] CELL IS GONE from the bundle: ae96fd0 deleted the flag, so
+       there is no such symbol and nothing to carve.  THE TRANSMIT LOCK IS
+       NOW TWO OF THEM ([Hltx0]/[Hltx1]) and neither is in .bss: at 163d39b
+       the kernel drives both 16550s out of one `struct uart uarts[2]` in
+       `.data`, so the lock is the FIELD [uarts[i].tx_lock] and uartinit
+       initialises both through [uartinitone(&uarts[i], "uart<i>")].  Each is
+       the ordinary [lk_raw] spinlock shape (three cells over 24 bytes),
+       consumed by that [initlock] and returned as [lk_fresh]; the two
+       [newlock]s that seal them are [mn_grp_printk]'s -- port 0's into
+       [console_caps], port 1's into [SpecPrputc.prputc_env], which is what
+       printk prints through now.
+       [Hient] -- the fifty itable entries' cells -- IS CONSUMED NOW: it
+       goes into [mn_grp_fs], which runs [IcacheBoot.icache_boot_at] on it at
+       main+0x92 against the era fupd's [FsCfgBoot.fs_kit_icache] (whose
+       stocked inode pool is the input that used to be missing).  That is
+       what discharged [LinkNameiRootBoot]'s Axiom -- fs-cfg-boot.md stage
+       (e).
+       [Hfirst] -- forkret's [static int first], one of the image's two
+       writable .data words (SpecMain's own row) -- is NO LONGER DROPPED
+       (fs-cfg-boot.md stage (f)): it goes into [mn_grp_fs] and out again
+       to userinit, which stages it at the park for forkret's [if (first)]
+       arm.  Its twin [Hnpid] goes into [mn_grp_kvm], which spends it on
+       the [newlock] that builds the [nextpid] lock.
+       [Hdevrest] -- the eighteen devsw entries consoleinit never writes --
+       is the console_inv campaign's new second row of [main_globals_raw];
+       it rides into [mn_grp_printk] beside the CONSOLE pair and comes back
+       inside [SpecFileread.console_ready_app]. *)
+    iDestruct "Hglobals" as "(Hdevsw & Hdevrest & Hkmem24 & Hkpt & Hprocs & Hppub &
+                             Hpshare & Hwres &
+                             Hfds & Hirs & Hfents & Hirfile & Hfdauth &
+                             Hbss & Hinitproc & Hticks & Hbufl & Hbufn & Hbhead &
+                             Hbpay & Hsbb & Hinl &
+                             Hient & Hlogr & Hdiskptr & Hdiskfree & Hdusedidx &
+                             Hdslots & Hring & Hrdtok & Hclean)".
+    iDestruct "Hhart" as "(Hsbit & Htlb & Htcsr)".
+    iDestruct "Hdiskfree" as (free0) "Hdiskfree".
+    (* ---- THE FILE SYSTEM'S BOOT-ERA MINT, opened into its ten ties and
+           its two kits.  The ties are what make the two config equations
+           userinit's namei corner takes DISCHARGEABLE at all -- they used
+           to be stuck behind [subG_fileΣ]'s [Qed] (SpecNameiRootBoot.v's
+           old header).  Only the first two are read here; the other eight
+           are stage (f)'s, at the [fs_ready] seal. ---- *)
+    iDestruct "Hfs" as "(%Hdevq & %Hnibq & %Histq & %Huartq & %Hdiskq &
+                         %Hcovq & %Hlogstq & %Hbmapq & %Hsizeq & %Hninq &
+                         %Hconsq & Hkit1 & Hkit2 & Hfolat & Hoffa)".
+    (* the boot face IS the liveness authority (the off LEDGER is retired,
+       r25 item 24: the off cell lives in the fd's own box) *)
+    iEval (rewrite flive_auth_at_eq) in "Hfolat".
+    assert (Hnibpos : (0 < icfg_nib)%nat) by (rewrite Hnibq; exact Hnib0).
+    assert (Hcovpos : (0 : Z) ∉ fsc_cov) by (rewrite Hcovq; exact Hcov0).
+    (* ---- STAGE (f)'S TWO PURE BLOCKS, produced HERE and nowhere else:
+           this is the one place in the tree that holds BOTH the image
+           hypothesis and the ten configuration ties, and the two producers
+           need exactly those.  [fs_geom_ok] is [FsReady.fs_ready_pre]'s
+           eighteenth conjunct; [first_fsinit_pures] is what is left of
+           [SpecFsinit]'s hypothesis list once [fs_geom_ok]'s accessors have
+           been taken out.  Both ride to forkret's first arm. ---- *)
+    assert (Hgeomok : fs_geom_ok)
+      by exact (fs_geom_ok_of_snap S Pb sb nib cov ndisk Hsbeq Hinibeq Hsnb
+                  Hicovin Hilogsub
+                  Hdevq Hnibq Histq Hcovq Hlogstq Hbmapq Hsizeq Hninq).
+    (* THE COLLECTION'S GEOMETRY RIDES THE SAME BLOCK (durable-disk C-8):
+       it needs [fs_geom_ok] -- just produced -- and the region's width tie,
+       which is the very hypothesis [fs_geom_ok_of_snap] above consumes. *)
+    assert (Hpures : first_fsinit_pures dk sb Pb)
+      by exact (first_fsinit_pures_of_snap dk S Pb sb cov Hsbeq Hsnb Hihwf
+                  Hilogsub Hiagr Hislot
+                  Histq Hcovq Hlogstq Hbmapq Hsizeq Hninq Hgeomok
+                  ltac:(rewrite Hnibq; exact Hinibeq)).
+    (* the kit's exception set is the header's write set at the ERA's
+       [logstart]; the supply states it at the superblock's, and the tie is
+       [Hlogstq] (durable-disk lane E-himg) *)
+    iEval (rewrite -Hlogstq) in "Hkit2".
+    (* kit 1's two EARLY peels: the "pr" lock's ghost goes to the printk
+       group at +0x6a and the "kmem" trio to the kvm group at +0x6e, so the
+       three [newlock]s that used to invent their own gnames now fill the
+       ambient [fsc_printk] / [fsc_kalloc] / [fsc_dlock]. *)
+    iDestruct (fs_kit_icache_split with "Hkit1")
+      as "(Hkprintk & Hkkalloc & Hkit1)".
+    (* --- 0x00 .. 0x14 : prologue, cpuid, the taken branch --- *)
+    iApply (mn_boot_entry m K p0 Hcid HK with "Hcg Htext Hpc").
+    iIntros (m1) "Hcg Hpc".
+    (* --- 0x42 .. 0x6a : console / printk --- *)
+    iApply (mn_grp_printk γd γv cn m1 (K - 2)%nat p0 l0 b0 0%nat None
+              γd1 l1 b1 0%nat None Hn50 Hl0 Hl1 eq_refl eq_refl
+              Hcnu Hcne Hconsq
+              with "Hcg Htext Hkdata Hdev Hpc Hfree Hcpu Hlcons Hltx0 Hltx1 Hlpr
+                    Hkprintk Hdevsw Hdevrest Hring Hclean Htx Hsent Hlb Htok
+                    Hhi Hlgh Harm Hdlab
+                    Hplic Hpinned Huinv1 Hubw0 Hurw0 Hubw1 Hurw1
+                    Htx1 Hsent1 Hlb1 Htok1 Hhi1 Hlgh1 Harm1 Hdlab1 Hecho").
+    iIntros (m2) "Hcg Hpc Hfree Hcpu #Hpenv #Hccaps #Hu1caps #Hcready".
+    (* ---- STAGE (f): the printk half of [FirstTok.first_boot_persist],
+       re-spelled at the CONFIGURATION's device gnames.  The group produces
+       it at [γd]/[γv]; the bundle is written at [fsc_uart]/[fsc_disk], and
+       [FsCfgBoot.fs_boot_supply]'s ties are exactly the two equations.  The
+       pure contract is [LinkPrintk]'s [PRINTK_GEN] read as a [Prop] -- this
+       functor argument is already main's, so nothing new is assumed. ---- *)
+    iAssert (printk_env fsc_printk fsc_uart fsc_disk) as "#Hpenvc".
+    { rewrite Huartq Hdiskq. iExact "Hpenv". }
+    (* ...and the crash seam, likewise: the boot chain hands it at the era's
+       [cov] and superblock, [FirstTok] spells it at the configuration. *)
+    iAssert (FsCrash.fs_crash_seam fsc_cov fsc_logst) as "#Hseamc".
+    { rewrite Hcovq Hlogstq. iExact "Hseam". }
+    (* --- 0x6e .. 0x7a : kinit / kvminit / kvminithart / procinit --- *)
+    iApply (mn_grp_kvm m2 (K - 2)%nat p0 ps s1entry phystop tlbvec0
+              Hn50 Hphystop Hs1 Hprun Hlen
+              (StartedInv.cid_zero_agent cpu_id Hcid) Hp0
+              with "Hcg Htext Hkdata Hpc Hfree Hcpu Hlkmem Hkkalloc Hkmem24 Hpages Hkpt
+                    Hsbit Htlb Hunset Hbunset Hkauth Hlpid Hlwait Hwres Hchb Hnpid Hprocs Hppub Hpshare Hfds Hirs
+                    Hbss Hparks Hpst").
+    iIntros (γp γw γs m3 root pas)
+      "Hcg Hpc Hfree Hcpu Hkenv #Hkmem #Hpinv #Hpidlock #Hwaitlock Hkpt Hstvec
+       #Hkinv #Hcreds #Hkptp #Htramp #Hkstx Htk".
+    (* --- 0x7e .. 0x8a : trap / plic, and the interrupt invariant --- *)
+    iApply (mn_grp_trap γd γv m3 (K - 2)%nat p0 Hn50 Hcid
+              with "Hcg Htext Hkdata Hdev Hpc Hltick Hticks Htk Hstvec Hq").
+    iIntros (m4 γtl) "Hcg Hpc #Htl Hstvec Hq".
+    (* THE READER TOKEN, AT THE CONFIGURATION'S CONSOLE NAMES (app-echo.md,
+       "SH-LINE RULING", R3).  The boot supply hands it at [cn], the group
+       and everything above it names [fsc_cons], and [Hconsq] is the tie
+       [FsCfgBoot.fs_boot_supply] carries for exactly this.  main no longer
+       DROPS it: it goes to userinit, the park's boot mode and forkret's
+       boot arm, which spends it on the first process's exec bundle. *)
+    iEval (rewrite -Hconsq) in "Hrdtok".
+    (* --- 0x8e .. 0x9e : binit / iinit / fileinit / virtio_disk_init /
+           userinit, and the disk lock --- *)
+    iApply (mn_grp_fs γp γs γv γd γw γtl m4 (K - 2)%nat p0 ps c0 free0 dk sb nib
+              Pb Rspent
+              Hn50 Hlen Hlive Hdevq Hnibpos Hcovpos Hnibq Hpures
+              Huartq Hdiskq Hgeomok Hp0
+              with "Hcg Htext Hkdata Hdev Hwire Hbundle Hrdtok Htramp Hccaps Hu1caps Hcready Htl Hwaitlock
+                    Hpenvc Hkmem Hcert Hcinv Hseamc Hfolat Hoffa Hfirst
+                    [Hpenv] Hpc Hfree Hcpu Hpinv Hpavail
+                    Hpidlock Hkenv Hlbc Hbufl
+                    Hbufn Hbhead Hbpay Hlit Hinl Hkit1 Hkit2
+                    Hsbb Hlogr Hmir Hirslot Hirauth Hient
+                    Hlft Hfents Hirfile Hfdauth Hldisk Hdiskptr Hdiskfree
+                    Hdusedidx Hdslots Hclaim Hcmauth Hdone Hcfg Hinitproc Hipt").
+    { iApply (printk_env_panic with "Hpenv"). }
+    iIntros (γk pd pav pu m5) "Hcg Hpc Hfree Hcpu #Hdlock #Hgeom Hftfresh".
+    (* ---- THE INSTALLED-HANDLER RESOURCE, folded HERE and not earlier: the
+           handler contract closes over [devintr_caps], and its disk lock and
+           geometry are exactly what the group above just produced.  ALL SEVEN
+           members are now in hand and NONE is assumed: [dev_inv], [procs_inv],
+           the disk lock and geometry from the group above,
+           [timer_cap] handed in by the boot chain (which mints it out of the
+           two cells timerinit wrote), and the tick keeper below. ---- *)
+    iDestruct (procs_inv_len with "Hpinv") as %Hnproc.
+    (* THE TICK KEEPER IS NOT ASSUMED: hart 0 IS the tick hart
+       ([tick_hart] is [cpuid() == 0]), so it owes the real arm -- the lock
+       trapinit's group brought up, plus [procs_inv]. *)
+    iAssert (tick_keeper γtl γs) as "#Htick".
+    { iRight. iFrame "Htl Hpinv". }
+    (* [Hu1caps] is the SECOND PORT'S ROW, which [devintr_caps] gained because
+       the [irq == UART1_IRQ] arm calls the same uartintr at [Uart1].
+       [mn_grp_printk] built it: two of its four members come down the boot
+       chain ([uart_inv Uart1 γd1] and the concrete [plic_inv γd γd1]), the
+       third, [uart_inited γd1], is minted there by port 1's own
+       receive-token deposit, and the fourth is that port's frozen DLAB.  It also travels to the
+       secondaries, through [SpecMainSecondary.main_deposit]. *)
+    iAssert (devintr_caps γd γv γk γtl γs pd pav pu) as "#Hcaps".
+    { rewrite /devintr_caps.
+      iFrame "Hdev Hccaps Hgeom Hdlock Htimc Htick Hpinv Hu1caps". }
+    iDestruct (mn_dup_hw with "Hcg") as "(#Hhw & #Hmin & Hcg)".
+    iPoseProof (Kernelvec.kernelvec_handler_spec γd γv γk γtl γs pd pav pu
+                  Hnproc with "Hhw Hmin Htext") as "#Hkvs".
+    iPoseProof (kernelvec_env_move γd γv γk γtl γs pd pav pu) as "#HEmv".
+    iDestruct (intr_res_intro (kernelvec_env γd γv γk γtl γs pd pav pu)
+                 (mword_of_int KernelSyms.kernelvec : mword 64) _
+                 kernelvec_tv_direct kernelvec_stvec_base
+                 with "Hq Hstvec [] [] HEmv")
+      as "Hintr".
+    { iApply bi.later_intro. iExact "Hkvs". }
+    { iEval (rewrite /kernelvec_env). iModIntro. iExact "Hcaps". }
+    (* --- 0xa2 .. the join : the deposit and the scheduler --- *)
+    iApply (mn_grp_started fsc_printk γk fsc_kalloc γs γd γv m5 (K - 2)%nat p0 pd pav pu
+              root pas γi ξd P ltac:(lia) Hp0 Hcid
+              with "Hcg Htext Hpc Hfree Hcpu [Htcsr Hintr Hkpt] Hsinv Hprim Hwand
+                    Hcreds Hpenv
+                    Hpinv Hccaps Hu1caps Hdlock Hgeom Hkinv Hkptp Htramp Hkstx").
+    (* fold the boot cells and the freshly built handler resource into the
+       [trap_csrs] the scheduler consumes. *)
+    iApply (trap_csrs_of_raw with "Htcsr Hintr Hkpt").
+  Qed.
+
+End ProofMain.
+End MainProof.

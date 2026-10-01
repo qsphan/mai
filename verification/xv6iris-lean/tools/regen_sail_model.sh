@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# ======================================================================
+# Regenerate model/Lean_RV64D/ (the Sail RISC-V model compiled to Lean)
+# from a sail-riscv checkout, using this repo's own config and module list:
+#
+#   model/sail-config-rv64d.json   the resolved rv64d_v256_e64 config with
+#                                  the xv6 deviations (same file as the Rocq
+#                                  MachCSL prototype's model-xv6iris/)
+#   model/sail-modules.txt         the module subset to compile
+#   model/Xv6Extras.lean           HAND-WRITTEN realisations of the Sail
+#                                  platform hooks (LR/SC reservation,
+#                                  plat_term_write, experimental extensions);
+#                                  passed as a second --lean-import-file, NOT
+#                                  regenerated (Rocq: xv6iris_extras.v)
+#
+# The generated Lean project `require`s the vendored lean-sail fork
+# (vendor/lean-sail), whose `PreSailM` is a free monad -- see its README.
+#
+# Usage:
+#   tools/regen_sail_model.sh [SAIL_RISCV_DIR]
+#
+# SAIL_RISCV_DIR defaults to $SAIL_RISCV_DIR in the environment, else
+# ./sail-riscv (gitignored; cloned here on demand).  The model is taken from
+# the MachCSL fork zeldovich/sail-riscv (branch `xv6`) pinned at
+# $SAIL_RISCV_REV; its deltas against riscv/sail-riscv upstream are the atomic
+# PTE A/D-bit update and the AK_ifetch/AK_ttw tagging of fetches and
+# page-table walks at the concurrency interface.
+#
+# Requires: `sail` 0.20.2 with `sail_lean_backend` on PATH, built from
+# rems-project/sail 5745ea9e ("Lean: use more generic term for initial
+# state", the sources of the opam switch `lean-xv6`) PLUS the short-circuit
+# fix "Lean: make boolean & and | short-circuit with effectful operands"
+# from https://github.com/zeldovich/sail/tree/lean-short-circuit (the tip
+# commit, 3c03fced; same patch as d0ef9371).  That branch sits on a NEWER sail
+# whose Lean backend targets lean-sail v6, so do not build the branch as is:
+# cherry-pick its tip onto 5745ea9e, the sail our vendored lean-sail matches.
+# Once upstream sail accepts the fix and releases a version with it, build
+# that release instead (and drop this paragraph).  Without the fix the backend hoists an
+# effectful right operand of `&`/`|` out of the condition and ALWAYS runs it
+# (e.g. `check_CSR` reaches `currentlyEnabled Ext_Zkr`, an `assert false`, on
+# a user access to mseccfg); Sail and Rocq short-circuit, and the proofs
+# assume the short-circuit form.  Do NOT use the unpatched opam `sail`.
+# Build the patched sail in a clone and put it first on PATH:
+#   git clone https://github.com/rems-project/sail sail-sc && cd sail-sc
+#   git fetch https://github.com/zeldovich/sail lean-short-circuit
+#   git checkout -b lean-sc-pin 5745ea9e && git cherry-pick FETCH_HEAD
+#   opam exec --switch=lean-xv6 -- dune build --release
+#   opam exec --switch=lean-xv6 -- dune install --prefix "$PWD/_inst"
+# then (opam env first, so that the patched sail wins on PATH):
+#   eval "$(opam env --switch=lean-xv6 --set-switch)"
+#   PATH=/path/to/sail-sc/_inst/bin:$PATH tools/regen_sail_model.sh
+# `sail --version` then prints "Sail 0.20.2 (lean-sc-pin @ ...)".
+# ======================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+SAIL_RISCV_URL="${SAIL_RISCV_URL:-https://github.com/zeldovich/sail-riscv}"
+SAIL_RISCV_REV="${SAIL_RISCV_REV:-070832a1e4b086f0c6f7635de54cc2b4cfd66993}"
+SAIL_RISCV_DIR="${1:-${SAIL_RISCV_DIR:-$REPO_ROOT/sail-riscv}}"
+case "$SAIL_RISCV_DIR" in /*) ;; *) SAIL_RISCV_DIR="$PWD/$SAIL_RISCV_DIR" ;; esac
+
+CONFIG_JSON="$REPO_ROOT/model/sail-config-rv64d.json"
+MODULES_FILE="$REPO_ROOT/model/sail-modules.txt"
+OUT_DIR="$REPO_ROOT/model"
+LEAN_SAIL_DIR="$REPO_ROOT/vendor/lean-sail"
+# HAND-WRITTEN, not regenerated: the realisations of the Sail platform hooks
+# (the Lean twin of Rocq's model-xv6iris/xv6iris_extras.v; see its header).
+# Passed as a SECOND --lean-import-file, so sail copies it into the generated
+# project as LeanRV64D/Xv6Extras.lean and every generated module imports it;
+# its definitions (in LeanRV64D.Functions) take precedence over the fork's
+# root-level axioms of the same names in RiscvExtras.lean.
+XV6_EXTRAS="$REPO_ROOT/model/Xv6Extras.lean"
+
+if ! command -v sail >/dev/null 2>&1; then
+  echo "error: 'sail' not on PATH -- run under 'opam exec --switch=lean-xv6 --'" >&2
+  exit 1
+fi
+
+if [ ! -d "$SAIL_RISCV_DIR" ]; then
+  echo "== Cloning $SAIL_RISCV_URL into $SAIL_RISCV_DIR =="
+  git clone "$SAIL_RISCV_URL" "$SAIL_RISCV_DIR"
+  git -C "$SAIL_RISCV_DIR" checkout --detach "$SAIL_RISCV_REV"
+fi
+
+have="$(git -C "$SAIL_RISCV_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [ "$have" != "$SAIL_RISCV_REV" ]; then
+  echo "WARNING: $SAIL_RISCV_DIR is at $have, not the pinned $SAIL_RISCV_REV" >&2
+fi
+
+SAIL_MODULES="$(sed -e 's/#.*//' "$MODULES_FILE" | tr -s '[:space:]' ' ')"
+if [ -f "$SAIL_RISCV_DIR/cmake/sail_required_version.txt" ]; then
+  SAIL_REQUIRED_VER="$(tr -d '[:space:]' < "$SAIL_RISCV_DIR/cmake/sail_required_version.txt")"
+else
+  SAIL_REQUIRED_VER="0.20.2"
+fi
+SAIL_HAVE_VER="$(sail --version | sed -E 's/^Sail ([0-9.]+).*/\1/')"
+if ! sail --version | grep -q 'lean-sc-pin\|lean-short-circuit'; then
+  echo "WARNING: '$(sail --version)' does not look like the short-circuit-patched sail;" >&2
+  echo "         see this script's header (the model must short-circuit & and |)." >&2
+fi
+if [ "$SAIL_REQUIRED_VER" != "$SAIL_HAVE_VER" ]; then
+  echo "note: model asks for sail $SAIL_REQUIRED_VER, this is sail $SAIL_HAVE_VER;"
+  echo "      generating with --require-version $SAIL_HAVE_VER."
+  SAIL_REQUIRED_VER="$SAIL_HAVE_VER"
+fi
+
+echo "== Running sail (--lean) with $(basename "$CONFIG_JSON") =="
+echo "   modules: $SAIL_MODULES"
+TMP_OUT="$(mktemp -d)"
+trap 'rm -rf "$TMP_OUT"' EXIT
+mkdir -p "$SAIL_RISCV_DIR/build/model"
+(
+  cd "$SAIL_RISCV_DIR/model"
+  # Flags mirror sail-riscv's model/CMakeLists.txt (`sail_common`,
+  # `lean_sail_common`, `lean_sail_default`), plus --lean-lib-path so the
+  # generated lakefile requires our vendored lean-sail.
+  sail --strict-var --strict-bitvector --strict-exponentials \
+    --require-version "$SAIL_REQUIRED_VER" \
+    --memo-z3 --memo-z3-path "$SAIL_RISCV_DIR/build/model/sail_smt_cache" \
+    --config "$CONFIG_JSON" \
+    --lean \
+    --lean-output-dir "$TMP_OUT" \
+    --lean-force-output \
+    --lean-non-beq-type instruction \
+    --lean-non-beq-type ExecutionResult \
+    --lean-non-beq-type Step \
+    --lean-noncomputable \
+    --lean-noncomputable-function encdec_forwards \
+    --lean-noncomputable-function encdec_backwards \
+    --lean-noncomputable-function encdec_forwards_matches \
+    --lean-noncomputable-function encdec_backwards_matches \
+    --lean-noncomputable-function encdec_compressed_forwards \
+    --lean-noncomputable-function encdec_compressed_backwards \
+    --lean-noncomputable-function encdec_compressed_forwards_matches \
+    --lean-noncomputable-function encdec_compressed_backwards_matches \
+    --lean-import-file ../handwritten_support/RiscvExtras.lean \
+    --lean-import-file "$XV6_EXTRAS" \
+    --lean-lib-path "$LEAN_SAIL_DIR" \
+    -o Lean_RV64D \
+    $SAIL_MODULES \
+    riscv.sail_project
+)
+
+echo "== Installing into $OUT_DIR/Lean_RV64D =="
+rm -rf "$OUT_DIR/Lean_RV64D"
+cp -r "$TMP_OUT/Lean_RV64D" "$OUT_DIR/Lean_RV64D"
+# pin the generated project to this repo's toolchain and lean-sail (relative path)
+cp "$REPO_ROOT/lean-toolchain" "$OUT_DIR/Lean_RV64D/lean-toolchain"
+sed -i "s|path = \"$LEAN_SAIL_DIR\"|path = \"../../vendor/lean-sail\"|" "$OUT_DIR/Lean_RV64D/lakefile.toml"
+rm -f "$OUT_DIR/Lean_RV64D/lake-manifest.json"
+# Two source-compat patches on the copied-in support files:
+#  1. the fork's handwritten RiscvExtras.lean predates Sail dropping the
+#     `Defs` namespace from the generated model;
+#  2. Sail's SpecializationV1.lean types the memory/barrier primitives
+#     polymorphically (any `pa_size ts arch`), but our free-monad `Outcome`
+#     fixes them at the Arch instance's types (the only ones a model can
+#     instantiate them at), so the abbrevs are pinned to match.
+sed -i 's/^open LeanRV64D\.Defs$/open LeanRV64D/' "$OUT_DIR/Lean_RV64D/LeanRV64D/RiscvExtras.lean"
+sed -i \
+  -e 's/(req : Mem_write_request n vasize (BitVec pa_size) ts arch)/(req : Mem_write_request n vasize Arch.pa Arch.translation Arch.arch_ak)/' \
+  -e 's/(req : Mem_read_request n vasize (BitVec pa_size) ts arch)/(req : Mem_read_request n vasize Arch.pa Arch.translation Arch.arch_ak)/' \
+  -e 's/abbrev sail_barrier (a : α) : SailM Unit/abbrev sail_barrier (a : Arch.barrier) : SailM Unit/' \
+  -e 's/ \[Arch\]//g' \
+  "$OUT_DIR/Lean_RV64D/LeanRV64D/SpecializationV1.lean"
+#  3. WORKAROUND for a Lean 4.32 do-notation performance bug: a run of
+#     non-final `(pure (f ...))` statements elaborates in time exponential in
+#     the run length (18 of them in `print_rvfi_exec` never finish).  Spelling
+#     them `discard <| pure (...)` is semantically identical and linear.
+sed -i 's/(pure (print_/(discard <| pure (print_/g' "$OUT_DIR"/Lean_RV64D/LeanRV64D/*.lean
+#  4. CONSTANT-FOLD the xlen-dependent widths: the backend prints the Sail
+#     type `bits(if xlen == 32 then 34 else 64)` as `BitVec (if (64 = 32 : Bool)
+#     then 34 else 64)`, an unreduced `ite` in a TYPE that makes `simp` stumble
+#     over ill-typed intermediate terms.  xlen is 64 in this configuration.
+sed -i -e 's/(if ( 64 = 32  : Bool) then 34 else 64)/64/g' \
+       -e 's/(if ( 64 = 32  : Bool) then 9 else 16)/16/g' "$OUT_DIR"/Lean_RV64D/LeanRV64D/*.lean
+#  5. `unwrapValue` (pure extraction of a config constant) ran the EStateM;
+#     on the free monad a value is pure exactly when the tree is a leaf.
+python3 - "$OUT_DIR/Lean_RV64D/LeanRV64D/SpecializationV1.lean" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = """  match x.run default with
+  | .ok x _ => x
+  | _ => default"""
+new = """  match x with
+  | .pure x => x
+  | _ => default"""
+assert old in s, "unwrapValue shape changed; update tools/regen_sail_model.sh"
+open(p, 'w').write(s.replace(old, new))
+PY
+# The installed copy of Xv6Extras.lean must be the master copy verbatim
+# (sail only substitutes THE_MODULE_NAME, which the master does not use).
+cmp -s "$XV6_EXTRAS" "$OUT_DIR/Lean_RV64D/LeanRV64D/Xv6Extras.lean" || {
+  echo "error: installed Xv6Extras.lean differs from $XV6_EXTRAS" >&2; exit 1; }
+echo "Done.  Review 'git diff model/' and rebuild with 'lake build'."

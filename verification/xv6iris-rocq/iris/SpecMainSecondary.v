@@ -1,0 +1,256 @@
+(* SpecMainSecondary.v -- main() entered on a SECONDARY hart (cpuid() != 0):
+   the spin on [started], the acquire fence, printk("hart %d starting\n"),
+   kvminithart / trapinithart / plicinithart, and the join into scheduler().
+
+     } else {
+       while (started == 0) ;
+       __atomic_thread_fence(__ATOMIC_SEQ_CST);
+       printk("hart %d starting\n", cpuid());
+       kvminithart(); trapinithart(); plicinithart();
+     }
+     scheduler();
+
+   DIVERGING, like the boot contract's: the conclusion is a bare
+   [WP Loop {{Φ}}] with no continuation.
+
+   THE DEPOSIT, CONCRETELY.  The boot contract (SpecMain.v) is stated over an
+   ABSTRACT persistent payload [P] plus a □-wand recipe for paying it in --
+   main's boot arm must not depend on what the secondaries want.  This file is
+   where the payload gets its canonical concrete shape: [main_deposit] is the
+   existential package of exactly the nine persistent facts the wand's
+   arguments assemble -- the printk credential, the hart-generic proc
+   protocol, the console's [console_caps], the disk lock + geometry, and the
+   shared kernel page table (invariant + persisted root cell + the 65
+   mapping claims).  The client
+   (adequacy) allocates [started_inv (main_deposit γd γv Φ)] once, hands it to
+   every hart, and discharges the boot arm's wand by packing the existentials.
+   The ghost names / pages / root / kstack pas are existential HERE because a
+   secondary hart genuinely does not know them: they were chosen by hart 0's
+   allocations (and by kalloc) after the secondary already entered main.
+
+   WHAT DOES NOT CROSS.  This hart's own resources enter as preconditions,
+   exactly as on the boot arm: its [sie_cap_gpr], its [cpu_own] at
+   [cpu_ctx_free], its SIE ghost's spare quarter (each hart allocates its OWN
+   [IntrDefs.intr_res] out of its own trapinithart's [stvec ↦ᵣ kernelvec] --
+   the invariant is per-hart because γ is), and [main_hart_raw] (the Bare
+   receipt kvminithart flips, the tlb cell it seals into the KPT arm, and the
+   [trap_csrs] the scheduler consumes at the far end).
+
+   THE TWO ARM-SELECTION PREMISES.  [cid_word ≠ 0] is what makes the [beqz]
+   at main+0x14 fall through into this arm (the boot contract's mirror
+   premise is [cid_word = 0]).  The [dev_ncpu] bound is plicinithart's: the
+   PLIC's per-hart enable/priority banks are modelled for [dev_ncpu] contexts,
+   and the hart indexes them with cpuid().  Both are discharged per hart by
+   the adequacy client, which knows the hart list.
+
+   THE STACK BUDGET.  The secondary arm's own 16-byte / 2-slot frame over its
+   deepest callee: printk wants 38, scheduler 20 at the frame depth main
+   calls it from, kvminithart / trapinithart 2, plicinithart 4.  So
+   [K_main_secondary = 40] -- the arm never runs the kvminit cone that forced
+   the boot arm's 52.
+
+   Requires only Spec files and the definitional layer -- never a [Proof*]
+   file. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import RegFile InstrBytes.
+Require Import KernelText KernelDataInv.
+Require Import IntrDefs.
+Require Import KptShare KptExecMap KvmMap.
+Require Import StartedInv.
+Require Import SpecPrintk.
+Require Import FdSlots CpuOwn SchedCtx.
+Require Import HartTp.
+(* [dev_ncpu], the PLIC's modelled hart count, for plicinithart's premise *)
+Require Import DevModel.
+Require Import DiskPtsto.
+Require Import WpUart.   (* [dev_inv] -- the deposit's last row *)
+Require Import UartNames.
+Require Import Xv6Cameras.
+Require Import DiskInv.
+Require Import WpLock.
+Require Import FileInvDefs.
+(* the boot-arm interface, for the per-hart bundle [main_hart_raw] (and the
+   □-wand whose arguments [main_deposit] packages) *)
+Require Import SpecConsoleintr.
+Require Import SpecDevintr.   (* [uart1_caps] -- the second port's row of [devintr_caps] *)
+Require Import SpecMain.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import TimerCap.
+From Kernel Require KernelSyms.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx CtxMorphTac UartTxInv ConsoleInv.
+Require Import UserFd.   (* [ufdG] -- the class a minted user slot needs *)
+
+(* the secondary arm's stack budget: see the header.  Like [SpecMain.K_main]
+   this is set by the SCHEDULER's trap reserve rather than by the arm's own
+   cone (38 slots below a 2-slot frame): the secondary hart also ends in
+   [jal scheduler], whose loop-head enable must fund [kv_frame_slots] out of
+   what it is given, i.e. [2 + kv_frame_slots + 22 = 114].  (The [22] was a
+   [20] until XV6_REV 7d258aa: scheduler's frame went 80 -> 96 when gcc
+   spilled one more callee-saved for the c->intena reset, so its own prologue
+   costs two slots more.) *)
+Notation K_main_secondary := (114%nat) (only parsing).
+Section SpecMainSecondary.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  (* ------------------------------------------------------------------- *)
+  (* THE DEPOSIT: the canonical instantiation of SpecMain's payload [P].  *)
+  (* The ten facts the boot arm's □-wand takes as arguments, packaged with *)
+  (* their ghost names / pages / root / pas existential -- plus [dev_inv],  *)
+  (* which the boot CHAIN frames from its own copy rather than routing      *)
+  (* through main (see the row itself).                                     *)
+  (* Every conjunct is persistent, which is what lets the whole package    *)
+  (* ride the one-shot [started] escrow to up to NCPU-1 readers.           *)
+  (* ------------------------------------------------------------------- *)
+  Definition main_deposit (γd : uart_names) (γv : disk_names)
+       : iProp Σ :=
+    (∃ (γpr γk : gname) (γs : list gname) (pd pav pu : mword 64)
+       (root : mword 44) (pas : nat -> mword 44),
+       printk_env γpr γd γv ∗
+       procs_inv γs ∗
+       (* consoleintr's credential, which the kernelvec handler contract
+          closes over ([SpecDevintr.devintr_caps]) and which no hart can make
+          for itself: both halves are locks over static globals. *)
+       console_caps γd ∗
+       (* THE SECOND PORT'S ROW (bump 163d39b).  [devintr_caps] gained it
+          because devintr's [irq == UART1_IRQ] arm runs the same uartintr at
+          [Uart1], and a SECONDARY hart makes no part of it: the [uart_inv
+          Uart1] and the [plic_inv] at the two concrete bundles are the boot
+          chain's ([BootShared.boot_shared_alloc] exports both), and the
+          [uart_inited] is minted by main's SECOND deposit.  So it arrives
+          through this one-shot escrow, beside [console_caps]. *)
+       uart1_caps γd ∗
+       is_lock γk d_lock "virtio_disk"%string (disk_res_at γv pd pav pu) ∗
+       disk_geom γv pd pav pu ∗
+       kpt_inv root ∗
+       (mword_of_int KernelSyms.kernel_pagetable : mword 64) ↦₈□
+         (zero_extend' 64 (concat_vec root (zeros' 12 : mword 12))) ∗
+       kmap_at tramp_vpn tramp_ppn KP_rx ∗
+       ([∗ list] i ∈ seq 0 64, kmap_at (kstack_vpn i) (pas i) KP_rw) ∗
+       (* THE DEVICE FABRIC, LAST (bump 163d39b).  A secondary hart used to
+          reach [dev_inv] by projecting it out of [printk_env]; at 163d39b
+          printk drives UART1 through [prputc] and its credential carries no
+          console row at all ([SpecPrintk.printk_env] is the "pr" lock plus
+          [SpecPrputc.prputc_env]), so the one route is gone.  [dev_inv] is
+          persistent and exists from time 0, so this costs the depositor
+          nothing -- [BootChain.boot_hart_primary] frames its own -- and it
+          keeps the secondary's [devintr_caps] assembly exactly where it
+          was. *)
+       dev_inv γd γv)%I.
+
+  Global Instance main_deposit_persistent γd γv :
+    Persistent (main_deposit γd γv).
+  Proof using . rewrite /main_deposit. apply _. Qed.
+
+  (* ------------------------------------------------------------------- *)
+  (* main(), entered on a SECONDARY hart.                                 *)
+  (* ------------------------------------------------------------------- *)
+End SpecMainSecondary.
+
+(* A6.132: THE DEPOSIT AS A FUNCTION OF THE CONTEXT, with its transport --
+   what the barrier record carries at [ξd] and each secondary absorbs into
+   its own context.  One [CtxMorph] instance per named row, as elsewhere. *)
+Section MainDepositMorph.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId}.
+
+  Global Instance is_txlock_morph γl γu : CtxMorph (λ ξ, is_txlock (XI := ξ) γl γu).
+  Proof using . rewrite /is_txlock. ctx_morph_solve. Qed.
+  Global Instance is_conslock_morph cn (Wd : iProp Σ) γ :
+    CtxMorph (λ ξ, is_conslock (XI := ξ) cn Wd γ).
+  Proof using . rewrite /is_conslock. ctx_morph_solve. Qed.
+  Global Instance printk_env_morph γpr γd γv : CtxMorph (λ ξ, printk_env (XI := ξ) γpr γd γv).
+  Proof using . rewrite /printk_env. ctx_morph_solve. Qed.
+  Global Instance disk_geom_morph γ pd pav pu : CtxMorph (λ ξ, disk_geom (XI := ξ) γ pd pav pu).
+  Proof using . rewrite /disk_geom. ctx_morph_solve. Qed.
+
+  (* A6.138: the deposit is POSITION-INDEXED -- it learns the flag store's
+     log position, and records that the kernel table's publication bound is
+     BELOW it.  That pure tie is what turns a secondary's read receipt
+     ([view_lb] at the flag's position) into the pin credentials
+     ([KptShare.kpt_creds]) its kvminithart call needs. *)
+  Definition main_dep (γd : uart_names) (γv : disk_names)
+      : nat -> CtxId -> iProp Σ :=
+    λ pos ξ, (main_deposit (XI := ξ) γd γv ∗
+              ∃ B : nat, KptGhost.kpt_bound B ∗ ⌜(B <= pos)%nat⌝)%I.
+  Global Instance main_dep_persistent γd γv pos ξ :
+    Persistent (main_dep γd γv pos ξ).
+  Proof using . rewrite /main_dep. apply _. Qed.
+  Global Instance main_dep_morph γd γv pos : CtxMorph (main_dep γd γv pos).
+  Proof using . rewrite /main_dep /main_deposit. ctx_morph_solve. Qed.
+End MainDepositMorph.
+
+Section SpecMainSecondaryBody.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Definition wp_main_secondary_sconf_body
+      (m : regfile) (K : nat)
+      (p0 : mword 64)
+      (γi : gname) (ξd : CtxId)
+      (γd : uart_names) (γv : disk_names)
+      (tlbvec0 : vec (option TLB_Entry) (2 ^ 6)) :=
+    let pcE : mword 64 := mword_of_int KernelSyms.main in
+    (* a secondary hart: cpuid() != 0, so the [beqz a0] at main+0x14 falls
+       through into the spin loop *)
+    cid_word <> (zero_reg : mword 64) ->
+    (* plicinithart indexes the PLIC's per-hart banks with cpuid() *)
+    (bv_unsigned cid_word < Z.of_nat dev_ncpu)%Z ->
+    (K_main_secondary <= K)%nat ->
+    (* a hart entering main has no current proc; scheduler() at the far end
+       is stated at that literal index (SpecScheduler.v). *)
+    p0 = zero_reg ->
+    (* [b = false]: main's secondary arm runs entirely with interrupts off --
+       it is scheduler() at the far end that first enables them.  So the hart
+       provably cannot move under this contract, and (as on the boot arm) it
+       needs no [wp_next] wrapper: it diverges, there is no continuation. *)
+    sie_cap_gpr KT0 m K false p0 -∗
+    cpu_ctx_free -∗
+    cpu_own 0 false p0 false ∅ -∗
+    (* the SIE live-bit ghost's INVARIANT quarter: this hart allocates its
+       own [intr_res] out of its own trapinithart's [stvec ↦ᵣ kernelvec].
+       The ghost is this hart's canonical [sie_gname] now, not a parameter. *)
+    ghost_var_frac sie_gname (1/4) ('b"0" : mword 1) -∗
+    kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+    (* HART-GENERIC, as on the boot arm: this arm reaches scheduler(), whose
+       acquire wants them hart-generically. *)
+    (* the handover channel, at the CONCRETE deposit *)
+    started_inv γi ξd (main_dep γd γv) -∗
+    (* this hart's own translation and trap resources *)
+    (* THE TIMER CAPABILITY, this hart's.  [timer_cap] is the sstc pin plus the
+       stimecmp invariant (TimerCap.v), allocated in the boot chain out of the
+       two cells timerinit wrote and the M->S bridge used to drop.  main needs
+       it because it is a member of [SpecDevintr.devintr_caps], which the
+       handler contract closes over -- clockintr is on kerneltrap's cone. *)
+    timer_cap -∗
+    (* A6.138: [KptShare.kpt_creds] is NO LONGER A PREMISE -- a secondary's
+       honest source is its own acquire of [started], and that is now
+       exactly where it is DERIVED: the deposit carries
+       [∃B, kpt_bound B ∗ ⌜B ≤ pos⌝] at the flag's position, the armed
+       read hands a [view_lb] receipt at that position, and
+       [view_lb_le] + [cv_boot_cred_view] + [kpt_creds_intro] mint the
+       credentials inside the spin's continuation. *)
+    main_hart_raw tlbvec0 -∗
+    mWP (Loop : expr riscv_lang).
+
+End SpecMainSecondaryBody.
+
+Module Type MAIN_SECONDARY.
+  Parameter wp_main_secondary_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      
+      (m : regfile) (K : nat)
+      (p0 : mword 64) (γi : gname) (ξd : CtxId)
+      (γd : uart_names) (γv : disk_names)
+      (tlbvec0 : vec (option TLB_Entry) (2 ^ 6)),
+      wp_main_secondary_sconf_body m K p0 γi ξd γd γv tlbvec0.
+End MAIN_SECONDARY.

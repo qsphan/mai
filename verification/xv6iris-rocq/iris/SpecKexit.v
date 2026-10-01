@@ -1,0 +1,439 @@
+(* SpecKexit.v -- the public interface of kexit(), stated independently of its
+   proof.
+
+     void kexit(int status) {
+       struct proc *p = myproc();
+       if (p == initproc) panic("init exiting");
+       for (int fd = 0; fd < NOFILE; fd++)
+         if (p->ofile[fd]) { struct file *f = p->ofile[fd];
+                             fileclose(f); p->ofile[fd] = 0; }
+       begin_op();  iput(p->cwd);  end_op();  p->cwd = 0;
+       acquire(&wait_lock);
+       reparent(p);                  // give any children to init
+       wakeup(p->parent);            // the parent might be in kwait()
+       acquire(&p->lock);
+       p->xstate = status;
+       p->state  = ZOMBIE;
+       release(&wait_lock);
+       sched();                      // jump into the scheduler, never to return
+       panic("zombie exit");
+     }
+
+   @ KernelSyms.kexit = 0x8000201c, 166 bytes / fifty instructions.  The shape,
+   read off the image:
+
+     +0x00  a 48-byte frame: ra and s0..s4 saved.  s4 = status, s3 = p,
+            s1 = the ofile cursor (&p->ofile[0], bumped by 8), s2 = &p->cwd,
+            which is ALSO the cursor's end pointer -- [ofile] runs 208..335
+            and [cwd] sits at 336, so the loop's [beq s1,s2] is literally
+            "the cursor has walked off the end of the array" ([p_ofile pa
+            NOFILE = p_cwd pa], ProcGeom.p_ofile_end).
+     +0x12  myproc()                +0x18  a5 = initproc  (auipc/ld)
+     +0x28  bne a5,a0 -> +0x3e (the loop's FIRST test); else panic
+     +0x38  the loop's back edge: s1 += 8; beq s1,s2 -> +0x4c
+     +0x3e  ld a0,0(s1); beqz -> +0x38; fileclose(a0); sd x0,0(s1); -> +0x38
+     +0x4c  begin_op / iput(p->cwd) / end_op / p->cwd = 0
+     +0x60  acquire(&wait_lock) / reparent(p) / wakeup(p->parent)
+     +0x7c  acquire(&p->lock) / p->xstate = s4 / p->state = 5 (ZOMBIE)
+     +0x92  release(&wait_lock) / sched() / panic("zombie exit")
+
+   ==== IT DIVERGES, SO THE CONTRACT IS A CONSUMPTION LIST ==============
+
+   Like scheduler()'s, this spec has no continuation: the postcondition of a
+   function that never returns is [mWP Loop], full stop
+   (claude-notes/completed/scheduler.md).  What that makes the precondition
+   is a list of everything kexit CONSUMES, and the interesting entries are
+   the process's own:
+
+   * [proc_priv] goes in and does not come back.  It is the ONE resource
+     kexit exists to retire: every descriptor's [file_ref] goes to
+     fileclose, the cwd reference goes to iput, and what is left --
+     the scalar cells, the emptied array with the fd units fileclose handed
+     back, the user page table and the trapframe page -- is exactly
+     [ProcInv.proc_dormant _ ZOMBIE] minus its context cells, which is what
+     the park deposits in [p->lock] for kwait()/freeproc to reclaim.  The
+     [FDSPARE] allowance travels beside it (FdSlots.v) and is retired the
+     same way.
+
+   * [own_ctx] and the hart tag go in and do not come back either, for the
+     same reason they come BACK from yield and sleep: the difference between
+     a park you return from and a park you do not is entirely in whether the
+     resume ever happens, and kexit's does not.  Its saved context is
+     nonetheless real memory, and the parked slot owns it -- see
+     [SchedCtx.proc_slots_park_gen], which forgets the RECORD and keeps the
+     cells.
+
+   * The whole file-system stack rides through because of the three
+     instructions [begin_op(); iput(p->cwd); end_op();]: [bio_ctx],
+     [log_ctx], the crash seam, the disk fabric and three buffer slots are
+     end_op's and iput's premises verbatim.  Nothing about the log survives
+     the call sequence -- the reservation is opened and closed inside kexit
+     -- so none of it appears in a postcondition that does not exist.
+
+   ==== WHAT ITS CALLER MUST HOLD ======================================
+
+   THE TRAP-CSR COMPLEMENT [trap_csrs_ext eb] / [cpu_claim_ext eb pj], and
+   NOT [eb = true ->].  At level 0 with an enabled base the pushing acquire
+   hands out the trap CSRs the chain payload demands: kexit's own
+   acquire(&wait_lock) produces that pay and the release(&wait_lock) before
+   sched() spends the SECOND acquire's, so at [eb = true] kexit is balanced,
+   the complement is [emp], and it asks the caller for no [arm_pay] -- the
+   sys_pause rule.  With the base DISABLED the acquire mints nothing, and
+   the pair has to come from the caller, which is the trap.  That is what
+   lets usertrap call kexit(-1) on the paths that have not run intr_on() --
+   the whole point of the eb-generic sweep.  Nothing is handed back, because
+   kexit does not return.
+
+   [is_lock γw wait_lock_addr ... wait_res_at] -- kexit is the second consumer
+   of the parent table after kwait, and takes it exactly as kwait does.
+
+   The [initproc] cell at any fraction: kexit reads it for the panic test and
+   reparent reads it again for the new parent.  It is write-once (userinit is
+   the only writer, and is one of the tree's assumed contracts), so a
+   fraction is all any reader needs and nothing here has to say who holds the
+   rest.  Same premise, same spelling, as SpecReparent.v's.
+
+   NOTE the panic arm is NOT ruled out.  kexit's caller does not have to
+   prove [p <> initproc]: [panic] never returns, so the no-postcondition
+   convention closes that arm at zero cost (SpecPanic.v), and the honest
+   reading of the contract is "exits the calling process, or panics".  The
+   same convention closes the [panic("zombie exit")] that follows sched --
+   which is the arm a resumed zombie would take, and the reason its saved
+   context can be forgotten rather than proved unreachable. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import KernelText.
+Require Import IntrDefs.
+Require Import WpMmodeLeafBase.
+Require Import WpLock.
+Require Import ProcGeom CpuOwn.
+Require Import FdSlots FileInv.
+Require Import ChildTok.  (* [my_pay]: the exit deposit's own naming *)
+Require Import ProcDefs.
+Require Import ProcInv.
+Require Import SchedCtx.
+Require Import KallocInv.
+Require Import IrefSlots.
+Require Import SpecFileclose.
+Require Import WaitInv.
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import FsBlocks LogInv.
+Require Import FsCrash.
+Require Import KernelDataInv.
+Require Import SpecPanic.
+Require Import SpecProcinit.   (* [wait_lock_addr] -- procinit is what makes it *)
+Require Import FsReady.  (* [fs_ready] and the ambient names it is at *)
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Local Open Scope Z_scope.
+Require Import TsoCtx.
+Import Defs.
+
+(* kexit's own six frame slots, plus the deepest callee below it: fileclose
+   (88 -- a descriptor may name an inode file, so its own arm reaches
+   end_op and iput); end_op wants 80, iput 78, reparent 24, sched 16. *)
+Notation K_kexit := (94%nat) (only parsing).
+(* THE STATUS ARGUMENT, READ ONCE.  [void exit(int status)] takes it in
+   a0, and this function stores its low 32 bits into [p->xstate]; the
+   escrow the ZOMBIE park carries is keyed at what that cell then reads
+   ([ProcGeom.xstate_val]), so the two are the same [Z] and no lemma has to
+   relate them.  On the exit-SYSCALL route it is also
+   [ProcGeom.exit_xs (pv_tf (us_V U))] -- sys_exit passes argument 0 of the
+   trapframe -- and on the killed route it is -1. *)
+Definition kexit_status (m : regfile) : Z :=
+  xstate_of (m !!! Regidx (mword_of_int 10 : mword 5)).
+
+Definition wp_kexit_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+      !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γft γf γw : gname)                               (* ftable lock, ftable, wait *)
+     (γs : list gname) (j : nat) (γl : gname)
+  (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+    (ip : mword 64) (dqi : dfrac)                     (* the initproc cell   *)
+               (* kmem.lock, kalloc   *)
+    (on : option nat) (fn : fclose_names)
+    (m : regfile) (av : nat) (eb : bool) (b : bool) (lks : gset string)
+    (pid : mword 32) (U : ustate) (sts : list fdstate) (cs : gset gname)
+    (* the exit deposit's own payload -- see the premise at the foot of the
+       list *)
+    (Q : Z -> iProp Σ) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.kexit in
+  let pj := proc_addr j in
+  (* [fn] is not an extra degree of freedom: it is exactly kexit's own ghosts,
+     bundled the way fileclose's environment is indexed.  One equation rather
+     than fifteen coherence conjuncts, and it computes away in the proof.  The
+     pid fraction is the quarter [ProcInv.proc_priv_pid_ofile] lends. *)
+  fn = MkFCloseNames γs j γl pd pav pu
+         pid (DfracOwn (1/4)) ->
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  (K_kexit <= av)%nat ->
+  (* the covered range's block-number bounds, and the log's own storage *)
+  log_geom_ok fsc_cov fsc_logst ->
+  (* THE PROCESS HAS A WORKING DIRECTORY.  [begin_op(); iput(p->cwd);] is
+     unconditional in xv6 -- there is no null test -- so a caller that
+     cannot exhibit one is calling iput on a null pointer.  IT IS NOT A
+     PREMISE ANY MORE: [ProcInv.cwd_ref] has no null arm, so
+     [proc_priv_cwd_nonzero] projects it straight out of the block this
+     contract already takes. *)
+  (* THE FRESHNESS PREMISE, AT THE LOWEST RANK kexit (OR ANY CALLEE)
+     TOUCHES: "ftable" (1), via the fileclose loop's [SpecFileclose.v]
+     premise; "itable" (2, [iput(p->cwd)] directly), "log" (3, [end_op]),
+     "wait_lock" (10) and "proc" (11, nested while holding "wait_lock") are
+     all higher and follow by [LockRank.locks_below_mono] /
+     [locks_below_union_singleton] at each call site. *)
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m av b pj -∗
+  (* THE STACK DEPOSIT, THREADED DOWN THE DIVERGING CHAIN.  kexit is where
+     the whole of this thread's kernel stack finally becomes dead, and the
+     slot it is about to leave at ZOMBIE has to own that page again or no
+     later process can run on it ([ProcDefs.kstack_free]).  What kexit can
+     assemble by itself is only the region from ITS sp down -- exactly the
+     region this capability owns; the frames ABOVE it belong to usertrap,
+     syscall and sys_exit, each of which is equally never-returning.  So each
+     of them hands its callee a closer that has captured its own frame, and
+     this is the one that reaches the bottom ([ProcDefs.kstack_closer]).
+     A CLOSER RATHER THAN A BORROW: nothing comes back on the arms that
+     RETURN, because the wand is affine and no such arm exists here anyway.
+     UNPAID FOR NOW, and honestly so -- an unpayable hypothesis is not a
+     vacuous theorem, and since K1/K3a it is not even unpayable: the words
+     exist ([KstackOwn.kstack_bank]) and the slot owns them.  What is still
+     missing is the route from allocproc's hand-out to a running thread's
+     trap frame, which is K3b/K4. *)
+  kstack_closer pj (m !!! Regidx csp_rs1) (trap_res b + av)%nat -∗
+  (* entered with no lock held *)
+  cpu_own 0 eb pj b lks -∗
+  (* THE TRAP-CSR COMPLEMENT, WHERE [eb = true ->] USED TO BE -- the whole
+     point of the sweep.  usertrap calls kexit(-1) on paths that have not
+     run intr_on(): the first killed(p) check runs before it, and the second
+     is reachable from the devintr and vmfault arms.  At [eb = true] both
+     conjuncts are [emp] and kexit's own acquire(&wait_lock) mints what the
+     interior sleeps need, so no existing caller gains an obligation; at
+     [eb = false] the acquire mints nothing and the pair can only have come
+     from the TRAP.
+     THERE IS NO GIVE-BACK, and that is not an oversight: kexit does not
+     return (see the header), so the pair is spent along with everything
+     else the dead process was holding.
+     See claude-notes/completed/eb-generic-sweep.md. *)
+  trap_csrs_ext KT1 eb -∗
+  cpu_claim_ext eb pj -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  (* the proc table, and the scheduler chain the park hands itself to *)
+  procs_inv γs -∗
+  panic_env -∗
+  (* the running-thread bundle -- consumed: this thread parks forever *)
+  (* wait_lock, and what it protects *)
+  is_lock γw wait_lock_addr "wait_lock"%string (wait_res_at) -∗
+  (* the open-file table: every non-null descriptor is fileclose'd *)
+  is_ftable γft γf -∗
+  (* ...and closing one can free a pipe's page, so kexit owns kalloc's side
+     too.  The count comes back MOVED -- a descriptor may have held a pipe's
+     last end -- which is why the loop carries it existentially. *)
+  is_lock fsc_kalloc (mword_of_int KernelSyms.kmem) "kmem"%string
+    (λ ξ : CtxId, kmem_res (XIk := ξ) fsc_kpages (mword_of_int (KernelSyms.kmem + 24))) -∗
+  kalloc_avail fsc_kpages on -∗
+  (* the file system, for [begin_op(); iput(p->cwd); end_op();] *)
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  fs_crash_seam fsc_cov fsc_logst -∗
+  gen_cert -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  bslots 3 -∗
+  (* THE FILE SYSTEM, as [SpecFileclose] sees it: the ambient [fs_ready]
+     and NOTHING pure beside it: [fclose_ties] died with the eight
+     [fclose_names] fields it tied (rank 1d).  kexit hands the predicate to
+     fileclose once per descriptor and then spends it itself on
+     [iput(p->cwd)], so stating it differently would be stating it twice. *)
+  FsReady.fs_ready -∗
+  (* the initproc pointer, at any fraction (write-once; see the header) *)
+  (mword_of_int KernelSyms.initproc : mword 64) ↦₈□ ip -∗
+  (* ...AND WHO <INIT> IS (lane TRAP-ROWS-3, T4(b)): the reparent below
+     hands both of the dying process's children columns to [ip], and the
+     wait-lock invariant's orphan conjunct can only be re-established at an
+     address it can name as <init>'s ([WaitInv.orph_at_init_at]).
+     PERSISTENT, sealed once by userinit. *)
+  WaitInv.init_ident ip -∗
+  (* the process itself: its private block and its fd-slot allowance *)
+  fd_slots FDSPARE -∗
+  (* the iref ALLOWANCE.  Only [IREFSPARE], not [1 + IREFSPARE]: the cwd's
+     own unit is not the caller's to bring -- it is parked in the itable
+     against the reference [p->cwd] holds, and [iput] hands it back at the
+     [ld a0,336(s3)].  The two rejoin into the [1 + IREFSPARE] the ZOMBIE
+     block parks. *)
+  iref_slots IREFSPARE -∗
+  (* THE BLOCK, WHOLE.  It carries the process's half of [p->xstate]
+     ([ProcInv.proc_priv_core]), which this function joins with <p->lock>'s
+     at [p->xstate = status], re-splits, and parks beside the escrow keyed
+     at what the cell then reads ([ProcDefs.proc_dormant]). *)
+  (* ...WITHOUT THE INCARNATION'S MARKER ([ProcInv.proc_priv_unmarked],
+     design/pipe.md "The exit path"): the marker is spent into <p->lock>'s
+     killed row either by the take below (the tear-down route) or by the
+     fault arm that founded the row for a self-kill, so it is a premise of
+     the tear-down route's side of the payment and not of the block. *)
+  proc_priv_unmarked γf pj pid U -∗
+  (* THE fd-STATE FRAGMENT BUNDLE.  kexit closes every descriptor, and after
+     [ProcInv]'s auth/frag split a close is a retype that needs both halves.
+     It is NOT given back: the process is ending, and the bundle dies with
+     the incarnation whose name it is keyed on (FdSlots.v). *)
+  fd_frags (pv_fdg (us_V U)) sts -∗
+  (* ...AND THE BYTE-QUEUE CLOSE PAYMENTS, one per row of that table
+     (design/pipe.md, "The byte queue"): every descriptor's close is a
+     [fileclose], and a pipe descriptor's last close steps the pipe's exact
+     ghost state, so the dying process pays a close link (or the taint) for
+     each pipe row it holds.  The table is NAMED here for exactly this row;
+     nothing else reads it and the bundle still dies with the process. *)
+  fileclose_cpays sts -∗
+  (* ...AND THE SLOT'S CHILDREN ROW, which does come back -- to the SLOT.
+     It rides the trap residue beside the fragment bundle
+     ([UsertrapRes.ut_own]), and kexit hands it to the ZOMBIE block it parks
+     ([kexit_park_pay]), which is where allocproc finds it again.  The set
+     is the caller's, and kexit EMPTIES it: at +0x60 it holds <wait_lock>,
+     which is what reparent(p) needs to move the children's parent cells,
+     and moving the row's own set to [∅] -- into <init>'s orphans
+     ([WaitInv.orphans_own]) -- is the ghost half of that same C statement.
+     So what is parked is the row at [∅] ([ProcDefs.proc_dormant]). *)
+  ch_frag (pv_chg (us_V U)) pj cs -∗
+  (* ...AND THE EXIT DEPOSIT, WHICH IS WHAT MAKES THE ZOMBIE WORTH REAPING.
+     The exiting process's own knowledge of the payload its exit owes its
+     parent, and that payload PAID AT THIS CALL'S STATUS ARGUMENT
+     ([kexit_status], the word this function stores into [p->xstate] and
+     the word the ZOMBIE escrow is therefore keyed at).  It comes down the
+     trap route from the U-mode slot's deposit
+     ([UexecRet.uexec_pay_dep]) through [SpecSyscall.sysc_pay_in] and
+     [SpecSysExit] on the exit-syscall route, and straight off the trap
+     loop's own copy on the killed route -- where the status is -1 and the
+     process's program never runs again.  kexit spends it, together with
+     the quarter its private block carries ([ProcInv.proc_priv_core]), on
+     the ESCROW it parks in the ZOMBIE slot ([ChildTok.exit_tok]).  [Q] IS
+     THE PROCESS'S OWN NAMING of the payload: the block's quarter names the
+     same predicate, but agreement between them costs a later and the
+     escrow carries both so that nothing on this path has to pay it
+     ([ChildTok.gen_pay] does, at the reaper). *)
+  my_pay (pv_gen (us_V U)) Q -∗
+  (* ...OR, AT THE KILLED ROUTE, NOTHING BUT THE ONE-SHOT (lane SELF-KILL,
+     P6).  A process the kernel is tearing down at [exit(-1)] holds no
+     [Q (-1)]: its program never ran again, and what it owes its parent was
+     DEPOSITED by whoever killed it, in <p->lock>'s killed row
+     ([SchedCtx.kill_row]'s paid arm).  kexit is the party that can take it
+     -- it holds the row at the ZOMBIE store and the incarnation's spent
+     MARKER in the block it is consuming -- so on this side the caller
+     brings only the fact that the row HAS a payment: the incarnation's kill
+     one-shot, fired by the writer of the flag and relayed out of
+     [killed()].  See [SchedCtx.kill_paid_take].
+       THE STATUS IS PINNED at -1 because that is the only status the
+     kernel's own tear-down uses; a process exiting with -1 of its own
+     accord takes the LEFT side and pays as any other exit does. *)
+  (Q (kexit_status m)
+   ∨ (⌜kexit_status m = -1⌝ ∗ ChildTok.kill_shot (pv_gen (us_V U))
+      ∗ ChildTok.taken_at (pv_gen (us_V U)))) -∗
+  (* NO continuation: kexit does not return.  See the header. *)
+  mWP (Loop : expr riscv_lang).
+
+(* ---------------------------------------------------------------------- *)
+(* WHAT THE CONSUMPTION LIST IS FOR, checked here.                          *)
+(*                                                                          *)
+(* The one thing an unproven contract cannot be trusted about is whether it  *)
+(* asks for enough.  The load-bearing case is the park: what kexit holds at  *)
+(* the [jal sched] -- the DEFICIT block (every descriptor nulled and the cwd *)
+(* reference already spent on iput, so there is no [proc_priv] at this V),   *)
+(* plus the FDSPARE allowance that travels beside it -- has to               *)
+(* BE [SchedCtx.park_pay _ ZOMBIE], or the park cannot be taken and the      *)
+(* contract is unprovable for a reason no reader would see.  It is, with no  *)
+(* side condition beyond the two facts the loop and the iput establish.      *)
+(* (SpecProcinit.proc_ready_lock_res is the same kind of check.)             *)
+(* ---------------------------------------------------------------------- *)
+Section KexitSeals.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, !fileG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  Lemma kexit_park_pay (γf : gname) (j : nat) (pid : mword 32) (U : ustate)
+      (Q : Z -> iProp Σ) (xsv : mword 32) :
+    pv_ofile (us_V U) = replicate NOFILE (zero_reg : mword 64) ->
+    pv_cwd (us_V U) = (zero_reg : mword 64) ->
+    proc_priv_nocwd γf (proc_addr j) pid U -∗
+    (* the incarnation's pair, split off with the working directory
+       ([ProcInv.proc_priv_split_cwd]) and spent here on the escrow *)
+    (∃ Q0 : Z -> iProp Σ,
+       gen_kq (pv_gen (us_V U)) (proc_addr j) pid Q0
+       ∗ my_pay (pv_gen (us_V U)) Q0) -∗
+    fd_slots FDSPARE -∗
+    iref_slots (1 + IREFSPARE) -∗
+    (* AND THE BIO ALLOWANCE, on exactly the same argument as the stack
+       below: a dormant slot owns three units, allocproc hands them to the
+       new process, and the ZOMBIE park is where a dying one gives them
+       back.  This is the only return path there is -- see
+       [ProcInv.proc_priv_to_dormant_zombie]'s note on why the supply drains
+       without it.  kexit still holds its three at the park: everything it
+       spends them on below ([SpecBread] / [SpecBrelse]) is a round trip. *)
+    bslots 3 -∗
+    (* AND THE KERNEL STACK, WHOLE.  A dormant slot owns its page
+       ([ProcDefs.kstack_free]) -- that is what lets the next allocproc give
+       it to a new process -- and the ZOMBIE park is where a dying thread
+       gives it back.  It can, because its swtch never returns: no record is
+       parked, so nothing of the page is captured in a continuation. *)
+    kstack_free (proc_addr j) -∗
+    (* AND THE SLOT'S CHILDREN ROW, AT [∅].  It rode the dying process's
+       trap residue ([UsertrapRes.ut_own]) down to here and was emptied
+       under <wait_lock> at the reparent, and the ZOMBIE block is where it
+       goes back to the slot it belongs to
+       ([ProcInv.proc_priv_to_dormant_zombie]). *)
+    ch_frag (pv_chg (us_V U)) (proc_addr j) ∅ -∗
+    (* ...AND THE SLOT'S HALF OF [p->xstate], AT THE STATUS JUST STORED.
+       kexit holds both halves at the store (its block's and <p->lock>'s
+       through [SchedCtx.proc_pub]), writes the whole cell and re-splits;
+       this is the half that goes back into the block, and the escrow below
+       is keyed at what it reads. *)
+    p_xstate (proc_addr j) ↦₄{DfracOwn (1/2)} xsv -∗
+    (* ...AND THE EXIT DEPOSIT, spent here on the escrow the block parks *)
+    my_pay (pv_gen (us_V U)) Q -∗
+    Q (xstate_val xsv) -∗
+    (* ...AND THE INCARNATION'S TWO HALVES, split off with the working
+       directory like the pair above ([ProcInv.proc_priv_split_cwd]) and
+       parked MINUS THE ONE-SHOT MARKER: a ZOMBIE block holds the
+       token-free core ([SlotGen.gen_halves_at]) because the marker is
+       what the dying process spends into <p->lock>'s killed row (lane
+       SELF-KILL, P6), and the reaper is what reunites the two halves with
+       the deposit the parent's entry carries. *)
+    gen_halves_at (proc_addr j) pid (pv_gen (us_V U)) -∗
+    park_pay (proc_addr j) ZOMBIE.
+  Proof using .
+    intros Hof Hcwd. rewrite /park_pay inv_dormant_ZOMBIE.
+    iIntros "Hpriv Hgq Hsp Hir Hbs Hkst Hrow Hxs Hmy HQ Hgh".
+    iApply (proc_priv_to_dormant_zombie γf (proc_addr j) pid U Q xsv Hof Hcwd
+              with "Hpriv Hgq Hsp Hir Hbs Hkst Hrow Hxs Hmy HQ Hgh").
+  Qed.
+
+End KexitSeals.
+
+Module Type KEXIT.
+  Parameter wp_kexit_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γft γf γw : gname)
+      (γs : list gname) (j : nat) (γl : gname)
+      (pd pav pu : mword 64)
+      (ip : mword 64) (dqi : dfrac)
+        (on : option nat) (fn : fclose_names)
+      (m : regfile) (av : nat) (eb : bool) (b : bool) (lks : gset string)
+      (pid : mword 32) (U : ustate) (sts : list fdstate) (cs : gset gname) (Q : Z -> iProp Σ),
+      wp_kexit_sconf_body γft γf γw γs j γl pd pav pu
+ ip dqi
+
+                          on fn m av eb b lks pid U sts cs Q.
+End KEXIT.

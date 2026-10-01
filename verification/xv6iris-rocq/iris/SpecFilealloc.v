@@ -1,0 +1,108 @@
+(* SpecFilealloc.v -- the public interface of filealloc, stated independently
+   of its proof.  Requires only the definitional layer -- never a whole-function
+   proof file -- so every function proof can be checked in parallel.
+
+     struct file *filealloc(void) {
+       struct file *f;
+       acquire(&ftable.lock);
+       for (f = ftable.file; f < ftable.file + NFILE; f++) {
+         if (f->ref == 0) { f->ref = 1; release(&ftable.lock); return f; }
+       }
+       release(&ftable.lock);
+       return 0;
+     }
+
+   filealloc reads the [ref] field of EVERY table entry, which is exactly why
+   [ftable_res] owns all NFILE of them and no reference ever carries one; and
+   it touches no OTHER field of any entry, which is why the scan needs no
+   content fraction at all.  What it returns on success is the exclusive
+   reference [file_ref γf k 1]: fraction 1 of all seven content cells, so
+   the caller (sys_open, pipealloc) can initialize them with no lock held,
+   which is precisely the discipline the real kernel relies on.  The
+   [fc_type Cf = FD_NONE] conjunct is the free-slot invariant coming back out
+   (fileclose writes FD_NONE before releasing; the BSS starts zeroed).
+
+   Design: claude-notes/design/file-table.md. *)
+From Stdlib Require Import Eqdep_dec ZArith Lia List.
+From stdpp Require Import gmap list list_monad bitvector.definitions bitvector.tactics.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import excl auth gmap frac numbers.
+From iris.base_logic.lib Require Import ghost_var gen_heap invariants.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import KernelText.
+Require Import RegFile WpNext.
+Require Import RiscvExtras.
+Require Import CalleeSaved.
+Require Import FdSlots FileInv.
+Require Import LockRank.
+Require Import IntrDefs.
+Require Import CpuOwn.
+From Kernel Require KernelSyms.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import IrefSlots.  (* [iref_frac] rides [file_core] -- FileInvDefs *)
+Local Open Scope Z_scope.
+Require Import CtxIdDefs.
+
+
+Section SpecFilealloc.
+  Context `{!riscvGS Σ, !xv6G Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ}.
+
+  (* filealloc's return value: either the table was full (a0 = 0), or a0 points
+     at entry [k] and the caller owns it exclusively and uninitialized.
+
+     THE FAILURE ARM GIVES THE fd_slot BACK.  The unit below pays for a
+     reference, and on this arm no reference was created -- the scan ran off
+     the end of the table and nothing entered the authority -- so keeping it
+     would burn a unit of a CONSERVED supply on a call that did nothing
+     (FdSlots.v).  A caller that retries, or that allocates two files and
+     must return its whole allowance whichever way the calls went (pipealloc,
+     hence sys_pipe), cannot balance its books without this. *)
+  (* THE FILE IS UNTYPED AND THE STATE SAYS SO.  There is no [fcontent] in
+     this post any more: [FdClosed] is exactly the claim [fc_type = FD_NONE]
+     used to make ([FileInvDefs.fdstate_ok]), and the caller reads the
+     content off the reference when it opens it ([ProofSysOpenParts.
+     so_open_slot]) rather than being handed a name for it here. *)
+  Definition filealloc_post `{XI : CurCtx} (γf : gname) (r : mword 64) : iProp Σ :=
+    (⌜r = (zero_reg : mword 64)⌝ ∗ fd_slot
+     ∨ ∃ k : nat,
+         ⌜(k < NFILE)%nat /\ r = fnode k⌝ ∗ file_ref γf k 1 FdClosed)%I.
+
+End SpecFilealloc.
+
+Definition wp_filealloc_sconf_body `{!riscvGS Σ, !xv6G Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (γl γf : gname) (m : regfile)
+    (n : nat) (eb : bool) (p : mword 64) (K : nat) (b : bool) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.filealloc in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5) : mword 64) in
+  (* filealloc's own frame is 4 slots (addi sp,sp,-32); acquire/release want 10
+     below that. *)
+  (14 <= K)%nat ->
+  (Z.of_nat n + 1 < 2 ^ 31)%Z ->
+  locks_below lks "ftable" ->
+  sie_cap_gpr KT1 m K b p -∗
+  cpu_own n eb p b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  is_ftable γl γf -∗
+  (* the new reference needs somewhere to live: one fd slot goes into the
+     table and comes back out of fileclose. *)
+  fd_slot -∗
+  wp_next b p (fun (CID : CpuId) =>
+    ∀ mr,
+    sie_cap_gpr KT1 mr K b p -∗
+    cpu_own n eb p b lks -∗
+    pc_is ret_tgt -∗
+    ⌜ callee_saved m mr ⌝ -∗
+    filealloc_post γf (mr !!! Regidx (mword_of_int 10 : mword 5)) -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type FILEALLOC.
+  Parameter wp_filealloc_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (γl γf : gname) (m : regfile)
+      (n : nat) (eb : bool) (p : mword 64) (K : nat) (b : bool) (lks : gset string),
+      wp_filealloc_sconf_body γl γf m n eb p K b lks.
+End FILEALLOC.

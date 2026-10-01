@@ -1,0 +1,72 @@
+# The floor of the user-program coverage (tools/proof_coverage.py --check):
+#   bytes <Prog> <n>   the text bytes of <Prog> the proofs step
+#   <Prog>:<function>  a function with a proved contract the top theorems reach
+# `--check` fails if a byte count drops or a function loses its contract:
+# coverage may grow, never shrink.  Regenerate with
+# `tools/proof_coverage.py --update-baseline` and review the diff -- a
+# removed row or a smaller number is a lost proof.
+bytes Init 652
+bytes Sh 3052
+bytes Cat 704
+bytes Grep 1204
+bytes Echo 218
+bytes Seccomp 552
+bytes Sync 44
+Cat:cat
+Cat:fprintf
+Cat:main
+Cat:start
+Echo:main
+Echo:start
+Echo:strlen
+Grep:fprintf
+Grep:grep
+Grep:main
+Grep:match
+Grep:matchhere
+Grep:matchstar
+Grep:memmove
+Grep:printf
+Grep:start
+Grep:strchr
+Init:main
+Init:printf
+Init:start
+Seccomp:fprintf
+Seccomp:main
+Seccomp:start
+Sh:close
+Sh:cmdalloc
+Sh:dup
+Sh:exec
+Sh:execcmd
+Sh:fork
+Sh:fork1
+Sh:fprintf
+Sh:free
+Sh:getcmd
+Sh:gets
+Sh:gettoken
+Sh:main
+Sh:malloc
+Sh:memset
+Sh:nulterminate
+Sh:panic
+Sh:parsecmd
+Sh:parseexec
+Sh:parseline
+Sh:parsepipe
+Sh:parseredirs
+Sh:peek
+Sh:pipecmd
+Sh:redircmd
+Sh:runcmd
+Sh:sbrk
+Sh:start
+Sh:strchr
+Sh:strlen
+Sh:sys_sbrk
+Sh:wait
+Sh:write
+Sync:main
+Sync:start

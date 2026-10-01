@@ -1,0 +1,1014 @@
+(* ProofVirtioDiskRwE.v -- virtio_disk_rw, phase P5: the device kick and the
+   completion wait (+0x19a .. +0x1d2).
+
+   The continuation of ProofVirtioDiskRwD.v, which proves P4 and leaves the
+   seam [VirtioDiskRwRestD.vdrw_p4_exit] at +0x19a.
+
+     0x19a lui  a5,0x10001
+     0x19e sw   x0,80(a5)     *R(QUEUE_NOTIFY) = 0   -- kick the device
+     0x1a2 lw   a5,4(s3)      a5 = b->disk
+     0x1a6 auipc s1,0x1e ; 0x1aa addi s1,s1,3138     s1 = &disk.vdisk_lock
+     0x1ae c.mv s2,a1         s2 = 1   (a1 has held 1 since +0x104)
+     0x1b0 bne  a5,a1,+34     b->disk != 1 -> +0x1d2 (done)
+     -- the completion-wait loop, head at +0x1b4 --
+     0x1b4 c.mv a0,s3 ; 0x1b6 jal sleep_prepare(b)
+     0x1ba c.mv a0,s1 ; 0x1bc jal release(&vdisk_lock)
+     0x1c0 jal sleep()
+     0x1c4 c.mv a0,s1 ; 0x1c6 jal acquire(&vdisk_lock)
+     0x1ca lw   a5,4(s3)
+     0x1ce beq  a5,s2,-26     still 1 -> back to +0x1b4
+
+   THE SLEEP PROTOCOL IS SPLIT (SpecSleep.v's header): the caller drops and
+   retakes [disk.vdisk_lock] itself, so this loop body is four calls rather
+   than one, and the window between its release and its re-acquire is the
+   one across which the head's ACTIVE receipt fragment must survive.
+
+   THE ONE INTERESTING STEP is the [b->disk] load.  That cell is not the
+   caller's: it lives INSIDE the device invariant, in the receipt of the
+   chain's head descriptor, and the publisher re-finds it with the ACTIVE
+   receipt fragment it kept ([VirtioProto.virtio_proto_poll_acc]).  The
+   read IS the test: 1 hands the fragment back and the loop sleeps; 0 is the
+   collect -- the same step returns the retired receipt, the claim's row in
+   the lock's map, [disk.info[h].b], [b->disk] and the whole chain
+   ([chain_back]), which is what P6 frees and returns to the caller.
+
+   So the loop needs no invariant of its own beyond "the lock is held and
+   the fragment is ours": the branch condition is READ OFF the device
+   invariant at each iteration, and the exit case is precisely the one that
+   collected.
+
+   P6 (+0x1d2 .. +0x234) follows in ProofVirtioDiskRwF.v.
+   The whole function is composed and sealed in ProofVirtioDiskRwF.v
+   ([Module VirtioDiskRwProof … : VIRTIODISKRW]) and instantiated in
+   LinkVirtioDiskRw.v.  Everything here is Qed-closed.
+ *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language weakestpre lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map mono_nat.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes WpMmodeLeafBase.
+Require Import WpGpr RegFile.
+Require Import KptPt.
+Require Import RiscvExtras.
+Require Import StackOwn CalleeSaved KernelText.
+Require Import WpLock.
+Require Import ProcGeom.
+Require Import IntrDefs.
+Require Import HartTp WpNext.
+Require Import CpuOwn SchedCtx FdSlots.
+Require Import WpSconfAlu WpSconfMem WpSconfCtl WpSconfBtype.
+Require Import VirtioQueue DiskPtsto VirtioProto DiskInv DiskAvail.
+Require Import VirtioModel.
+Require Import WpVirtioDev.
+Require Import WpUart.
+Require Import SpecAcquire SpecRelease SpecSleepPrepare SpecSleep SpecFreeDesc.
+Require Import CodeVirtioDiskRw.
+Require Import SpecVirtioDiskRw.
+Require Import VirtioDiskRwDefs.
+Require Import ProofVirtioDiskRwD ProofVirtioDiskRwDSeam.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Import Defs.
+
+Local Open Scope Z_scope.
+
+(* [rget m k] back to [m !!! Regidx k] across the whole proofmode goal. *)
+Ltac rgall := repeat (rewrite rget_ne; [| vm_compute; discriminate]).
+
+(* ===================================================================== *)
+(* §0  Pure helpers: the addresses and immediates of the nine             *)
+(*     instructions, all closed [vm_compute]s.                            *)
+(* ===================================================================== *)
+
+Lemma vdrwe_addv_zero (x : SailStdpp.Values.mword 64) : add_vec zero_reg x = x.
+Proof.
+  rewrite (add_vec64_comm zero_reg x).
+  apply bv_add_0_r. vm_compute. reflexivity.
+Qed.
+
+(* [lui a5,0x10001] *)
+Lemma vdrwe_lui : luival (mword_of_int 65537 : mword 20)
+                  = (mword_of_int 0x10001000 : SailStdpp.Values.mword 64).
+Proof. apply bv_eq; vm_compute; reflexivity. Qed.
+
+(* the QUEUE_NOTIFY address, [80(a5)] *)
+Lemma vdrwe_notify_addr :
+  add_vec (mword_of_int 0x10001000 : SailStdpp.Values.mword 64)
+          (sign_extend' 64 (mword_of_int 80 : mword 12))
+  = (mword_of_int 0x10001050 : SailStdpp.Values.mword 64).
+Proof. apply bv_eq; vm_compute; reflexivity. Qed.
+
+Lemma vdrwe_notify_geom :
+  (virtio_base <= uint (mword_of_int 0x10001050 : SailStdpp.Values.mword 64)
+   < virtio_base + virtio_size)%Z
+  /\ is_aligned_vaddr (Virtaddr (mword_of_int 0x10001050 : SailStdpp.Values.mword 64)) 4 = true
+  /\ neq_vec (bits_of_virtaddr (Virtaddr (mword_of_int 0x10001050 : SailStdpp.Values.mword 64)))
+       (sign_extend' 64 (subrange_vec_dec
+          (bits_of_virtaddr (Virtaddr (mword_of_int 0x10001050 : SailStdpp.Values.mword 64)))
+          (Z.sub 39 1) 0)) = false
+  /\ kpt_dev_vpn (svpn_of (mword_of_int 0x10001050 : SailStdpp.Values.mword 64)).
+Proof.
+  split_and!.
+  - apply Z.leb_le. vm_compute. reflexivity.
+  - apply Z.ltb_lt. vm_compute. reflexivity.
+  - vm_compute. reflexivity.
+  - vm_compute. reflexivity.
+  - unfold kpt_dev_vpn. split.
+    + apply Z.leb_le. vm_compute. reflexivity.
+    + apply Z.ltb_lt. vm_compute. reflexivity.
+Qed.
+
+Lemma vdrwe_notify_off :
+  (uint (mword_of_int 0x10001050 : SailStdpp.Values.mword 64) - virtio_base)%Z
+  = vio_off_queue_notify.
+Proof. vm_compute. reflexivity. Qed.
+
+(* the [4(s3)] displacement onto [b->disk] *)
+Lemma vdrwe_sext4 :
+  sign_extend' 64 (mword_of_int 4 : mword 12) = (mword_of_int 4 : SailStdpp.Values.mword 64).
+Proof. apply bv_eq; vm_compute; reflexivity. Qed.
+
+Lemma vdrwe_bdisk_addr (b : Arch.pa) :
+  add_vec (b : SailStdpp.Values.mword 64) (sign_extend' 64 (mword_of_int 4 : mword 12))
+  = (b_disk b : SailStdpp.Values.mword 64).
+Proof.
+  rewrite vdrwe_sext4. unfold b_disk.
+  rewrite (vdrw_pa_add_moi b 4). reflexivity.
+Qed.
+
+(* the two values [b->disk] can hold, normalised after the load's sign
+   extension, and their comparison against [a1 = 1] *)
+Lemma vdrwe_sext_one :
+  sign_extend' 64 (SailStdpp.Values.mword_of_int (len := 32) 1)
+  = (mword_of_int 1 : SailStdpp.Values.mword 64).
+Proof. apply bv_eq; vm_compute; reflexivity. Qed.
+
+Lemma vdrwe_sext_zero :
+  sign_extend' 64 (SailStdpp.Values.mword_of_int (len := 32) 0)
+  = (mword_of_int 0 : SailStdpp.Values.mword 64).
+Proof. apply bv_eq; vm_compute; reflexivity. Qed.
+
+Lemma vdrwe_eq_one :
+  eq_vec (mword_of_int 1 : SailStdpp.Values.mword 64)
+         (mword_of_int 1 : SailStdpp.Values.mword 64) = true.
+Proof. vm_compute. reflexivity. Qed.
+
+Lemma vdrwe_neq_zero_one :
+  neq_vec (mword_of_int 0 : SailStdpp.Values.mword 64)
+          (mword_of_int 1 : SailStdpp.Values.mword 64) = true.
+Proof. vm_compute. reflexivity. Qed.
+
+Lemma vdrwe_eq_zero_one :
+  eq_vec (mword_of_int 0 : SailStdpp.Values.mword 64)
+         (mword_of_int 1 : SailStdpp.Values.mword 64) = false.
+Proof. vm_compute. reflexivity. Qed.
+
+Lemma vdrwe_neq_one :
+  neq_vec (mword_of_int 1 : SailStdpp.Values.mword 64)
+          (mword_of_int 1 : SailStdpp.Values.mword 64) = false.
+Proof. vm_compute. reflexivity. Qed.
+
+(* ===================================================================== *)
+(* §1  P5 and the P4 -> P5 glue.                                          *)
+(*                                                                       *)
+(* P5 calls [sleep], so -- unlike P3/P4 -- the phase itself has to live   *)
+(* inside the functor.                                                    *)
+(* ===================================================================== *)
+
+(* ===================================================================== *)
+(* §1  THE POLL: [lw rd,4(rs1)] with rs1 = b, reading [b->disk] out of the *)
+(*     device invariant's receipt.                                        *)
+(* ===================================================================== *)
+
+Section VdrweLeaves.
+  Context `{!riscvGS Σ, !xv6G Σ}.
+  Context `{GEN : GenId} `{CID : CpuId}.
+  Context `{XI : CurCtx}.
+
+  (* what one poll leaves behind, by the value it read: 1 keeps the ACTIVE
+     fragment, 0 IS the collect *)
+  Definition vdrwe_polled (γd : disk_names) (nr q : nat) (dc : dclaim)
+      (w : SailStdpp.Values.mword 32) : iProp Σ :=
+    (* THE ROW DESIGN: the poll reads [b->disk] off the claim ROW in the
+       vdisk-lock payload; the row comes back whole either way, and a 0 is
+       witnessed by the position's completion record below the watermark *)
+    ((⌜w = SailStdpp.Values.mword_of_int (len := 32) 1⌝ ∗ claim_cells γd nr q dc)
+     ∨ (⌜w = SailStdpp.Values.mword_of_int (len := 32) 0⌝ ∗
+        d_info_b (sl_head (dc_slot dc)) ↦₈ (dc_buf dc : SailStdpp.Values.mword 64) ∗
+        hcell_map cur_ctx (dc_pin dc) ∗
+        b_disk (dc_buf dc) ↦₄ (SailStdpp.Values.mword_of_int (len := 32) 0) ∗
+        ∃ u : nat, disk_ord γd q u ∗ ⌜(u < nr)%nat⌝))%I.
+
+  Lemma wp_vdrwe_lw_bdisk (γu : uart_names) (γd : disk_names) (pme : Arch.pa)
+      (pc : mword 64) (rd rs1 : mword 5) `{!SrcOk rs1} (imm : mword 12)
+      (m : regfile) (n : nat) (nr q : nat) (dc : dclaim) :
+    add_vec (rget m rs1) (sign_extend' 64 imm) = (b_disk (dc_buf dc) : mword 64) ->
+    uint rd <> 0 -> rd_ok rd ->
+    sie_cap_gpr KT1 m n false pme -∗ pc_is pc -∗
+    instr pc false (LOAD (imm, Regidx rs1, Regidx rd, false, 4)) -∗
+    (* the sleeper's claim ROW, out of the payload it holds *)
+    claim_cells γd nr q dc -∗
+    ( ∀ w : SailStdpp.Values.mword 32,
+      sie_cap_gpr KT1 (<[Regidx rd := regval_into_reg (sign_extend' 64 w)]> m) n false pme -∗
+      pc_is (add_vec_int pc 4) -∗
+      vdrwe_polled γd nr q dc w -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hea Hrd Hrdok.
+    iIntros "Hcg Hpc Hinstr Hrow Hcont".
+    rewrite /claim_cells.
+    iDestruct "Hrow" as "(Hib & Hhc & [Hbd | [Hbd #Hu]])".
+    - (* still in flight: the cell reads 1 *)
+      iApply (wp_lw_s_sconf (kt := KT1) (ktd := KT0) pc rd rs1 imm m n
+                (SailStdpp.Values.mword_of_int (len := 32) 1) false (dqm := DfracOwn 1)
+                Hrd Hrdok with "Hcg Hpc Hinstr [Hbd]").
+      { rewrite Hea. iExact "Hbd". }
+      iApply wp_next_off_intro. iIntros "Hcg Hpc Hbd".
+      iEval (rewrite Hea) in "Hbd".
+      iApply ("Hcont" with "Hcg Hpc [Hib Hhc Hbd]").
+      rewrite /vdrwe_polled /claim_cells. iLeft. iSplitR; [done|].
+      iFrame "Hib Hhc". iLeft. iExact "Hbd".
+    - (* reclaimed: the cell reads 0, and the row says which record *)
+      iApply (wp_lw_s_sconf (kt := KT1) (ktd := KT0) pc rd rs1 imm m n
+                (SailStdpp.Values.mword_of_int (len := 32) 0) false (dqm := DfracOwn 1)
+                Hrd Hrdok with "Hcg Hpc Hinstr [Hbd]").
+      { rewrite Hea. iExact "Hbd". }
+      iApply wp_next_off_intro. iIntros "Hcg Hpc Hbd".
+      iEval (rewrite Hea) in "Hbd".
+      iApply ("Hcont" with "Hcg Hpc [Hib Hhc Hbd]").
+      rewrite /vdrwe_polled. iRight. iSplitR; [done|].
+      iFrame "Hib Hhc Hbd". iExact "Hu".
+  Qed.
+
+End VdrweLeaves.
+
+Module VirtioDiskRwRestE (Acquire : ACQUIRE) (Release : RELEASE)
+                         (SleepPrepare : SLEEP_PREPARE) (Sleep : SLEEP) (FreeDesc : FREEDESC).
+
+Module P4 := VirtioDiskRwRestD Acquire Release SleepPrepare Sleep FreeDesc.
+
+Section ProofVirtioDiskRwE.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+
+  Notation Rra := (mword_of_int 1  : mword 5).
+  Notation Rtp := (mword_of_int 4  : mword 5).
+  Notation Rs0 := (mword_of_int 8  : mword 5).
+  Notation Rs1 := (mword_of_int 9  : mword 5).
+  Notation Ra0 := (mword_of_int 10 : mword 5).
+  Notation Ra1 := (mword_of_int 11 : mword 5).
+  Notation Ra5 := (mword_of_int 15 : mword 5).
+  Notation Rs2 := (mword_of_int 18 : mword 5).
+  Notation Rs3 := (mword_of_int 19 : mword 5).
+  Notation Rs6 := (mword_of_int 22 : mword 5).
+  Notation Rs7 := (mword_of_int 23 : mword 5).
+
+  Local Ltac reg_neq :=
+    lazymatch goal with
+    | |- ?a <> ?b => tryif unify a b then fail else (vm_compute; discriminate)
+    end.
+
+  Local Ltac pcstep := apply bv_eq; vm_compute; reflexivity.
+
+  (* ------------------------------------------------------------------- *)
+  (* THE P5/P6 SEAM at +0x1d2.                                            *)
+  (*                                                                      *)
+  (* [P4.vdrw_p4_exit] with (a) the pc at +0x1d2 and (b) the head's ACTIVE  *)
+  (* fragment replaced by what the poll's read of 0 handed back: the       *)
+  (* retired receipt, the claim's row (to delete under the lock), the two  *)
+  (* driver cells and the whole chain.  P6 frees the chain out of it.       *)
+  (* Note that s1/s2 are NOT pinned: +0x1d2 reloads [idx[0]] into s2 and   *)
+  (* P6 never reads s1 again.                                             *)
+  (* ------------------------------------------------------------------- *)
+  Definition vdrw_p5_exit (CID0 : CPU) (γk : gname) 
+      (γs : list gname) (j : nat) (γd : disk_names)
+      (pd pav pu : SailStdpp.Values.mword 64) (K : nat) (eb : bool)
+      (sp0 b : Arch.pa) (wr sector : SailStdpp.Values.mword 64)
+      (bs_buf bs_disk : list (bv 8)) (m0 : regfile)
+      (kq : nat * positive) (lks : gset string) : iProp Σ :=
+    (wp_next (CID0 := CID0) true (proc_addr j) (fun (CID : CpuId) =>
+     ∀ (M : regfile) (q np nr : nat) (cm : gmap nat dclaim)
+       (fr : nat -> bool) (h m2 t : nat) pin,
+       ⌜vdrw_regs M sp0 b wr sector /\ vdrw_hi M m0⌝ -∗
+       ⌜tri_ok (h, m2, t)⌝ -∗
+       ⌜pin = foldr union ∅ (vdrwd_pinr_regions pd b h m2 t wr sector
+                            (vdrwd_bufwin b wr bs_buf))
+        /\ pm_ok (vdrwd_pinr_regions pd b h m2 t wr sector
+                    (vdrwd_bufwin b wr bs_buf))⌝ -∗
+       ⌜is_aligned_paddr (Physaddr (pa_stk sp0 11)) 8 = true
+        /\ is_aligned_paddr (Physaddr (pa_stk sp0 12)) 8 = true⌝ -∗
+       sie_cap_gpr KT1 M (trap_res eb + (K - 12))%nat false (proc_addr j) -∗
+       cpu_own 1 eb (proc_addr j) false ({["virtio_disk"]} ∪ lks) -∗
+       trap_csrs KT1 -∗
+       cpu_claim (proc_addr j) -∗
+       pc_is (mword_of_int (KernelSyms.virtio_disk_rw + 0x1d2) : mword 64) -∗
+       locked γk cpu_id -∗
+       (* THE ROW DESIGN: the poll read [b->disk = 0] off the claim ROW, whose
+          Right arm names the position's completion record below the
+          payload's watermark; the row's pieces travel beside the body (which
+          has the row taken out, [vdrw_body_ex]), and the receipt is still
+          ACTIVE -- P6 collects the chain through the protocol
+          ([virtio_proto_collect_acc]) and retires the claim *)
+       vdrw_body_ex γd pd pav np nr cm fr q -∗
+       h ↪[dn_head γd] HActive (DClaim b (vdrwd_slot kq b h wr sector
+                                            (vdrwd_sldata wr bs_buf bs_disk))
+                                       pin q) -∗
+       d_info_b h ↦₈ (b : SailStdpp.Values.mword 64) -∗
+       hcell_map cur_ctx pin -∗
+       b_disk b ↦₄ (SailStdpp.Values.mword_of_int (len := 32) 0) -∗
+       (∃ u : nat, disk_ord γd q u ∗ ⌜(u < nr)%nat⌝) -∗
+       m2 ↪[dn_head γd] HInactive -∗
+       t ↪[dn_head γd] HInactive -∗
+       vdrw_slot_rest m2 -∗ vdrw_slot_rest t -∗
+       vdrw_idx (KTR := KT1) sp0 (mword_of_int (Z.of_nat h)) (mword_of_int (Z.of_nat m2))
+                    (mword_of_int (Z.of_nat t)) -∗
+       mWP (Loop : expr riscv_lang)))%I.
+
+  (* what the completion-wait loop head at +0x1b4 consumes.  The lock's
+     resource is CLOSED here (sleep takes it as [Rk]); what survives an
+     iteration besides the register discipline is the head's ACTIVE fragment
+     and the two other descriptors' INACTIVE ones. *)
+  Definition vdrw_p5_loop (CID0 : CPU) (γk : gname)
+      (γs : list gname) (j : nat) (γd : disk_names)
+      (pd pav pu : SailStdpp.Values.mword 64) (K : nat) (eb : bool)
+      (sp0 b : Arch.pa) (wr sector : SailStdpp.Values.mword 64)
+      (bs_buf bs_disk : list (bv 8)) (h m2 t : nat) (q : nat) (pin : _)
+      (m0 : regfile) (kq : nat * positive) (lks : gset string) : iProp Σ :=
+    (wp_next (CID0 := CID0) true (proc_addr j) (fun (CID : CpuId) =>
+     ∀ M : regfile,
+       ⌜vdrw_regs M sp0 b wr sector
+        /\ M !!! Regidx Rs1 = (d_lock : SailStdpp.Values.mword 64)
+        /\ M !!! Regidx Rs2 = (mword_of_int 1 : SailStdpp.Values.mword 64)
+        /\ vdrw_hi M m0⌝ -∗
+       sie_cap_gpr KT1 M (trap_res eb + (K - 12))%nat false (proc_addr j) -∗
+       cpu_own 1 eb (proc_addr j) false ({["virtio_disk"]} ∪ lks) -∗
+       trap_csrs KT1 -∗
+       cpu_claim (proc_addr j) -∗
+       pc_is (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b4) : mword 64) -∗
+       locked γk cpu_id -∗
+       disk_res γd pd pav pu -∗
+       h ↪[dn_head γd] HActive (DClaim b (vdrwd_slot kq b h wr sector
+                                            (vdrwd_sldata wr bs_buf bs_disk))
+                                       pin q) -∗
+       m2 ↪[dn_head γd] HInactive -∗
+       t ↪[dn_head γd] HInactive -∗
+       vdrw_slot_rest m2 -∗ vdrw_slot_rest t -∗
+       vdrw_idx (KTR := KT1) sp0 (mword_of_int (Z.of_nat h)) (mword_of_int (Z.of_nat m2))
+                    (mword_of_int (Z.of_nat t)) -∗
+       ⌜tri_ok (h, m2, t)⌝ -∗
+       ⌜is_aligned_paddr (Physaddr (pa_stk sp0 11)) 8 = true
+        /\ is_aligned_paddr (Physaddr (pa_stk sp0 12)) 8 = true⌝ -∗
+       ⌜pin = foldr union ∅ (vdrwd_pinr_regions pd b h m2 t wr sector
+                            (vdrwd_bufwin b wr bs_buf))
+        /\ pm_ok (vdrwd_pinr_regions pd b h m2 t wr sector
+                    (vdrwd_bufwin b wr bs_buf))⌝ -∗
+       vdrw_p5_exit CID0 γk γs j γd pd pav pu K eb sp0 b wr sector bs_buf bs_disk m0 kq lks -∗
+       mWP (Loop : expr riscv_lang)))%I.
+
+  (* ------------------------------------------------------------------- *)
+  (* P5, packaged as the wand P4 consumes.                                 *)
+  (* ------------------------------------------------------------------- *)
+  Lemma wp_vdrw_p5_seam (γk : gname)
+      (γs : list gname) (j : nat) (γl : gname)
+      (γu : uart_names) (γd : disk_names)
+      (pd pav pu : SailStdpp.Values.mword 64) (K : nat) (eb : bool)
+      (sp0 b : Arch.pa) (wr sector : SailStdpp.Values.mword 64)
+      (bs_buf bs_disk : list (bv 8)) (m0 : regfile) (kq : nat * positive)
+      (lks : gset string) :
+    (K_virtio_disk_rw <= K)%nat ->
+    (j < NPROC)%nat -> γs !! j = Some γl ->
+    (* THE BUFFER POINTER IS NON-NULL.  [sleep_prepare] panics on a zero
+       channel, and the channel here IS [b].  The caller supplies this out of
+       the spec's [addr_is_kdata (pa_add (b_data b) k)] premise
+       ([ProofVirtioDiskRwF.vdrwf_bnz]); it is not derivable from anything
+       this phase holds, because a points-to says nothing about the address. *)
+    eq_vec (b : SailStdpp.Values.mword 64) (zero_reg : SailStdpp.Values.mword 64) = false ->
+    (* the seam still holds disk.vdisk_lock; sleep_prepare/wakeup at
+       "proc" (11) follow from this by [locks_below_mono]. *)
+    locks_below lks "virtio_disk" ->
+    kernel_text -∗
+    procs_inv γs -∗
+    dev_inv γu γd -∗
+    is_lock γk d_lock "virtio_disk"%string (disk_res_at γd pd pav pu) -∗
+    vdrw_p5_exit CID γk γs j γd pd pav pu K eb sp0 b wr sector bs_buf bs_disk
+                 m0 kq lks -∗
+    P4.vdrw_p4_exit CID γk γs j γd pd pav pu K eb sp0 b wr sector bs_buf
+                    bs_disk m0 kq lks.
+  Proof using .
+    intros HK Hj Hjl Hbnz Hbelow.
+    iIntros "#Htext #Hpinv #Hdinv #Hlk Hexit".
+    rewrite /P4.vdrw_p4_exit.
+    iIntros (CIDx Hsx M q np nr cm fr h m2 t pin)
+            "%Hrh %Ha1 %Hok %Hpinr %Hal Hcg Hown Htc Hclm Hpc Htok Hbody Hact Hfm Hft Hrm Hrt Hidx".
+    destruct Hrh as (Hregs & Hhi).
+    pose proof Hok as (Hhm & Hht & Hmt & Hh8 & Hm8 & Ht8). cbn in Hh8, Hm8, Ht8.
+    set (V := DClaim b (vdrwd_slot kq b h wr sector (vdrwd_sldata wr bs_buf bs_disk))
+                     pin q).
+    pose proof Hregs as Hregs'.
+    destruct Hregs' as (Hsp & Hs0 & Hs3 & Hs6 & Hs7).
+    (* ================= THE LOOP, first (it is used by both arms) ======= *)
+    iAssert (vdrw_p5_loop CID γk γs j γd pd pav pu K eb sp0 b wr sector
+               bs_buf bs_disk h m2 t q pin m0 kq lks)%I with "[]" as "Hloop".
+    { iLöb as "IH". rewrite {2}/vdrw_p5_loop.
+      iIntros (CIDlp Hslp M') "%Hinv Hcg Hown Htc Hclm Hpc Htok HR Hact Hfm Hft Hrm Hrt Hidx
+                    %HokL %HalL %HpinrL HexitL".
+      destruct Hinv as (HregsL & Hs1L & Hs2L & HhiL).
+      pose proof HregsL as HregsL'.
+      destruct HregsL' as (HspL & Hs0L & Hs3L & Hs6L & Hs7L).
+      (* =============================================================== *)
+      (* THE SLEEP PROTOCOL, IN FOUR CALLS -- see ProofVirtioDiskRwB.v.  *)
+      (*   +0x1b4/+0x1b6  a0 := b;             sleep_prepare(a0)         *)
+      (*   +0x1ba/+0x1bc  a0 := &vdisk_lock;   release(a0)               *)
+      (*   +0x1c0                              sleep()                   *)
+      (*   +0x1c4/+0x1c6  a0 := &vdisk_lock;   acquire(a0)               *)
+      (* The pair is still CARRIED by the loop predicates; it is SPLIT    *)
+      (* across the window ([arm_pay] into release's pop_off, the         *)
+      (* complement into sleep) and rejoined out of acquire's push_off.   *)
+      (* =============================================================== *)
+      (* ---- +0x1b4  c.mv a0,s3 ---- *)
+      iApply (wp_cmv_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b4) : mword 64) Ra0 Rs3 M'
+                (trap_res eb + (K - 12))%nat false ltac:(vm_compute; discriminate)
+                ltac:(rdok) with "Hcg Hpc []").
+      { iApply (rwi_1b4 with "Htext"). }
+      iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+      set (W1 := <[Regidx Ra0 := regval_into_reg
+                    (add_vec zero_reg (M' !!! Regidx Rs3))]> M').
+      change (<[Regidx Ra0 := regval_into_reg
+                    (add_vec zero_reg (M' !!! Regidx Rs3))]> M') with W1.
+      assert (HW1a0 : W1 !!! Regidx Ra0 = (b : SailStdpp.Values.mword 64)).
+      { rewrite /W1 upd_eq vdrwe_addv_zero. exact Hs3L. }
+      assert (Hp1b6 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b4) : mword 64) 2
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1b6)) by pcstep.
+      iEval (rewrite Hp1b6) in "Hpc".
+      (* ---- +0x1b6  jal ra,sleep_prepare ---- *)
+      iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b6) : mword 64) Rra
+                (mword_of_int 2081818 : mword 21) W1 (trap_res eb + (K - 12))%nat false
+                ltac:(vm_compute; discriminate) ltac:(rdok)
+                ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+      { iApply (rwi_1b6 with "Htext"). }
+      iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+      set (W2 := <[Regidx Rra := regval_into_reg
+                    (add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b6) : mword 64) 4)]> W1).
+      change (<[Regidx Rra := regval_into_reg
+                    (add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b6) : mword 64) 4)]> W1) with W2.
+      assert (Hjsp : add_vec (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b6) : mword 64)
+                       (sign_extend' 64 (mword_of_int 2081818 : mword 21))
+                     = mword_of_int KernelSyms.sleep_prepare) by pcstep.
+      iEval (rewrite Hjsp) in "Hpc".
+      assert (HW2ra : W2 !!! Regidx Rra
+                      = add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b6) : mword 64) 4)
+        by (rewrite /W2; apply upd_eq).
+      assert (HW2a0 : W2 !!! Regidx Ra0 = (b : SailStdpp.Values.mword 64)).
+      { rewrite /W2 upd_ne; [| reg_neq]. exact HW1a0. }
+      assert (HcsW2 : callee_saved M' W2).
+      { rewrite /W2 /W1.
+        apply callee_saved_insert_r; [vm_compute; reflexivity|].
+        apply callee_saved_insert_r; [vm_compute; reflexivity|].
+        apply callee_saved_refl. }
+      (* ================= sleep_prepare(b) ================= *)
+      iApply (SleepPrepare.wp_sleep_prepare_sconf γs j γl W2
+                (trap_res eb + (K - 12))%nat 1%nat eb false
+                ({["virtio_disk"]} ∪ lks)
+                Hj Hjl ltac:(rewrite HW2a0; exact Hbnz) vdrwb_lvl1
+                ltac:(pose proof (vdrw_K22 K HK); lia)
+                with "Hcg Hown Htext Hpc Hpinv").
+      all: try lkbelow.
+      iApply wp_next_off_intro. iIntros (mfp) "%Hpcs Hcg Hown Hpc". rgall.
+      assert (Hr1ba : ret_pc (W2 !!! Regidx Rra)
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1ba))
+        by (rewrite HW2ra; pcstep).
+      iEval (rewrite Hr1ba) in "Hpc".
+      assert (Hmfps1 : mfp !!! Regidx Rs1 = (d_lock : SailStdpp.Values.mword 64)).
+      { rewrite (callee_saved_lookup Hpcs Rs1 ltac:(vm_compute; reflexivity)).
+        rewrite /W2 upd_ne; [| reg_neq]. rewrite /W1 upd_ne; [| reg_neq]. exact Hs1L. }
+      (* ---- +0x1ba  c.mv a0,s1 ---- *)
+      iApply (wp_cmv_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ba) : mword 64) Ra0 Rs1 mfp
+                (trap_res eb + (K - 12))%nat false ltac:(vm_compute; discriminate)
+                ltac:(rdok) with "Hcg Hpc []").
+      { iApply (rwi_1ba with "Htext"). }
+      iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+      set (W3 := <[Regidx Ra0 := regval_into_reg
+                    (add_vec zero_reg (mfp !!! Regidx Rs1))]> mfp).
+      change (<[Regidx Ra0 := regval_into_reg
+                    (add_vec zero_reg (mfp !!! Regidx Rs1))]> mfp) with W3.
+      assert (HW3a0 : W3 !!! Regidx Ra0 = (d_lock : SailStdpp.Values.mword 64)).
+      { rewrite /W3 upd_eq vdrwe_addv_zero. exact Hmfps1. }
+      assert (Hp1bc : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ba) : mword 64) 2
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1bc)) by pcstep.
+      iEval (rewrite Hp1bc) in "Hpc".
+      (* ---- +0x1bc  jal ra,release ---- *)
+      iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1bc) : mword 64) Rra
+                (mword_of_int 2076960 : mword 21) W3 (trap_res eb + (K - 12))%nat false
+                ltac:(vm_compute; discriminate) ltac:(rdok)
+                ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+      { iApply (rwi_1bc with "Htext"). }
+      iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+      set (W4 := <[Regidx Rra := regval_into_reg
+                    (add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1bc) : mword 64) 4)]> W3).
+      change (<[Regidx Rra := regval_into_reg
+                    (add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1bc) : mword 64) 4)]> W3) with W4.
+      assert (Hjrl : add_vec (mword_of_int (KernelSyms.virtio_disk_rw + 0x1bc) : mword 64)
+                       (sign_extend' 64 (mword_of_int 2076960 : mword 21))
+                     = mword_of_int KernelSyms.release) by pcstep.
+      iEval (rewrite Hjrl) in "Hpc".
+      assert (HW4ra : W4 !!! Regidx Rra
+                      = add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1bc) : mword 64) 4)
+        by (rewrite /W4; apply upd_eq).
+      assert (HW4a0 : add_vec (W4 !!! Regidx Ra0)
+                        (sign_extend' 64 (mword_of_int 0 : mword 12))
+                      = (d_lock : SailStdpp.Values.mword 64)).
+      { rewrite /W4 upd_ne; [| reg_neq]. rewrite HW3a0. apply vdrw_addv_sext0. }
+      assert (HcsW4 : callee_saved mfp W4).
+      { rewrite /W4 /W3.
+        apply callee_saved_insert_r; [vm_compute; reflexivity|].
+        apply callee_saved_insert_r; [vm_compute; reflexivity|].
+        apply callee_saved_refl. }
+      iDestruct (arm_pay_ext_split eb (proc_addr j) with "Htc Hclm")
+        as "[Hpay [Hextc Hextm]]".
+      (* ================= release(&disk.vdisk_lock) ================= *)
+      iApply (Release.wp_release_sconf KT1 γk d_lock "virtio_disk"%string (disk_res_at γd pd pav pu) W4 0%nat eb (proc_addr j) (K - 12)%nat
+                ({["virtio_disk"]} ∪ lks)
+                HW4a0 ltac:(pose proof (vdrw_K10 K HK); lia)
+                with "Hcg Htext Hpc Hlk Htok HR Hown Hpay").
+      iIntros (CIDrl Hsrl mfr) "Hcg Hpc %Hrcs Hown". rgall.
+      assert (Hr1c0 : ret_pc (W4 !!! Regidx Rra)
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1c0))
+        by (rewrite HW4ra; pcstep).
+      iEval (rewrite Hr1c0) in "Hpc".
+      (* ---- +0x1c0  jal ra,sleep ---- *)
+      iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c0) : mword 64) Rra
+                (mword_of_int 2081868 : mword 21) mfr (K - 12)%nat eb
+                ltac:(vm_compute; discriminate) ltac:(rdok)
+                ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+      { iApply (rwi_1c0 with "Htext"). }
+      iIntros (CIDjs Hsjs) "Hcg Hpc". rgall.
+      set (W5 := <[Regidx Rra := regval_into_reg
+                    (add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c0) : mword 64) 4)]> mfr).
+      change (<[Regidx Rra := regval_into_reg
+                    (add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c0) : mword 64) 4)]> mfr) with W5.
+      assert (Hjsl : add_vec (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c0) : mword 64)
+                       (sign_extend' 64 (mword_of_int 2081868 : mword 21))
+                     = mword_of_int KernelSyms.sleep) by pcstep.
+      iEval (rewrite Hjsl) in "Hpc".
+      assert (HW5ra : W5 !!! Regidx Rra
+                      = add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c0) : mword 64) 4)
+        by (rewrite /W5; apply upd_eq).
+      assert (HcsW5 : callee_saved mfr W5).
+      { rewrite /W5. apply callee_saved_insert_r; [vm_compute; reflexivity|].
+        apply callee_saved_refl. }
+      (* ========================== sleep() ========================== *)
+      iDestruct (cpu_own_transport CIDrl CIDjs 0 eb (proc_addr j) eb
+                   ltac:(wp_next_chain) with "Hown") as "Hown".
+      iDestruct (trap_csrs_ext_transport CIDlp CIDjs eb (proc_addr j)
+                   ltac:(wp_next_chain) with "Hextc") as "Hextc".
+      iDestruct (cpu_claim_ext_transport CIDlp CIDjs eb (proc_addr j)
+                   ltac:(wp_next_chain) with "Hextm") as "Hextm".
+      (* the release above gave the virtio rank back; spell the set as the
+         bare entry one sleep's contract names. *)
+      iEval (rewrite (locks_add_del_below "virtio_disk" lks Hbelow)) in "Hown".
+      iApply (Sleep.wp_sleep_sconf γs j γl W5 (K - 12)%nat eb lks
+                Hj Hjl ltac:(pose proof (vdrw_K22 K HK); lia)
+                with "Hcg Hown Htext Hpc Hpinv Hextc Hextm").
+      all: try lkbelow.
+      iIntros (CIDsl Hssl mfs) "%Hscs Hcg Hown Hpc Hextc Hextm". rgall.
+      assert (Hr1c4 : ret_pc (W5 !!! Regidx Rra)
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1c4))
+        by (rewrite HW5ra; pcstep).
+      iEval (rewrite Hr1c4) in "Hpc".
+      assert (Hmfss1 : mfs !!! Regidx Rs1 = (d_lock : SailStdpp.Values.mword 64)).
+      { rewrite (callee_saved_lookup Hscs Rs1 ltac:(vm_compute; reflexivity)).
+        rewrite /W5 upd_ne; [| reg_neq].
+        rewrite (callee_saved_lookup Hrcs Rs1 ltac:(vm_compute; reflexivity)).
+        rewrite /W4 upd_ne; [| reg_neq]. rewrite /W3 upd_ne; [| reg_neq].
+        exact Hmfps1. }
+      (* ---- +0x1c4  c.mv a0,s1 ---- *)
+      iApply (wp_cmv_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c4) : mword 64) Ra0 Rs1 mfs
+                (K - 12)%nat eb ltac:(vm_compute; discriminate)
+                ltac:(rdok) with "Hcg Hpc []").
+      { iApply (rwi_1c4 with "Htext"). }
+      iIntros (CIDm Hsm) "Hcg Hpc". rgall.
+      set (W6 := <[Regidx Ra0 := regval_into_reg
+                    (add_vec zero_reg (mfs !!! Regidx Rs1))]> mfs).
+      change (<[Regidx Ra0 := regval_into_reg
+                    (add_vec zero_reg (mfs !!! Regidx Rs1))]> mfs) with W6.
+      assert (HW6a0 : W6 !!! Regidx Ra0 = (d_lock : SailStdpp.Values.mword 64)).
+      { rewrite /W6 upd_eq vdrwe_addv_zero. exact Hmfss1. }
+      assert (Hp1c6 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c4) : mword 64) 2
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1c6)) by pcstep.
+      iEval (rewrite Hp1c6) in "Hpc".
+      (* ---- +0x1c6  jal ra,acquire ---- *)
+      iApply (wp_jal_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c6) : mword 64) Rra
+                (mword_of_int 2076814 : mword 21) W6 (K - 12)%nat eb
+                ltac:(vm_compute; discriminate) ltac:(rdok)
+                ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+      { iApply (rwi_1c6 with "Htext"). }
+      iIntros (CIDd3 Hsd3) "Hcg Hpc". rgall.
+      set (W7 := <[Regidx Rra := regval_into_reg
+                    (add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c6) : mword 64) 4)]> W6).
+      change (<[Regidx Rra := regval_into_reg
+                    (add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c6) : mword 64) 4)]> W6) with W7.
+      assert (Hjaq : add_vec (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c6) : mword 64)
+                       (sign_extend' 64 (mword_of_int 2076814 : mword 21))
+                     = mword_of_int KernelSyms.acquire) by pcstep.
+      iEval (rewrite Hjaq) in "Hpc".
+      assert (HW7ra : W7 !!! Regidx Rra
+                      = add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1c6) : mword 64) 4)
+        by (rewrite /W7; apply upd_eq).
+      assert (HW7a0 : W7 !!! Regidx Ra0 = (d_lock : SailStdpp.Values.mword 64)).
+      { rewrite /W7 upd_ne; [| reg_neq]. exact HW6a0. }
+      assert (HcsW7 : callee_saved mfs W7).
+      { rewrite /W7 /W6.
+        apply callee_saved_insert_r; [vm_compute; reflexivity|].
+        apply callee_saved_insert_r; [vm_compute; reflexivity|].
+        apply callee_saved_refl. }
+      (* ================= acquire(&disk.vdisk_lock) ================= *)
+      iDestruct (cpu_own_transport CIDsl CIDd3 0 eb (proc_addr j) eb
+                   ltac:(wp_next_chain) with "Hown") as "Hown".
+      iApply (Acquire.wp_acquire_sconf KT1 γk "virtio_disk"%string (disk_res_at γd pd pav pu) W7 0%nat eb (proc_addr j) (K - 12)%nat eb lks
+                vdrw_noff0 ltac:(pose proof (vdrw_K10 K HK); lia)
+                with "Hcg Hown Htext Hpc []").
+      all: try lkbelow.
+      { iEval (rewrite HW7a0). iExact "Hlk". }
+      iIntros (CIDaq Hsaq msA Mf) "_ Hcg Hpc %Hacs Htok HR _ Hown Hpay". rgall.
+      assert (Hret : ret_pc (W7 !!! Regidx Rra) = mword_of_int (KernelSyms.virtio_disk_rw + 0x1ca))
+        by (rewrite HW7ra; pcstep).
+      iEval (rewrite Hret) in "Hpc".
+      iDestruct (trap_csrs_ext_transport CIDsl CIDaq eb (proc_addr j)
+                   ltac:(wp_next_chain) with "Hextc") as "Hextc".
+      iDestruct (cpu_claim_ext_transport CIDsl CIDaq eb (proc_addr j)
+                   ltac:(wp_next_chain) with "Hextm") as "Hextm".
+      iDestruct (arm_pay_ext_join eb (proc_addr j) with "Hpay [$Hextc $Hextm]")
+        as "[Htc Hclm]".
+      assert (Hcsf : callee_saved M' Mf).
+      { eapply callee_saved_trans; [exact HcsW2|].
+        eapply callee_saved_trans; [exact Hpcs|].
+        eapply callee_saved_trans; [exact HcsW4|].
+        eapply callee_saved_trans; [exact Hrcs|].
+        eapply callee_saved_trans; [exact HcsW5|].
+        eapply callee_saved_trans; [exact Hscs|].
+        eapply callee_saved_trans; [exact HcsW7|].
+        exact Hacs. }
+      (* the register discipline survives the whole four-call window *)
+      assert (HMfs3 : Mf !!! Regidx Rs3 = (b : SailStdpp.Values.mword 64)).
+      { rewrite (callee_saved_lookup Hcsf Rs3 ltac:(vm_compute; reflexivity)). exact Hs3L. }
+      assert (HMfs1 : Mf !!! Regidx Rs1 = (d_lock : SailStdpp.Values.mword 64)).
+      { rewrite (callee_saved_lookup Hcsf Rs1 ltac:(vm_compute; reflexivity)). exact Hs1L. }
+      assert (HMfs2 : Mf !!! Regidx Rs2 = (mword_of_int 1 : SailStdpp.Values.mword 64)).
+      { rewrite (callee_saved_lookup Hcsf Rs2 ltac:(vm_compute; reflexivity)). exact Hs2L. }
+      assert (HMfregs : vdrw_regs Mf sp0 b wr sector).
+      { unfold vdrw_regs. rewrite (proj1 Hcsf). split_and!.
+        - exact HspL.
+        - rewrite (callee_saved_lookup Hcsf Rs0 ltac:(vm_compute; reflexivity)). exact Hs0L.
+        - exact HMfs3.
+        - rewrite (callee_saved_lookup Hcsf Rs6 ltac:(vm_compute; reflexivity)). exact Hs6L.
+        - rewrite (callee_saved_lookup Hcsf Rs7 ltac:(vm_compute; reflexivity)). exact Hs7L. }
+      (* ---- +0x1ca  lw a5,4(s3) : re-read b->disk, through the receipt ---- *)
+      iDestruct (vdrw_body_open γd pd pav pu with "HR") as (np' nr' cm' fr') "Hbody".
+      rewrite /vdrw_body.
+      iDestruct "Hbody" as "(%Hcm' & Hpub & #Hlb & Hrd & Hdfl & Hstg & Hcl & Hrows & Huidx & Hfb & Hring & Havh)".
+      assert (Haddr : add_vec (rget Mf Rs3) (sign_extend' 64 (mword_of_int 4 : mword 12))
+                      = (b_disk b : SailStdpp.Values.mword 64))
+        by (rgall; rewrite HMfs3; apply vdrwe_bdisk_addr).
+      (* THE ROW: the receipt names the claim, the payload's authority its row *)
+      iApply fupd_wp.
+      iDestruct (dev_inv_disk with "Hdinv") as "#Hvinvc".
+      iInv "Hvinvc" as ">Hdbc" "Hdclosec".
+      iDestruct "Hdbc" as (vstc) "(Hvfc & Hprotoc & %Hvokc)".
+      iDestruct (virtio_proto_head_claim with "Hprotoc Hact Hcl") as %Hcmq.
+      iMod ("Hdclosec" with "[Hvfc Hprotoc]") as "_".
+      { iNext. iExists vstc. iFrame. iPureIntro. exact Hvokc. }
+      iModIntro.
+      assert (Hcmq' : cm' !! q = Some V) by exact Hcmq.
+      iDestruct (big_sepM_delete _ cm' q V Hcmq' with "Hrows") as "[Hrow Hrows]".
+      iApply (wp_vdrwe_lw_bdisk γu γd (proc_addr j)
+                (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ca) : mword 64) Ra5 Rs3
+                (mword_of_int 4 : mword 12) Mf (trap_res eb + (K - 12))%nat nr' q V Haddr
+                ltac:(vm_compute; discriminate) ltac:(rdok)
+                with "Hcg Hpc [] Hrow").
+      { iApply (rwi_1ca with "Htext"). }
+      iIntros (dv) "Hcg Hpc Hres". rgall.
+      set (L4 := <[Regidx Ra5 := regval_into_reg (sign_extend' 64 dv)]> Mf).
+      change (<[Regidx Ra5 := regval_into_reg (sign_extend' 64 dv)]> Mf) with L4.
+      assert (Hp1ac : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ca) : mword 64) 4
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1ce)) by pcstep.
+      iEval (rewrite Hp1ac) in "Hpc".
+      assert (HL4s1 : L4 !!! Regidx Rs1 = (d_lock : SailStdpp.Values.mword 64))
+        by (rewrite /L4 upd_ne; [| reg_neq]; exact HMfs1).
+      assert (HL4s2 : L4 !!! Regidx Rs2 = (mword_of_int 1 : SailStdpp.Values.mword 64))
+        by (rewrite /L4 upd_ne; [| reg_neq]; exact HMfs2).
+      assert (HL4a5 : L4 !!! Regidx Ra5 = sign_extend' 64 dv)
+        by (rewrite /L4; apply upd_eq).
+      (* ---- +0x1ce  beq a5,s1 : still 1 -> loop ---- *)
+      iDestruct "Hres" as "[(-> & Hrow) | (-> & Hib & Hhc & Hbd & #Hu)]".
+      + (* still in flight: TAKEN, back to +0x1b4 *)
+        iAssert (vdrw_body γd pd pav np' nr' cm' fr')
+          with "[Hpub Hrd Hdfl Hstg Hcl Hrow Hrows Huidx Hfb Hring Havh]" as "Hbody".
+        { rewrite /vdrw_body. iSplitR; [iPureIntro; exact Hcm'|].
+          iFrame "Hpub Hlb Hrd Hdfl Hstg Hcl Huidx Hfb Hring Havh".
+          rewrite (big_sepM_delete _ cm' q V Hcmq'). iFrame "Hrow Hrows". }
+        iApply (wp_beq_taken_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ce) : mword 64)
+                  (mword_of_int 8166 : mword 13) Rs2 Ra5 L4 (trap_res eb + (K - 12))%nat false
+                  ltac:(vm_compute; discriminate) ltac:(vm_compute; discriminate)
+                  ltac:(rgall; rewrite HL4a5 HL4s2 vdrwe_sext_one; exact vdrwe_eq_one)
+                  ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+        { iApply (rwi_1ce with "Htext"). }
+        iNext. iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+        assert (Hback : add_vec (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ce) : mword 64)
+                          (sign_extend' 64 (mword_of_int 8166 : mword 13))
+                        = mword_of_int (KernelSyms.virtio_disk_rw + 0x1b4)) by pcstep.
+        iEval (rewrite Hback) in "Hpc".
+        iDestruct (vdrw_body_close γd pd pav pu with "Hbody") as "HR".
+        iSpecialize ("IH" $! CIDaq with "[%]"); [wp_next_chain|].
+        iApply ("IH" $! L4 with
+                  "[%] Hcg Hown Htc Hclm Hpc Htok HR Hact Hfm Hft Hrm Hrt Hidx
+                   [%] [%] [%] HexitL").
+        * split_and!; [| exact HL4s1 | |].
+          -- unfold vdrw_regs. destruct HMfregs as (F1 & F2 & F3 & F4 & F5).
+             split_and!;
+               [ rewrite /L4 upd_ne; [exact F1 | reg_neq]
+               | rewrite /L4 upd_ne; [exact F2 | reg_neq]
+               | rewrite /L4 upd_ne; [exact F3 | reg_neq]
+               | rewrite /L4 upd_ne; [exact F4 | reg_neq]
+               | rewrite /L4 upd_ne; [exact F5 | reg_neq] ].
+          -- rewrite /L4 upd_ne; [exact HMfs2 | reg_neq].
+          -- vdrw_hi_peel. exact (vdrw_hi_cs M' Mf m0 Hcsf HhiL).
+        * exact HokL.
+        * exact HalL.
+        * exact HpinrL.
+      + (* collected: FALL THROUGH to +0x1d2 *)
+        iApply (wp_beq_fall_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ce) : mword 64)
+                  (mword_of_int 8166 : mword 13) Rs2 Ra5 L4 (trap_res eb + (K - 12))%nat false
+                  ltac:(vm_compute; discriminate) ltac:(vm_compute; discriminate)
+                  ltac:(rgall; rewrite HL4a5 HL4s2 vdrwe_sext_zero; exact vdrwe_eq_zero_one)
+                  with "Hcg Hpc []").
+        { iApply (rwi_1ce with "Htext"). }
+        iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+        assert (Hp1b0 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ce) : mword 64) 4
+                        = mword_of_int (KernelSyms.virtio_disk_rw + 0x1d2)) by pcstep.
+        iEval (rewrite Hp1b0) in "Hpc".
+        rewrite /vdrw_p5_exit.
+        iSpecialize ("HexitL" $! CIDaq with "[%]"); [wp_next_chain|].
+        (* the row's pieces, spelled at the claim's projections *)
+        iEval (rewrite /V; cbn [dc_buf dc_slot dc_pin];
+               rewrite (vdrwd_slot_head kq b h wr sector _ Hh8)) in "Hib".
+        iEval (rewrite /V; cbn [dc_buf dc_slot dc_pin]) in "Hhc".
+        iEval (rewrite /V; cbn [dc_buf dc_slot dc_pin]) in "Hbd".
+        iAssert (vdrw_body_ex γd pd pav np' nr' cm' fr' q)
+          with "[Hpub Hrd Hdfl Hstg Hcl Hrows Huidx Hfb Hring Havh]" as "Hbody".
+        { rewrite /vdrw_body_ex. iSplitR; [iPureIntro; exact Hcm'|].
+          iFrame "Hpub Hlb Hrd Hdfl Hstg Hcl Hrows Huidx Hfb Hring Havh". }
+        iApply ("HexitL" $! L4 q np' nr' cm' fr' h m2 t pin with
+                  "[%] [%] [%] [%] Hcg Hown Htc Hclm Hpc Htok Hbody
+                   Hact Hib Hhc Hbd Hu Hfm Hft Hrm Hrt Hidx").
+        * split; [| vdrw_hi_peel; exact (vdrw_hi_cs M' Mf m0 Hcsf HhiL)].
+          unfold vdrw_regs. destruct HMfregs as (F1 & F2 & F3 & F4 & F5).
+          split_and!;
+            [ rewrite /L4 upd_ne; [exact F1 | reg_neq]
+            | rewrite /L4 upd_ne; [exact F2 | reg_neq]
+            | rewrite /L4 upd_ne; [exact F3 | reg_neq]
+            | rewrite /L4 upd_ne; [exact F4 | reg_neq]
+            | rewrite /L4 upd_ne; [exact F5 | reg_neq] ].
+        * exact HokL.
+        * exact HpinrL.
+        * exact HalL. }
+    (* ================= +0x19a .. +0x1b0, the entry ==================== *)
+    (* ---- +0x19a  lui a5,0x10001 ---- *)
+    iApply (wp_lui_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x19a) : mword 64) Ra5
+              (mword_of_int 65537 : mword 20)
+              (mword_of_int 0x10001000 : SailStdpp.Values.mword 64) M (trap_res eb + (K - 12))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              vdrwe_lui with "Hcg Hpc []").
+    { iApply (rwi_19a with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    set (N1 := <[Regidx Ra5 := regval_into_reg
+                  (mword_of_int 0x10001000 : SailStdpp.Values.mword 64)]> M).
+    change (<[Regidx Ra5 := regval_into_reg
+                  (mword_of_int 0x10001000 : SailStdpp.Values.mword 64)]> M) with N1.
+    assert (HN1a5 : N1 !!! Regidx Ra5
+                    = (mword_of_int 0x10001000 : SailStdpp.Values.mword 64))
+      by (rewrite /N1; apply upd_eq).
+    assert (Hp18a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x19a) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x19e)) by pcstep.
+    iEval (rewrite Hp18a) in "Hpc".
+    (* ---- +0x19e  sw x0,80(a5) : *R(QUEUE_NOTIFY) = 0 ---- *)
+    iDestruct (sie_cap_gpr_x0 N1 (trap_res eb + (K - 12))%nat false (proc_addr j) (mword_of_int 0 : mword 5)
+                 ltac:(vm_compute; reflexivity) with "Hcg") as "[%Hx0 Hcg]".
+    assert (Hnaddr : add_vec (N1 !!! Regidx Ra5) (sign_extend' 64 (mword_of_int 80 : mword 12))
+                     = (mword_of_int 0x10001050 : SailStdpp.Values.mword 64))
+      by (rewrite HN1a5; apply vdrwe_notify_addr).
+    assert (Ha8 : sign_extend' 64 (subrange_vec_dec
+                    (add_vec (rget N1 Ra5) (sign_extend' 64 (mword_of_int 80 : mword 12)))
+                    (xlen - 0 - 1) 0)
+                  = (mword_of_int 0x10001050 : SailStdpp.Values.mword 64)).
+    { rgall. rewrite subrange_id sign_extend'_id. exact Hnaddr. }
+    pose proof vdrwe_notify_geom as (Hgr & Hga & Hgc & Hgd).
+    assert (Hsw : (autocast (T := mword)
+                     (subrange_vec_dec (N1 !!! Regidx (mword_of_int 0 : mword 5))
+                        (Z.sub (Z.mul 4 8) 1) 0) : mword 32)
+                  = (mword_of_int 0 : mword 32))
+      by (rewrite Hx0; apply bv_eq; vm_compute; reflexivity).
+    assert (Hwrite : forall v : virtio_state, virtio_isr_ok v ->
+              exists v' : virtio_state,
+                virtio_write v (uint (mword_of_int 0x10001050 : SailStdpp.Values.mword 64)
+                                - virtio_base)%Z (mword_of_int 0 : mword 32) = Some v'
+                /\ virtio_isr_ok v'
+                /\ v_cfg v' = v_cfg v /\ v_seen v' = v_seen v
+                /\ v_used_idx v' = v_used_idx v /\ v_disk v' = v_disk v
+                /\ v_cache v' = v_cache v /\ v_taken v' = v_taken v
+                /\ v_inflight v' = v_inflight v).
+    { intros v Hvok. rewrite vdrwe_notify_off.
+      apply (virtio_notify_write_ok v (mword_of_int 0 : mword 32));
+        [ vm_compute; reflexivity | exact Hvok ]. }
+    iApply (wp_sw_virtio_dev_s_sconf (CID := CIDx) (p := proc_addr j) γu γd (mword_of_int (KernelSyms.virtio_disk_rw + 0x19e) : mword 64)
+              false (mword_of_int 0 : mword 5) Ra5 (mword_of_int 80 : mword 12)
+              N1 (trap_res eb + (K - 12))%nat
+              ltac:(rewrite Ha8; exact Hgr)
+              ltac:(rewrite Ha8; exact Hga)
+              ltac:(rewrite Ha8; exact Hgc)
+              ltac:(rewrite Ha8; exact Hgd)
+              ltac:(rewrite Ha8; rgall; rewrite Hsw; exact Hwrite)
+              with "Hcg Hpc [] Hdinv").
+    { iApply (rwi_19e with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    assert (Hp18e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x19e) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x1a2)) by pcstep.
+    iEval (rewrite Hp18e) in "Hpc".
+    (* ---- +0x1a2  lw a5,4(s3) : the first b->disk read, through the receipt ---- *)
+    assert (HN1s3 : N1 !!! Regidx Rs3 = (b : SailStdpp.Values.mword 64))
+      by (rewrite /N1 upd_ne; [| reg_neq]; exact Hs3).
+    rewrite /vdrw_body.
+    iDestruct "Hbody" as "(%Hcm & Hpub & #Hlb & Hrd & Hdfl & Hstg & Hcl & Hrows & Huidx & Hfb & Hring & Havh)".
+    assert (Haddr0 : add_vec (rget N1 Rs3) (sign_extend' 64 (mword_of_int 4 : mword 12))
+                     = (b_disk b : SailStdpp.Values.mword 64))
+      by (rgall; rewrite HN1s3; apply vdrwe_bdisk_addr).
+    (* THE ROW: the receipt names the claim, the payload's authority its row *)
+    iApply fupd_wp.
+    iDestruct (dev_inv_disk with "Hdinv") as "#Hvinvc".
+    iInv "Hvinvc" as ">Hdbc" "Hdclosec".
+    iDestruct "Hdbc" as (vstc) "(Hvfc & Hprotoc & %Hvokc)".
+    iDestruct (virtio_proto_head_claim with "Hprotoc Hact Hcl") as %Hcmq.
+    iMod ("Hdclosec" with "[Hvfc Hprotoc]") as "_".
+    { iNext. iExists vstc. iFrame. iPureIntro. exact Hvokc. }
+    iModIntro.
+    assert (Hcmq' : cm !! q = Some V) by exact Hcmq.
+    iDestruct (big_sepM_delete _ cm q V Hcmq' with "Hrows") as "[Hrow Hrows]".
+    iApply (wp_vdrwe_lw_bdisk γu γd (proc_addr j)
+              (mword_of_int (KernelSyms.virtio_disk_rw + 0x1a2) : mword 64) Ra5 Rs3
+              (mword_of_int 4 : mword 12) N1 (trap_res eb + (K - 12))%nat nr q V Haddr0
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] Hrow").
+    { iApply (rwi_1a2 with "Htext"). }
+    iIntros (dv) "Hcg Hpc Hres". rgall.
+    set (N2 := <[Regidx Ra5 := regval_into_reg (sign_extend' 64 dv)]> N1).
+    change (<[Regidx Ra5 := regval_into_reg (sign_extend' 64 dv)]> N1) with N2.
+    assert (Hp192 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1a2) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x1a6)) by pcstep.
+    iEval (rewrite Hp192) in "Hpc".
+    (* ---- +0x1a6 / +0x1aa  s1 := &disk.vdisk_lock ---- *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1a6) : mword 64) Rs1
+              (mword_of_int 30 : mword 20) N2 (trap_res eb + (K - 12))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (rwi_1a6 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    set (N3 := <[Regidx Rs1 := regval_into_reg
+                  (add_vec (mword_of_int (KernelSyms.virtio_disk_rw + 0x1a6) : mword 64)
+                           (auipc_off (mword_of_int 30 : mword 20)))]> N2).
+    change (<[Regidx Rs1 := regval_into_reg
+                  (add_vec (mword_of_int (KernelSyms.virtio_disk_rw + 0x1a6) : mword 64)
+                           (auipc_off (mword_of_int 30 : mword 20)))]> N2) with N3.
+    assert (Hp196 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1a6) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x1aa)) by pcstep.
+    iEval (rewrite Hp196) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1aa) : mword 64) Rs1 Rs1
+              (mword_of_int 3246 : mword 12) N3 (trap_res eb + (K - 12))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (rwi_1aa with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    set (N4 := <[Regidx Rs1 := regval_into_reg
+                  (add_vec (N3 !!! Regidx Rs1)
+                     (sign_extend' 64 (mword_of_int 3246 : mword 12)))]> N3).
+    change (<[Regidx Rs1 := regval_into_reg
+                  (add_vec (N3 !!! Regidx Rs1)
+                     (sign_extend' 64 (mword_of_int 3246 : mword 12)))]> N3) with N4.
+    assert (HN4s1 : N4 !!! Regidx Rs1 = (d_lock : SailStdpp.Values.mword 64)).
+    { rewrite /N4 upd_eq /N3 upd_eq.
+      unfold d_lock, disk_base, pa_add, add_vec_int. apply bv_eq; vm_compute; reflexivity. }
+    assert (Hp19a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1aa) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x1ae)) by pcstep.
+    iEval (rewrite Hp19a) in "Hpc".
+    (* ---- +0x1ae  c.mv s2,a1 ---- *)
+    assert (HN4a1 : N4 !!! Regidx Ra1 = (mword_of_int 1 : SailStdpp.Values.mword 64)).
+    { rewrite /N4 upd_ne; [| reg_neq]. rewrite /N3 upd_ne; [| reg_neq].
+      rewrite /N2 upd_ne; [| reg_neq]. rewrite /N1 upd_ne; [| reg_neq]. exact Ha1. }
+    iApply (wp_cmv_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ae) : mword 64) Rs2 Ra1 N4
+              (trap_res eb + (K - 12))%nat false ltac:(vm_compute; discriminate)
+              ltac:(rdok) with "Hcg Hpc []").
+    { iApply (rwi_1ae with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    set (N5 := <[Regidx Rs2 := regval_into_reg
+                  (add_vec zero_reg (N4 !!! Regidx Ra1))]> N4).
+    change (<[Regidx Rs2 := regval_into_reg
+                  (add_vec zero_reg (N4 !!! Regidx Ra1))]> N4) with N5.
+    assert (HN5s2 : N5 !!! Regidx Rs2 = (mword_of_int 1 : SailStdpp.Values.mword 64)).
+    { rewrite /N5 upd_eq vdrwe_addv_zero. exact HN4a1. }
+    assert (HN5a1 : N5 !!! Regidx Ra1 = (mword_of_int 1 : SailStdpp.Values.mword 64))
+      by (rewrite /N5 upd_ne; [| reg_neq]; exact HN4a1).
+    assert (HN5a5 : N5 !!! Regidx Ra5 = sign_extend' 64 dv).
+    { rewrite /N5 upd_ne; [| reg_neq]. rewrite /N4 upd_ne; [| reg_neq].
+      rewrite /N3 upd_ne; [| reg_neq]. rewrite /N2; apply upd_eq. }
+    assert (HN5s1 : N5 !!! Regidx Rs1 = (d_lock : SailStdpp.Values.mword 64))
+      by (rewrite /N5 upd_ne; [| reg_neq]; exact HN4s1).
+    assert (HN5regs : vdrw_regs N5 sp0 b wr sector).
+    { unfold vdrw_regs. split_and!.
+      - rewrite /N5 upd_ne; [| reg_neq]. rewrite /N4 upd_ne; [| reg_neq].
+        rewrite /N3 upd_ne; [| reg_neq]. rewrite /N2 upd_ne; [| reg_neq].
+        rewrite /N1 upd_ne; [| reg_neq]. exact Hsp.
+      - rewrite /N5 upd_ne; [| reg_neq]. rewrite /N4 upd_ne; [| reg_neq].
+        rewrite /N3 upd_ne; [| reg_neq]. rewrite /N2 upd_ne; [| reg_neq].
+        rewrite /N1 upd_ne; [| reg_neq]. exact Hs0.
+      - rewrite /N5 upd_ne; [| reg_neq]. rewrite /N4 upd_ne; [| reg_neq].
+        rewrite /N3 upd_ne; [| reg_neq]. rewrite /N2 upd_ne; [| reg_neq].
+        rewrite /N1 upd_ne; [| reg_neq]. exact Hs3.
+      - rewrite /N5 upd_ne; [| reg_neq]. rewrite /N4 upd_ne; [| reg_neq].
+        rewrite /N3 upd_ne; [| reg_neq]. rewrite /N2 upd_ne; [| reg_neq].
+        rewrite /N1 upd_ne; [| reg_neq]. exact Hs6.
+      - rewrite /N5 upd_ne; [| reg_neq]. rewrite /N4 upd_ne; [| reg_neq].
+        rewrite /N3 upd_ne; [| reg_neq]. rewrite /N2 upd_ne; [| reg_neq].
+        rewrite /N1 upd_ne; [| reg_neq]. exact Hs7. }
+    assert (Hp19c : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1ae) : mword 64) 2
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x1b0)) by pcstep.
+    iEval (rewrite Hp19c) in "Hpc".
+    (* ---- +0x1b0  bne a5,a1 ---- *)
+    iDestruct "Hres" as "[(-> & Hrow) | (-> & Hib & Hhc & Hbd & #Hu)]".
+    - (* IN FLIGHT: fall through into the wait loop *)
+      iAssert (vdrw_body γd pd pav np nr cm fr)
+        with "[Hpub Hrd Hdfl Hstg Hcl Hrow Hrows Huidx Hfb Hring Havh]" as "Hbody".
+      { rewrite /vdrw_body. iSplitR; [iPureIntro; exact Hcm|].
+        iFrame "Hpub Hlb Hrd Hdfl Hstg Hcl Huidx Hfb Hring Havh".
+        rewrite (big_sepM_delete _ cm q V Hcmq'). iFrame "Hrow Hrows". }
+      iApply (wp_bne_fall_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b0) : mword 64)
+                (mword_of_int 34 : mword 13) Ra1 Ra5 N5 (trap_res eb + (K - 12))%nat false
+                ltac:(vm_compute; discriminate) ltac:(vm_compute; discriminate)
+                ltac:(rgall; rewrite HN5a5 HN5a1 vdrwe_sext_one; exact vdrwe_neq_one)
+                with "Hcg Hpc []").
+      { iApply (rwi_1b0 with "Htext"). }
+      iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+      assert (Hp1a0 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b0) : mword 64) 4
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1b4)) by pcstep.
+      iEval (rewrite Hp1a0) in "Hpc".
+      iDestruct (vdrw_body_close γd pd pav pu with "Hbody") as "HR".
+      rewrite /vdrw_p5_loop.
+      iSpecialize ("Hloop" $! CIDx with "[%]"); [wp_next_chain|].
+      iApply ("Hloop" $! N5 with
+                "[%] Hcg Hown Htc Hclm Hpc Htok HR Hact Hfm Hft Hrm Hrt Hidx
+                 [%] [%] [%] Hexit").
+      + split_and!; [ exact HN5regs | exact HN5s1 | exact HN5s2
+                    | vdrw_hi_peel; exact Hhi ].
+      + exact Hok.
+      + exact Hal.
+      + exact Hpinr.
+    - (* ALREADY COLLECTED: the branch is taken, straight to +0x1d2 *)
+      iApply (wp_bne_taken_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b0) : mword 64)
+                (mword_of_int 34 : mword 13) Ra1 Ra5 N5 (trap_res eb + (K - 12))%nat false
+                ltac:(vm_compute; discriminate) ltac:(vm_compute; discriminate)
+                ltac:(rgall; rewrite HN5a5 HN5a1 vdrwe_sext_zero; exact vdrwe_neq_zero_one)
+                ltac:(vm_compute; reflexivity) with "Hcg Hpc []").
+      { iApply (rwi_1b0 with "Htext"). }
+      iNext. iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+      assert (Hb1b0 : add_vec (mword_of_int (KernelSyms.virtio_disk_rw + 0x1b0) : mword 64)
+                        (sign_extend' 64 (mword_of_int 34 : mword 13))
+                      = mword_of_int (KernelSyms.virtio_disk_rw + 0x1d2)) by pcstep.
+      iEval (rewrite Hb1b0) in "Hpc".
+      rewrite /vdrw_p5_exit.
+      iSpecialize ("Hexit" $! CIDx with "[%]"); [wp_next_chain|].
+      (* the row's pieces, spelled at the claim's projections *)
+      iEval (rewrite /V; cbn [dc_buf dc_slot dc_pin];
+             rewrite (vdrwd_slot_head kq b h wr sector _ Hh8)) in "Hib".
+      iEval (rewrite /V; cbn [dc_buf dc_slot dc_pin]) in "Hhc".
+      iEval (rewrite /V; cbn [dc_buf dc_slot dc_pin]) in "Hbd".
+      iAssert (vdrw_body_ex γd pd pav np nr cm fr q)
+        with "[Hpub Hrd Hdfl Hstg Hcl Hrows Huidx Hfb Hring Havh]" as "Hbody".
+      { rewrite /vdrw_body_ex. iSplitR; [iPureIntro; exact Hcm|].
+        iFrame "Hpub Hlb Hrd Hdfl Hstg Hcl Hrows Huidx Hfb Hring Havh". }
+      iApply ("Hexit" $! N5 q np nr cm fr h m2 t pin with
+                "[%] [%] [%] [%] Hcg Hown Htc Hclm Hpc Htok Hbody
+                 Hact Hib Hhc Hbd Hu Hfm Hft Hrm Hrt Hidx").
+      + split; [exact HN5regs | vdrw_hi_peel; exact Hhi].
+      + exact Hok.
+      + exact Hpinr.
+      + exact Hal.
+  Qed.
+
+End ProofVirtioDiskRwE.
+End VirtioDiskRwRestE.

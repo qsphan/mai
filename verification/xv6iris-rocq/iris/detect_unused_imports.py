@@ -1,0 +1,1844 @@
+#!/usr/bin/env python3
+"""detect_unused_imports.py -- find removable Coq `Require Import` modules.
+
+Problem
+-------
+A `Require Import M` line can be genuinely *needed* even when no NAME from M is
+ever written in the file, because M may contribute, invisibly to a text search:
+
+  * typeclass `Instance`s      (resolved by `apply`/`typeclasses eauto`),
+  * `Notation`s               (parsing/printing),
+  * `Hint`s                   (auto/eauto/autorewrite databases),
+  * `Canonical Structure`s / `Coercion`s.
+
+None of those appear as name references in the compiler's `.glob` output, so a
+pure glob/grep "is this name used?" check yields FALSE "unused" verdicts.  The
+ONLY reliable test is: delete the import, recompile the file, and see whether it
+still builds.
+
+Method (glob-shortlist + build-confirm)
+---------------------------------------
+1. Parse each `.v` for import statements and map every imported module token to
+   its full logical path (respecting the `-R <dir> <prefix>` mappings in
+   `_CoqProject`), e.g.
+       From stdpp Require Import gmap          -> stdpp.gmap
+       From iris.proofmode Require Import proofmode -> iris.proofmode.proofmode
+       Require Import RiscvModelBytes          -> xv6iris.RiscvModelBytes
+       From Kernel Require KernelSyms          -> Kernel.KernelSyms  (no Import)
+
+2. SHORTLIST (fast, `.glob`-only): read the file's `.glob`, collect every `R`
+   (reference) line's defining libname, EXCLUDING kind==`lib` refs (those are the
+   import/qualifier sites themselves, not "usage that needs an Import").  A module
+   whose logical path contributes no non-`lib` reference is a *candidate* unused
+   import -- this only NARROWS the set to build-test; it never decides.
+
+   Three rules keep the shortlist honest (each was a large false-positive
+   source):
+
+   a. GLOB FRESHNESS.  A missing `.glob` reads as "this file references nothing",
+      which flags EVERY import; a `.glob` that does not match its `.v` misses any
+      use added since the last build.  Neither is evidence of an unused import, so
+      a file whose glob is missing/stale is reported as UNANALYSED (rebuild it, or
+      pass `--all`, which build-tests and so needs no glob).  Freshness is decided
+      on the `.v`'s md5, which coqc stamps into the glob's `DIGEST` line -- mtime
+      would call a glob stale after a byte-identical `cp`/`git checkout`.
+      `--allow-stale` opts back into trusting an out-of-date glob.
+
+   b. EXPORT CLOSURE.  glob attributes a reference to the module that DEFINES the
+      name, but `Require Export` makes a name reachable through an importer.  If
+      `A.v` does `Require Export B` and our file does `Require Import A` and uses
+      a name defined in B, glob records only a ref to B -- so A looks unused while
+      removing it actually breaks the build (this is exactly what the `WpGpr*`
+      shims do here).  Such an import is therefore not reported as REMOVABLE but
+      as a REWRITE: nothing defined in A itself is used, so the fix is to import
+      B -- the module actually providing the name -- directly, dropping A's
+      forwarding indirection.  `--verify` build-tests that rewrite, not a bare
+      deletion.  The closure is read from each module's own source, resolved
+      through the `-R/-Q` load paths and the opam `user-contrib` tree; a module
+      whose source cannot be found has an UNKNOWN closure and is conservatively
+      never flagged.
+
+   c. TACTICS ARE NOT IN THE GLOB.  Every reference glob records carries a kind
+      -- def, thm, constr, not, inst, ind, ... -- and there is no kind for a
+      tactic: neither `Ltac foo` nor a use of `foo` is written to the glob at
+      all.  A module reached only for a tactic therefore contributes zero
+      references and looks unused, and in a proof tree driven by named tactics
+      that is the LARGEST source of shortlist false positives -- each costing a
+      whole-file compile to disprove.  So an import is also skipped when the
+      file mentions a tactic name the module (or its Export closure) defines;
+      see TacticIndex for why that test is textual and why erring toward
+      "keep" is the safe direction.
+
+   d. THE SAME MODULE REQUIRED TWICE needs no reference evidence at all, so
+      duplicates are a separate, GLOB-FREE finding -- reported (and applied) as
+      DUPE candidates even for a file whose glob is missing or stale.  Only an
+      occurrence a LATER one subsumes is flagged (`Require Export` outranks
+      `Require Import`, which outranks a bare `Require`), and by default only
+      when the two sit in the SAME contiguous run of `Require` statements.
+      With nothing but other `Require`s between them, dropping the earlier one
+      provably changes nothing: module LOADING does not consult the import
+      scope, so no statement in between can care, and the surviving occurrence
+      re-imports at exactly the same point -- which is what decides shadowing.
+      A re-import placed AFTER real code is a different animal; this tree uses
+      it deliberately, to re-establish instance resolution at a later point
+      (see `UtResFits.v`'s header), so it is only considered under
+      `--dupes-across-code`, where the build-confirm is what decides.
+
+      Unlike a removal, a de-dup CANNOT break a DOWNSTREAM file: the module is
+      still required by this one, so nothing it transitively loaded goes away.
+
+3. CONFIRM (`--verify`, correct): for each file, apply ALL candidate edits at once
+   (a removal drops its module; a rewrite drops it and adds the imports it
+   forwards to) and rebuild.  If it still builds, every candidate is genuinely
+   applicable.  If it fails, fall back to one candidate at a time.  A candidate
+   that still builds is CONFIRMED; one that breaks the build was actually NEEDED
+   (an instance/notation/hint false positive).
+
+   A build-test NEVER touches the file under test.  The edited text is written to
+   a uniquely-named SIBLING copy (`Foo__dead_import_check_<pid>_<n>.v`) which coqc
+   compiles in its place, so the only artifacts written are that copy's own
+   `.vo`/`.glob` (deleted right after).  `Foo.v`, `Foo.vo` and `Foo.glob` are left
+   byte-identical throughout.  This is what makes step 3 SAFE TO RUN IN PARALLEL
+   (`--jobs`): files import each other, so a build-test that overwrote `Foo.vo`
+   -- even transiently, even with an identical-in-the-end rebuild -- would be read
+   half-written, or in its import-deleted form, by a concurrent test of a file
+   that requires `Foo`, silently corrupting that file's verdict.  A copy under a
+   fresh module name is imported by nobody, so nothing can observe it.  (The
+   `XV6_USE_MAKE=1` fallback builds the real target in place and is therefore
+   forced back to `--jobs 1`.)
+
+Caveats
+-------
+* `Require Export ...` re-exports to DOWNSTREAM files, so a single-file `make` is
+  insufficient to prove it removable.  Export lines are SKIPPED by default
+  (`--include-export` + `--full-make` would be required to test them safely).
+* Shortlist false-negative: if a name defined in M is referenced but is ALSO
+  reachable through another (transitive) import, glob still attributes the ref to
+  M, so M is not shortlisted and a real removal can be missed.  Pass `--all` to
+  build-test every import module (ignoring the glob shortlist) for completeness
+  at the cost of many more compiles.
+
+Scope
+-----
+By DEFAULT the checker only considers imports of THIS package's own modules --
+those whose logical path carries the local `-R . <prefix>` prefix (here
+`xv6iris.`).  Imports from other packages (SailStdpp, Riscv, stdpp, iris.*,
+Kernel, Stdlib, ...) are skipped, since removing a stray external import is
+low-value and its provenance is noisier.  Pass `--include-external` to test
+those too.
+
+Usage
+-----
+  detect_unused_imports.py --dir .                  # list glob-only candidates (local pkg)
+  detect_unused_imports.py --dir . --verify         # build-confirm candidates
+  detect_unused_imports.py --dir . --verify --jobs 8  # ... 8 files at a time
+  detect_unused_imports.py --dir . --verify --all   # build-test ALL local imports
+                                                    # (also covers unbuilt files)
+  detect_unused_imports.py --dir . --allow-stale    # shortlist from out-of-date globs
+  detect_unused_imports.py --dir . --verify --include-external   # also other packages
+  detect_unused_imports.py --dir . --verify --files WpAdd.v WpAmo.v
+  detect_unused_imports.py --dir . --verify --report unused_imports_report.md
+  detect_unused_imports.py --dir . --verify --apply   # delete them; then `make`
+  detect_unused_imports.py --dir . --no-dupes         # skip the duplicate scan
+  detect_unused_imports.py --dir . --dupes-across-code  # ... also re-imports
+                                                    # placed after real code
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import hashlib
+import itertools
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# Build command.
+# ---------------------------------------------------------------------------
+# The project's documented build is `make -f CoqMakefile <file>.vo`.  For
+# import-testing we instead call `coqc` DIRECTLY with the same load paths (the
+# `-R`/`-arg` lines of _CoqProject) so that recompiling one file NEVER triggers
+# a recursive rebuild of its dependencies (make would, if we touch a .v that is
+# a dependency of another) -- this keeps every test hermetic and fast.  Set
+# XV6_USE_MAKE=1 to fall back to the make-based build instead.
+SWITCH = os.environ.get("XV6_SWITCH", "/shared/xv6rocq")
+OPAM_PREFIX = ["opam", "exec", "--switch", SWITCH, "--"]
+USE_MAKE = os.environ.get("XV6_USE_MAKE") == "1"
+
+# Infix marking a build-test's throwaway copy of a file (see the module
+# docstring, step 3).  It is a legal Coq identifier fragment, so the copy's
+# module name is legal too, and it is distinctive enough that a real module can
+# never collide with it -- both properties are load-bearing.
+TEMP_MARK = "__dead_import_check_"
+_temp_counter = itertools.count()
+
+# Kinds of Coq stdlib prefixes we recognise as "already fully-qualified" logical
+# paths (so we do NOT prepend the local `-R .` prefix to them).
+KNOWN_LIB_PREFIXES = (
+    "SailStdpp", "Riscv", "Kernel", "stdpp", "iris", "Stdlib", "Corelib",
+    "Coq", "Ltac2", "elpi", "RecordUpdate", "Equations",
+)
+
+
+# ---------------------------------------------------------------------------
+# Import-statement parsing.
+# ---------------------------------------------------------------------------
+@dataclass
+class ImportStmt:
+    lineno: int            # 1-based line number in the .v file
+    raw: str               # exact original line text (without trailing newline)
+    kind: str              # 'import' | 'export' | 'require'  (Import / Export / bare)
+    from_prefix: str | None  # the `From X` prefix, or None
+    modules: list[str]     # module tokens exactly as written on the line
+    trailer: str = ""      # text after the period (a trailing comment), verbatim
+    endline: int = 0       # last line of the statement; > lineno iff the
+                           # trailing comment runs on (see parse_imports)
+
+
+# One `Require` per line (verified: no multi-line Require in this codebase) --
+# but a STATEMENT may still span lines, because its trailing comment can; see
+# the third paragraph and `ImportStmt.endline`.
+#
+# THE TRAILING COMMENT IS PART OF THE STATEMENT.  `Require Import X.  (* why *)`
+# is this tree's house style for explaining an import, and a pattern that stops
+# at the period does not match those lines at ALL -- which does not merely lose
+# their comment, it makes the whole import INVISIBLE to every pass here: never
+# reported, never removed, never de-duplicated, and (worse, because it is
+# silent) counted as CODE by `code_lines`, so a duplicate straddling one looks
+# separated by a definition.  That was 1072 of this tree's 25833 `Require`
+# lines, across 628 files.
+#
+# A TRAILING COMMENT THAT RUNS ON IS STILL A TRAILING COMMENT.  `_STMT_RE`'s
+# `.*\*\)` cannot cross a newline, so a comment opening on the Require line and
+# closing two lines down used to fail to match -- and by the paragraph above,
+# that made the import invisible to every pass rather than merely losing its
+# comment.  It was not a rare shape: 367 `Require` lines across 181 files, and
+# it is why `SpecNameiTr.v` survived every sweep while nothing used it (its
+# three importers each annotated the import across three lines).  So a line
+# that ends in an UNCLOSED `(*` is now joined with the lines up to the `*)`
+# that closes it -- `_OPEN_RE` spots the opening, `comment_spans` finds the
+# close (respecting nesting), and `_STMT_ML_RE` matches the joined block.
+# `endline` then carries the span, so a deletion takes the whole comment with
+# it and can never strand half of one.
+#
+# Anything after the closing `*)` still fails to match, so a
+# `Require ... . (* c *) Definition ...` one-liner is never rewritten.
+_STMT_RE = re.compile(
+    r"""^\s*
+        (?:From\s+(?P<from>[\w.]+)\s+)?      # optional  From X
+        Require\s+
+        (?P<mode>Import\s+|Export\s+)?        # optional  Import / Export
+        (?P<mods>[\w.\s]+?)                    # module tokens
+        \s*\.                                  # terminating period
+        (?P<tail>[ \t]*\(\*.*\*\))?           # optional trailing comment
+        \s*$
+    """,
+    re.VERBOSE,
+)
+
+
+# A statement whose trailing comment does NOT close on its own line: the same
+# shape as `_STMT_RE` up to the period, then an opening `(*`.  Used only to
+# decide whether to join the following lines -- `_STMT_ML_RE` does the parse.
+_OPEN_RE = re.compile(
+    r"""^\s*
+        (?:From\s+[\w.]+\s+)?
+        Require\s+
+        (?:Import\s+|Export\s+)?
+        [\w.\t ]+?
+        [ \t]*\.
+        [ \t]*\(\*
+    """,
+    re.VERBOSE,
+)
+
+# `_STMT_RE` with a tail that may span lines.  Two deliberate narrowings from
+# the single-line pattern: the module list is `[\w.\t ]` rather than `[\w.\s]`,
+# so the MODULES can never be read across a newline (there is no multi-line
+# `Require` in this codebase, and letting the tokens run on would silently
+# swallow the next statement), and the tail is `[\s\S]` rather than a DOTALL
+# `.`, so only the comment is allowed to cross lines.
+_STMT_ML_RE = re.compile(
+    r"""^\s*
+        (?:From\s+(?P<from>[\w.]+)\s+)?
+        Require\s+
+        (?P<mode>Import\s+|Export\s+)?
+        (?P<mods>[\w.\t ]+?)
+        [ \t]*\.
+        (?P<tail>[ \t]*\(\*[\s\S]*\*\))
+        \s*$
+    """,
+    re.VERBOSE,
+)
+
+
+def comment_spans(text: str) -> dict[int, int]:
+    """Offset of each TOP-LEVEL `(*` -> offset just past its matching `*)`.
+
+    Same nesting walk as `blank_coq_comments`; an unterminated comment simply
+    contributes no span, so a statement whose trailing `(*` never closes stays
+    unmatched (and so untouched) exactly as it was before multi-line support.
+    """
+    spans: dict[int, int] = {}
+    depth, start = 0, 0
+    for m in _COQ_COMMENT.finditer(text):
+        if m.group() == "(*":
+            if depth == 0:
+                start = m.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                spans[start] = m.end()
+    return spans
+
+
+def parse_imports(text: str) -> list[ImportStmt]:
+    stmts: list[ImportStmt] = []
+    lines = text.splitlines()
+    spans: dict[int, int] | None = None     # built lazily: most files need none
+    starts: list[int] | None = None         # byte offset of each line
+    for i, line in enumerate(lines, start=1):
+        m = _STMT_RE.match(line)
+        endline = i
+        if not m:
+            # A trailing comment that runs on to a later line.  Join the block
+            # and re-match; `endline` then spans it.
+            om = _OPEN_RE.match(line)
+            if not om:
+                continue
+            if spans is None:
+                spans = comment_spans(text)
+                starts, off = [], 0
+                for ln in lines:
+                    starts.append(off)
+                    off += len(ln) + 1
+            end = spans.get(starts[i - 1] + om.end() - 2)
+            if end is None:
+                continue                    # unterminated: leave it alone
+            endline = text.count("\n", 0, end) + 1
+            if endline <= i:
+                continue                    # closed on its own line after all
+            m = _STMT_ML_RE.match("\n".join(lines[i - 1:endline]))
+            if not m:
+                continue
+            line = "\n".join(lines[i - 1:endline])
+        mode = (m.group("mode") or "").strip()
+        kind = {"Import": "import", "Export": "export", "": "require"}[mode]
+        mods = m.group("mods").split()
+        stmts.append(
+            ImportStmt(
+                lineno=i,
+                raw=line,
+                kind=kind,
+                from_prefix=m.group("from"),
+                modules=mods,
+                trailer=m.group("tail") or "",
+                endline=endline,
+            )
+        )
+    return stmts
+
+
+def first_line(raw: str) -> str:
+    """The statement's own line, for a report -- a run-on trailing comment is
+    elided rather than pasted into a one-line bullet."""
+    head, _, rest = raw.strip().partition("\n")
+    return head + (" ..." if rest else "")
+
+
+def logical_path(stmt: ImportStmt, token: str, local_prefix: str) -> str:
+    """Full logical (dotted) module path for one module `token` of `stmt`."""
+    if stmt.from_prefix:
+        return f"{stmt.from_prefix}.{token}"
+    # Bare `Require [Import] token`.
+    head = token.split(".", 1)[0]
+    if head in KNOWN_LIB_PREFIXES:
+        return token
+    # Local module referenced by short name -> prepend the `-R .` prefix.
+    return f"{local_prefix}.{token}" if local_prefix else token
+
+
+# ---------------------------------------------------------------------------
+# _CoqProject: discover the `-R <dir> <prefix>` for the tool's own directory.
+# ---------------------------------------------------------------------------
+def local_prefix_for_dir(dir_path: str) -> str:
+    cp = os.path.join(dir_path, "_CoqProject")
+    if not os.path.isfile(cp):
+        return ""
+    with open(cp) as f:
+        for line in f:
+            parts = line.split()
+            # -R <dir> <prefix>   (also accept -Q)
+            if len(parts) >= 3 and parts[0] in ("-R", "-Q"):
+                d = parts[1]
+                if os.path.abspath(os.path.join(dir_path, d)) == os.path.abspath(dir_path):
+                    return parts[2]
+    return ""
+
+
+def load_path_mappings(dir_path: str) -> list[tuple[str, str]]:
+    """The `(directory, logical-prefix)` pairs a module name resolves through.
+
+    The `-R/-Q` lines of _CoqProject, plus the opam switch's `user-contrib` tree
+    (logical prefix "") so external packages (stdpp, iris, SailStdpp, Stdlib...)
+    resolve too.
+    """
+    maps: list[tuple[str, str]] = []
+    cp = os.path.join(dir_path, "_CoqProject")
+    if os.path.isfile(cp):
+        with open(cp) as f:
+            toks = strip_comments(f.read()).split()
+        i = 0
+        while i < len(toks):
+            if toks[i] in ("-R", "-Q") and i + 2 < len(toks):
+                maps.append((os.path.join(dir_path, toks[i + 1]), toks[i + 2]))
+                i += 3
+            else:
+                i += 1
+    user_contrib = os.path.join(SWITCH, "_opam", "lib", "coq", "user-contrib")
+    if os.path.isdir(user_contrib):
+        maps.append((user_contrib, ""))
+    return maps
+
+
+def strip_comments(text: str) -> str:
+    """Drop `#` comments from a _CoqProject."""
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+def resolve_module_source(full_path: str, maps: list[tuple[str, str]]) -> str | None:
+    """Filesystem path of the `.v` defining logical module `full_path`, if found."""
+    for directory, prefix in maps:
+        if prefix and full_path == prefix:
+            rest = ""
+        elif prefix:
+            if not full_path.startswith(prefix + "."):
+                continue
+            rest = full_path[len(prefix) + 1:]
+        else:
+            rest = full_path
+        if not rest:
+            continue
+        cand = os.path.join(directory, *rest.split(".")) + ".v"
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+class ExportGraph:
+    """Transitive `Require Export` closure of a logical module path.
+
+    `closure(M)` returns `(modules, unknown)`: every module whose names `Import M`
+    brings into scope, and whether some source along the way could not be resolved
+    (in which case the closure is incomplete and the caller must stay conservative).
+    """
+
+    def __init__(self, maps: list[tuple[str, str]]):
+        self.maps = maps
+        self._direct: dict[str, set[str] | None] = {}
+        self._closure: dict[str, tuple[frozenset[str], bool]] = {}
+
+    def direct_exports(self, full_path: str) -> set[str] | None:
+        """Modules `full_path` re-exports directly; None if its source is missing."""
+        if full_path in self._direct:
+            return self._direct[full_path]
+        src = resolve_module_source(full_path, self.maps)
+        if src is None:
+            self._direct[full_path] = None
+            return None
+        # A module's own `-R .` prefix is everything up to its last component.
+        own_prefix = full_path.rsplit(".", 1)[0] if "." in full_path else ""
+        out: set[str] = set()
+        try:
+            with open(src, errors="replace") as f:
+                text = f.read()
+        except OSError:
+            self._direct[full_path] = None
+            return None
+        for stmt in parse_imports(text):
+            if stmt.kind != "export":
+                continue
+            for token in stmt.modules:
+                out.add(logical_path(stmt, token, own_prefix))
+        self._direct[full_path] = out
+        return out
+
+    def closure(self, full_path: str) -> tuple[frozenset[str], bool]:
+        if full_path in self._closure:
+            return self._closure[full_path]
+        # Seed with a self-referential entry so an Export cycle terminates.
+        self._closure[full_path] = (frozenset([full_path]), False)
+        seen = {full_path}
+        unknown = False
+        direct = self.direct_exports(full_path)
+        if direct is None:
+            unknown = True
+        else:
+            for m in direct:
+                sub, sub_unknown = self.closure(m)
+                seen |= sub
+                unknown = unknown or sub_unknown
+        result = (frozenset(seen), unknown)
+        self._closure[full_path] = result
+        return result
+
+
+_COQ_COMMENT = re.compile(r"\(\*|\*\)")
+
+
+def strip_coq_comments(text: str) -> str:
+    """Drop Coq `(* ... *)` comments (nested), keeping offsets irrelevant.
+
+    Only used to decide whether a NAME occurs in a file, so a commented-out
+    mention must not count -- otherwise a stale note about a tactic keeps its
+    module imported forever.
+    """
+    out, depth, pos = [], 0, 0
+    for m in _COQ_COMMENT.finditer(text):
+        if m.group() == "(*":
+            if depth == 0:
+                out.append(text[pos:m.start()])
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                pos = m.end()
+    if depth == 0:
+        out.append(text[pos:])
+    return " ".join(out)
+
+
+# `Local Ltac` is file-private, so importing the module does not bring it into
+# scope and its name is no evidence of anything.
+_LTAC_DEF = re.compile(r"^[ \t]*(?:Global[ \t]+)?(?:Ltac2?|Tactic\s+Notation)\b(.*)$",
+                       re.M)
+_LTAC_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
+
+
+class TacticIndex:
+    """Tactic names each module makes visible to a file that imports it.
+
+    THE reason the glob shortlist over-reports.  A `.glob` records references by
+    kind -- def, thm, constr, not, inst, ... -- and there is NO kind for a
+    tactic: neither `Ltac foo` nor a use of `foo` is written to the glob at all.
+    So a module a file reaches only for a tactic contributes zero references,
+    looks unused, and is shortlisted -- and the build-confirm then always keeps
+    it.  In a proof tree driven by named tactics that is the bulk of the
+    shortlist, and every one of them costs a full-file compile to disprove.
+
+    The check is textual and deliberately one-directional: a tactic name of the
+    module (or of anything it re-exports) occurring anywhere in the importing
+    file means "keep, do not even build-test".  A name collision between two
+    modules therefore keeps both, and a tactic invoked through some alias this
+    misses is still caught by the build-confirm.  It can only cost a missed
+    removal, never license a wrong one -- the same direction as the rest of the
+    shortlist.
+    """
+
+    def __init__(self, graph: "ExportGraph", maps: list[tuple[str, str]]):
+        self.graph = graph
+        self.maps = maps
+        self._own: dict[str, frozenset[str]] = {}
+        self._vis: dict[str, frozenset[str]] = {}
+
+    def _own_tactics(self, full_path: str) -> frozenset[str]:
+        if full_path in self._own:
+            return self._own[full_path]
+        names: set[str] = set()
+        src = resolve_module_source(full_path, self.maps)
+        if src:
+            try:
+                with open(src, errors="replace") as f:
+                    body = strip_coq_comments(f.read())
+            except OSError:
+                body = ""
+            for m in _LTAC_DEF.finditer(body):
+                rest = m.group(1)
+                # `Tactic Notation "foo" ...` is invoked by its literal tokens;
+                # `Ltac foo ...` by its head identifier.
+                quoted = re.findall(r'"([^"]+)"', rest)
+                if quoted:
+                    for q in quoted:
+                        names.update(_LTAC_NAME.findall(q))
+                else:
+                    head = _LTAC_NAME.search(rest)
+                    if head:
+                        names.add(head.group())
+        self._own[full_path] = frozenset(names)
+        return self._own[full_path]
+
+    def visible(self, full_path: str) -> frozenset[str]:
+        """Tactic names `Require Import full_path` puts in scope."""
+        if full_path in self._vis:
+            return self._vis[full_path]
+        modules, _ = self.graph.closure(full_path)   # cycle-safe already
+        out: set[str] = set()
+        for m in modules:
+            out |= self._own_tactics(m)
+        self._vis[full_path] = frozenset(out)
+        return self._vis[full_path]
+
+
+def coqc_flags(dir_path: str) -> list[str]:
+    """The `-R/-Q/-arg` load-path flags from _CoqProject, for direct coqc runs."""
+    cp = os.path.join(dir_path, "_CoqProject")
+    flags: list[str] = []
+    if not os.path.isfile(cp):
+        return flags
+    with open(cp) as f:
+        toks = f.read().split()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-R", "-Q") and i + 2 < len(toks):
+            flags += [t, toks[i + 1], toks[i + 2]]
+            i += 3
+        elif t == "-arg" and i + 1 < len(toks):
+            flags.append(toks[i + 1])   # unwrap: -arg X -> X passed to coqc
+            i += 2
+        else:
+            i += 1
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# .glob parsing: set of libnames with a non-`lib` reference.
+# ---------------------------------------------------------------------------
+def referenced_libnames(glob_path: str) -> set[str]:
+    """Return defining-module libnames that have >=1 non-`lib` R reference.
+
+    A `Require Import M` emits an  `R... M <> <> lib`  self-reference at the
+    import site, so `lib`-kind refs are excluded -- only "real" usages (def,
+    thm, notation, constr, ind, var, mod, ...) count as evidence that a module
+    is needed for the shortlist.
+    """
+    used: set[str] = set()
+    if not os.path.isfile(glob_path):
+        return used
+    with open(glob_path, errors="replace") as f:
+        for line in f:
+            if not line.startswith("R"):
+                continue
+            # R<start>:<end> <libname> <secpath> <name> <kind>
+            parts = line.rstrip("\n").split(" ")
+            if len(parts) < 5:
+                continue
+            libname, kind = parts[1], parts[-1]
+            if kind == "lib":
+                continue
+            used.add(libname)
+    return used
+
+
+def is_referenced(full_path: str, used: set[str]) -> bool:
+    """True if `full_path` (or a sub-module of it) has a non-lib reference."""
+    if full_path in used:
+        return True
+    prefix = full_path + "."
+    return any(u.startswith(prefix) for u in used)
+
+
+def classify_import(full_path: str, used: set[str],
+                    graph: ExportGraph,
+                    tactics: "TacticIndex | None" = None,
+                    tokens: frozenset[str] = frozenset()
+                    ) -> tuple[str, list[str]] | None:
+    """How (if at all) `Require Import full_path` is actionable.
+
+    Returns None when the import is needed as written, else `(kind, via)`:
+
+      ('remove',  [])    -- neither the module nor anything it re-exports is
+                            referenced: a candidate for deletion.
+      ('rewrite', [M..]) -- NO name defined in the module itself is referenced,
+                            but names it re-exports are.  The import is doing
+                            nothing but forwarding, so the candidate is to import
+                            the modules actually providing those names directly
+                            (see rule (b)).  `via` is the minimal such set: any
+                            member reachable by Export from another is dropped,
+                            since importing the latter already brings it in.
+
+    An unresolvable Export closure yields None (conservative: never flagged).
+
+    `tokens` is the importing file's identifier set: an import whose module (or
+    Export closure) defines a TACTIC named there is needed as written, and the
+    glob cannot see it -- see TacticIndex.
+    """
+    modules, unknown = graph.closure(full_path)
+    if unknown:
+        return None
+    if is_referenced(full_path, used):
+        return None                       # the module itself provides a name
+    if tactics is not None and tactics.visible(full_path) & tokens:
+        return None                       # reached for a tactic, invisible to glob
+    via = {m for m in modules if m != full_path and is_referenced(m, used)}
+    if not via:
+        return ("remove", [])
+    # Keep only maximal elements: drop any X already re-exported by another
+    # member Y, since `Import Y` brings X's names along anyway.
+    minimal = [x for x in via
+               if not any(y != x and x in graph.closure(y)[0] for y in via)]
+    return ("rewrite", sorted(minimal))
+
+
+def import_line(full_path: str, local_prefix: str) -> str:
+    """Source text of a `Require Import` bringing in logical module `full_path`."""
+    if local_prefix and full_path.startswith(local_prefix + "."):
+        return f"Require Import {full_path[len(local_prefix) + 1:]}."
+    head, _, rest = full_path.partition(".")
+    if rest and head in KNOWN_LIB_PREFIXES:
+        return f"From {head} Require Import {rest}."
+    return f"Require Import {full_path}."
+
+
+def glob_status(dir_path: str, vfile: str) -> str:
+    """'fresh' | 'stale' | 'missing' -- is the file's `.glob` usable as evidence?
+
+    coqc stamps the `.v`'s md5 into the glob's leading `DIGEST` line, so freshness
+    is decided on CONTENT.  That is what we want: mtime would call a glob stale
+    after a `cp`/`git checkout`/verify-restore that changed no bytes, and every
+    such false 'stale' silently costs the file its analysis.
+    """
+    path = os.path.join(dir_path, vfile)
+    glob = os.path.join(dir_path, vfile[:-2] + ".glob")
+    if not os.path.isfile(glob):
+        return "missing"
+    try:
+        with open(glob, errors="replace") as f:
+            first = f.readline().split()
+        with open(path, "rb") as f:
+            digest = hashlib.md5(f.read()).hexdigest()
+    except OSError:
+        return "missing"
+    if len(first) == 2 and first[0] == "DIGEST":
+        return "fresh" if first[1] == digest else "stale"
+    # No DIGEST line (unexpected): fall back to the mtime comparison.
+    return "stale" if os.path.getmtime(path) > os.path.getmtime(glob) else "fresh"
+
+
+# ---------------------------------------------------------------------------
+# Per-file analysis.
+# ---------------------------------------------------------------------------
+@dataclass
+class Candidate:
+    stmt: ImportStmt
+    token: str
+    full_path: str
+    kind: str = "remove"               # 'remove' | 'rewrite' | 'dupe'
+    via: list[str] = field(default_factory=list)   # 'rewrite': import these instead
+    # WHICH occurrence on the line, when the same token appears more than once
+    # (`Require Import A B A.`): dropping "the token named A" would drop both.
+    # None means "every occurrence of this token on the line", the old behaviour.
+    occurrence: int | None = None
+    # 'dupe': the OTHER occurrence -- the one this candidate keeps.  Recorded in
+    # full (not just its line) so the edit can be resolved the other way round;
+    # see `mirror_candidate`.
+    dup_of: int = 0
+    dup_token: str = ""
+    dup_occurrence: int | None = None
+
+
+@dataclass
+class FileResult:
+    vfile: str
+    candidates: list[Candidate] = field(default_factory=list)
+    removable: list[Candidate] = field(default_factory=list)   # build-confirmed
+    needed: list[Candidate] = field(default_factory=list)      # false positives
+    verified: bool = False
+    jointly_removable: bool = True   # do all `removable` compile when dropped together?
+    note: str = ""
+    glob_state: str = "fresh"        # 'fresh' | 'stale' | 'missing'
+    analysed: bool = True            # False => no usable evidence, NOT "no candidates"
+    # Build-confirmed edits withheld by `downstream_guard`, each with the reason
+    # (which downstream file loses which module).
+    downstream: list[tuple[Candidate, str]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate imports: the same module required twice in one file.
+# ---------------------------------------------------------------------------
+# How much one occurrence does, so we can ask whether a LATER one subsumes it.
+# `Require Export M` imports M here AND re-exports it; `Require Import M` only
+# imports it here; a bare `Require M` only loads it.
+_STRENGTH = {"require": 0, "import": 1, "export": 2}
+
+
+def blank_coq_comments(text: str) -> str:
+    """`text` with every `(* ... *)` comment blanked out, LINE STRUCTURE KEPT.
+
+    `strip_coq_comments` cannot be used where line numbers matter: it joins the
+    surviving fragments and so renumbers everything after the first comment.
+    Here each comment character becomes a space and every newline survives, so
+    line N of the result is line N of the input with its comments erased.
+    """
+    chars = list(text)
+    depth, start = 0, 0
+    for m in _COQ_COMMENT.finditer(text):
+        if m.group() == "(*":
+            if depth == 0:
+                start = m.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                for i in range(start, m.end()):
+                    if chars[i] != "\n":
+                        chars[i] = " "
+    if depth:                                   # unterminated comment: blank the tail
+        for i in range(start, len(chars)):
+            if chars[i] != "\n":
+                chars[i] = " "
+    return "".join(chars)
+
+
+def code_lines(text: str, req_lines: set[int]) -> set[int]:
+    """Line numbers carrying something that is neither blank, comment, nor Require."""
+    blanked = blank_coq_comments(text).splitlines()
+    return {n for n, line in enumerate(blanked, start=1)
+            if line.strip() and n not in req_lines}
+
+
+def duplicate_candidates(text: str, stmts: list[ImportStmt], local_prefix: str,
+                         already: set[tuple[int, str]],
+                         across_code: bool = False) -> list["Candidate"]:
+    """Occurrences of a module that a later occurrence in the same file subsumes.
+
+    Purely textual -- a module required twice is redundant whatever it provides,
+    so this consults neither the glob nor the Export graph, and it applies to
+    imports of ANY package (a duplicate needs no provenance judgement, unlike
+    the `--include-external` question for removals).
+
+    Flags only the EARLIER occurrence, never the last one: the surviving import
+    is what fixes shadowing order, and a re-import after real code is often
+    there precisely to re-establish it.  By default the pair must also sit in
+    one contiguous run of `Require` statements -- see rule (d) in the module
+    docstring for why that makes the drop a provable no-op, and what
+    `across_code` gives up.
+
+    `already` holds the (lineno, token) pairs the glob pass has itself flagged;
+    those are skipped on both sides, so an import that is simply unused is
+    reported as the removal it is rather than as a duplicate.
+    """
+    code = set() if across_code else code_lines(
+        text, {n for s in stmts for n in range(s.lineno, s.endline + 1)})
+    occ: dict[str, list[tuple[ImportStmt, int, str]]] = {}
+    for s in stmts:
+        for i, tok in enumerate(s.modules):
+            occ.setdefault(logical_path(s, tok, local_prefix), []).append((s, i, tok))
+
+    out: list[Candidate] = []
+    for full_path, seen in occ.items():
+        live = [x for x in seen if (x[0].lineno, x[2]) not in already]
+        for k, (stmt, idx, token) in enumerate(live):
+            strength = _STRENGTH[stmt.kind]
+            keeper = next((x for x in live[k + 1:]
+                           if _STRENGTH[x[0].kind] >= strength), None)
+            if keeper is None:
+                continue                       # nothing later does as much
+            if any(stmt.lineno < c < keeper[0].lineno for c in code):
+                continue                       # real code in between: not a no-op
+            out.append(Candidate(stmt=stmt, token=token, full_path=full_path,
+                                 kind="dupe", occurrence=idx,
+                                 dup_of=keeper[0].lineno,
+                                 dup_token=keeper[2],
+                                 dup_occurrence=keeper[1]))
+    return out
+
+
+def is_documented(stmt: ImportStmt, text: str,
+                  stmts: list[ImportStmt]) -> bool:
+    """Does a human comment attach to this import statement?
+
+    True when the line carries a trailing comment, or when the comment block
+    directly above it -- reached over any contiguous `Require` lines, with NO
+    blank line anywhere on the way -- is entirely comment.  The walk over
+    neighbouring `Require`s is what catches a comment heading a group of import
+    lines rather than a single one (`UserMemClassifyAmo.v`, where the note is
+    three imports above the one at issue).
+
+    A blank line breaks the attachment: a comment across one is a banner for
+    what follows, not an annotation on this statement.  That is exactly what
+    separates `RiscvExec.v`'s "win over SailStdpp's homonyms ...", which sits
+    directly on top of its re-import, from `VirtioDiskRwDefs.v`'s "---- from
+    ProofVirtioDiskRwB.v ----", which sits a blank line above a whole pasted
+    header block.
+    """
+    if stmt.trailer.strip():
+        return True
+    lines = text.splitlines()
+    blanked = blank_coq_comments(text).splitlines()
+    req = {n for s in stmts for n in range(s.lineno, s.endline + 1)}
+    j = stmt.lineno - 2                      # 0-based index of the line above
+    while j >= 0 and (j + 1) in req:         # skip the rest of the import group
+        j -= 1
+    if j < 0:
+        return False
+    return lines[j].strip() != "" and blanked[j].strip() == ""
+
+
+def mirror_candidate(c: Candidate, stmts: list[ImportStmt],
+                     text: str) -> "Candidate | None":
+    """The same duplicate resolved the OTHER way: drop the occurrence `c` keeps.
+
+    WHY BOTH DIRECTIONS EXIST.  Dropping the EARLIER occurrence is the safe
+    edit -- the import state after the survivor is identical, so shadowing is
+    untouched -- and it is the only one offered for a duplicate inside one
+    contiguous run of `Require`s, where it is a provable no-op.  But once REAL
+    CODE sits between the two, that direction is also the one most likely to
+    FAIL: anything in between that uses a name from the module needs the
+    earlier import.  The build then rejects the candidate and both copies
+    survive, even when the honest reading is that the LATER one is the
+    redundant half.
+
+    So this is the fallback, tried only after the safe direction is rejected.
+    It is genuinely weaker: dropping the later occurrence lets any module
+    imported between the two keep its shadow over the module's names for the
+    rest of the file, where the re-import used to win it back.  A single-file
+    compile catches a name that DISAPPEARS, not one that resolves elsewhere and
+    still typechecks -- so what stands behind this direction is the whole-tree
+    rebuild (a changed meaning almost always breaks a downstream user), and its
+    diff is worth reading rather than trusting.
+
+    Refused when the two occurrences differ in strength, which here can only
+    mean the kept one is a `Require Export` and this one is not: dropping an
+    Export changes what DOWNSTREAM files see, and no single-file compile here
+    can see that.
+
+    ALSO REFUSED WHEN A COMMENT ATTACHES TO THE OCCURRENCE IT WOULD DROP.  This
+    direction's whole risk is that it silently undoes a DELIBERATE re-import,
+    and in this tree a deliberate one is documented on the line above it --
+    "win over SailStdpp's homonyms for the sections below" (`RiscvExec.v`),
+    "RE-IMPORT, fileread's line for line: [IcacheInv.islot] shadows ..."
+    (`ProofFilewrite.v`), "at the top would put the certificate layer's names
+    in scope for it (the shadowing trap ...)" (`UserMemClassifyAmo.v`).  Each of
+    those compiles perfectly well without the line, and the whole tree still
+    builds, so NOTHING ELSE HERE CATCHES THEM: the comment is the only evidence
+    that survives.  Treat it as the author saying "leave this alone".
+    """
+    if c.kind != "dupe" or not c.dup_of or c.dup_occurrence is None:
+        return None
+    keeper = next((s for s in stmts if s.lineno == c.dup_of), None)
+    if keeper is None or c.dup_occurrence >= len(keeper.modules):
+        return None
+    if keeper.modules[c.dup_occurrence] != c.dup_token:
+        return None
+    if _STRENGTH[keeper.kind] != _STRENGTH[c.stmt.kind]:
+        return None
+    if is_documented(keeper, text, stmts):
+        return None
+    return Candidate(stmt=keeper, token=c.dup_token, full_path=c.full_path,
+                     kind="dupe", occurrence=c.dup_occurrence,
+                     dup_of=c.stmt.lineno, dup_token=c.token,
+                     dup_occurrence=c.occurrence)
+
+
+def analyze_file(dir_path: str, vfile: str, local_prefix: str,
+                 include_export: bool, use_all: bool,
+                 graph: ExportGraph,
+                 local_only: bool = True,
+                 allow_stale: bool = False,
+                 tactics: "TacticIndex | None" = None,
+                 find_dupes: bool = True,
+                 dupes_across_code: bool = False) -> FileResult:
+    path = os.path.join(dir_path, vfile)
+    with open(path) as f:
+        text = f.read()
+    glob = os.path.join(dir_path, vfile[:-2] + ".glob")
+    used = referenced_libnames(glob)
+    tokens = frozenset(_LTAC_NAME.findall(strip_coq_comments(text)))
+
+    res = FileResult(vfile=vfile)
+    res.glob_state = glob_status(dir_path, vfile)
+    stmts = parse_imports(text)
+    # `--all` build-tests every import and never consults the glob, so its verdict
+    # does not depend on glob freshness.  The shortlist does: an absent/outdated
+    # glob is not evidence of non-use, it is absence of evidence (rule (a)).
+    # The DUPLICATE scan below is unaffected either way -- it reads only the
+    # file's own text -- so an unanalysed file still gets that half.
+    res.analysed = (use_all or res.glob_state == "fresh"
+                    or (res.glob_state == "stale" and allow_stale))
+    if not res.analysed:
+        res.note = f"{res.glob_state} .glob -- rebuild the file, or use --all"
+    for stmt in (stmts if res.analysed else []):
+        if stmt.kind == "export" and not include_export:
+            continue
+        # Bare `Require` (no Import): removing it can break qualified accesses in
+        # non-obvious ways; still a valid candidate, build-confirm decides.
+        for token in stmt.modules:
+            fp = logical_path(stmt, token, local_prefix)
+            # By default only consider imports of THIS package's own modules
+            # (logical prefix == local_prefix, e.g. `xv6iris.`).  External
+            # packages (SailStdpp, Riscv, stdpp, iris.*, Kernel, Stdlib, ...)
+            # are skipped -- pass --include-external to test them too.
+            if local_only and local_prefix and not fp.startswith(local_prefix + "."):
+                continue
+            if use_all:
+                res.candidates.append(Candidate(stmt=stmt, token=token, full_path=fp))
+                continue
+            verdict = classify_import(fp, used, graph, tactics, tokens)
+            if verdict is None:
+                continue
+            kind, via = verdict
+            res.candidates.append(Candidate(stmt=stmt, token=token, full_path=fp,
+                                            kind=kind, via=via))
+    if find_dupes:
+        # After the glob pass, so an occurrence it already flagged is reported
+        # as the removal/re-point it is rather than as a duplicate.
+        already = {(c.stmt.lineno, c.token) for c in res.candidates}
+        res.candidates.extend(duplicate_candidates(
+            text, stmts, local_prefix, already, across_code=dupes_across_code))
+        res.candidates.sort(key=lambda c: (c.stmt.lineno, c.occurrence or 0))
+    return res
+
+
+# ---------------------------------------------------------------------------
+# File rewriting for build-tests.
+# ---------------------------------------------------------------------------
+def apply_edits(text: str, edits: list[Candidate], local_prefix: str) -> str:
+    """Return `text` with each candidate's proposed edit applied.
+
+    Every candidate drops its own module token from its statement (deleting the
+    line if nothing is left).  A 'rewrite' candidate additionally emits the
+    imports it forwards to, on their own line after the original statement --
+    a separate line because the replacement may need a different `From` prefix,
+    and ONLY for modules the file does not already import.  That last clause is
+    load-bearing: without it a re-point trades a forwarding import for a
+    DUPLICATE one, which is exactly how earlier sweeps manufactured pairs like
+    `Require Import KptExecMap.` twice in a row.
+    """
+    stmts = parse_imports(text)
+    stmt_by_line = {s.lineno: s for s in stmts}
+
+    # Token POSITIONS to drop, per line -- positions, not names, because the
+    # same module can appear twice on one line (`Require Import A B A.`), where
+    # dropping "the token named A" would drop both.  A candidate with no
+    # `occurrence` means every position holding that token, the old behaviour.
+    drop_idx: dict[int, set[int]] = {}
+    for c in edits:
+        stmt = stmt_by_line.get(c.stmt.lineno)
+        if stmt is None:
+            continue
+        occ = getattr(c, "occurrence", None)
+        drop_idx.setdefault(stmt.lineno, set()).update(
+            {occ} if occ is not None
+            else {i for i, m in enumerate(stmt.modules) if m == c.token})
+
+    # What the file still imports once the drops land: a 'rewrite' target
+    # already in here needs no new line (see the docstring).
+    surviving = {logical_path(s, tok, local_prefix)
+                 for s in stmts
+                 for i, tok in enumerate(s.modules)
+                 if i not in drop_idx.get(s.lineno, ())}
+
+    added_by_line: dict[int, list[str]] = {}
+    for c in edits:
+        for m in c.via:
+            if m in surviving:
+                continue
+            added_by_line.setdefault(c.stmt.lineno, []).append(
+                import_line(m, local_prefix))
+            surviving.add(m)
+
+    # A re-pointed line's explanatory comment FOLLOWS THE IMPORT to its new
+    # home, when the original line goes away whole.  In this tree such a
+    # comment says what the import is for -- the names it provides -- and a
+    # re-point aims at the module actually providing exactly those names, so
+    # the comment stays true of the line that replaces it.  Dropping it instead
+    # would silently delete hand-written documentation on every sweep.  A line
+    # that SURVIVES with other tokens keeps its own comment and the replacement
+    # gets none: the comment is still attached to what it was written about.
+    for lineno, added in added_by_line.items():
+        stmt = stmt_by_line.get(lineno)
+        if not stmt or not stmt.trailer or not added:
+            continue
+        if any(j not in drop_idx.get(lineno, ()) for j in range(len(stmt.modules))):
+            continue
+        added[0] += stmt.trailer
+
+    # Continuation lines of a statement whose trailing comment runs on.  When
+    # that statement is edited they must NOT be re-emitted: a partial edit
+    # rebuilds the line with the whole `trailer` (newlines and all) and a whole
+    # deletion takes the comment with it, so in both cases the original
+    # continuation lines are already accounted for.  A statement nobody edits
+    # keeps every line of its span verbatim.
+    cont_of = {n: s.lineno for s in stmts
+               for n in range(s.lineno + 1, s.endline + 1)}
+
+    out_lines: list[str] = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        if cont_of.get(i) in drop_idx:
+            out_lines.extend(added_by_line.get(i, []))
+            continue
+        if i in drop_idx:
+            stmt = stmt_by_line[i]
+            remaining = [m for j, m in enumerate(stmt.modules)
+                         if j not in drop_idx[i]]
+            if remaining:
+                # Rebuild the statement line, preserving From/Import/Export shape.
+                head = ""
+                if stmt.from_prefix:
+                    head += f"From {stmt.from_prefix} "
+                head += "Require "
+                if stmt.kind == "import":
+                    head += "Import "
+                elif stmt.kind == "export":
+                    head += "Export "
+                # `trailer` carries the line's explanatory comment through a
+                # partial edit; a line dropped whole takes its comment with it,
+                # which is right -- the comment was about that import.
+                out_lines.append(head + " ".join(remaining) + "."
+                                 + stmt.trailer)
+        else:
+            out_lines.append(line)
+        out_lines.extend(added_by_line.get(i, []))
+    trailing_nl = "\n" if text.endswith("\n") else ""
+    return "\n".join(out_lines) + trailing_nl
+
+
+def apply_removals(dir_path: str, vfile: str, confirmed, local_prefix: str,
+                   include_rewrites: bool = False,
+                   include_dupes: bool = True) -> tuple[int, int, int]:
+    """Apply the build-confirmed edits of `confirmed` to `vfile` on disk.
+
+    Returns `(removed, repointed, deduped)` -- counted separately because they
+    are not the same change: a removal deletes dead code, a re-point swaps a
+    forwarding import for the module defining the name, a de-dup drops a second
+    `Require` of a module the file requires anyway.  Callers report them apart
+    rather than describing any of them as a "removed import".
+
+    Re-parses the file and re-matches each candidate by (lineno, token), so this
+    works both for freshly-verified results and for ones reloaded from a
+    checkpoint (whose `stmt` is a stub carrying only lineno/raw).  A candidate
+    that no longer matches means the file moved under us since it was verified;
+    that is a hard error rather than a silent skip -- applying a stale removal
+    would delete the wrong line.
+
+    'remove' and 'dupe' candidates are applied; a 'rewrite' only under
+    `include_rewrites`.  A 'rewrite' is not dead code: the import forwards a
+    name that IS used, so deleting it breaks the build (what --verify confirmed
+    is the re-point, not a deletion), and re-pointing it is a layering
+    judgement -- the re-exporting shims in this tree are deliberate.  A 'dupe',
+    by contrast, is no judgement at all: the module stays required by the same
+    file, so the edit cannot even reach a downstream one.  Each candidate's
+    `kind`/`via`/`occurrence` must be carried through here; rebuilding it as a
+    bare Candidate would silently downgrade a verified rewrite into an
+    unverified deletion, or widen a one-occurrence de-dup into a name-wide one.
+    """
+    kinds = {"remove", "dupe"} if include_dupes else {"remove"}
+    if include_rewrites:
+        kinds.add("rewrite")
+    todo = [c for c in confirmed if getattr(c, "kind", "remove") in kinds]
+    if not todo:
+        return (0, 0, 0)
+    path = os.path.join(dir_path, vfile)
+    with open(path) as f:
+        text = f.read()
+    stmts = {s.lineno: s for s in parse_imports(text)}
+    edits: list[Candidate] = []
+    for c in todo:
+        stmt = stmts.get(c.stmt.lineno)
+        occ = getattr(c, "occurrence", None)
+        matches = stmt is not None and (
+            c.token in stmt.modules if occ is None
+            else occ < len(stmt.modules) and stmt.modules[occ] == c.token)
+        if not matches:
+            raise SystemExit(
+                f"apply: {vfile}:{c.stmt.lineno} no longer matches the verified "
+                f"import of `{c.token}` -- the file changed since verification; "
+                f"re-run without a stale --checkpoint"
+            )
+        edits.append(Candidate(stmt=stmt, token=c.token, full_path=c.full_path,
+                               kind=getattr(c, "kind", "remove"),
+                               via=list(getattr(c, "via", [])),
+                               occurrence=occ,
+                               dup_of=getattr(c, "dup_of", 0)))
+    with open(path, "w") as f:
+        f.write(apply_edits(text, edits, local_prefix))
+    n_rw = sum(1 for c in edits if c.kind == "rewrite")
+    n_dp = sum(1 for c in edits if c.kind == "dupe")
+    return (len(edits) - n_rw - n_dp, n_rw, n_dp)
+
+
+def build(dir_path: str, vfile: str, flags: list[str] | None = None) -> tuple[bool, str]:
+    """Compile <vfile> (writing its .vo/.glob). Return (ok, error_text).
+
+    Uses `coqc` directly (no dependency recursion) unless XV6_USE_MAKE=1.
+    """
+    if USE_MAKE:
+        cmd = OPAM_PREFIX + ["make", "-f", "CoqMakefile", vfile[:-2] + ".vo"]
+    else:
+        cmd = OPAM_PREFIX + ["coqc"] + (flags or []) + [vfile]
+    proc = subprocess.run(
+        cmd, cwd=dir_path,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    out = proc.stdout
+    # coqc/make both exit non-zero on failure; `***` guards make-style errors.
+    ok = proc.returncode == 0 and "***" not in out
+    return ok, out
+
+
+def build_text(dir_path: str, vfile: str, text: str,
+               flags: list[str]) -> tuple[bool, str]:
+    """Compile `text` AS IF it were <vfile>, without touching <vfile>'s artifacts.
+
+    The text is written to a uniquely-named sibling copy and coqc is pointed at
+    that, so the compile writes only the copy's own `.vo`/`.glob` (removed on the
+    way out) and leaves `<vfile>`, `<vfile>.vo` and `<vfile>.glob` untouched.
+    That isolation is what lets build-tests of different files run concurrently:
+    they import each other's `.vo`, so an in-place test would hand a concurrent
+    test a `.vo` that is half-written or built from import-deleted source.
+
+    The copy is a SIBLING (not a tempdir) because it must sit under the same
+    `-R <dir> <prefix>` load path for its own `Require`s to resolve, and its
+    module name is `<vfile>`'s plus a unique suffix, so nothing requires it.
+    """
+    stem = f"{vfile[:-2]}{TEMP_MARK}{os.getpid()}_{next(_temp_counter)}"
+    litter = [os.path.join(dir_path, stem + ext)
+              for ext in (".v", ".vo", ".vos", ".vok", ".glob")]
+    litter.append(os.path.join(dir_path, f".{stem}.aux"))
+    try:
+        with open(os.path.join(dir_path, stem + ".v"), "w") as f:
+            f.write(text)
+        return build(dir_path, stem + ".v", flags)
+    finally:
+        for p in litter:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def _narrow_candidates(res: FileResult, compiles) -> None:
+    """Split `res.candidates` into `removable`/`needed` using `compiles(cands)`.
+
+    `compiles` build-tests the file with exactly `cands` applied (and nothing
+    else), returning whether it still compiles; how that test is staged is the
+    caller's business (see `verify_file`).
+    """
+    # First: try removing ALL candidates at once (1 compile).
+    if compiles(res.candidates):
+        res.removable = list(res.candidates)
+        res.jointly_removable = True
+        return
+    # Fall back: one candidate at a time (each removed from the ORIGINAL,
+    # i.e. with every OTHER import still present).  This answers "is X
+    # redundant given the rest?".
+    for c in res.candidates:
+        if compiles([c]):
+            res.removable.append(c)
+        else:
+            res.needed.append(c)
+    # Individually-redundant does not guarantee JOINTLY removable (two
+    # imports might each cover for the other).  Confirm the whole
+    # `removable` set drops together; if not, greedily shrink it until the
+    # file compiles, moving the culprits back into `needed`.
+    if len(res.removable) > 1:
+        if compiles(res.removable):
+            res.jointly_removable = True
+        else:
+            res.jointly_removable = False
+            keep = list(res.removable)
+            # Greedily remove one at a time from the drop-set until it builds.
+            while keep:
+                if compiles(keep):
+                    break
+                moved = keep.pop()              # this one is NOT jointly-droppable
+                res.needed.append(moved)
+            res.removable = keep
+
+
+def _retry_dupes_mirrored(res: FileResult, stmts: list[ImportStmt],
+                          text: str, compiles) -> None:
+    """Re-offer each REJECTED duplicate resolved the other way round.
+
+    The shortlist always proposes dropping the earlier occurrence (see
+    `mirror_candidate` for why that is the safe direction).  When the build
+    rejects it -- overwhelmingly because code between the two copies uses the
+    module -- the pair is not thereby proved necessary: the LATER copy may be
+    the redundant one.  Each rejected candidate is retried in that direction,
+    on top of everything already confirmed, so a mirror that only works in
+    isolation is never accepted.
+    """
+    for c in [c for c in res.needed if c.kind == "dupe"]:
+        mirror = mirror_candidate(c, stmts, text)
+        if mirror is None:
+            continue
+        if compiles(res.removable + [mirror]):
+            res.needed.remove(c)
+            res.removable.append(mirror)
+
+
+def verify_file(dir_path: str, res: FileResult, flags: list[str],
+                local_prefix: str) -> None:
+    """Build-confirm which of `res`'s candidate edits actually still compile.
+
+    Every build-test compiles a throwaway COPY (`build_text`), so this touches
+    none of `res.vfile`'s own files and is safe to run concurrently with the
+    verification of any other file.  The one exception is `XV6_USE_MAKE=1`, whose
+    whole point is to drive the project's real make target: that has to edit the
+    file in place and rebuild its `.vo`, so it is serialised (`--jobs 1`).
+    """
+    if not res.candidates:
+        res.verified = True
+        return
+    path = os.path.join(dir_path, res.vfile)
+    with open(path) as f:
+        original = f.read()
+
+    stmts = parse_imports(original)
+
+    if not USE_MAKE:
+        def compiles(cands):
+            return build_text(dir_path, res.vfile,
+                              apply_edits(original, cands, local_prefix),
+                              flags)[0]
+        _narrow_candidates(res, compiles)
+        _retry_dupes_mirrored(res, stmts, original, compiles)
+        res.verified = True
+        return
+
+    def write(cands):
+        with open(path, "w") as f:
+            f.write(apply_edits(original, cands, local_prefix))
+
+    try:
+        def compiles(cands):
+            write(cands)
+            return build(dir_path, res.vfile, flags)[0]
+        _narrow_candidates(res, compiles)
+        _retry_dupes_mirrored(res, stmts, original, compiles)
+        res.verified = True
+    finally:
+        with open(path, "w") as f:                # restore the original bytes
+            f.write(original)
+        build(dir_path, res.vfile, flags)         # leave a correct .vo behind
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing (crash-resilient / partial-harvest across a long verify run).
+# ---------------------------------------------------------------------------
+def _cand_dict(c: Candidate) -> dict:
+    return {"token": c.token, "full_path": c.full_path,
+            "lineno": c.stmt.lineno, "raw": c.stmt.raw,
+            "kind": c.kind, "via": list(c.via),
+            "occurrence": c.occurrence, "dup_of": c.dup_of,
+            "dup_token": c.dup_token, "dup_occurrence": c.dup_occurrence}
+
+
+def describe(c: Candidate) -> str:
+    """One report bullet for a candidate."""
+    where = (f"- `{c.token}`  (logical `{c.full_path}`) "
+             f"-- line {c.stmt.lineno}: `{first_line(c.stmt.raw)}`")
+    if c.kind == "rewrite":
+        where += "\n  - provides no referenced name itself; import instead: " + \
+                 ", ".join(f"`{m}`" for m in c.via)
+    elif c.kind == "dupe":
+        # `dup_of` can be either side: the shortlist drops the earlier
+        # occurrence, the mirrored retry the later one.  Say which.
+        rel = "again at line" if c.dup_of > c.stmt.lineno else \
+              "already at line"
+        where += (f"\n  - duplicate: the same module is required {rel} "
+                  f"{c.dup_of}, which this drop keeps")
+    return where
+
+
+def result_to_dict(r: FileResult) -> dict:
+    return {
+        "vfile": r.vfile,
+        "verified": r.verified,
+        "jointly_removable": r.jointly_removable,
+        "glob_state": r.glob_state,
+        "analysed": r.analysed,
+        "note": r.note,
+        "candidates": [_cand_dict(c) for c in r.candidates],
+        "removable": [_cand_dict(c) for c in r.removable],
+        "needed": [_cand_dict(c) for c in r.needed],
+    }
+
+
+def save_checkpoint(path: str, results: dict[str, FileResult]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({k: result_to_dict(v) for k, v in results.items()}, f, indent=1)
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path: str) -> dict[str, dict]:
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+class _DictCand:
+    """Lightweight Candidate reconstructed from a checkpoint dict."""
+    def __init__(self, d):
+        self.token = d["token"]
+        self.full_path = d["full_path"]
+        self.kind = d.get("kind", "remove")
+        self.via = d.get("via", [])
+        self.occurrence = d.get("occurrence")
+        self.dup_of = d.get("dup_of", 0)
+        self.dup_token = d.get("dup_token", "")
+        self.dup_occurrence = d.get("dup_occurrence")
+        self.stmt = type("S", (), {"lineno": d["lineno"], "raw": d["raw"]})()
+
+
+def result_from_dict(d: dict) -> FileResult:
+    r = FileResult(vfile=d["vfile"])
+    r.verified = d["verified"]
+    r.jointly_removable = d.get("jointly_removable", True)
+    r.glob_state = d.get("glob_state", "fresh")
+    r.analysed = d.get("analysed", True)
+    r.note = d.get("note", "")
+    r.candidates = [_DictCand(c) for c in d["candidates"]]
+    r.removable = [_DictCand(c) for c in d["removable"]]
+    r.needed = [_DictCand(c) for c in d["needed"]]
+    return r
+
+
+# ---------------------------------------------------------------------------
+# The downstream guard: a removal must not unload a module a LATER file uses.
+# ---------------------------------------------------------------------------
+def _local_module(u: str, locals_: set[str]) -> str | None:
+    """The local file module a glob libname lives in (or None if not local)."""
+    while u:
+        if u in locals_:
+            return u
+        u = u.rpartition(".")[0]
+    return None
+
+
+def downstream_guard(dir_path: str, results: list[FileResult],
+                     local_prefix: str, graph: ExportGraph,
+                     applied_kinds: set[str]) -> int:
+    """Withhold every build-confirmed edit that would break a DOWNSTREAM file.
+
+    `--verify` compiles each file on its own, but `Require` is transitive for
+    LOADING: a file G may use a module B -- typically qualified, `B.lemma` --
+    that it never requires itself, because something G requires happens to
+    require B.  Removing that link elsewhere compiles fine where it is made and
+    breaks G.  (`UkFileDev.v` used `UEchoOut.echo_count_is` and reached
+    `UEchoOut` only through `UEchoFile.v`'s dead import of it; every nightly
+    sweep removed that import, failed its whole-tree gate, and so landed
+    nothing at all.)
+
+    So: B is BORROWED by G when G's glob references B but no `Require` of G's
+    own (nor the Export closure of one) loads it.  Once the edits are applied
+    to the require graph, a borrowed module G can no longer reach is LOST, and
+    every edit that dropped an edge F -> M with F reachable from G and B
+    reachable from M is withheld.  Restoring all such edges restores every
+    original path from G to B, so one pass suffices, and nothing else is
+    touched.  This is conservative (it may withhold an edit another path made
+    harmless) and only as good as the globs: a file without a fresh glob
+    borrows nothing here, and the whole-tree rebuild remains the gate.
+
+    The real fix is always in G -- require what it uses -- so the report names
+    each borrower.  Returns the number of edits withheld.
+    """
+    by_mod = {f"{local_prefix}.{r.vfile[:-2]}": r for r in results}
+    locals_ = set(by_mod)
+    texts: dict[str, str] = {}
+    req: dict[str, set[str]] = {}
+    for mod, r in by_mod.items():
+        with open(os.path.join(dir_path, r.vfile)) as f:
+            texts[mod] = f.read()
+        req[mod] = _local_requires(texts[mod], local_prefix, locals_)
+
+    borrowed: dict[str, set[str]] = {}
+    for mod, r in by_mod.items():
+        if glob_status(dir_path, r.vfile) != "fresh":
+            continue
+        glob = os.path.join(dir_path, r.vfile[:-2] + ".glob")
+        used = {m for u in referenced_libnames(glob)
+                if (m := _local_module(u, locals_)) is not None}
+        covered = {mod}
+        for s in parse_imports(texts[mod]):
+            for tok in s.modules:
+                covered |= graph.closure(logical_path(s, tok, local_prefix))[0]
+        if used - covered:
+            borrowed[mod] = used - covered
+    if not borrowed:
+        return 0
+
+    edits = {mod: [c for c in r.removable
+                   if getattr(c, "kind", "remove") in applied_kinds]
+             for mod, r in by_mod.items()}
+    new_req = dict(req)
+    for mod, es in edits.items():
+        if es:
+            new_req[mod] = _local_requires(
+                apply_edits(texts[mod], es, local_prefix), local_prefix, locals_)
+
+    def reach(start: str, g: dict[str, set[str]], memo: dict) -> set[str]:
+        if start in memo:
+            return memo[start]
+        seen, stack = {start}, [start]
+        while stack:
+            for n in g.get(stack.pop(), ()):
+                if n not in seen:
+                    seen.add(n)
+                    stack.append(n)
+        memo[start] = seen
+        return seen
+
+    old_memo: dict = {}
+    new_memo: dict = {}
+    withheld: dict[int, tuple[str, Candidate, str]] = {}
+    for g, bs in sorted(borrowed.items()):
+        old = reach(g, req, old_memo)
+        lost = bs - reach(g, new_req, new_memo)
+        for b in sorted(lost):
+            for f in old:
+                for c in edits.get(f, ()):
+                    if getattr(c, "kind", "remove") == "dupe":
+                        continue       # the module stays required by f
+                    if b in reach(c.full_path, req, old_memo):
+                        why = (f"`{by_mod[g].vfile}` uses `{b}` without "
+                               f"requiring it; it is loaded only through this "
+                               f"import -- add `Require {b[len(local_prefix) + 1:]}.` "
+                               f"to `{by_mod[g].vfile}`")
+                        withheld.setdefault(id(c), (f, c, why))
+    for f, c, why in withheld.values():
+        r = by_mod[f]
+        r.removable.remove(c)
+        r.downstream.append((c, why))
+    return len(withheld)
+
+
+def _local_requires(text: str, local_prefix: str, locals_: set[str]) -> set[str]:
+    """The local modules `text` requires (any of Require/Import/Export)."""
+    return {fp for s in parse_imports(text) for tok in s.modules
+            if (fp := logical_path(s, tok, local_prefix)) in locals_}
+
+
+# ---------------------------------------------------------------------------
+# Reporting.
+# ---------------------------------------------------------------------------
+def render_report(results: list[FileResult], verified_mode: bool) -> str:
+    lines: list[str] = []
+    lines.append("# Unused-import report")
+    lines.append("")
+    total_removable = sum(len(r.removable) for r in results)
+    files_with = [r for r in results if r.removable]
+    total_needed = sum(len(r.needed) for r in results)
+
+    def count(rs, attr, kind):
+        return sum(1 for r in rs for c in getattr(r, attr)
+                   if getattr(c, "kind", "remove") == kind)
+
+    n_rewrite = count(results, "candidates", "rewrite")
+    n_dupe_c = count(results, "candidates", "dupe")
+    if verified_mode:
+        verified = [r for r in results if r.verified]
+        n_rw = count(results, "removable", "rewrite")
+        n_dp = count(results, "removable", "dupe")
+        lines.append(f"- Files build-verified: **{len(verified)}** "
+                     f"(of {len(results)} analysed).")
+        lines.append(f"- Build-confirmed **jointly**-applicable edits: "
+                     f"**{total_removable}** across **{len(files_with)}** files "
+                     f"({total_removable - n_rw - n_dp} removals, {n_rw} "
+                     f"re-points at the module providing the name, {n_dp} "
+                     f"duplicate `Require`s of a module the file keeps anyway) "
+                     f"-- each file's listed set was compiled with all of them "
+                     f"applied together.")
+        lines.append(f"- Glob candidates that build-testing showed are NEEDED "
+                     f"(false positives -- instances/notations/hints): "
+                     f"**{total_needed}**.")
+        not_joint = [r for r in results if not r.jointly_removable]
+        if not_joint:
+            lines.append(f"- Files where some individually-redundant imports were "
+                         f"NOT jointly removable (interdependence): "
+                         f"{', '.join(r.vfile for r in not_joint)}.")
+    else:
+        total_cand = sum(len(r.candidates) for r in results)
+        lines.append(f"- Candidates (NOT build-confirmed): "
+                     f"**{total_cand}** across "
+                     f"**{len([r for r in results if r.candidates])}** files "
+                     f"({total_cand - n_rewrite - n_dupe_c} to remove, "
+                     f"{n_rewrite} to re-point at the module providing the "
+                     f"name, {n_dupe_c} duplicates to drop).")
+    unanalysed = [r for r in results if not r.analysed]
+    if unanalysed:
+        lines.append(f"- Files SKIPPED for lack of usable `.glob` evidence: "
+                     f"**{len(unanalysed)}** (see below) -- their imports are "
+                     f"neither confirmed used nor unused (their DUPLICATES are "
+                     f"still reported: that scan reads only the file's text).")
+    lines.append("")
+
+    if verified_mode:
+        lines.append("## Build-confirmed edits")
+        lines.append("")
+        for r in results:
+            if not r.removable:
+                continue
+            lines.append(f"### {r.vfile}")
+            for c in r.removable:
+                lines.append(describe(c))
+            lines.append("")
+        lines.append("## Glob candidates that were actually NEEDED "
+                     "(instances / notations / hints)")
+        lines.append("")
+        any_needed = False
+        for r in results:
+            if not r.needed:
+                continue
+            any_needed = True
+            lines.append(f"### {r.vfile}")
+            for c in r.needed:
+                lines.append(describe(c))
+            lines.append("")
+        if not any_needed:
+            lines.append("_(none)_")
+            lines.append("")
+        withheld = [r for r in results if r.downstream]
+        if withheld:
+            lines.append("## Confirmed edits WITHHELD for a downstream file")
+            lines.append("")
+            lines.append("Each compiles where it is made, but unloads a module "
+                         "some later file uses without requiring it.  Fix that "
+                         "file (require what it uses) and the next sweep lands "
+                         "the edit.")
+            lines.append("")
+            for r in withheld:
+                lines.append(f"### {r.vfile}")
+                for c, why in r.downstream:
+                    lines.append(describe(c) + f"\n  - withheld: {why}")
+                lines.append("")
+    else:
+        lines.append("## Candidates (require --verify to confirm)")
+        lines.append("")
+        for r in results:
+            if not r.candidates:
+                continue
+            lines.append(f"### {r.vfile}")
+            for c in r.candidates:
+                lines.append(describe(c))
+            lines.append("")
+
+    unanalysed = [r for r in results if not r.analysed]
+    if unanalysed:
+        lines.append("## Files skipped (no usable `.glob`)")
+        lines.append("")
+        lines.append("A missing/outdated `.glob` is absence of evidence, not "
+                     "evidence of an unused import -- flagging these files' "
+                     "imports would be a false positive.  Rebuild them (or pass "
+                     "`--all` to build-test their imports without a glob).  The "
+                     "duplicate scan needs no glob, so it still covered them.")
+        lines.append("")
+        for r in unanalysed:
+            lines.append(f"- `{r.vfile}` -- {r.note}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main.
+# ---------------------------------------------------------------------------
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dir", default=".", help="directory of .v files (default: .)")
+    ap.add_argument("--verify", action="store_true",
+                    help="build-confirm candidates (else: fast glob-only listing)")
+    ap.add_argument("--all", action="store_true",
+                    help="build-test EVERY import, ignoring the glob shortlist "
+                         "(needs no .glob, so it also covers unbuilt files)")
+    ap.add_argument("--allow-stale", action="store_true",
+                    help="shortlist from a .glob older than its .v (may report "
+                         "imports used only by edits made since the last build)")
+    ap.add_argument("--apply", action="store_true",
+                    help="DELETE the build-confirmed removable imports from the "
+                         ".v files (requires --verify; the glob shortlist alone "
+                         "is ~half false positives and must never be applied). "
+                         "'remove' and 'dupe' candidates are applied; a "
+                         "'rewrite' is a layering judgement (the re-exporting "
+                         "shims here are deliberate), so it is reported for a "
+                         "human and applied only under --apply-rewrites. "
+                         "Single-file compiles do not prove the WHOLE tree still "
+                         "builds -- `Require` is transitive for LOADING, so a "
+                         "downstream file may reference a module this one pulled "
+                         "in.  Always run a full `make` afterwards.")
+    ap.add_argument("--apply-rewrites", action="store_true",
+                    help="with --apply, ALSO re-point build-confirmed 'rewrite' "
+                         "candidates at the module providing the name (off by "
+                         "default: it rewrites deliberate shim imports)")
+    ap.add_argument("--no-dupes", dest="dupes", action="store_false",
+                    help="skip the duplicate-import scan (the same module "
+                         "required twice in one file). It is ON by default: it "
+                         "needs no .glob, and the drop leaves the module still "
+                         "required by the file, so it cannot reach a downstream "
+                         "one. --apply applies confirmed duplicates.")
+    ap.add_argument("--dupes-across-code", action="store_true",
+                    help="also flag a duplicate whose occurrences are separated "
+                         "by real code, not just other `Require`s. Off by "
+                         "default: such a re-import is often deliberate (it "
+                         "re-establishes instance resolution at that point), and "
+                         "each one costs its own build-confirm compile.")
+    ap.add_argument("--include-external", action="store_true",
+                    help="also check imports of OTHER packages (SailStdpp, Riscv, "
+                         "stdpp, iris.*, Kernel, Stdlib). Default: only this "
+                         "package's own modules (local `-R .` prefix).")
+    ap.add_argument("--include-export", action="store_true",
+                    help="also consider `Require Export` lines (needs --full-make "
+                         "to be sound; unsafe with single-file verify)")
+    ap.add_argument("--jobs", "-j", type=int, default=0,
+                    help="verify this many files concurrently (default: "
+                         "min(8, cpu count)). Each job is one coqc, and these "
+                         "are memory-hungry, so this is capped well below the "
+                         "core count; raise it if the box has the RAM. Files "
+                         "are build-tested through throwaway copies, so a job "
+                         "never sees another's edits. XV6_USE_MAKE=1 forces 1.")
+    ap.add_argument("--files", nargs="*", default=None,
+                    help="restrict to these .v files (default: all in --dir)")
+    ap.add_argument("--report", default=None,
+                    help="write the markdown report to this path (also prints)")
+    ap.add_argument("--checkpoint", default=None,
+                    help="JSON file of per-file results; written after each file "
+                         "and reused on restart (crash-resilient / partial harvest)")
+    args = ap.parse_args()
+
+    if args.apply and not args.verify:
+        ap.error("--apply requires --verify (refusing to delete unconfirmed "
+                 "glob candidates)")
+    if args.apply_rewrites and not args.apply:
+        ap.error("--apply-rewrites requires --apply (it widens what --apply "
+                 "writes; on its own it would silently do nothing)")
+
+    jobs = args.jobs or min(8, os.cpu_count() or 1)
+    if jobs < 1:
+        ap.error("--jobs must be >= 1")
+    if USE_MAKE and jobs > 1:
+        # The make path edits the file in place and rebuilds the real .vo, which
+        # concurrent jobs would import mid-write.  Downgrade loudly.
+        print(f"warning: XV6_USE_MAKE=1 builds in place; forcing --jobs 1 "
+              f"(was {jobs})", file=sys.stderr)
+        jobs = 1
+
+    dir_path = os.path.abspath(args.dir)
+    if shutil.which("opam") is None:
+        print("warning: `opam` not found; --verify will fail", file=sys.stderr)
+
+    local_prefix = local_prefix_for_dir(dir_path)
+    flags = coqc_flags(dir_path)
+    maps = load_path_mappings(dir_path)
+    graph = ExportGraph(maps)
+    tactics = TacticIndex(graph, maps)
+    if args.files:
+        vfiles = sorted(args.files)
+    else:
+        # Skip any build-test copy a killed run left behind: it is not a source
+        # file of this package, and analysing it would report its own imports.
+        vfiles = sorted(f for f in os.listdir(dir_path)
+                        if f.endswith(".v") and TEMP_MARK not in f)
+
+    ckpt: dict[str, FileResult] = {}
+    if args.checkpoint:
+        for k, v in load_checkpoint(args.checkpoint).items():
+            ckpt[k] = result_from_dict(v)
+
+    # Shortlist every file FIRST, serially: it is cheap (a .glob read), and the
+    # ExportGraph's memo tables are not thread-safe.  Only the build-confirm --
+    # the part that is minutes of coqc per file -- is parallelised.
+    results: list[FileResult] = []
+    todo: list[FileResult] = []
+    for vf in vfiles:
+        if args.verify and vf in ckpt and ckpt[vf].verified:
+            print(f"[skip] {vf}: from checkpoint", file=sys.stderr, flush=True)
+            results.append(ckpt[vf])
+            continue
+        res = analyze_file(dir_path, vf, local_prefix,
+                           args.include_export, args.all, graph,
+                           local_only=not args.include_external,
+                           allow_stale=args.allow_stale, tactics=tactics,
+                           find_dupes=args.dupes,
+                           dupes_across_code=args.dupes_across_code)
+        results.append(res)
+        if args.verify and res.candidates:
+            todo.append(res)
+
+    if todo:
+        # Each job compiles throwaway copies only (see build_text), so no job can
+        # observe another's edits -- concurrency changes the SPEED of --verify,
+        # never its verdicts.  The lock covers the shared checkpoint dict.
+        ckpt_lock = threading.Lock()
+
+        def verify_one(res: FileResult) -> None:
+            print(f"[verify] {res.vfile}: {len(res.candidates)} candidate(s)...",
+                  file=sys.stderr, flush=True)
+            verify_file(dir_path, res, flags, local_prefix)
+            if args.checkpoint:
+                with ckpt_lock:
+                    ckpt[res.vfile] = res
+                    save_checkpoint(args.checkpoint, ckpt)
+            print(f"[done] {res.vfile}: {len(res.removable)} confirmed, "
+                  f"{len(res.needed)} needed", file=sys.stderr, flush=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(verify_one, r) for r in todo]
+            for fut in concurrent.futures.as_completed(futures):
+                fut.result()   # re-raise in the main thread rather than swallow
+
+    if args.verify:
+        kinds = {"remove", "dupe"} | ({"rewrite"} if args.apply_rewrites else set())
+        n_held = downstream_guard(dir_path, results, local_prefix, graph, kinds)
+        if n_held:
+            print(f"[guard] withheld {n_held} edit(s) that would unload a module "
+                  f"a downstream file uses (see the report)", file=sys.stderr)
+
+    report = render_report(results, verified_mode=args.verify)
+    print(report)
+    if args.report:
+        with open(args.report, "w") as f:
+            f.write(report + "\n")
+        print(f"\n[wrote {args.report}]", file=sys.stderr)
+
+    # Apply LAST, and single-threaded: verification build-tests copies (or, under
+    # XV6_USE_MAKE, restores what it edited), so the on-disk text here is still
+    # the original one the candidates' line numbers refer to.
+    if args.apply:
+        n_rm = n_rm_files = n_rw = n_rw_files = n_dp = n_dp_files = 0
+        for r in results:
+            rm, rw, dp = apply_removals(dir_path, r.vfile, r.removable,
+                                        local_prefix,
+                                        include_rewrites=args.apply_rewrites)
+            n_rm += rm
+            n_rw += rw
+            n_dp += dp
+            n_rm_files += bool(rm)
+            n_rw_files += bool(rw)
+            n_dp_files += bool(dp)
+            if rm or rw or dp:
+                print(f"[apply] {r.vfile}: removed {rm}, re-pointed {rw}, "
+                      f"de-duplicated {dp}", file=sys.stderr, flush=True)
+        # NB: `.github/workflows/dead-imports.yml` greps these three lines' exact
+        # wording to build its commit message -- keep the phrasing in sync.  The
+        # counts stay separate: neither a re-point nor a de-dup is a removed
+        # import.
+        print(f"[apply] removed {n_rm} import(s) across {n_rm_files} file(s)",
+              file=sys.stderr)
+        if args.dupes:
+            print(f"[apply] de-duplicated {n_dp} import(s) across {n_dp_files} "
+                  f"file(s)", file=sys.stderr)
+        if args.apply_rewrites:
+            print(f"[apply] re-pointed {n_rw} import(s) across {n_rw_files} "
+                  f"file(s)", file=sys.stderr)
+        else:
+            skipped = sum(1 for r in results for c in r.removable
+                          if getattr(c, "kind", "remove") == "rewrite")
+            if skipped:
+                print(f"[apply] left {skipped} confirmed re-point(s) for a human "
+                      f"(see the report; --apply-rewrites applies them)",
+                      file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

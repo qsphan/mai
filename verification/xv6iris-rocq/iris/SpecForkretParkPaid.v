@@ -1,0 +1,391 @@
+(* SpecForkretParkPaid.v -- forkret_park, stated at the premises a caller
+   must PAY.  The park turns a freshly-allocated process's raw saved context
+   (ra = forkret, sp = kstack + PGSIZE, twelve don't-care callee-saved slots)
+   into a member of the scheduler's swtch chain, [SchedCtx.proc_ctx] -- so
+   that kfork and userinit can release the process at RUNNABLE.
+
+   [SpecForkretPark.FORKRET_PARK] is the same park ASSUMED, in the form the
+   two callers use today; this file is what a proof of it is stated against.
+   The difference between the two is exactly the bundle below, and that
+   difference -- not anything about forkret -- is what keeps the axiom alive.
+
+   HISTORY, because this file was deleted and rewritten.  An earlier version
+   (last green at 4bbc418f) was a functor over [FORKRET_NF]: forkret's
+   contract MINUS a [first] premise, assumed in [LinkForkretNF.v].  Forkret
+   is now PROVED outright -- boot arm, kexec, panic tail and all
+   (ProofForkret.fkr_boot) -- and its contract has moved with it, so that
+   whole scaffold is gone: no [FORKRET_NF], no [LinkForkretNF.v], no
+   [Pfirst], no [pt] parameter, no [is_lock γl p s Rlk] triple.  A park
+   proved against THIS statement is functor over [SpecForkret.FORKRET] and
+   is instantiated with [LinkForkret.Forkret], so its cone carries no
+   first-related axiom at all.
+
+   WHAT MOVED, ITEM BY ITEM, relative to that earlier statement:
+
+     - THE [first] PREMISE IS GONE and nothing replaces it here.  The branch
+       is decided by [FirstTok]'s arms, which the block premise below
+       carries and this contract passes through untouched.  A STEADY caller
+       owes a [proc_priv] whose token is the steady arm, and
+       [FirstTok.first_done] is persistent and is already the last conjunct
+       of [ProofSyscall.syscall_env], which the closer needs anyway; a BOOT
+       caller owes the block minus its token, the cwd reference and
+       [FirstTok.first_boot], which is the mode itself as a resource.
+
+     - THE DESCRIPTOR IS NOT PINNED.  forkret's residue closer is now
+       [∀ pt'], because the boot arm's kexec REPLACES the address space:
+       the table userret runs on is not the one forkret was entered with, so
+       no [pt] fixed on entry can name both.  The closer below is quantified
+       the same way and is handed the two page-table facts rather than
+       taking them as premises of the park.  Consequently [V] left
+       [forkret_park_pkg]'s signature entirely -- it occurred only inside
+       [pv_upt V].
+
+     - THE DEPTH PREMISE IS GONE, not merely restated.  It used to read
+       [6 + trap_res true + K_prepare_return <= av]; forkret's deepest
+       callee is now kexec's, so the obligation is [K_kexec <= av2] at
+       [av2 = av - 6 - trap_res eb'].  With [K_kexec = 188],
+       [trap_res true = kv_frame_slots = 90] and [K_usertrap = 346], that is
+       [284 <= av] -- implied by the [K_usertrap <= av] this file already
+       carries, so it is [lia]'s job and not a caller's.
+
+   ====================================================================== *)
+(* WHAT THE CALLER PAYS, AND WHAT IS ACTUALLY MISSING                     *)
+(*                                                                        *)
+(* A record must be paid for at the moment it is BUILT, and the thread it  *)
+(* promises has not run yet, so its creator owes what the first trap round *)
+(* will consume.  Of the seven conjuncts below, six are payable TODAY:     *)
+(*                                                                        *)
+(*   - [kernel_text], [wire_inv], the trampoline's kernel mapping,         *)
+(*     [procs_inv γs], [pslot_used_at pa] -- all PERSISTENT, free for any  *)
+(*     caller, but they have to be NAMED, because the record's             *)
+(*     continuation is a closure and a closure captures what it uses.      *)
+(*     [pslot_used_at] is already in [SpecAllocproc]'s postcondition.      *)
+(*                                                                        *)
+(*   - [stack_own ksp av] -- the child's KERNEL STACK, free below its top. *)
+(*     A running thread carries its stack inside [sie_cap_gpr] and a       *)
+(*     parked one inside its record ([SwtchCtx.valid_context_pre] has it   *)
+(*     as a conjunct); a never-run one has it nowhere, so the park must    *)
+(*     own it.  THIS IS NO LONGER A HOLE, and the older comment here       *)
+(*     saying it was is wrong: [ProcDefs.kstack_free] (= [is_kstack] plus  *)
+(*     exactly these words at KSTACK_AV) is a conjunct of [proc_dormant],  *)
+(*     and [SpecAllocproc]'s postcondition ALREADY hands it back beside    *)
+(*     the [is_kstack] one line above it.  [ProcDefs.kstack_free_at]       *)
+(*     recovers the words at the caller's concrete [ks].  And the arithmetic*)
+(*     lands exactly: [KSTACK_AV = 346 = K_usertrap], so [av := KSTACK_AV] *)
+(*     satisfies the depth premise on the nose, at either [eb'].           *)
+(*                                                                        *)
+(*   - THE RESIDUE CLOSER -- the wand that turns what forkret's tail       *)
+(*     yields into the trap loop's kernel-side bundle.  It reads worse     *)
+(*     than it is: [forkret_yield] hands it [ut_trap_parked] and           *)
+(*     [proc_priv_nopt], its own two arguments hand it the allowances,     *)
+(*     and [ut_caps] and [ProofSyscall.syscall_env] are both entirely      *)
+(*     PERSISTENT, so a second process's copy of either costs nothing.     *)
+(*     It takes [fd_slots FDSPARE] / [iref_slots IREFSPARE] as ARGUMENTS   *)
+(*     because those are the child's and live INSIDE                      *)
+(*     [UsertrapRes.ut_own_nopt] rather than beside it -- a closer that    *)
+(*     did not take them would leave the park holding two resources with   *)
+(*     nowhere to put them and its supplier owing two it does not have.    *)
+(*                                                                        *)
+(* SO EXACTLY ONE ROW HAS NO SOURCE: [bslots 3], the first       *)
+(* conjunct of [UsertrapRes.ut_own_nopt].  (The [initproc] share that used *)
+(* to sit beside it is DONE: userint discards the cell right after its     *)
+(* store, so every later reader takes it persistently.)  The pool has room *)
+(* -- [BSLOTS = 1024] against [3 * NPROC = 192] plus main's 35 -- but the  *)
+(* authority [BioInv.bslots_auth] lives inside [bcache_res], behind the    *)
+(* bcache lock, so a bystander cannot mint fragments from persistent facts.*)
+(* THE NATURAL FIX IS NOT A WP STEP: [ProcDefs.proc_dormant] already parks *)
+(* [fd_slots FDSPARE] and [iref_slots (1 + IREFSPARE)] per slot, and three *)
+(* bio slots belong in exactly the same place, carved once at procinit --  *)
+(* whereupon allocproc hands them out with everything else and BOTH        *)
+(* callers can pay this contract in full.                                  *)
+(* ====================================================================== *)
+
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language weakestpre lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import KernelText WireInv.
+Require Import KptExecMap.
+Require Import StackOwn.
+Require Import UserPtTree.
+Require Import ProcGeom.
+Require Import ProcDefs.
+Require Import ProcPtOwn.
+Require Import SwtchCtx.
+Require Import FdSlots.
+Require Import FileInvDefs.
+Require Import IrefSlots.
+Require Import ProcAvail.
+Require Import ProcInv.
+Require Import SchedCtx.
+Require Import UsertrapRes UtResFits.
+Require Import FirstTok.
+Require Import SpecForkret.
+Require Import SpecForkretPark.
+Require Import ChildTok.  (* [my_pay] -- the boot mode's payload row *)
+Require Import ParkCap.   (* [park_token] *)
+Require Import FsCfg.      (* [fsc_cons] *)
+Require Import ConsoleInv.  (* [cons_reader] -- the boot mode's token row *)
+Require Import InitBoot.  (* [init_boot_bundle] -- the BOOT mode's payload *)
+Require Import UexecSlot. (* [uvis] / [uvis_of] *)
+Require Import UexecRet.  (* [uslot] -- required DIRECTLY, the seal does not
+                             travel through a re-export (durable-notes) *)
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Local Open Scope Z_scope.
+Require Import TsoCtx.
+
+Definition forkret_park_pkg
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{XI : CurCtx}
+    (* the trap loop's kernel-side bundle, abstract exactly as [SpecForkret]
+       takes it *)
+    (URes : CpuId -> CurCtx -> uptd -> mword 64 -> ustate -> list fdstate -> gset gname -> mword 32 -> iProp Σ)
+    (* what the closer is handed at the resume beside [first_done] -- the
+       park token, abstract here; see [SpecForkret] and ParkCap.v *)
+    (W : iProp Σ)
+    (γs : list gname) (γw γft γf γtl : gname) (pa ks : mword 64)
+    (* THE PARKED PROCESS'S fd-STATE GHOST NAME.  The package's closer holds
+       that process's fragment bundle, which is keyed on this name; the
+       resume hands back a record [V'] for the same process, and the
+       [pv_fdg V' = g] premise below is what re-keys the bundle onto it.
+       A NAME rather than the whole [pprivate]: the package deliberately
+       does not carry [V] (see this file's header), and the name is the only
+       part of it the bundle needs. *)
+    (g : gname)
+    (* ...AND ITS CHILDREN-ROW GHOST NAME, beside the descriptor
+       one and for its reason: the parked row is at
+       [ProcDefs.pv_chg] of the parked block, and the closer's pure
+       premise below demands the resumed record name the same one --
+       nothing between the park and the resume re-incarnates the
+       slot. *)
+    (γch : gname)
+    (* ...and its cwd's inum -- see [ParkCap.park_pkg] *)
+    (cw : Z) (secc : mword 64)
+    (* ...and its descriptor states, which the parker names off the
+       fragment bundle it holds -- see [ParkCap.park_pkg] *)
+    (sts : list fdstate)
+    (* ...and the parked process's generation and children set, beside
+       [sts] and for its reason -- see [ParkCap.park_pkg] *)
+    (gn : gname) (cs : gset gname)
+    (* ...AND THE PARKED RUN KEY, WHEN THERE IS ONE -- the two modes of a
+       park, selected by the parker.  [None] is the BOOT mode: the resume
+       still runs forkret's boot arm, so no key captured at the park
+       survives it and what the package carries instead is the EXEC BUNDLE
+       that arm spends (the row below), whose slot piece answers at the key
+       kexec builds.  [Some Wk]: the parker holds [FirstTok.first_done]
+       (the row below), the boot arm is dead, and the closer's pure premise
+       re-keys the parker's ONE slot onto the record the steady arm resumes
+       with.  [ParkCap.park_pkg] is this verbatim; the note there is the
+       design. *)
+    (Wk : option uvis)
+    (pid : mword 32) (av : nat) : iProp Σ :=
+  (* [ksp] is spelled out rather than [let]-bound: this bundle is DESTRUCTED
+     by its consumer, and a [let] survives [rewrite /forkret_park_pkg]. *)
+  ((* ---- the persistent world the parked closure captures ---- *)
+   kernel_text ∗
+   wire_inv ∗
+   kmap_at tramp_vpn tramp_ppn KP_rx ∗
+   procs_inv γs ∗
+   UsertrapRes.park_globals cur_ctx γs γw γft γf γtl ∗
+   pslot_used_at pa ∗
+   (* ---- the child's kernel stack, free below its top ---- *)
+   stack_own (KTR := KT1) (add_vec ks (mword_of_int 4096)) av ∗
+   (* ---- THE MODE'S PAYLOAD.  On the steady mode, THE PARKER'S EVIDENCE
+          THAT THE BOOT ARM IS DEAD: [FirstTok.first_done]'s
+          [first_addr ↦₄□ 0] half is incompatible with the boot arm's
+          [first_addr ↦₄ 1] ([FirstTok.first_tok_boot_excl]), which is how
+          forkret REFUTES that arm rather than owing a run key it cannot
+          have.  Persistent, so a parker that has it pays nothing.
+          On the BOOT mode, THE FIRST PROCESS'S EXEC BUNDLE -- what that
+          arm's kexec("/init") is called with, at this record's working
+          directory and descriptor states.  LINEAR.
+          [ParkCap.park_pkg] is this verbatim. ---- *)
+   (match Wk with
+    | Some _ => FirstTok.first_done
+    | None => init_boot_bundle cw secc sts ∗ ConsoleInv.cons_reader fsc_cons 0%nat
+    end) ∗
+   (* ---- the residue closer, at every hart the record may resume on.
+          It takes the two ALLOWANCES the park's own arguments carry
+          ([fd_slots FDSPARE] / [iref_slots IREFSPARE]): those are the
+          child's, they are inside the trap loop's bundle
+          ([UsertrapRes.ut_own_nopt]) rather than beside it, and the record
+          is where they get captured -- so a closer that did not take them
+          would leave the park holding two resources with nowhere to put
+          them and its supplier owing two it does not have. ---- *)
+   (* QUANTIFIED OVER THE DESCRIPTOR, exactly as forkret's own closer is
+          (SpecForkret.v, "THE RESIDUE IS A CLOSER"): the boot arm's kexec
+          replaces the address space, so the table userret runs on is not
+          the one forkret was entered with.  The two page-table facts are
+          HANDED to this wand rather than taken as premises of the park --
+          forkret proves them of the descriptor it actually ends on. *)
+   (* ...AND IT IS HANDED [FirstTok.first_done], which is the whole reason
+          this package is payable at all.  [UsertrapRes.ut_caps] carries
+          [fs_ready] as a conjunct, the syscall environment is derived from
+          it, and that environment's LAST conjunct is [first_done] -- whose
+          discarded [first_addr ↦₄□ 0] half is minted by exactly one
+          instruction in the kernel, the [first = 0] store on forkret's own
+          boot arm.  So a closer that had to OWN either could not be built by
+          userinit, which parks the very process that runs that store.
+          forkret pays both instead (SpecForkret.v, "...AND THE CLOSER IS
+          HANDED [first_done]") and the builder here owes only the
+          persistent rows neither supplies. *)
+   ▷ (∀ (h : CpuId) (Xc : CurCtx) (pt' : uptd) (U' : ustate),
+      ⌜pv_upt (us_V U') = pt'⌝ -∗
+      ⌜ud_data pt' = ud_pas pt'⌝ -∗
+      ⌜proc_pt_wf pt'⌝ -∗
+      (* THE fd-STATE GHOST NAME IS THE PARKED ONE.  The bundle the parker
+         closed over is keyed on [pv_fdg V]; the resume hands back a record
+         [V'] for the SAME process, and nothing between park and resume
+         reassigns a live process's descriptor ghost (only allocproc chooses
+         one).  Saying so here is what lets the closed-over bundle be handed
+         to the residue at [V']. *)
+      ⌜pv_fdg (us_V U') = g⌝ -∗
+      (* ...and its children row -- see [γch] above *)
+      ⌜pv_chg (us_V U') = γch⌝ -∗
+      ⌜pv_gen (us_V U') = gn⌝ -∗
+      ⌜pv_cwi (us_V U') = cw⌝ -∗
+      (* ...AND, ON THE STEADY MODE, THAT THE RESUMED RECORD CARRIES THE
+         PARKED RUN KEY ([UexecRet.urun_eq]).  forkret's steady arm has
+         exactly those facts; [None] asks nothing.  [ParkCap.park_pkg] is
+         this verbatim. *)
+      ⌜match Wk with Some W0 => urun_eq W0 U' | None => True end⌝ -∗
+      UsertrapRes.park_globals Xc γs γw γft γf γtl -∗
+      UsertrapRes.ut_tfk (CID := h) (add_vec ks (mword_of_int 4096)) (us_V U') -∗
+      FirstTok.first_done (XI := Xc) -∗
+      W -∗
+ (* THE RESUMING HART'S TIMER CAPABILITY.  It is a conjunct of
+    [IntrDefs.sie_cap] now (see the note there), so the residue cannot
+    assemble the kernel bundle at the trap without one -- and it must be
+    THIS hart's, which is why it is supplied PER APPLICATION rather than
+    owned by the closer: a record parked before that hart ever booted
+    could not hold it.  forkret has one, out of the very capability it
+    is about to hand back. *)
+      TimerCap.timer_cap (CID := h) -∗
+      forkret_yield (CID := h) (XI := Xc) γf pa (add_vec ks (mword_of_int 4096)) pid av (us_V U') -∗
+      fd_slots FDSPARE -∗
+      iref_slots IREFSPARE -∗
+      (* ...AND, ON THE STEADY MODE, IT YIELDS A SLOT KEYED AT THE RECORD
+         IT RESUMES WITH, beside the residue; on the BOOT mode the record's
+         slot is exec's own receipt and the closer produces only the
+         residue.  [ParkCap.park_pkg] is this verbatim; the note there is
+         the design.  ONE [sts] for the residue and the key -- the
+         package's argument. *)
+      (URes h Xc pt' (add_vec ks (mword_of_int 4096)) U' sts cs pid
+       ∗ match Wk with
+         | Some _ => uslot (uvis_of U' sts gn cs pid)
+         | None => emp
+         end)))%I.
+
+Definition forkret_park_paid_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (URes : CpuId -> CurCtx -> uptd -> mword 64 -> ustate -> list fdstate -> gset gname -> mword 32 -> iProp Σ) (W : iProp Σ)
+    (γs : list gname) (γw γft γf γtl : gname) (pa ks : mword 64) (rest : list (mword 64))
+    (pid : mword 32) (U : ustate) (sts : list fdstate)
+    (* THE GENERATION IS THE BLOCK'S FIELD, not a parameter: see
+       [ParkCap.park_cap]. *)
+    (cs : gset gname) (av : nat)
+    (* WHICH OF THE PACKAGE'S TWO MODES THE CALLER PAID.  A [true] package
+       carries the parked record's RUN KEY -- the projection of the very [U]
+       this park is at, at a placeholder descriptor view, since
+       [UexecRet.urun_eq] does not read one -- and [FirstTok.first_done]
+       beside it; a [false] package carries the first process's exec bundle
+       instead, and its closer yields no slot.  The bit is a PARAMETER rather
+       than an existential inside the package because forkret is the party
+       that cases on it: its steady arm proves the run key of the record it
+       resumes with, and its boot arm is refuted by [first_done]. *)
+    (steady : bool) : Prop :=
+  (length rest = 12%nat) ->
+  (* the record is stored in [procs_inv]'s slot for [pa], so [pa] is one of
+     the NPROC slots -- [SpecAllocproc]'s postcondition says which.  It is
+     what identifies the dispatch payload's existential process with this
+     one; the assumed form gets the same fact out of the payload itself,
+     which it can afford to because it never has to USE the [j]. *)
+  (exists j : nat, pa = proc_addr j /\ (j < NPROC)%nat) ->
+  (* THE PARKED DEPTH, and it is ONE premise now.  A resumption is always
+     at level 1 with interrupts off, but the record's resume wand is
+     [∀ eb'] -- the RESUMER's base enable -- and forkret's budget equation
+     is stated over that [eb'], so the depth must cover the ENABLED arm's
+     reserve as well as forkret's own frame and its deepest callee's.  That
+     callee is now KEXEC, not prepare_return: [6 + trap_res true + K_kexec
+     = 6 + 90 + 188 = 284], which [K_usertrap = 346] already dominates.  So
+     the second premise this used to carry is [lia]'s job, not a caller's.
+       [KSTACK_AV = 346] too, which is not a coincidence: a caller that
+     hands over a whole free kernel stack satisfies this exactly. *)
+  (K_usertrap <= av)%nat ->
+  (* THE PACKAGE IS TAKEN UNDER A LATER.  The proof uses none of it before
+     the context's own [▷] ([ProofForkretPark]'s [iNext]), and that is what
+     lets [ParkCap.park_token] -- whose cap this is -- be a guarded
+     fixpoint: the package's closer names the token, and a parker holds the
+     token only under a later. *)
+  ⊢ own_context cur_ctx -∗
+    forkret_park_pkg URes W γs γw γft γf γtl pa ks (pv_fdg (us_V U))
+      (pv_chg (us_V U)) (pv_cwi (us_V U)) (pv_secc (us_V U)) sts (pv_gen (us_V U)) cs
+      (if steady then Some (uvis_of U [] (pv_gen (us_V U)) cs pid) else None)
+      pid av -∗
+    ▷ W -∗
+    is_kstack pa ks -∗
+    ctx_cells (p_context pa) (forkret_pc :: add_vec ks (mword_of_int 4096) :: rest) -∗
+    (* THE BLOCK, AT THE MODE'S SHAPE.  [ParkCap.park_child] is this
+       verbatim: whole on the steady mode, and on the boot mode split into
+       the deficit block, the working-directory reference and
+       [FirstTok.first_boot]'s four rows -- so that "this record is the
+       first process" is a row the caller pays rather than a promise
+       forkret has to believe.  forkret's steady arm refutes the boot rows
+       against the [first_done] it reads there
+       ([FirstTok.first_boot_done_excl]), and its boot arm takes them
+       already split. *)
+    (if steady then proc_priv γf pa pid U
+     else proc_priv_nocwd γf pa pid U
+          ∗ cwd_ref_at (pv_cwd (us_V U)) (pv_cwi (us_V U))
+          ∗ first_boot
+          (* ...AND THE INCARNATION'S PAIR, at the trivial payload: the
+             boot park is <init>'s, which has no parent to owe, and the
+             pair joins the block at the same store the working directory
+             and the token do ([ProcInv.proc_priv_split_cwd] is six-way).
+             forkret's boot arm hands the persistent half to
+             kexec("/init") for the exec'd image's slot
+             ([SpecKexec.exec_slot_pre]). *)
+          ∗ gen_kq (pv_gen (us_V U)) pa pid (fun _ => True)%I
+          ∗ my_pay (pv_gen (us_V U)) (fun _ => True)%I
+          (* ...and the two quarters, on the pair's footing
+             ([SlotGen.gen_halves_priv]) *)
+          ∗ gen_halves_priv pa pid (pv_gen (us_V U))
+          ∗ (∃ xsv : mword 32, p_xstate pa ↦₄{DfracOwn (1/2)} xsv)) -∗
+    fd_slots FDSPARE -∗
+    iref_slots IREFSPARE -∗
+    |==> own_context cur_ctx ∗ proc_ctx γs pa.
+
+Require Import UserFd.   (* [ufdG] -- carried through the park/forkret seals *)
+
+Module Type FORKRET_PARK_PAID.
+  (* the residue is the module-type parameter it is everywhere else *)
+  (* ...AND THE PARK'S ONE PRODUCER-SIDE ENTRY, threaded with the rest.
+     [UtResFits.USERTRAP_RES_PARK] is [USERTRAP_RES] plus
+     [usertrap_res_bare_park]: the residue stays opaque to every CONSUMER,
+     and the one party that has to BUILD one -- whoever parks a process that
+     has never trapped -- gets a closer instead.  See that file's "THE
+     PARK'S CHANNEL THROUGH THE MODULE TYPES". *)
+  Include UtResFits.USERTRAP_RES_PARK.
+  Parameter forkret_park_paid :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (W : iProp Σ)
+      (γs : list gname) (γw γft γf γtl : gname) (pa ks : mword 64) (rest : list (mword 64))
+      (pid : mword 32) (U : ustate) (sts : list fdstate)
+      (cs : gset gname) (av : nat) (steady : bool),
+      forkret_park_paid_body
+        (fun (h : CpuId) (Xc : CurCtx) => usertrap_res_bare (CID := h) (XI := Xc)) W
+        γs γw γft γf γtl pa ks rest pid U sts cs av steady.
+  (* ...AND THE TOKEN, which is the park as every parker sees it
+     ([ParkCap.park_token]): the cap above at [W := the token] plus the
+     residue's channel, tied into the fixpoint.  This is the one entry the
+     parkers use; the statement above is its proof. *)
+  Parameter park_token_intro :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{XI : CurCtx}
+      (γs : list gname),
+      ⊢ park_token γs.
+End FORKRET_PARK_PAID.

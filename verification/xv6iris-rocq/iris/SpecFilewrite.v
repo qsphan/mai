@@ -1,0 +1,1319 @@
+(* SpecFilewrite.v -- the public interface of filewrite, stated independently
+   of its proof.  Requires only the definitional layer and its callees' SPECS
+   -- never a whole-function proof file -- so every function proof can be
+   checked in parallel.
+
+     int filewrite(struct file *f, uint64 addr, int n) {
+       int r, ret = 0;
+       if (f->writable == 0) return -1;
+       if (f->type == FD_PIPE)   ret = pipewrite(f->pipe, addr, n);
+       else if (f->type == FD_DEVICE) {
+         if (f->major < 0 || f->major >= NDEV || !devsw[f->major].write)
+           return -1;
+         ret = devsw[f->major].write(1, addr, n);
+       } else if (f->type == FD_INODE) {
+         int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+         int i = 0;
+         while (i < n) {
+           int n1 = n - i;
+           if (n1 > max) n1 = max;
+           begin_op();
+           ilock(f->ip);
+           if ((r = writei(f->ip, 1, addr + i, f->off, n1)) > 0) f->off += r;
+           iunlock(f->ip);
+           end_op();
+           if (r != n1) break;          (* error from writei *)
+           i += r;
+         }
+         ret = (i == n ? n : -1);
+       } else panic("filewrite");
+       return ret;
+     }
+
+   308 bytes.  fileread's four arms plus a LOOP, and the loop is the whole
+   difference: each iteration is its own log transaction, so [begin_op] and
+   [end_op] bracket every chunk and the reservation is minted and spent
+   inside the body rather than threaded across the call.
+
+   ==== DECODE FACTS THIS CONTRACT IS STATED AGAINST ====================
+
+   Read off the tracked dump; the four that a reader of the C would get
+   wrong are recorded in claude-notes/projects/fs-sysfile.md (S3a's list):
+
+   1. The [!writable] return at +0x00/+0x04 is BEFORE THE PROLOGUE, so its
+      [ret] at +0x124 runs with sp untouched.  Nothing in the frame exists
+      on that path, which is why this contract's environment must already
+      contain everything the postcondition promises.
+   2. [devsw[major].write] is at OFFSET 8 -- [.read] is the first of the two
+      function pointers -- so the device arm's cell is [devsw + 16*mj + 8]
+      and is NOT [SpecFileread.a_devsw_read].
+   3. [panic("filewrite")] at +0x11e is the ELSE arm (the type is none of
+      FD_PIPE / FD_DEVICE / FD_INODE), exactly like fileread's.  It is NOT a
+      short-write panic: a short write [break]s the loop at +0xc0 and the
+      tail at +0xf4 answers -1.
+   4. [max = ((MAXOPBLOCKS-1-1-2)/2)*BSIZE = 3072], materialised TWICE
+      ([lui]/[addi] into s7 and s9) at +0x42..+0x4e.
+
+   ==== WHAT THE FD_INODE ARM NEEDS THAT FILEREAD DID NOT ===============
+
+   (a) THE TYPE WITNESS (design fs-icache.md §17, closed by §17.6/§17.7 after
+   five iterations).  The arm re-parks [IcacheEscrow.ic_loaded], whose
+   [DirView.dir_ok] conjunct constrains a DIRECTORY's data bytes -- and an
+   arbitrary user write into a directory breaks [dir_inums_ok].  writei
+   cannot change [di_type], and the record is ilock's OUTPUT, so "not a
+   directory" cannot be a premise about a caller-held record.  The real xv6
+   invariant is five frames up: sys_open refuses writable directory fds.
+
+   It crosses as a resource.  The lent share is GENERATION-NAMED
+   ([IcacheRef.inode_shr_gen] at [fwn_g]); SpecIlock's postcondition hands
+   back [IcacheRefDefs.ity_shot fwn_g (di_type dn)] at that same generation
+   (pinned by [live_gen_agree], with no itable fact anywhere); this contract
+   carries the fd's own [ity_shot fwn_g fwn_ty] with [fwn_ty <> T_DIR];
+   [IcacheRefDefs.ity_shot_agree] joins them and [DirView.dir_ok_not_dir]
+   finishes.  A generation sees AT MOST ONE FILL (§17.6), which is what makes
+   that agreement mean anything.
+
+   The witness is CONDITIONAL ON [fc_wbool Cf], exactly as
+   [FileInvDefs.inode_pay] states it: an O_RDONLY directory fd is legal and
+   fileread never needs the fact.  filewrite discharges the condition from
+   its own [f->writable] test at +0x00 -- past that branch the bool is true,
+   and it is true in the caller's [fcontent] because the content fraction is
+   what the [lbu] read.
+
+   The re-park then closes for free: [SpecWritei.wi_dinode] is
+   [MkDinode (di_type dn) ...], so the flushed record's type is
+   DEFINITIONALLY the fill's and every chunk re-parks with the shot it was
+   handed (§17.6 constraint 8).
+
+   (b) THE ALLOCATOR AND THE LOG.  writei calls bmap, which calls balloc, so
+   the arm carries the bitmap, [sb.size], [sb.bmapstart] and balloc's printk
+   credentials; and it is bracketed by begin_op/end_op, so it carries
+   [log_ctx], the crash seam and the generation certificate.  The bitmap
+   is a persistent invariant ([BitmapInv.bitmap_inv]), so nothing about
+   it comes back.
+
+   ==== THE NUMERIC PREMISES, AND THE ONE FILEREAD HAD THAT THIS DOES NOT ==
+
+   writei's joint bound is [off + n1 < 2^31].  Here it is DISCHARGEABLE
+   RATHER THAN INHERITED, and that is the chunking's doing: [n1 <= 3072] by
+   construction and [off <= MAXFILE*BSIZE] by [FileInvDefs.off_wf], so the sum is
+   at most 277504 -- a closed fact.  So this contract does NOT carry
+   fileread's [MAXFILE*BSIZE + n < 2^31] premise, and sys_write will be able
+   to take [n] from unchecked user input where sys_read cannot.  (See
+   claude-notes/design/file-table.md; this is the one place the write side is
+   BETTER off than the read side.)
+
+   [f->off] stays inside [off_wf] for the same reason from the other end:
+   writei answers -1 rather than writing when [MAXFILE*BSIZE < off + n1], so
+   a chunk that returns a count has [off + tot <= MAXFILE*BSIZE].
+
+   ==== WHAT THE POSTCONDITION SAYS =====================================
+
+   [filewrite_ret n r]: minus one, or a count between 0 and n --
+   [PipeInv.pipe_rw_ret] verbatim, as fileread.  The inode arm is strictly
+   inside it and in fact answers [n] or [-1] and nothing between (decode fact
+   3), but stating the sharper fact would buy a caller nothing: sys_write
+   returns the value unexamined, and the pipe and device arms are not sharp.
+
+   The WRITTEN BYTES are not describable here, and that is inherited rather
+   than lost: writei's range clause is about [data'], which lives inside the
+   escrow's parked payload and no caller-held resource names.  The file's
+   OFFSET likewise stays in its inode's off LEDGER (off-ledger ruling). *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import SpecPanic.
+Require Import FdSlots.
+Require Import ProcGeom.
+Require Export SwtchCtx.
+Require Import CpuOwn.
+Require Import SchedCtx.
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import FsBlocks LogInv.
+Require Import FsCrash.
+Require Import DinodeEnc.
+Require Import InodeInv.
+Require Import InodeRegion.
+Require Import IrefSlots.
+Require Import IcacheInv.
+Require Import IcacheEscrow.
+Require Import UserPerm.   (* [perm_of], [lazy_free], [uperm] -- RULING WR-TB *)
+Require Import UserPtTree.
+Require Import KvmSpec.
+Require Import ProcPtOwn.
+Require Import PipeInvDefs.
+Require Import ChildTok.   (* [kill_shot]: the pipe arm's -1-by-kill evidence *)
+Require Import ProcInv.
+Require Import FileInvDefs.
+Require Import BitmapInv.
+Require Import KernelDataInv.
+Require Import SpecPrintk.
+Require Import SpecWritei.
+Require Import ConsoleInv.  (* [a_devsw_write], [devsw_write_val] -- the
+                               devsw geometry lives with the console *)
+Require Import SpecFileread.
+Require Import UartTxInv.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Import Defs.
+Require Import AppInv.      (* [app_step]/[app_inv]: the application's
+                               claim and the step a fire pays for it
+                               (round E2, lane E2-W)                     *)
+Require Import FsBytesGamma.     (* [fs_gamma_L]: the live Γ                 *)
+Require Import SpecCopyin.       (* [ubytes_at]: the content seam (RULING A) *)
+Require Import SysWriteDefs.   (* [FW_MAX], [wri_pre], [wchunks]           *)
+Require Import FsAbsWriteFire.   (* [awrite_chain]: the cursor chain         *)
+Require Import SpecConsolewrite. (* [cons_out_chain]: the callee's premise  *)
+Require Import SpecUartPutc.     (* [uart_base_word]: relayed to consolewrite *)
+Require Import TsoCtx.
+
+Local Open Scope Z_scope.
+
+(* filewrite's own frame is 12 slots ([c.addi16sp sp,sp,-96]: ra, s0, s1,
+   s2..s9 saved), and its deepest callee is WRITEI again at [K_writei] = 78
+   -- not consolewrite at 72, which is what it was before [K_writei] grew
+   (SpecReadi.v's header traces the chain: printk's real stack need, 48, now
+   dominates bmap, which dominates balloc's out-of-blocks arm, which
+   dominates bmap's callers).  consolewrite's own sixteen-slot frame (a
+   32-byte bounce buffer lives in it) sits under either_copyin's 56, and
+   neither of its calls is made with interrupts off, so nothing of
+   [IntrDefs.trap_res] is spendable there; [SpecConsolewrite.consolewrite_stack]
+   has the accounting.  pipewrite (64), begin_op / end_op / ilock / iunlock
+   are all below both.  A CONSTANT, not a per-arm bound: the stack a
+   function may need is a property of the function (durable-notes.md). *)
+Notation filewrite_stack := ((12 + K_writei)%nat) (only parsing).
+(* &devsw[mj].write.  [struct devsw] is two function pointers with [read]
+   FIRST, so the entry is 16 bytes and this field is at offset 8 -- which is
+   what the [slli a5,a5,4] / [ld a5,8(a5)] pair at +0x6c / +0x78 computes.
+   The read side is [SpecFileread.a_devsw_read]; the two must not be
+   confused, and S3a's decode note 2 exists because they were. *)
+(* THE CHUNK SIZE lives in [SysWriteDefs.v] -- the write delta's pure
+   vocabulary leaf -- because the INVARIANT layer needs it too
+   ([FsAbsWriteFire]'s [wri_count_*] and [wchunks]) and a spec file may not
+   own a definition the invariant layer needs
+   (design/code-organization.md).  Its DERIVATION stays here, where the log
+   budget is in scope: as the two [lui]/[addi] pairs at +0x42..+0x4e
+   materialise it, ((MAXOPBLOCKS-1-1-2)/2)*BSIZE with MAXOPBLOCKS = 10 and
+   BSIZE = 1024. *)
+Lemma fw_max_value : FW_MAX = ((Z.of_nat MAXOPBLOCKS - 1 - 1 - 2) / 2) * Z.of_nat BSIZE.
+Proof. reflexivity. Qed.
+
+(* WHAT FILEWRITE RETURNS.  [PipeInv.pipe_rw_ret]'s reading, and deliberately
+   the same predicate as [SpecFileread.fileread_ret]: three of the four arms
+   produce it verbatim and the inode arm is strictly inside it. *)
+Definition filewrite_ret (n : Z) (r : mword 64) : Prop := pipe_rw_ret n r.
+
+Lemma filewrite_ret_m1 (n : Z) : filewrite_ret n (mword_of_int (-1) : mword 64).
+Proof. left. reflexivity. Qed.
+
+Lemma filewrite_ret_all (n : Z) : 0 <= n -> filewrite_ret n (mword_of_int n : mword 64).
+Proof. intro Hn. right. exists n. split; [reflexivity | lia]. Qed.
+
+(* THE CHUNKING'S ARITHMETIC, in one lemma: writei's joint premise is a
+   CLOSED FACT here, not an inherited obligation.  [off] is bounded by
+   [FileInvDefs.off_wf] and the chunk by the [max] the code computes, so the sum
+   cannot approach 2^31 whatever the caller's [n] is.  This is why
+   SpecFilewrite has no counterpart of [SpecFileread]'s
+   [MAXFILE*BSIZE + n < 2^31] premise. *)
+Lemma fw_chunk_joint (off n1 : nat) :
+  (Z.of_nat off <= Z.of_nat MAXFILE * Z.of_nat BSIZE) ->
+  (Z.of_nat n1 <= FW_MAX) ->
+  Z.of_nat off + Z.of_nat n1 < 2 ^ 31.
+Proof.
+  unfold FW_MAX, MAXFILE, BSIZE, NDIRECT. cbn. lia.
+Qed.
+
+(* ...and the offset's own induction step, filewrite's counterpart of
+   [SpecFileread.fileread_off_advance].  writei REFUSES rather than writes
+   when the range would leave the file's capacity, so a chunk that returns a
+   count leaves the offset inside [off_wf]. *)
+Lemma fw_off_advance (off tot n1 : nat) :
+  ((MAXFILE * BSIZE < off + n1)%nat -> False) ->
+  (tot <= n1)%nat ->
+  (off + tot <= MAXFILE * BSIZE)%nat.
+Proof. intros Hle Htot. lia. Qed.
+
+(* ---------------------------------------------------------------------- *)
+(*  The ghost names and geometry the two heavy arms are indexed by          *)
+(* ---------------------------------------------------------------------- *)
+(* NOTHING PER-INODE IS IN HERE (fs-sysfile S4' / blocker 2's ratified
+   alternative; [SpecFilestat.fstat_names] is the landed template and
+   [SpecFileread.fread_names] the sibling).  NINE fields went: the itable
+   slot, the inum, the lent share's fraction, its GENERATION, the recorded
+   inode TYPE, the entry's two sleeplock gnames, the device and the region's
+   block count.  Every one of them is something a CALLER cannot know -- a
+   reference borrowed out of [ProcInv.ofile_slot] comes with its slot,
+   fraction and content existentially quantified -- and every one comes out
+   of the reference itself ([SpecFileread.fileread_pay_carve], which is
+   [SpecFilestat.filestat_pay_carve] GROWN by the [ty] output precisely so
+   that filewrite's [ity_shot] can come from the same place), or is the
+   ambient cache's ([IcacheRefDefs.icfg_dev] / [icfg_nib]), or is existential
+   under the sleeplock FAMILY. *)
+Record fwrite_names := MkFWriteNames {
+  fwn_procs      : list gname;    (* the proc table's per-slot lock names   *)
+  fwn_j          : nat;           (* the running process's index            *)
+  fwn_plock      : gname;
+  fwn_txlock     : gname;         (* uart tx_lock -- the DEVICE arm's        *)
+  (* [fwn_uart] / [fwn_disk] / [fwn_dlock] / [fwn_bio] / [fwn_pr] /
+     [fwn_bmapstart] / [fwn_size] ARE GONE (rank 1d): each was a copy of a
+     [FsCfg.fscfg] field.  The three ring pages stay for FsCfg.v's
+     ruling-R1 reason. *)
+  fwn_pd         : mword 64;
+  fwn_pav        : mword 64;
+  fwn_pu         : mword 64;
+  fwn_dqs        : dfrac;         (* sb.inodestart                          *)
+  fwn_dqb        : dfrac;         (* sb.bmapstart                           *)
+  fwn_dqbs       : dfrac;         (* sb.size                                *)
+  (* THE DEVICE TABLE'S WRITE COLUMN, AS FUNCTIONS OF THE MAJOR -- the read
+     side's story verbatim (SpecFileread.v's note): one cell covers one
+     major, and a syscall cannot know which major its descriptor names. *)
+  fwn_wp         : Z -> mword 64; (* devsw[mj].write                        *)
+  fwn_dqv        : Z -> dfrac;    (* ...and that cell's fraction            *)
+}.
+
+(* Spelled out rather than derived, exactly as [SpecFileread.fread_names] is:
+   several of these records have no [Inhabited] instance of their own and
+   [bio_names] has function fields.  Nothing reads these values -- a caller
+   that passes them cannot reach the arm they belong to -- so any closed term
+   does. *)
+Global Instance fwrite_names_inhabited : Inhabited fwrite_names :=
+  populate (MkFWriteNames
+    [] 0%nat 1%positive
+
+
+ 1%positive
+    (mword_of_int 0) (mword_of_int 0) (mword_of_int 0)
+
+
+
+    (DfracOwn 1) (DfracOwn 1) (DfracOwn 1)
+    (fun _ => mword_of_int 0) (fun _ => DfracOwn 1)).
+
+(* THE DUPLICATE [!icacheG Σ] IS GONE.  [fileG] BUNDLES [icacheG] (and the
+   [icfg]), so binding both gives TWO instances and propositions that print
+   identically but do not unify (durable-notes.md).  It was invisible while
+   nothing here mixed the two; the carve does -- the payload's share is at
+   [fileG]'s [icfg_dev].  Same edit as SpecFilestat's and SpecFileread's. *)
+Section SpecFilewrite.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  (* ---- the FD_DEVICE arm's environment ---- *)
+
+  (* WHAT THE CALLEE NEEDS, as opposed to what the DISPATCH needs.  The cell
+     below is how filewrite finds consolewrite; this is what consolewrite
+     itself asks for (SpecConsolewrite.v) -- uartwrite's whole credential,
+     the device fabric and the transmit lock.  Both are PERSISTENT, so a
+     caller pays for them once and the loop carries them for free, and the
+     read side's twin ([SpecFileread.fileread_dev_caps]) is one conjunct
+     rather than two because consoleread never touches the UART. *)
+  Definition filewrite_dev_caps (fn : fwrite_names) : iProp Σ :=
+    (dev_inv (fsc_uart) (fsc_disk) ∗
+     is_txlock (fwn_txlock fn) (fsc_uart) ∗
+     (* since 163d39b uartwrite LOADS its MMIO base out of uarts[i].base
+        rather than spelling it as a constant, so consolewrite relays the
+        .data word -- AT THE VA TIER, which is the only tier an S-mode load
+        leaf consumes and the only one the driver's contract will take (the
+        raw physical [UartsFields.uarts_pinned] does not cross).  Genuinely
+        absent from filewrite's own context: kernel_text / kernel_data do not
+        cover .data, and panic_env's [prputc_env] carries the same word at
+        [Uart1] -- right tier, wrong port. *)
+     SpecUartPutc.uart_base_word Uart0)%I.
+
+  Global Instance filewrite_dev_caps_persistent fn :
+    Persistent (filewrite_dev_caps fn).
+  Proof using . apply _. Qed.
+
+  (* ONE cell, and only when the major is in range.  The disjunction is the
+     honest statement of what the kernel installs: [consoleinit] fills
+     [devsw[CONSOLE]] and nothing fills any other entry, so a write slot is
+     either null (and the code returns -1) or [consolewrite] (whose
+     contract, [SpecConsolewrite.CONSOLEWRITE], is what the walk
+     calls -- at every major, since this disjunction pins none).  The
+     address is [a_devsw_write], NOT
+     [SpecFileread.a_devsw_read]: decode note 2. *)
+  (* keyed on the MAJOR, [SpecFileread.fileread_dev_env]'s twin -- see its
+     note for why the lower bound joined the range test. *)
+  Definition filewrite_dev_env (fn : fwrite_names) (mj : Z) : iProp Σ :=
+    (if decide (0 <= mj <= NDEV_max)
+     then ⌜fwn_wp fn mj = (zero_reg : mword 64)
+           \/ fwn_wp fn mj
+               = (mword_of_int KernelSyms.consolewrite : mword 64)⌝ ∗
+          a_devsw_write mj ↦₈{fwn_dqv fn mj} fwn_wp fn mj ∗
+          filewrite_dev_caps fn
+     else emp)%I.
+
+  (* it is only READ, so it comes back as it went in *)
+  Definition filewrite_dev_out (fn : fwrite_names) (mj : Z) : iProp Σ :=
+    filewrite_dev_env fn mj.
+
+  (* ---- THE WHOLE COLUMN, and how one entry comes out of it ----
+     [SpecFileread.fileread_devsw]'s twin at the write side, and there for the
+     same reason: it is what a caller that cannot name its descriptor's major
+     must own. *)
+  Definition filewrite_devsw (fn : fwrite_names) : iProp Σ :=
+    (filewrite_dev_caps fn ∗
+     [∗ list] i ∈ seq 0 (Z.to_nat NDEV_max + 1),
+       ⌜fwn_wp fn (Z.of_nat i) = (zero_reg : mword 64)
+         \/ fwn_wp fn (Z.of_nat i)
+             = (mword_of_int KernelSyms.consolewrite : mword 64)⌝ ∗
+       a_devsw_write (Z.of_nat i) ↦₈{fwn_dqv fn (Z.of_nat i)}
+         fwn_wp fn (Z.of_nat i))%I.
+
+  (* ---- THE COLUMN, OUT OF THE CONSOLE INVARIANT ----------------------
+     [SpecFileread.fileread_devsw_of_console]'s twin.  The CAPS half differs
+     and is NOT here: consolewrite drives the UART, so [filewrite_dev_caps]
+     is [dev_inv] and the tx lock rather than [is_conslock], and both come
+     from [printk_env] -- which is why this lemma takes them rather than
+     producing them.  The CELLS are the same table.
+     -------------------------------------------------------------------- *)
+  Lemma filewrite_devsw_of_console (fn : fwrite_names) :
+    fwn_wp fn = ConsoleInv.devsw_write_val ->
+    fwn_dqv fn = (fun _ => DfracDiscarded) ->
+    filewrite_dev_caps fn -∗ ConsoleInv.devsw_table -∗ filewrite_devsw fn.
+  Proof using .
+    intros Hwp Hdq. iIntros "#Hcaps #Htbl".
+    rewrite /filewrite_devsw Hwp Hdq.
+    iSplitR; [iExact "Hcaps" |].
+    rewrite /ConsoleInv.devsw_table.
+    iApply (big_sepL_impl with "Htbl").
+    iModIntro. iIntros (k i Hk) "[_ Hw]".
+    iSplitR; [iPureIntro; apply ConsoleInv.devsw_write_val_cases |].
+    iExact "Hw".
+  Qed.
+
+  Lemma filewrite_devsw_acc (fn : fwrite_names) (mj : Z) :
+    filewrite_devsw fn -∗
+    filewrite_dev_env fn mj ∗ (filewrite_dev_out fn mj -∗ filewrite_devsw fn).
+  Proof using .
+    (* THE UNFOLD ORDER MATTERS: [/filewrite_dev_out] rewrites to [filewrite_dev_env], so
+       unfolding [filewrite_dev_env] FIRST leaves the out side folded and the
+       closing [iExact] fails on two terms that print differently for that
+       reason alone. *)
+    rewrite /filewrite_dev_out /filewrite_dev_env /filewrite_devsw.
+    iIntros "[#Hcaps H]".
+    case_decide as Hle;
+      [| iSplitR; [done | iIntros "_"; iFrame "Hcaps"; iExact "H"]].
+    destruct Hle as [Hnn Hle].
+    set (i := Z.to_nat mj).
+    assert (Hid : Z.of_nat i = mj)
+      by (rewrite /i; apply Z2Nat.id; exact Hnn).
+    assert (Hlk : seq 0 (Z.to_nat NDEV_max + 1) !! i = Some i).
+    { rewrite lookup_seq. split; [reflexivity|].
+      rewrite /i. exact (devsw_idx_lt _ Hnn Hle). }
+    (* an EXPLICIT [Phi]: underscores leave the big-op's typeclass evars
+       unresolved and the destructuring pattern then fails (durable-notes.md) *)
+    iDestruct (big_sepL_lookup_acc
+                 (fun (_ : nat) (jj : nat) =>
+                    (⌜fwn_wp fn (Z.of_nat jj) = (zero_reg : mword 64)
+                      \/ fwn_wp fn (Z.of_nat jj)
+                          = (mword_of_int KernelSyms.consolewrite : mword 64)⌝ ∗
+                     a_devsw_write (Z.of_nat jj) ↦₈{fwn_dqv fn (Z.of_nat jj)}
+                       fwn_wp fn (Z.of_nat jj))%I)
+                 _ i i Hlk with "H") as "[Hone Hback]".
+    iEval (rewrite Hid) in "Hone".
+    iSplitL "Hone".
+    { iDestruct "Hone" as "[Hp Hc]". iFrame "Hp Hc". iExact "Hcaps". }
+    iIntros "(Hp & Hc & _)". iFrame "Hcaps".
+    iApply "Hback". rewrite Hid. iFrame "Hp Hc".
+  Qed.
+
+  (* ---- the FD_INODE arm's environment ----------------------------------
+     begin_op's, ilock's, writei's, iunlock's and end_op's, in that order.
+     It is bigger than fileread's by exactly the log and the allocator, which
+     is what makes this a WRITE.
+
+     CONTENT-INDEPENDENT, in [SpecFilestat.filestat_fs_env]'s form: the
+     escrow FAMILY, the sleeplock FAMILY, the off-borrow FAMILY, and the
+     region-WIDE inum geometry (BOTH geometry facts quantified, since the
+     inum is existential in the reference).  It names neither [Cf], nor an
+     itable slot, nor an fd slot, so a syscall that has not yet borrowed its
+     descriptor can own it.  The per-inode pieces -- including §17.6's type
+     witness, which used to sit at the end of this bundle -- come out of the
+     reference at the call ([SpecFileread.fileread_pay_carve]). *)
+  Definition filewrite_fs_env (γf : gname) (fn : fwrite_names) : iProp Σ :=
+    (⌜log_geom_ok fsc_cov fsc_logst⌝ ∗
+     ⌜0 <= icfg_ist⌝ ∗
+     (* EVERY inum the region covers has its block inside [cov] *)
+     ⌜forall inum : mword 32,
+        bv_unsigned inum < 16 * Z.of_nat icfg_nib ->
+        IBLOCK inum icfg_ist ∈ fsc_cov⌝ ∗
+     (* ...and none of those blocks is one of the log's own slots.  writei's
+        iupdate flushes the inode's block, and this is iupdate's premise,
+        quantified for the same reason as the one above. *)
+     ⌜forall inum : mword 32,
+        bv_unsigned inum < 16 * Z.of_nat icfg_nib ->
+        ~ (IBLOCK inum icfg_ist
+             ∈ log_region_set fsc_logst)⌝ ∗
+     (* the bitmap's geometry, forwarded through bmap to balloc *)
+     ⌜bitmap_geom_ok fsc_cov fsc_logst (fsc_bmapstart)
+                     (fsc_size)⌝ ∗
+     bio_ctx (fsc_bio)
+       (fs_view fsc_fs (fsc_disk) icfg_dev fsc_cov) ∗
+     (* THE LOG: begin_op mints the reservation, end_op spends it, and the
+        loop does one transaction PER CHUNK *)
+     log_ctx icfg_log (fsc_bio) fsc_fs fsc_cov
+             fsc_logst icfg_dev ∗
+     (* end_op's crash seam and era certificate *)
+     fs_crash_seam fsc_cov fsc_logst ∗
+     gen_cert ∗
+     (* balloc's two PERSISTENT printk credentials *)
+     kernel_data ∗
+     printk_env (fsc_printk) (fsc_uart) (fsc_disk) ∗
+     (* THE THREE PERSISTENT ICACHE INVARIANTS SpecIlock / SpecIunlock take,
+        the escrow at the FAMILY where it was per-slot *)
+     itable_inv ∗
+     IcacheInv.iref_claims ∗
+     ic_escrows fsc_ic fsc_fs fsc_ireg fsc_cov
+                fsc_logst ∗
+     ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib ∗
+     (* EVERY ENTRY'S SLEEPLOCK -- over the CHECKOUT TOKEN alone *)
+     ic_sleeplocks fsc_ic ∗
+     (* THE LENT SHARE AND ITS GENERATION'S TYPE WITNESS ARE NOT HERE.
+        Both used to be: the generation-named share (design fs-icache.md
+        §17.3, ratified §17.4) and [ity_shot] at that generation (§17.6 (5),
+        ratified §17.7), the resource that carries sys_open's "no writable
+        directory fd" down to the re-park.  Both are EXACTLY what
+        [FileInvDefs.inode_pay] holds, in exactly those forms -- which is why
+        asking a caller for them was always redundant and, once the caller is
+        a syscall, unsatisfiable.  [SpecFileread.fileread_pay_carve] hands out
+        the share, the generation, [ity_shot] AND the [fc_wbool] side
+        condition together, and takes the share back. *)
+     (* sb.inodestart (iupdate), sb.size and sb.bmapstart (bmap -> balloc) *)
+     sb_inodestart ↦₄{fwn_dqs fn}
+       (mword_of_int icfg_ist : mword 32) ∗
+     sb_size ↦₄{fwn_dqbs fn} (mword_of_int (fsc_size) : mword 32) ∗
+     sb_bmapstart ↦₄{fwn_dqb fn} (mword_of_int (fsc_bmapstart) : mword 32) ∗
+     (* THE BITMAP's invariant (BitmapInv.v): the pool bmap -> balloc draws
+        from; persistent, and it says nothing about which blocks are in use *)
+     bitmap_inv fsc_fs (fsc_bmapstart) fsc_cov fsc_logst
+                (fsc_size) ∗
+     (* the disk fabric *)
+     dev_inv (fsc_uart) (fsc_disk) ∗
+     disk_geom (fsc_disk) (fwn_pd fn) (fwn_pav fn) (fwn_pu fn) ∗
+     is_lock (fsc_dlock) d_lock "virtio_disk"%string
+       (disk_res_at (fsc_disk) (fwn_pd fn) (fwn_pav fn) (fwn_pu fn)) ∗
+     (* THREE slot units: writei's peak (bmap's, and its own bread held
+        across either_copyin and log_write).  ilock's bread and end_op's
+        commit borrow from the same three, one transaction at a time. *)
+     bslots 3)%I.
+
+  (* What comes back: the three superblock fields and the slot units.  NO
+     SHARE: it never left the reference's payload, so there is nothing here
+     for it to be returned through, and hence no generation to lose (which
+     is what made a returned [inode_shr] ungatherable in the first place).
+     And nothing about the bitmap: its invariant is persistent. *)
+  Definition filewrite_fs_out (fn : fwrite_names) : iProp Σ :=
+    (sb_inodestart ↦₄{fwn_dqs fn}
+       (mword_of_int icfg_ist : mword 32) ∗
+     sb_size ↦₄{fwn_dqbs fn} (mword_of_int (fsc_size) : mword 32) ∗
+     sb_bmapstart ↦₄{fwn_dqb fn} (mword_of_int (fsc_bmapstart) : mword 32) ∗
+     bslots 3)%I.
+
+  (* ---- and the three, selected by the file's type ---- *)
+  (* keyed on the descriptor's STATE -- see [SpecFileread.fileread_env]. *)
+  Definition filewrite_env (γf : gname)
+      (fn : fwrite_names) (st : fdstate) : iProp Σ :=
+    (match st with
+     | FdOpen _ _ (FdPipe _)    => emp
+     | FdOpen _ _ (FdDevice mj) => filewrite_dev_env fn mj
+     | FdOpen _ _ (FdInode _ _ _)   => filewrite_fs_env γf fn
+     | FdClosed             => emp
+     end)%I.
+
+  Definition filewrite_env_out (fn : fwrite_names) (st : fdstate)
+      : iProp Σ :=
+    (match st with
+     | FdOpen _ _ (FdPipe _)    => emp
+     | FdOpen _ _ (FdDevice mj) => filewrite_dev_out fn mj
+     | FdOpen _ _ (FdInode _ _ _)   => filewrite_fs_out fn
+     | FdClosed             => emp
+     end)%I.
+
+  (* THE EARLY RETURN'S OBLIGATION, checked here rather than discovered in
+     the proof: [f->writable == 0] returns BEFORE THE PROLOGUE (decode note
+     1) and before the type is ever tested, so the environment must already
+     contain everything the postcondition promises. *)
+  Lemma filewrite_fs_env_out γf fn :
+    filewrite_fs_env γf fn -∗ filewrite_fs_out fn.
+  Proof using .
+    rewrite /filewrite_fs_env /filewrite_fs_out.
+    iIntros "(_ & _ & _ & _ & _ & _ & _ & _ & _ & _ & _ & _ & _ & _ & _ & _ &
+              Hsbi & Hsbs & Hsbb & _ & _ & _ & _ & Hbsl)".
+    iFrame "Hsbi Hsbs Hsbb Hbsl".
+  Qed.
+
+  Lemma filewrite_env_out_of_env γf fn st :
+    filewrite_env γf fn st -∗ filewrite_env_out fn st.
+  Proof using .
+    rewrite /filewrite_env /filewrite_env_out.
+    destruct st as [|? ? [? ? ?| |?]]; try by iIntros "$".
+    iApply filewrite_fs_env_out.
+  Qed.
+
+  (* A file that is neither a pipe, nor a device, nor an inode costs its
+     writer nothing -- the arm is [panic] at +0x11e (decode note 3), and
+     [SpecPanic] discharges it. *)
+  Lemma filewrite_env_none γf fn :
+    ⊢ filewrite_env γf fn FdClosed.
+  Proof using . done. Qed.
+
+  (* =================================================================== *)
+  (*  THE ARMED POSTS, ONE PER DESCRIPTOR STATE                           *)
+  (* =================================================================== *)
+
+  (* ONE SPEC PER SYSCALL.  filewrite has ONE contract, over every
+     descriptor kind, and what the descriptor's STATE keys is a
+     caller-supplied INPUT ([filewrite_in]) and an armed OUTPUT
+     ([filewrite_arms]) -- the same key the CODE branches on.  The arms are
+     below: the chunk chain's two posts on an inode, the caller's own
+     cursor on the console, the landed blanket and nothing more anywhere
+     else.
+
+     Since lane OUT-FUPD there is no console RECEIPT: what the bytes mean
+     was settled inside the view shifts the caller supplied at the store,
+     so what comes back is the caller's own [Q] at the count. *)
+
+  (* ---- THE INODE ARM ------------------------------------------------- *)
+
+  (* ret n (0 <= n): every byte landed.  The fired chunks concatenate to the
+     whole count, their concatenation IS the caller's own run at [ua] in the
+     image it lent (RULING A), and the chain's node at the stop position
+     hands back the cursor.  Every chunk was FULL (a short one ends the loop
+     at -1), so the chain resumes exactly at [length bss].
+
+     THERE IS NO PER-CHUNK RECEIPT BUNDLE, and none is needed: whatever the
+     caller wants to record per chunk it records in the PREFIX CURSOR [Q],
+     inside the phase 2 that builds the next node, and
+     [awrite_chain … Q (length bss) _] IS [Q (length bss)] at the stop
+     ([FsAbsWriteFire.awrite_chain_cursor]). *)
+  (* [P] IS THE WRITER'S OWN TABLE (lane WRITE-RELAY-2), the one
+     [filewrite_extra] already carries for the console arm's short return:
+     the chain the caller gets BACK names it, because its partial arms carry
+     the reason a copy gave up ([FsAbsWriteFire.awrite_part_at]).  Nothing
+     above [filewrite_extra] moved -- exactly the read side's finding. *)
+  Definition write_post_ok_at Γ (i : Z) (γo : gname) (P : uptd) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ) : iProp Σ :=
+    (∃ bss : list (list (bv 8)),
+       ⌜Z.of_nat (length (concat bss)) = n⌝ ∗
+       ⌜(length bss <= wchunks n)%nat⌝ ∗
+       ⌜ubytes_at M ua (concat bss)⌝ ∗
+       awrite_chain_at Γ appE i γo M ua P n Q (length bss)
+         (wchunks n - length bss)%nat)%I.
+
+  (* ret -1: filewrite's honest partial arm.  A PREFIX of chunks fired --
+     possibly empty -- their deltas are REAL, and the total falls short of
+     the count.  The short chunk that ENDED the loop is deliberately not in
+     [bss]: writei's disturbed tail is not the splice.  BUT IT IS NOT
+     SILENT: if anything landed, the kernel took the chain's PARTIAL arm and
+     the row moved, so the chain resumes ONE node past the prefix ([x = 1])
+     and the cursor at that position is what the caller built inside that
+     arm's phase 2; on writei's -1, on a chunk that landed nothing, and on
+     the never-entered loop nothing moved ([x = 0]).  The cursor's position
+     is the whole of what says which of the two happened -- there is no
+     separate short-chunk receipt. *)
+  Definition write_post_fail_at Γ (i : Z) (γo : gname) (P : uptd) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ) : iProp Σ :=
+    (∃ (bss : list (list (bv 8))) (x : nat),
+       ⌜Z.of_nat (length (concat bss)) < n \/ (n < 0 /\ bss = [])⌝ ∗
+       ⌜(length bss + x <= wchunks n)%nat⌝ ∗
+       ⌜(x <= 1)%nat⌝ ∗
+       ⌜ubytes_at M ua (concat bss)⌝ ∗
+       awrite_chain_at Γ appE i γo M ua P n Q (length bss + x)
+         (wchunks n - length bss - x)%nat)%I.
+
+  (* THERE IS NO THIRD ARM ("the row does not read as a FILE"):
+     [FileInvDefs.inode_pay]'s FD_INODE arm carries the not-a-device
+     conjunct, and [SpecWritei]'s success arm reports [off <= di_size] of the
+     pre-write record, so no chunk the loop completes has to be skipped and
+     the two arms are keyed on the return value alone. *)
+  Definition write_arms_at Γ (i : Z) (γo : gname) (P : uptd) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ)
+      (r : mword 64) : iProp Σ :=
+    ((⌜r = (mword_of_int n : mword 64) /\ 0 <= n⌝
+      ∗ write_post_ok_at Γ i γo P n M ua Q)
+     ∨ (⌜r = (mword_of_int (-1) : mword 64)⌝
+        ∗ write_post_fail_at Γ i γo P n M ua Q))%I.
+
+  (* =================================================================== *)
+  (*  THE WRITER'S TABLE GUARD (RULING WR-TB)                              *)
+  (* =================================================================== *)
+  (* WHAT A HELD CHAIN'S NODES MAY ASSUME ABOUT THE PAGE TABLE THEY ARE
+     FIRED AT, and it is not a predicate the program chooses.  Lane
+     WRITE-RELAY-3 asked for a free [TB : uptd -> Prop] on the [∀ P]; that
+     is not dischargeable, because the one place the program's choice and
+     the kernel's [P] meet -- [UexecExecInst.xv6_sbundle]'s row 16 -- is a
+     function of a [UexecSlot.uvis], which by construction has NO [uptd]
+     field (the page table is not user-visible state).  The guard that IS
+     dischargeable is the one the key's own three rows already determine,
+     and it is exactly what [UEchoFile.ef_relay4] needs to refute the
+     partial arm: the table is well formed, its permission map at the
+     break IS the key's, and -- when the key says the break is not lazy --
+     its free tail is free.  The kernel proves all three off [ProcInv]'s
+     own readings of [proc_priv]; the program assumes them. *)
+  Definition wr_tb (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool)
+      (P : uptd) : Prop :=
+    ProcPtOwn.proc_pt_wf P
+    /\ perm_of (ud_um P) sz = pmv
+    /\ (lz = false -> lazy_free (ud_um P) sz).
+
+  (* THE VACUITY CHECK (the bar's rule for a new guard): the guard is not
+     free -- a client cannot instantiate it at [False] and walk away with a
+     chain it never has to pay, because the KERNEL is what discharges it,
+     and at the key's own three values it always can. *)
+  Example vacuity_wr_tb_not_empty (P : uptd) (sz : Z) :
+    ProcPtOwn.proc_pt_wf P ->
+    wr_tb (perm_of (ud_um P) sz) sz true P.
+  Proof using .
+    intro Hwf. rewrite /wr_tb.
+    split; [ exact Hwf | split; [ reflexivity | intro Hc; discriminate Hc ] ].
+  Qed.
+
+  (* =================================================================== *)
+  (*  THE HELD ROW'S ARMS (lanes OFF-LINK-4/5; design/app-file.md SS3,      *)
+  (*  SS3.5)                                                               *)
+  (* =================================================================== *)
+  (* WHAT A HELD DESCRIPTOR'S WRITE PAYS, and it is the owner's principle
+     spelled at this coupling.  The LINK arm: the caller's chain is the
+     CLIENT-ADVANCED one ([FsAbsWriteFire.awrite_chain_adv]), whose nodes
+     hand the box's arm back ADVANCED BY THE CHUNK.  Its half is in the
+     NODE'S OWN CLOSURE, not in the kernel's hands -- so the node reads the
+     offset it is fired at off that half ([UserOff.uoff_agree_k] against the
+     arm it was lent), INSIDE its own [forall off], and nothing has to be
+     relayed in from outside.  (Lane OFF-LINK-4 relayed it, at the anchored
+     chain; lane OFF-LINK-5 found the half belongs in the closure, and with
+     it the anchor, the kernel's carried [uoff] and the fire's whole
+     supplier step all go away -- FsAbsWriteFire's section 2b.)  The TAINT
+     arm: today's plain chain beside [app_taint], which is what the generic
+     tier pays with (the survey's Fact A) and what a disconnected object
+     leaves.
+
+     AND THERE IS NO SECOND POST.  What the caller gets back that a parked
+     one does not -- its own half at the position the file reached -- rides
+     in ITS OWN CURSOR [Q], which is where its nodes put it, so
+     [filewrite_extra] is the landed [write_arms_at] at BOTH modes and no
+     consumer above the fire learns which row it was.
+
+     THE MATCH IS OUTSIDE THE [∀ P] on both arms, so WRITE-RELAY-3's guard
+     ([∀ P, ⌜TB P⌝ -∗]) goes in front of each chain without restating
+     this. *)
+  Definition filewrite_in_held (pmv : gmap (mword 27) uperm) (sz : Z)
+      (lz : bool) (i : Z) (γo : gname) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ) : iProp Σ :=
+    ((* THE CHAIN, UNDER THE WRITE GUARD (RULING WR-TB).  The guard is the
+        three facts about the page table the fire will run on, stated at
+        the three USER-VISIBLE values the key already fixes; the KERNEL is
+        what discharges it, at [ProofFilewriteChain.fw_au_st_init].
+        NOTHING SITS BESIDE THE CHAIN.  An earlier draft put an unguarded
+        [Q 0%nat] here so that the [-1] exits could hand the cursor back
+        without naming a table; that made the client pay its cursor TWICE
+        (once as [Q 0], once inside the chain), which no client holding a
+        single cursor can do.  The [-1] exits instantiate the guard
+        instead -- they are the kernel, so they have the table
+        ([filewrite_extra_neg]). *)
+      (∀ P : uptd, ⌜wr_tb pmv sz lz P⌝ -∗
+                   awrite_chain_adv (fs_gamma_L fsc_fs) appE i γo M ua P n
+                     Q 0%nat (wchunks n))
+     ∨ (awrite_chain (fs_gamma_L fsc_fs) appE i γo M ua n Q 0%nat (wchunks n)
+        ∗ app_taint))%I.
+
+  (* [write_held_post] IS GONE (lane OFF-LINK-5), with its two constructors.
+     It said "the caller's half comes back at [off0 + d], or the taint says
+     why", and it was unstatable at the shape it was landed in: its [off0]
+     was the payment's EXISTENTIAL, and a caller that has handed the half in
+     cannot line the post's witness up with the one it named.  At the
+     client-advanced chain the question does not arise -- the half never
+     leaves the client's closure, so what comes back is whatever the
+     client's own nodes put in [Q], at the position they moved it to. *)
+
+  (* the arms refine the landed blanket: each pins [r] *)
+  Lemma write_arms_at_ret Γ (i : Z) (γo : gname) (P : uptd) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ)
+      (r : mword 64) :
+    write_arms_at Γ i γo P n M ua Q r -∗ ⌜filewrite_ret n r⌝.
+  Proof using .
+    rewrite /write_arms_at. iIntros "[[%Hok _] | [%Hm1 _]]"; iPureIntro.
+    - destruct Hok as [Hr Hn]. rewrite Hr. exact (filewrite_ret_all n Hn).
+    - rewrite Hm1. exact (filewrite_ret_m1 n).
+  Qed.
+
+  (* ---- THE CONSOLE ARM ----------------------------------------------- *)
+
+  (* THE THREE ARMS, keyed on a0.  [wcons_ok] / [wcons_short] -- the
+     located receipts that said "these bytes were accepted, in order, after
+     the seed" -- are RETIRED with the rest of the prefix/sublist
+     vocabulary (lane OUT-FUPD, F4).  The NEG arm is filewrite's own sign
+     guard, the only -1 the console premises leave reachable. *)
+  (* THE ARMED DISJUNCTION AT THE CALLER'S OWN CURSOR (lane OUT-FUPD).
+     [wcons_ok]/[wcons_short] said "these bytes were accepted, in order,
+     after the seed"; the caller now knows that already -- it justified
+     every one of them at its store -- so what comes back is its own
+     payload at the count consolewrite reached, exactly as the inode arm's
+     [write_arms_at] hands back [Q] at the chunk cursor. *)
+  (* ...AND THE SHORT ARM CARRIES ITS REASON (lane TRAP-ROWS, T1), which
+     is the twin of the read's swallow reason ([SpecFileread.
+     console_receipt]'s [~ uva_wmapped]).  consolewrite's loop has one
+     break -- [either_copyin(...) == -1] -- so a count below the request
+     says that a byte of the run at or after the cursor is on a page the
+     kernel could not READ through: present-and-V&U is what walkaddr
+     tests and copyin has no PTE_R re-walk, so the predicate is
+     [UserPtTree.uva_rmapped] and not [uva_wmapped].
+     [P] IS THE WRITER'S OWN TABLE, the entry descriptor the call ran at,
+     exactly as it is on the read side; [ua] is the buffer this contract
+     already names.  THE OFFSET IS EXISTENTIAL AND NOT THE CURSOR: the
+     chunk the break fired in is up to 32 bytes wide and copyin walks it
+     one page at a time.  The U tier refutes the arm from its own
+     permission map, which knows every byte of its buffer; this layer only
+     exposes the fact. *)
+  Definition write_cons_short (P : uptd) (ua : mword 64) (k : nat) (n : Z) : Prop :=
+    exists d : nat, (Z.of_nat k <= Z.of_nat d)%Z /\ (Z.of_nat d < n)%Z /\
+      ~ uva_rmapped P (uint (add_vec_int ua (Z.of_nat d))).
+
+  Definition write_cons_arms (P : uptd) (ua : mword 64) (Q : nat -> iProp Σ)
+      (n : Z) (r : mword 64) : iProp Σ :=
+    ((⌜r = (mword_of_int n : mword 64) /\ 0 <= n⌝ ∗ Q (Z.to_nat n))
+     ∨ (∃ k : nat, ⌜r = (mword_of_int (Z.of_nat k) : mword 64)⌝ ∗
+                   ⌜Z.of_nat k < n⌝ ∗ ⌜write_cons_short P ua k n⌝ ∗ Q k)
+     ∨ ⌜r = (mword_of_int (-1) : mword 64) /\ n < 0⌝)%I.
+
+  (* NO PERSISTENCE INSTANCE any more, and that is the point: [Q] is the
+     CALLER's own cursor family and is in general a linear resource -- the
+     receipt was persistent because it said nothing the caller could spend.
+     Nothing in the tree needed the instance for the console arm; the inode
+     arm's [write_arms_at] has none either. *)
+
+  Lemma write_cons_arms_ret P ua Q n r :
+    write_cons_arms P ua Q n r -∗ ⌜filewrite_ret n r⌝.
+  Proof using .
+    iIntros "[[%Hr _] | [H | %Hr]]".
+    - iPureIntro. destruct Hr as [-> Hn]. by apply filewrite_ret_all.
+    - iDestruct "H" as (k) "(%Hr & %Hlt & _ & _)". iPureIntro.
+      rewrite /filewrite_ret /pipe_rw_ret. right.
+      exists (Z.of_nat k). split; [exact Hr | lia].
+    - iPureIntro. destruct Hr as [-> _]. apply filewrite_ret_m1.
+  Qed.
+
+  (* satisfiability at the degenerate count: the caller's own cursor at 0,
+     which the chain hands back for free ([SpecConsolewrite.
+     cons_out_chain_0]) *)
+  Lemma write_cons_arms_zero (P : uptd) (ua : mword 64) (Q : nat -> iProp Σ) :
+    Q 0%nat -∗ write_cons_arms P ua Q 0 (mword_of_int 0 : mword 64).
+  Proof using .
+    clear GEN. (* unused; else Rocq counts it as used (asks for Proof using … GEN) *)
+    iIntros "H". iLeft. iSplitR; [iPureIntro; split; [done | lia]|].
+    iExact "H".
+  Qed.
+
+  (* THE CALLEE'S POST, IN THE ARMS' VOCABULARY.  The FD_DEVICE arm relays
+     consolewrite's return value untouched -- no offset, no re-read, no
+     clamp -- so [r] IS the count the cursor is read at. *)
+  Lemma write_cons_arms_of_cursor (P : uptd) (ua : mword 64)
+      (Q : nat -> iProp Σ) (n r : Z) :
+    (0 <= n)%Z -> (0 <= r <= n)%Z ->
+    ((r < n)%Z -> write_cons_short P ua (Z.to_nat r) n) ->
+    Q (Z.to_nat r) -∗ write_cons_arms P ua Q n (mword_of_int r : mword 64).
+  Proof using .
+    clear GEN. (* unused; else Rocq counts it as used (asks for Proof using … GEN) *)
+    iIntros (Hn Hr Hsh) "H".
+    destruct (Z.eq_dec r n) as [-> | Hne].
+    - iLeft. iSplitR; [by iPureIntro|]. iExact "H".
+    - iRight. iLeft. iExists (Z.to_nat r).
+      iSplitR; [iPureIntro; by rewrite Z2Nat.id; [| lia]|].
+      iSplitR; [iPureIntro; rewrite Z2Nat.id; lia|].
+      iSplitR; [iPureIntro; apply Hsh; lia|]. iExact "H".
+  Qed.
+
+  (* =================================================================== *)
+  (*  THE ONE INPUT AND THE ONE OUTPUT, KEYED ON THE DESCRIPTOR STATE     *)
+  (* =================================================================== *)
+
+  (* WHAT THE CALLER HANDS IN, by [st] -- the same key the CODE branches on
+     ([f->type] after the [f->writable] test).
+
+     - an open, writable INODE: the commit CHAIN at the cursor [Q], one node
+       per possible chunk ([wchunks n] of them);
+     - an open, writable CONSOLE DEVICE: the trace seed, and nothing else.
+       THE DEVSW PIN IS NOT HERE: [filewrite_dev_env] carries the honest
+       disjunction "the slot is null or it is consolewrite"
+       ([ConsoleInv.devsw_write_val_cases]) and a null slot is a -1 return at
+       +0x12a that no console arm allows, so the pin is REQUIRED -- but it
+       is a PURE fact about the names record and it rides this contract's
+       Coq premise list ([Hconw] below), not its caller-supplied input.
+       That is the piece-shape rule's corollary at the console arm: an
+       arbitrary user process supplying this bundle under the ARM knows
+       nothing of the kernel's [fwrite_names], so the input may not mention
+       one.  A caller discharges the premise from the table it already owns
+       ([fwn_wp fn = devsw_write_val] plus
+       [ConsoleInv.devsw_write_val_console]).
+     - everything else -- a pipe, another device major, an unwritable or
+       closed descriptor -- costs nothing and gets the landed blanket back.
+       A PIPE AU IS OUT OF SCOPE and deliberately not invented here. *)
+  (* ...AND THE DEVICE ARM IS NOW THE INODE ARM'S TWIN (lane OUT-FUPD, F3):
+     both arms are a CHAIN over the caller's own cursor family [Q], one node
+     per unit of progress -- a chunk on the inode arm, a BYTE on the device
+     arm (port [Uart0]'s transmit lock is per byte).  The trace seed [tr0]
+     is GONE with the located receipts, and with it the record field
+     [UexecExecInst]'s trace-seed field: [wf_Q] serves both arms.
+
+     AND IT IS ASKED FOR AT EVERY MAJOR, not only the console's.  The
+     [decide] the seed carried was affordable because the seed was FREE;
+     the chain is not.  What the walk actually does is read
+     [devsw[major].write] and CALL it, and [filewrite_dev_env] pins that
+     cell only to "null or consolewrite" -- at EVERY major, because nothing
+     in the kernel's own invariant says a non-console slot is null.  So a
+     writable device descriptor at ANY major can reach the console UART,
+     and the honest premise is the chain at any major.  (The OUTPUT side of
+     the match keeps its [decide]: what is REPORTED is the console's arm
+     alone, because only there does the caller know the callee was
+     consolewrite.) *)
+  Definition filewrite_in (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool)
+      (st : fdstate) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ)
+      (* THE PIPE ARM'S OBSERVATION FAMILY (design/pipe.md, "The byte
+         queue"): what the caller asks to be told if its write stops at
+         byte [j] because the read end is shut, at that instant's ghost
+         state.  Unread by the other two arms. *)
+      (Qe : nat -> pipe_st -> iProp Σ) : iProp Σ :=
+    match st with
+    (* KEYED ON THE ROW'S OFFSET MODE (lane OFF-LINK-4): a PARKED row pays
+       what it always paid, and a HELD one pays [link ∨ taint]
+       ([filewrite_in_held] above).  The match is outside the chains' own
+       [∀ P]. *)
+    | FdOpen _ true (FdInode i γo OffParked) =>
+        awrite_chain (fs_gamma_L fsc_fs) appE i γo M ua n Q 0%nat (wchunks n)
+    | FdOpen _ true (FdInode i γo OffHeld) =>
+        filewrite_in_held pmv sz lz i γo n M ua Q
+    | FdOpen _ true (FdDevice _) =>
+        cons_out_chain (S gen_id) M ua Q 0%nat (Z.to_nat n)
+    (* the pipe: the caller's links over the byte queue at its cursor, one
+       per byte, each pinned to the byte its image holds -- or the taint,
+       which is what the generic supply pays *)
+    | FdOpen _ true (FdPipe γp) =>
+        pipe_wpay (pn_queue γp) M ua Q Qe (Z.to_nat n)
+    | _ => emp
+    end%I.
+
+  (* WHAT THE ARM PAYS BEYOND THE LANDED BLANKET, at the same key.  Split
+     out from [filewrite_arms] so [SpecSysWrite] can reuse it under its own
+     blanket ([sys_write_ret]) without restating the match. *)
+  (* [P] IS THE WRITER'S OWN PAGE TABLE (lane TRAP-ROWS, T1), and it rides
+     here for the same reason [SpecFileread.fileread_extra_core]'s does:
+     the console arm's short return is a fact about which of the caller's
+     buffer bytes the kernel could read, and that is a fact about this
+     table and nothing else.  The other arms neither have one nor need
+     one. *)
+  (* [gn] IS THE PROCESS'S GENERATION, for the pipe arm alone: its -1 by
+     kill carries the incarnation's kill shot, exactly as the read side's
+     console receipt does. *)
+  Definition filewrite_extra (gn : gname) (P : uptd) (st : fdstate) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ)
+      (Qe : nat -> pipe_st -> iProp Σ)
+      (r : mword 64) : iProp Σ :=
+    match st with
+    | FdOpen _ true (FdInode i γo _) =>
+        write_arms_at (fs_gamma_L fsc_fs) i γo P n M ua Q r
+    | FdOpen _ true (FdDevice ma) =>
+        if decide (ma = ConsoleInv.CONSOLE)
+        then write_cons_arms P ua Q n r
+        else emp
+    (* the pipe: the chain at the stop cursor and the answer's reason, or
+       the taint with the payment back ([PipeQueue.pipe_wpost]).  As on the
+       read side, the KILL reason carries the KILLER's taint beside the
+       shot (lane KILL-TAINT, [PipeKillMark]) -- a writer can build nothing
+       from the bare shot. *)
+    | FdOpen _ true (FdPipe γp) =>
+        pipe_wpost P (pn_queue γp) M ua Q Qe (ChildTok.kill_shot gn ∗ app_taint)%I (Z.to_nat n) r
+    | _ => emp
+    end%I.
+
+  (* ...and the whole post: the landed return clause, verbatim, PLUS the
+     arm's extra.  Stating the blanket unconditionally rather than deriving
+     it per arm is what makes "the unified contract implies each landed
+     form" true BY CONSTRUCTION -- there is nothing to check. *)
+  Definition filewrite_arms (gn : gname) (P : uptd) (st : fdstate) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ)
+      (Qe : nat -> pipe_st -> iProp Σ)
+      (r : mword 64) : iProp Σ :=
+    (⌜filewrite_ret n r⌝ ∗ filewrite_extra gn P st n M ua Q Qe r)%I.
+
+  Lemma filewrite_arms_ret gn P st n M ua Q Qe r :
+    filewrite_arms gn P st n M ua Q Qe r -∗ ⌜filewrite_ret n r⌝.
+  Proof using . iIntros "[%H _]". by iPureIntro. Qed.
+
+  (* ---- READING THE KEYED INPUT, BUILDING THE KEYED OUTPUT -------------
+     Eight one-liners, so that no walk ever has to unfold the two matches
+     and every arm names the fact it is standing on. *)
+
+  (* ...AND THE READING KEYED ON THE MODE (lane OFF-LINK-6), which is what
+     a walk that gets its row's mode off [FileInvDefs.fdstate_ok] holds: at
+     PARK the landed chain, at HAND [filewrite_in_held]'s two arms.  One
+     name, so [ProofFilewrite]'s entry does not have to match on [st]. *)
+  Definition filewrite_in_inode_om (pmv : gmap (mword 27) uperm) (sz : Z)
+      (lz : bool) (om : offmode) (i : Z) (γo : gname) (n : Z)
+      (M : gmap Z (bv 8)) (ua : mword 64) (Q : nat -> iProp Σ) : iProp Σ :=
+    match om with
+    | OffParked =>
+        awrite_chain (fs_gamma_L fsc_fs) appE i γo M ua n Q 0%nat (wchunks n)
+    | OffHeld => filewrite_in_held pmv sz lz i γo n M ua Q
+    end.
+
+  Lemma filewrite_in_inode_any rb om i γo n M ua Q Qe (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool) :
+    filewrite_in pmv sz lz (FdOpen rb true (FdInode i γo om)) n M ua Q Qe -∗
+    filewrite_in_inode_om pmv sz lz om i γo n M ua Q.
+  Proof using . destruct om; by iIntros "$". Qed.
+
+  Lemma filewrite_in_inode rb i γo n M ua Q Qe (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool) :
+    filewrite_in pmv sz lz (FdOpen rb true (FdInode i γo OffParked)) n M ua Q Qe -∗
+    awrite_chain (fs_gamma_L fsc_fs) appE i γo M ua n Q 0%nat (wchunks n).
+  Proof using . by iIntros "$". Qed.
+
+  (* ...and the HELD row's reading, the one a held leaf hands in and the one
+     the fire site reads back (lane OFF-LINK-4). *)
+  Lemma filewrite_in_inode_held rb i γo n M ua Q Qe (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool) :
+    filewrite_in pmv sz lz (FdOpen rb true (FdInode i γo OffHeld)) n M ua Q Qe -∗
+    filewrite_in_held pmv sz lz i γo n M ua Q.
+  Proof using . by iIntros "$". Qed.
+
+  Lemma filewrite_in_of_inode_held rb i γo n M ua Q Qe (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool) :
+    filewrite_in_held pmv sz lz i γo n M ua Q -∗
+    filewrite_in pmv sz lz (FdOpen rb true (FdInode i γo OffHeld)) n M ua Q Qe.
+  Proof using . by iIntros "$". Qed.
+
+  (* the device arm's input is now the OUTPUT CHAIN (lane OUT-FUPD), the
+     inode arm's twin: one node per byte instead of a trace seed, and at
+     EVERY major because the cell is null-or-consolewrite at every major *)
+  Lemma filewrite_in_cons rb (mj : Z) n M ua Q Qe (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool) :
+    filewrite_in pmv sz lz (FdOpen rb true (FdDevice mj)) n M ua Q Qe -∗
+    cons_out_chain (S gen_id) M ua Q 0%nat (Z.to_nat n).
+  Proof using . by iIntros "$". Qed.
+
+  Lemma filewrite_extra_inode gn P rb om i γo n M ua Q Qe r :
+    write_arms_at (fs_gamma_L fsc_fs) i γo P n M ua Q r -∗
+    filewrite_extra gn P (FdOpen rb true (FdInode i γo om)) n M ua Q Qe r.
+  Proof using . by iIntros "$". Qed.
+
+  Lemma filewrite_extra_cons gn P rb (mj : Z) n M ua Q Qe r :
+    mj = ConsoleInv.CONSOLE ->
+    write_cons_arms P ua Q n r -∗
+    filewrite_extra gn P (FdOpen rb true (FdDevice mj)) n M ua Q Qe r.
+  Proof using .
+    intros Hmj. rewrite /filewrite_extra.
+    case_decide as Hc; [by iIntros "$" | by exfalso].
+  Qed.
+
+  (* a device at any OTHER major writes no receipt: the cell is null there
+     (nothing but consoleinit fills the table) and the arm is a -1 *)
+  Lemma filewrite_extra_dev_other gn P rb wb (mj : Z) n M ua Q Qe r :
+    mj <> ConsoleInv.CONSOLE ->
+    ⊢ filewrite_extra gn P (FdOpen rb wb (FdDevice mj)) n M ua Q Qe r.
+  Proof using .
+    intros Hne. rewrite /filewrite_extra. destruct wb; [| done].
+    case_decide as Hc; [by exfalso | done].
+  Qed.
+
+  (* the pipe arm: the chain's stop node comes back on the WRITABLE end
+     ([PipeQueue.pipe_wpost]); an unwritable pipe descriptor pays nothing *)
+  Lemma filewrite_in_pipe rb (γp : pipe_names) n M ua Q Qe (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool) :
+    filewrite_in pmv sz lz (FdOpen rb true (FdPipe γp)) n M ua Q Qe -∗
+    pipe_wpay (pn_queue γp) M ua Q Qe (Z.to_nat n).
+  Proof using . by iIntros "$". Qed.
+
+  Lemma filewrite_extra_pipe gn P rb (γp : pipe_names) n M ua Q Qe r :
+    pipe_wpost P (pn_queue γp) M ua Q Qe (ChildTok.kill_shot gn ∗ app_taint)%I (Z.to_nat n) r -∗
+    filewrite_extra gn P (FdOpen rb true (FdPipe γp)) n M ua Q Qe r.
+  Proof using . by iIntros "$". Qed.
+
+  Lemma filewrite_extra_pipe_ro gn P rb (γp : pipe_names) n M ua Q Qe r :
+    ⊢ filewrite_extra gn P (FdOpen rb false (FdPipe γp)) n M ua Q Qe r.
+  Proof using . rewrite /filewrite_extra. done. Qed.
+
+  (* the [f->writable == 0] early return: no arm of the match is armed
+     there, because every armed one is a WRITABLE descriptor *)
+  Lemma filewrite_extra_unwritable (gn : gname) (P : uptd) (inum : mword 32) (γo : gname)
+      (om : offmode) (γp : pipe_names) (C : fcontent) (st : fdstate) n M ua Q Qe r :
+    fdstate_ok inum γo om γp C st ->
+    (* the WORD the code tested, not a re-reading of it: the walk arrives
+       with [beq a5,x0]'s own boolean *)
+    eq_vec (zero_extend' 64 (fc_writable C : mword 8) : mword 64)
+           (zero_reg : mword 64) = true ->
+    ⊢ filewrite_extra gn P st n M ua Q Qe r.
+  Proof using .
+    destruct st as [| rb wb ty]; [by iIntros |].
+    destruct wb; [| rewrite /filewrite_extra; by iIntros].
+    cbn. intros (_ & Hw & _) Hz. exfalso.
+    rewrite Hw in Hz. vm_compute in Hz. discriminate.
+  Qed.
+
+  (* THE SIGN GUARD'S EXIT, at every arm at once.  filewrite's [n < 0] test
+     at +0x1c fires BEFORE the type dispatch, so this exit must answer for a
+     descriptor whose kind the walk has not read yet -- and it can, for
+     free: at a non-positive count [wchunks n] is 0, so the inode arm's
+     input IS the cursor at the empty prefix and the fail arm's refund is
+     that same cursor; the console arm's NEG disjunct is pure; every other
+     arm is [emp]. *)
+  (* ...and the HELD row's, at the same count: [wchunks n] is 0 there, so the
+     client-advanced chain IS the cursor -- a negative request moves no
+     offset (lanes OFF-LINK-4/5). *)
+  Lemma write_arms_at_neg_held Γ i γo (P : uptd) n M ua Q :
+    (n < 0)%Z ->
+    Q 0%nat -∗
+    write_arms_at Γ i γo P n M ua Q (mword_of_int (-1) : mword 64).
+  Proof using .
+    clear GEN. (* unused; else Rocq counts it as used (asks for Proof using … GEN) *)
+    intros Hn. iIntros "Hc".
+    rewrite /write_arms_at. iRight.
+    iSplitR; [done |]. rewrite /write_post_fail_at.
+    rewrite (wchunks_nonpos n ltac:(lia)).
+    iExists [], 0%nat.
+    iSplitR; [iPureIntro; right; split; [exact Hn | reflexivity] |].
+    iSplitR; [iPureIntro; simpl; lia |].
+    iSplitR; [iPureIntro; lia |].
+    iSplitR; [iPureIntro; apply ubytes_at_nil |].
+    simpl. iExact "Hc".
+  Qed.
+
+  Lemma write_arms_at_neg Γ i γo (P : uptd) n M ua Q :
+    (n < 0)%Z ->
+    awrite_chain Γ appE i γo M ua n Q 0%nat (wchunks n) -∗
+    write_arms_at Γ i γo P n M ua Q (mword_of_int (-1) : mword 64).
+  Proof using .
+    clear GEN. (* unused; else Rocq counts it as used (asks for Proof using … GEN) *)
+    intros Hn. iIntros "Hc".
+    iDestruct (awrite_chain_at_of Γ appE i γo M ua n Q 0%nat (wchunks n) P
+                 with "Hc") as "Hc".
+    rewrite /write_arms_at. iRight.
+    iSplitR; [done |]. rewrite /write_post_fail_at.
+    rewrite (wchunks_nonpos n ltac:(lia)).
+    iExists [], 0%nat.
+    iSplitR; [iPureIntro; right; split; [exact Hn | reflexivity] |].
+    iSplitR; [iPureIntro; simpl; lia |].
+    iSplitR; [iPureIntro; lia |].
+    iSplitR; [iPureIntro; apply ubytes_at_nil |].
+    simpl. iExact "Hc".
+  Qed.
+
+  (* THE SIGN GUARD'S EXIT TAKES THE WRITE GUARD (RULING WR-TB).  At a held
+     row the caller's input is the chain UNDER the guard, and this exit has
+     to hand the cursor back; it is the kernel, so it pays the guard at the
+     table it is running on, and [wchunks n] is 0 at a negative count, so
+     what comes out of the chain IS the cursor. *)
+  Lemma filewrite_extra_neg gn P st n M ua Q Qe (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool) :
+    (n < 0)%Z ->
+    wr_tb pmv sz lz P ->
+    filewrite_in pmv sz lz st n M ua Q Qe -∗
+    filewrite_extra gn P st n M ua Q Qe (mword_of_int (-1) : mword 64).
+  Proof using .
+    intros Hn Htb. destruct st as [| rb wb ty]; [by iIntros |].
+    destruct wb; [| by iIntros].
+    destruct ty as [i γo om | γp | mj]; rewrite /filewrite_in /filewrite_extra.
+    - destruct om as [|].
+      + iIntros "Hc". by iApply (write_arms_at_neg with "Hc").
+      + (* the HELD row's two arms: the guarded chain, or the plain
+           chain beside the taint (lanes OFF-LINK-4/5) *)
+        rewrite /filewrite_in_held.
+        iIntros "[Hc | [Hc _]]".
+        * iDestruct ("Hc" $! P with "[//]") as "Hc".
+          assert (Hw0 : wchunks n = 0%nat) by (apply wchunks_nonpos; lia).
+          iEval (rewrite Hw0) in "Hc".
+          by iApply (write_arms_at_neg_held (fs_gamma_L fsc_fs) i γo P n M ua Q Hn
+                       with "Hc").
+        * by iApply (write_arms_at_neg with "Hc").
+    - (* a negative request never reaches the pipe: the payment comes back
+         at the empty count *)
+      assert (Hn0 : Z.to_nat n = 0%nat) by (destruct n; [lia | lia | reflexivity]).
+      rewrite Hn0. iApply pipe_wpost_neg. reflexivity.
+    - case_decide as Hc; [| by iIntros].
+      iIntros "_". iRight. iRight. iPureIntro. split; [reflexivity | exact Hn].
+  Qed.
+
+  (* ...and at a NON-console major nothing is armed, so the chain is simply
+     dropped: what the caller justified was pushed (or not) by a callee this
+     layer cannot name, and there is nothing true left to say about it. *)
+  Lemma filewrite_extra_dev_drop gn P rb (mj : Z) n M ua Q Qe r (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool) :
+    mj <> ConsoleInv.CONSOLE ->
+    filewrite_in pmv sz lz (FdOpen rb true (FdDevice mj)) n M ua Q Qe -∗
+    filewrite_extra gn P (FdOpen rb true (FdDevice mj)) n M ua Q Qe r.
+  Proof using .
+    intros Hne. rewrite /filewrite_extra.
+    case_decide as Hc; [by exfalso | by iIntros "_"].
+  Qed.
+
+End SpecFilewrite.
+
+Definition wp_filewrite_sconf_body
+    (pmv : gmap (mword 27) uperm) (sz : Z) (lz : bool)
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+ (γf : gname)                    (* kalloc, the file table  *)
+    (γs : list gname) (j : nat) (γlp : gname)    (* the running process     *)
+    (k : nat) (q : Qp) (st : fdstate)            (* the borrowed reference  *)
+    (fn : fwrite_names)                          (* the heavy arms' ghosts  *)
+    (pidv : mword 32) (U : ustate)
+    (m : regfile) (K : nat) (eb : bool) (n : Z) (b : bool) (lks : gset string)
+    (* ---- THE ONE ARM PARAMETER, since lane OUT-FUPD ----
+       [Q] is the PREFIX CURSOR of BOTH heavy arms: "what the caller knows
+       after k units of progress" -- a chunk on the inode arm, a BYTE on
+       the console arm.  The console arm's trace seed [tr0] is gone with
+       the located receipts it fed.  A caller that does not care
+       instantiates it trivially ([fun _ => True]). *)
+    (Q : nat -> iProp Σ)
+    (* ...and the pipe arm's OBSERVATION family, what the caller asks to be
+       told where its write stops on a shut read end (design/pipe.md) *)
+    (Qe : nat -> pipe_st -> iProp Σ) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.filewrite in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* THE USER SOURCE (RULING A).  filewrite reads [addr + i] per chunk with
+     [i] its own running total, and hands a1 to a device's write untouched,
+     so a1 is the base the whole run is pinned at; a [let], not a premise,
+     so no caller moves. *)
+  let uaddr : mword 64 := m !!! Regidx (mword_of_int 11 : mword 5) in
+  (* RULING WR-TB: the table guard, at the three key values the row is
+     stated at and the table the walk will fire the chain on.  The caller
+     proves it off [ProcInv.proc_priv_pt_wf] and [proc_priv_lazy] and the
+     permission map's own definition; the kernel spends it at exactly one
+     place, [ProofFilewriteChain.fw_au_st_init]. *)
+  wr_tb pmv sz lz (pv_upt (us_V U)) ->
+  (filewrite_stack <= K)%nat ->
+  (k < NFILE)%nat ->
+  (j < NPROC)%nat ->
+  γs !! j = Some γlp ->
+  length γs = NPROC ->
+  (* the ghost record's process fields ARE the running one: the fs arm's
+     callees are all indexed by [j], and the record carries it so that the
+     environment can be stated without them *)
+  fwn_j fn = j ->
+  fwn_procs fn = γs ->
+  (* THE DEVSW PIN, as a PURE premise rather than as part of the caller's
+     input ([filewrite_in]'s header): the console arm has to refute the
+     null-slot disjunct [filewrite_dev_env] carries, and the fact that does
+     it is an equation about the names record the CALLER builds.  Every
+     caller discharges it off [fwn_wp fn = ConsoleInv.devsw_write_val] and
+     [ConsoleInv.devsw_write_val_console]. *)
+  fwn_wp fn ConsoleInv.CONSOLE
+    = (mword_of_int KernelSyms.consolewrite : mword 64) ->
+  (* a0 = f, a1 = addr (the user source, never inspected here), a2 = n *)
+  m !!! Regidx (mword_of_int 10 : mword 5) = fnode k ->
+  m !!! Regidx (mword_of_int 12 : mword 5) = (mword_of_int n : mword 64) ->
+  (* THE COUNT: AN int, AND NOTHING ELSE.  filewrite is the layer a syscall
+     hands unchecked user input to, so it may not ask for a SIGN --
+     [SpecSysRead.sys_rw_count_range] is what a trapframe word gives, and
+     this is exactly that.  XV6_REV 31f115a is what makes it dischargeable:
+     [srliw a5,a2,0x1f ; c.bnez a5] at +0x1c is xv6's own [n < 0] test, so
+     past the fall-through [0 <= n] is a FACT OF THE CODE.
+     NOTE what is also NOT here: fileread's [MAXFILE*BSIZE + n < 2^31] -- the
+     chunking makes writei's joint premise a closed fact ([fw_chunk_joint]). *)
+  - 2 ^ 31 <= n < 2 ^ 31 ->
+  (* PARKING PREMISE (hart-generic scheduler protocol): every arm sleeps. *)
+  eb = true ->
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m K b pj -∗
+  (* noff = 0: everything below reaches sleep *)
+  cpu_own 0%nat eb pj b lks -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  (* WHAT THE ELSE ARM COSTS.  [f->type] outside {FD_PIPE, FD_DEVICE,
+     FD_INODE} reaches [panic("filewrite")], and panic is an ordinary call:
+     the literal comes out of [kernel_data] and the console credentials
+     printk needs out of [panic_env].  Both are persistent, and both reach
+     the arm -- note that [filewrite_fs_env]'s own copies do NOT: on exactly
+     this path [filewrite_env] reduces to [emp]. *)
+  panic_env -∗
+  (* the borrowed reference -- at an ARBITRARY fraction, and given back *)
+  file_ref γf k q st -∗
+  (* ambient, because three of the four arms copy FROM user memory *)
+  proc_priv_core pj pidv U -∗
+  kalloc_env fsc_kalloc None -∗
+  procs_inv γs -∗
+  (* ...and what the file's TYPE selects *)
+  filewrite_env γf fn st -∗
+  (* THE DESCRIPTOR'S OFFSET ROW, and it is what ADVANCES [f->off].  The
+     chain's nodes lend the shadow's kernel half at the chunk's offset and
+     take it back UNMOVED (the piece-shape rule,
+     design/fs-syscall-specs.md section 4), so the advance is the fire
+     lemma's ([FsAbsWriteFire.wrf_awrite_fire]/[wrf_apart_fire]) and it is
+     paid out of this row: [FdSlots.foff_row] at an [FdInode] IS
+     [OffGv.off_user_inv], and it is [True] at every other descriptor kind.
+     PERSISTENT, and sys_write already holds it inside its descriptor
+     bundle, so it costs the caller nothing.  fileread is the same one size
+     down. *)
+  foff_row st -∗
+  (* ---- THE CALLER'S INPUT, KEYED ON [st] ([filewrite_in]) ----
+     The chain on an inode descriptor, the trace seed on the console,
+     [emp] everywhere else.  IT NAMES NO KERNEL GHOST RECORD: the devsw pin
+     is the Coq premise above, so an arbitrary user process can state this
+     input at its own key (the ARM).
+     THE APPLICATION'S PER-CHUNK STEP RIDES IN IT: the FD_INODE arm's row
+     retag pays the application's claim out of the chain's own node
+     ([FsAbsWriteFire.awrite_full_at]'s [app_step]), so this contract asks
+     for no blanket license of its own. *)
+  filewrite_in pmv sz lz st n (us_M U) uaddr Q Qe -∗
+  (* THE CROSSING IS [true], NOT [b].  Every arm of this function parks, and
+     the porting guide's rule is that a PARKING function's [wp_next] index is
+     [true] unconditionally -- a swtch moves the hart whatever SIE was doing.
+     The [eb = true] premise above plus [cpu_own_eb_agree] at level 0 forces
+     [b = true] at the only constructible instance, so this is not a change of
+     strength today; it is the spelling the eb-generic sweep needs. *)
+  wp_next true pj (fun (CID : CpuId) =>
+    (* THE IMAGE DOES NOT MOVE.  filewrite only READS user memory -- its
+       three arms are writei (either_copyin), consolewrite (either_copyin)
+       and pipewrite (copyin) -- and at the lazy view a fault inside a copy
+       backs a page already in the view reading 0.  So the block comes back
+       at the caller's own [us_M U]; only the DESCRIPTOR grows.
+       (image campaign, tier 3.) *)
+  ∀ (mf : regfile) (r : mword 64) (P' : uptd) (k' : nat),
+      ⌜callee_saved m mf⌝ -∗
+      ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+      ⌜mf !!! Regidx (mword_of_int 10 : mword 5) = r⌝ -∗
+      (* THE EVENT COUNTER (permit sweep L1b): every arm lends the block's counter to a copy, which may step it,
+         so the block comes back at a count at least the one it left at *)
+      ⌜(pv_ev (us_V U) <= k')%nat⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0%nat eb pj b lks -∗
+      pc_is ret_tgt -∗
+      file_ref γf k q st -∗
+      proc_priv_core pj pidv (us_upt (upd_usV U (upd_ev (us_V U) k')) P') -∗
+      filewrite_env_out fn st -∗
+      (* ---- THE ARMED OUTPUT, KEYED ON [st] ([filewrite_arms]) ----
+         The blanket [⌜filewrite_ret n r⌝], and beside it what the arm the
+         descriptor selects proved: the chunk arms and the cursor at the
+         stop position on an inode, the accepted-trace receipt on the
+         console, nothing anywhere else. *)
+      filewrite_arms (pv_gen (us_V U)) (pv_upt (us_V U)) st n (us_M U) uaddr Q Qe r -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* ONE MODULE TYPE: there is no parallel statement pinned to an inode or to
+   the console, and no second walk against the code.  The arms are keyed on
+   the descriptor's state inside this one. *)
+Module Type FILEWRITE.
+  Parameter wp_filewrite_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+ (γf : gname)
+      (γs : list gname) (j : nat) (γlp : gname)
+      (k : nat) (q : Qp) (st : fdstate)
+      (fn : fwrite_names)
+      (pidv : mword 32) (U : ustate)
+      (m : regfile) (K : nat) (eb : bool) (n : Z) (b : bool) (lks : gset string)
+      (Q : nat -> iProp Σ) (Qe : nat -> pipe_st -> iProp Σ)
+      (pmv : gmap (mword 27) uperm) (szv : Z) (lzv : bool),
+      wp_filewrite_sconf_body pmv szv lzv γf γs j γlp k q st fn pidv U m K eb n b
+        lks Q Qe.
+End FILEWRITE.

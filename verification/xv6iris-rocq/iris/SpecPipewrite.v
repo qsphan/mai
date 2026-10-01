@@ -1,0 +1,193 @@
+(* SpecPipewrite.v -- the public interface of pipewrite, stated independently
+   of its proof.  Requires only the definitional layer -- never a whole-function
+   proof file -- so every function proof can be checked in parallel.
+
+     int pipewrite(struct pipe *pi, uint64 addr, int n);
+
+   pipewrite copies up to [n] bytes from user address [addr] into the pipe,
+   sleeping on [&pi->nwrite] while the pipe is full, and returns the number
+   it copied -- or -1 if the read end closed or the process was killed while
+   it waited.  @ KernelSyms.pipewrite = 0x8000449e, ~84 instructions, a
+   112-byte frame; ra/s0..s5 saved in the prologue, s6..s10 SHRINK-WRAPPED
+   onto the paths that need them.
+
+   THE ALTITUDE.  Two objects meet here, and the spec sits at each one's
+   public tier:
+
+   - the PIPE, at the reference tier (PipeInv.v): [is_pipe] is persistent
+     and [pipe_ref γp w q] -- at ANY positive fraction, and at the WRITE end
+     ([w = true]) -- is the whole credential story.  It is what licenses
+     acquire (and release, and the re-acquire inside sleep) on the pipe's
+     cancellable lock, and it comes back untouched.  THE END IS PINNED (lane
+     PQ-FLAG; it used to be either end): the byte queue's write link fires
+     only at [ps_wo s = true], and a share of the WRITE end is the only thing
+     that proves it -- see the premise below.  Everything pipewrite does to the pipe's fields happens
+     under [pi->lock] and is invisible to the caller: the counters move, the
+     queue coupling [pipe_count_ok] is preserved, and no contract weaker
+     than a contents-indexed pipe could say more (see design/pipe.md).
+
+   - the PROCESS, at the [proc_priv] altitude (the fetchaddr shape): the
+     copies go through [pr->pagetable] and may fault pages in, so the block
+     comes back with its user-table descriptor EXTENDED ([uptd_ext],
+     transitive across the loop's copyin calls) and everything else intact.
+
+   THE RETURN VALUE ([pipe_rw_ret]): -1, or some 0 <= i <= max 0 n.  The
+   spec deliberately does not say WHICH: how many bytes fit is decided by
+   concurrent readers, and whether a byte crossed at all is decided by
+   copyin's own contract (an unmapped user page vmfault declines to back
+   fails the copy).  A 0-or-negative [n] returns 0 -- but still takes the
+   lock and still wakes the readers, exactly as the C does.
+
+   INTERRUPT LEVEL IS PINNED AT 0: sleep parks through sched(), whose
+   invariant demands noff = 1 -- the pipe lock and nothing else -- so
+   pipewrite as a whole must be entered with no lock held.  The running-
+   thread bundle ([own_ctx] + [sched_vc] + [procs_inv], SpecSleep.v's shape)
+   is threaded through for the same reason.
+
+   Design & worklist: claude-notes/projects/pipe-rw.md. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import LockRank.
+Require Import ProcGeom CpuOwn.
+Require Import UserPtTree.
+Require Import KvmSpec.
+Require Import ProcPtOwn.
+Require Import FdSlots ProcInv.
+Require Import FileInvDefs.
+Require Import PipeInvDefs.
+Require Import ChildTok.   (* [kill_shot]: the -1-by-kill exit's evidence *)
+Require Import SchedCtx.
+Require Export SwtchCtx.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import CtxIdDefs.
+Import Defs.
+Local Open Scope Z_scope.
+
+
+(* pipewrite's own frame is 14 slots; the deepest callee is copyin at 50
+   (walkaddr 10 / vmfault 38 / memmove 2); sleep wants 22, wakeup 18,
+   killed 14, myproc/acquire/release 10. *)
+Notation pipewrite_stack := (64%nat) (only parsing).
+Definition wp_pipewrite_sconf_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γf : gname) 
+    (γs : list gname) (j : nat) (γlp : gname)
+    (γl : gname) (γp : pipe_names) (w : bool) (q : Qp)
+    (m : regfile) (av : nat) (eb : bool)
+    (pid : mword 32) (U : ustate) (n : Z) (b : bool) (lks : gset string)
+    (* THE CALLER'S CURSOR AND OBSERVATION FAMILIES over the pipe's byte
+       queue (design/pipe.md, "The byte queue"; [PipeQueue.pipe_wchain]):
+       [Q j] is what the caller knows after [j] bytes landed, [Qe j s] what
+       it asks to be told if the loop stops at byte [j] because the read
+       end is shut, at the ghost state [s] of that instant. *)
+    (Q : nat -> iProp Σ) (Qe : nat -> pipe_st -> iProp Σ) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.pipewrite in
+  let pj := proc_addr j in
+  let pi := m !!! Regidx (mword_of_int 10 : mword 5) in
+  (* a1 = addr, the user source the bytes are copied from *)
+  let addr := m !!! Regidx (mword_of_int 11 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* the process running here is proc j (sleep/killed's linkage) *)
+  (j < NPROC)%nat ->
+  γs !! j = Some γlp ->
+  length γs = NPROC ->
+  (* a2 is the int argument [n] *)
+  m !!! Regidx (mword_of_int 12 : mword 5) = (mword_of_int n : mword 64) ->
+  (- 2 ^ 31 <= n < 2 ^ 31)%Z ->
+  (pipewrite_stack <= av)%nat ->
+  (* PARKING PREMISE (hart-generic scheduler protocol): the saved base enable
+     is [true].  Everything below sleeps, and a parking thread must hand the
+     trap CSRs across the crossing -- at level 0 with an enabled base the
+     pushing acquire produces exactly that set.  See SpecSched.v. *)
+  eb = true ->
+  (* THE END IS THE WRITE END (lane PQ-FLAG, design/app-pipe.md 3.1).
+     pipewrite pushes a byte through the caller's own [PipeQueue.pipe_wlink],
+     which fires only at [ps_wo s = true]; the fact is the caller's to give,
+     and the only thing that gives it is a share of the WRITE end -- with
+     which [PipeInvDefs.pipe_endstate_holder] reads [writeopen <> 0] off the
+     lock's payload at every round.  Not a restriction on the code: filewrite
+     reaches this call only on [f->writable <> 0], which IS this boolean
+     ([FileInvDefs.fc_wbool], [ProofFilewrite.fw_wbool_of_fall]). *)
+  w = true ->
+  (* pipewrite acquires "pipe" (7) DIRECTLY, and while holding it reaches
+     "proc" (11) via wakeup / sleep_prepare / killed -- its own re-acquire
+     after sleep is at the entry [lks] again.  ONE premise at the LOWEST rank
+     the whole cone touches, "pipe", covers every one of those:
+     [locks_below_mono] lifts it to "proc" wherever a callee wants that
+     instead (LockRank.v). *)
+  locks_below lks "pipe" ->
+  sie_cap_gpr KT1 m av b pj -∗
+  (* noff = 0: sleep demands the pipe lock be the ONLY lock held *)
+  cpu_own 0%nat eb pj b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  (* the pipe, and a share of one end -- the whole credential *)
+  is_pipe γl γp pi -∗
+  pipe_ref γp w q -∗
+  (* THE BYTE QUEUE'S PAYMENT: one link per byte the caller may push, each
+     pinned to the byte its own image holds at [addr + j] -- or the taint,
+     which disconnects the queue from the ring for good.  The link fires at
+     the [sw] of [nwrite++], where the ring takes the byte. *)
+  pipe_wpay (pn_queue γp) (us_M U) addr Q Qe (Z.to_nat n) -∗
+  (* the process block (copyin's tier is reached via proc_priv_copy) *)
+  proc_priv_core pj pid U -∗
+  kalloc_env γa None -∗
+  (* the running-thread bundle (SpecSleep.v) *)
+  procs_inv γs -∗
+  wp_next b pj (fun (CID : CpuId) =>
+  (* THE IMAGE DOES NOT MOVE.  pipewrite only READS user memory (one byte
+     per round, through copyin), and at the lazy view a fault inside the
+     copy backs a page already in the view reading 0.  So the block comes
+     back at the caller's own [us_M U]; only the DESCRIPTOR grows.
+     (image campaign, tier 3: the loop calls
+     [SpecCopyin.wp_copyin_sconf_mem].) *)
+  ∀ (mf : regfile) (P' : uptd) (k' : nat),
+      ⌜callee_saved m mf⌝ -∗
+      ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+      ⌜pipe_rw_ret n (mf !!! Regidx (mword_of_int 10 : mword 5))⌝ -∗
+      (* THE EVENT COUNTER (permit sweep L1b): the copy loop lends the block's counter to copyin, which may step it,
+         so the block comes back at a count at least the one it left at *)
+      ⌜(pv_ev (us_V U) <= k')%nat⌝ -∗
+      sie_cap_gpr KT1 mf av b pj -∗
+      cpu_own 0%nat eb pj b lks -∗
+      pc_is ret_tgt -∗
+      pipe_ref γp w q -∗
+      (* THE QUEUE'S POST ([PipeQueue.pipe_wpost]): the chain at the stop
+         cursor with the answer's reason -- the request met, copyin's
+         unreadable byte, the read end observed shut, or the kill shot
+         WITH THE KILLER'S TAINT -- or the taint with the payment back.
+         The short reason is stated at the ENTRY table, which is the one
+         the caller can name.  For the kill arm's taint see lane
+         KILL-TAINT and [PipeKillMark]: the caller reads <p->lock>'s
+         killed row holding its own incarnation's marker, which refutes
+         the row's spent arm and leaves the third party's payment. *)
+      pipe_wpost (pv_upt (us_V U)) (pn_queue γp) (us_M U) addr Q Qe
+        (kill_shot (pv_gen (us_V U)) ∗ app_taint)%I (Z.to_nat n)
+        (mf !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      proc_priv_core pj pid (us_upt (upd_usV U (upd_ev (us_V U) k')) P') -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type PIPEWRITE.
+  Parameter wp_pipewrite_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γf : gname) (γs : list gname) (j : nat) (γlp : gname)
+      (γl : gname) (γp : pipe_names) (w : bool) (q : Qp)
+      (m : regfile) (av : nat) (eb : bool)
+      (pid : mword 32) (U : ustate) (n : Z) (b : bool) (lks : gset string)
+      (Q : nat -> iProp Σ) (Qe : nat -> pipe_st -> iProp Σ),
+      wp_pipewrite_sconf_body γa γf γs j γlp γl γp w q m av eb pid U n b lks Q Qe.
+End PIPEWRITE.

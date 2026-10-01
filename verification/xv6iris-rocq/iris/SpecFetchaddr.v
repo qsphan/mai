@@ -1,0 +1,177 @@
+(* SpecFetchaddr.v -- the public interface of fetchaddr(), stated
+   independently of its proof.  Requires only the definitional layer --
+   never a whole-function proof file -- so every function proof can be
+   checked in parallel.
+
+     int fetchaddr(uint64 addr, uint64 *ip) {
+       struct proc *p = myproc();
+       if (addr >= p->sz || addr + sizeof(uint64) > p->sz)
+         return -1;                 // both tests needed, in case of overflow
+       if (copyin(p->pagetable, p->sz, (char * )ip, addr, sizeof( *ip)) != 0)
+         return -1;
+       return 0;
+     }
+
+   @ KernelSyms.fetchaddr = 0x8000277a, 26 instructions / 74 bytes; a 32-byte
+   frame with all four slots used (ra / s0 / s1 = addr / s2 = ip).
+
+   THE ALTITUDE.  fetchaddr is the first function that spans the two tiers
+   the [struct proc] work has kept apart: it is a [proc_priv] consumer (it
+   calls myproc() and reads two of the private fields) whose whole body is a
+   call to copyin, which is stated one tier DOWN over the bare [p_sz] /
+   [p_pagetable] cells plus [ProcPtOwn.proc_pt].  [ProcInv.proc_priv_copy] is
+   that bridge, and the shape of this spec follows from it:
+
+   - the process comes back with its descriptor EXTENDED ([uptd_ext]: same
+     root, same trapframe, a user map that only gained entries), because
+     copyin may fault pages in on the way.  Everything else about the block
+     is unchanged, which is what [upd_upt] says;
+   - [p->sz <= MAXVA] is NOT a premise here.  It is a premise of copyin, of
+     copyout and of vmfault, all of which take the bare cell -- but a caller
+     at THIS altitude holds nothing but [proc_priv], so it could not
+     discharge one.  The bound lives in [proc_priv] instead and this proof
+     pays copyin's premise out of it.
+
+   WHAT *ip GETS.  On the answer 0, THE PROCESS'S OWN WORD at [addr]:
+   copyin is memory-indexed ([SpecCopyin.copyin_got] names byte [j] at
+   [addr + j] of the block's image) and [ByteBuf.bb_word_acc]'s rebuild
+   ties the eight bytes to the value the caller reads back, so
+   [fetchaddr_got] below says the word IS
+   [SpecCopyin.uimg_word_at (us_M U) (uint addr)].  The two arms of
+   [fetchaddr_post] are:
+
+   - the range test failed: [*ip] is untouched (fetchaddr returned before
+     calling copyin), and the answer is -1;
+   - the range test passed: the caller owns [*ip] holding some [w], and
+     [fetchaddr_got] pins [w] on the 0 arm.  On -1 it pins nothing -- a
+     copyin that gives up part-way has already written a prefix, so the
+     value is only ownership there, which is the copy family's failure arm
+     exactly ([SpecFetchstr.fetchstr_got], keyed on the answer).
+
+   ONE SPEC, NOT TWO.  There is no ∃-weakened twin: a caller that does not
+   care about the value simply drops the clause.
+
+   THE RETURN VALUE IS NOT AN UNCONSTRAINED DISJUNCTION.  [r = 0] implies the
+   second arm, i.e. [fetch_ok addr (pv_sz V)] -- a caller that gets 0 learns
+   the whole doubleword lay inside the process's address space.  It cannot
+   learn more: copyin's own contract permits failure (an unmapped page that
+   vmfault declines to back), so "returns 0" is not a function of the inputs
+   the way argfd's answer is. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import CpuOwn.
+Require Import UserPtTree.
+Require Import KvmSpec.
+Require Import ProcPtOwn.
+Require Import SpecCopyin.    (* [uimg_word_at]: the image's word at an address *)
+Require Import FdSlots ProcInv.
+Require Import FileInvDefs.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Import Defs.
+Local Open Scope Z_scope.
+
+
+(* fetchaddr's own frame is 4 slots; copyin wants 50 below it (walkaddr 10,
+   vmfault 38, memmove 2) and myproc 10, so 50 covers both calls. *)
+Notation fetchaddr_stack := (54%nat) (only parsing).
+(* ===================================================================== *)
+(*  What fetchaddr TESTS.                                                 *)
+(* ===================================================================== *)
+(* The C is two unsigned compares -- [addr >= p->sz] and [addr + 8 > p->sz],
+   the second one there to catch the wrap the first would miss -- and the
+   machine keeps them as two ([bgeu s1,a5] then [bltu a5,a4] with
+   [a4 = addr + 8]).  Under [proc_priv]'s [p->sz <= MAXVA] invariant they
+   collapse to ONE arithmetic condition, because a [addr] that survives the
+   first test is below 2^38 and [addr + 8] cannot then wrap.  ProofFetchaddr's
+   [fa_z_ge_bad] / [fa_z_range] / [fa_z_lt_bad] are that collapse; stating the
+   contract in the collapsed form is what keeps it readable. *)
+Definition fetch_ok (addr szv : mword 64) : Prop :=
+  (uint addr + 8 <= uint szv)%Z.
+
+(* WHICH WORD IT WROTE, at the image it read from.  [r = 0] is the only
+   arm that promises anything: copyin ran to completion, so the eight bytes
+   it moved ARE the process's own at [addr] and the word the caller reads
+   back is their little-endian value ([SpecCopyin.uimg_word_at]).  On the
+   [-1] arm the clause is vacuous, which is the copy family's failure arm
+   exactly -- [SpecFetchstr.fetchstr_got]'s mold, keyed on the answer.
+
+   [uimg_word_at]'s eight addresses are consecutive in [Z], and [fetch_ok]
+   -- which the same arm carries -- is what rules the wrap out. *)
+Definition fetchaddr_got (M : gmap Z (bv 8)) (addr : mword 64)
+    (r w : mword 64) : Prop :=
+  r = (mword_of_int 0 : mword 64) -> uimg_word_at M (uint addr) w.
+
+Section SpecFetchaddr.
+  Context `{!riscvGS Σ}.
+
+  (* fetchaddr's result, keyed by the returned a0 (the [argfd_post] shape). *)
+  Definition fetchaddr_post `{XI : CurCtx} (M : gmap Z (bv 8))
+      (ip oldv addr szv r : mword 64) : iProp Σ :=
+    (⌜r = (mword_of_int (-1) : mword 64) /\ ¬ fetch_ok addr szv⌝ ∗ ip ↦₈[KT1] oldv
+     ∨ ⌜(r = (mword_of_int 0 : mword 64) \/ r = (mword_of_int (-1) : mword 64))
+        /\ fetch_ok addr szv⌝
+        ∗ ∃ w : mword 64, ip ↦₈[KT1] w ∗ ⌜fetchaddr_got M addr r w⌝)%I.
+
+End SpecFetchaddr.
+
+Definition wp_fetchaddr_sconf_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γf : gname)
+    (m : regfile) (av : nat) (eb : bool) (p : mword 64)
+    (pid : mword 32) (U : ustate) (oldv : mword 64) (b : bool) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.fetchaddr in
+  let addr := m !!! Regidx (mword_of_int 10 : mword 5) in
+  let ip := m !!! Regidx (mword_of_int 11 : mword 5) in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (fetchaddr_stack <= av)%nat ->
+  sie_cap_gpr KT1 m av b p -∗
+  (* [n = 0]: copyin's chain reaches vmfault, whose kalloc runs with
+     interrupts un-pushed (SpecCopyin.v) *)
+  cpu_own 0%nat eb p b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  proc_priv γf p pid U -∗
+  kalloc_env γa None -∗
+  ip ↦₈[KT1] oldv -∗
+  wp_next b p (fun (CID : CpuId) =>
+    (* THE IMAGE DOES NOT MOVE.  fetchaddr READS eight bytes of user memory
+       through copyin; the pages copyin faults in on the way were already in
+       the block's view -- as lazy pages reading 0 -- so vmfault does not move
+       it either ([SpecCopyin.wp_copyin_sconf_mem] is same-[M]).  Only the
+       DESCRIPTOR grows, and the block comes back at the image it was
+       handed. *)
+    ∀ (mf : regfile) (P' : uptd) (k' : nat),
+      ⌜callee_saved m mf⌝ -∗
+      ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+      (* THE EVENT COUNTER (permit sweep L1b): fetchaddr lends the block's counter to copyin, which may step it,
+         so the block comes back at a count at least the one it left at *)
+      ⌜(pv_ev (us_V U) <= k')%nat⌝ -∗
+      sie_cap_gpr KT1 mf av b p -∗
+      cpu_own 0%nat eb p b lks -∗
+      pc_is ret_tgt -∗
+      proc_priv γf p pid (us_upt (upd_usV U (upd_ev (us_V U) k')) P') -∗
+      fetchaddr_post (us_M U) ip oldv addr (pv_sz (us_V U))
+        (mf !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type FETCHADDR.
+  Parameter wp_fetchaddr_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γf : gname) (m : regfile) (av : nat) (eb : bool) (p : mword 64)
+      (pid : mword 32) (U : ustate) (oldv : mword 64) (b : bool) (lks : gset string),
+      wp_fetchaddr_sconf_body γa γf m av eb p pid U oldv b lks.
+End FETCHADDR.

@@ -1,0 +1,338 @@
+(* SpecKerneltrap.v -- kerneltrap()'s interface, in TWO layers.
+
+   [KERNELTRAP] (bottom of this file) is the real thing: the house-spec
+   contract of the C function, discharged by ProofKerneltrap.v.
+
+   [KERNELTRAP_RETURNS] (first) is the LEGACY round-trip contract kernelvec
+   was written against and which [LinkKerneltrap.v] still supplies with an
+   [Axiom].  It says nothing about what kerneltrap DOES -- only that it
+   returns, preserving the caller's registers, saved-register stack windows,
+   and S-mode config cells.  It exists only until [ProofKernelvec.v] is
+   rewired onto [KERNELTRAP] (explicit-cpuid Stage 2: the handler contract
+   has to start handing the handler the trap CSRs, [cpu_hart], a deeper
+   stack carve and a hart-generic Loeb -- see
+   claude-notes/completed/kerneltrap.md).  THE DAY THAT LANDS, DELETE
+   [KERNELTRAP_RETURNS], [kv_cell], [kt_clobbered] AND [LinkKerneltrap.v]'s
+   axiom; nothing else refers to them.
+
+   Keeping two interfaces for one function is not the intended end state,
+   and the removal condition above is the whole reason it is tolerable now:
+   the new contract cannot be CONSUMED until the engine changes, and the old
+   one cannot be deleted until it is.                                       *)
+
+(* ===================================================================== *)
+(* LAYER 1: the legacy assumed round-trip contract (to be deleted).       *)
+(*                                                                       *)
+(*   misa / mseccfg / elp / pma_regions / htif are pinned persistently by *)
+(*   [hw_config] and the minstret counter cells live in the (persistent)  *)
+(*   [minstret_inv], so neither appears in the footprint; sepc is NOT in  *)
+(*   it either (kerneltrap saves and restores it), so it frames around    *)
+(*   the call.                                                            *)
+(* ===================================================================== *)
+From Stdlib Require Import ZArith List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language weakestpre lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import RiscvLang RiscvPtsto RiscvExtras.
+Require Import RegFile.
+Require Import InstrBytes.
+Require Import WpGpr.
+Require Import WpMmodeLeafBase.
+Require Import SmodeCore.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import LockRank.
+Require Import FdSlots.
+Require Import ProcGeom CpuOwn.
+Require Import DiskPtsto.
+Require Import UartNames.
+Require Import Xv6Cameras.
+Require Import SpecDevintr.
+From Kernel Require KernelSyms.
+Require Import IrefSlots.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import CtxIdDefs.
+Local Open Scope Z_scope.
+Import Defs.
+
+Section KvCell.
+  Context `{!riscvGS Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+  (* the 8-byte stack cell at address [a] currently holding [v]: a
+     doubleword points-to, bundling the 8 byte facts with 8-alignment. *)
+  Definition kv_cell (a : mword 64) (v : bv 64) : iProp Σ :=
+    word_pointsto a (DfracOwn 1) v.
+End KvCell.
+
+(* The caller-saved temporaries a C function (kerneltrap) may clobber:
+   ra + t0..t6 + a0..a7 -- exactly the registers kernelvec's assembly saves
+   and restores around the call.  Every OTHER register (sp, gp, tp, s0..s11)
+   is callee-saved and must be preserved by kerneltrap. *)
+Definition kt_clobbered : gset regidx :=
+  {[ Regidx (mword_of_int 1 : mword 5); Regidx (mword_of_int 5 : mword 5);
+     Regidx (mword_of_int 6 : mword 5); Regidx (mword_of_int 7 : mword 5);
+     Regidx (mword_of_int 10 : mword 5); Regidx (mword_of_int 11 : mword 5);
+     Regidx (mword_of_int 12 : mword 5); Regidx (mword_of_int 13 : mword 5);
+     Regidx (mword_of_int 14 : mword 5); Regidx (mword_of_int 15 : mword 5);
+     Regidx (mword_of_int 16 : mword 5); Regidx (mword_of_int 17 : mword 5);
+     Regidx (mword_of_int 28 : mword 5); Regidx (mword_of_int 29 : mword 5);
+     Regidx (mword_of_int 30 : mword 5); Regidx (mword_of_int 31 : mword 5) ]}.
+
+Definition wp_kerneltrap_returns_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ} `{GenId} `{CpuId}
+    (γ : gname) (dq : dfrac)
+    (m : regfile) (spv rava : mword 64)
+    (satp0 : mword 64)
+    (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+    (pa1 pa2 pa3 pa4 pa5 pa6 pa7 pa8 pa9 pa10 pa11 pa12 pa13 pa14 pa15 pa16 pa17 : mword 64)
+    (v1 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12 v13 v14 v15 v16 v17 : bv 64) :=
+  m !!! Regidx csp_rs1 = spv ->
+  m !!! Regidx (mword_of_int 1 : mword 5) = rava ->
+  smode_config γ dq -∗
+  satp ↦ᵣ satp0 -∗
+  tlb ↦ᵣ tlbvec -∗
+  pc_is (mword_of_int (KernelSyms.kerneltrap) : mword 64) -∗
+  gpr_file m -∗
+  kv_cell pa1 v1 -∗ kv_cell pa2 v2 -∗ kv_cell pa3 v3 -∗ kv_cell pa4 v4 -∗
+  kv_cell pa5 v5 -∗ kv_cell pa6 v6 -∗ kv_cell pa7 v7 -∗ kv_cell pa8 v8 -∗
+  kv_cell pa9 v9 -∗ kv_cell pa10 v10 -∗ kv_cell pa11 v11 -∗ kv_cell pa12 v12 -∗
+  kv_cell pa13 v13 -∗ kv_cell pa14 v14 -∗ kv_cell pa15 v15 -∗ kv_cell pa16 v16 -∗
+  kv_cell pa17 v17 -∗
+  ▷ ( ∀ m' : regfile,
+      ⌜ ∀ r : regidx, r ∉ kt_clobbered → m' !!! r = m !!! r ⌝ -∗
+      smode_config γ dq -∗
+      satp ↦ᵣ satp0 -∗
+      tlb ↦ᵣ tlbvec -∗
+      pc_is rava -∗
+      gpr_file m' -∗
+      kv_cell pa1 v1 -∗ kv_cell pa2 v2 -∗ kv_cell pa3 v3 -∗ kv_cell pa4 v4 -∗
+      kv_cell pa5 v5 -∗ kv_cell pa6 v6 -∗ kv_cell pa7 v7 -∗ kv_cell pa8 v8 -∗
+      kv_cell pa9 v9 -∗ kv_cell pa10 v10 -∗ kv_cell pa11 v11 -∗ kv_cell pa12 v12 -∗
+      kv_cell pa13 v13 -∗ kv_cell pa14 v14 -∗ kv_cell pa15 v15 -∗ kv_cell pa16 v16 -∗
+      kv_cell pa17 v17 -∗
+      mWP (Loop : expr riscv_lang) ) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type KERNELTRAP_RETURNS.
+  Parameter kerneltrap_returns :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ} `{GenId} `{CpuId}
+      (γ : gname) (dq : dfrac)
+      (m : regfile) (spv rava : mword 64)
+      (satp0 : mword 64)
+      (tlbvec : vec (option TLB_Entry) (2 ^ 6))
+      (pa1 pa2 pa3 pa4 pa5 pa6 pa7 pa8 pa9 pa10 pa11 pa12 pa13 pa14 pa15 pa16 pa17 : mword 64)
+      (v1 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12 v13 v14 v15 v16 v17 : bv 64),
+      wp_kerneltrap_returns_body γ dq m spv rava satp0 tlbvec
+        pa1 pa2 pa3 pa4 pa5 pa6 pa7 pa8 pa9 pa10 pa11 pa12 pa13 pa14 pa15 pa16 pa17
+        v1 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12 v13 v14 v15 v16 v17.
+End KERNELTRAP_RETURNS.
+
+(* ===================================================================== *)
+(* LAYER 2: THE REAL CONTRACT.                                            *)
+(* ===================================================================== *)
+
+(* The public interface of kerneltrap(), the C trap handler kernelvec calls.
+   Requires only the definitional layer and its callees' Spec files --
+   never a whole-function proof file.
+
+     void kerneltrap() {
+       int which_dev = 0;
+       uint64 sepc = r_sepc(); uint64 sstatus = r_sstatus(); uint64 scause = r_scause();
+       if ((sstatus & SSTATUS_SPP) == 0) panic("kerneltrap: not from supervisor mode");
+       if (intr_get() != 0)              panic("kerneltrap: interrupts enabled");
+       if ((which_dev = devintr()) == 0) {
+         printk("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
+         panic("kerneltrap");
+       }
+       if (which_dev == 2 && myproc() != 0) yield();
+       w_sepc(sepc); w_sstatus(sstatus);
+     }
+
+   @ KernelSyms.kerneltrap = 0x80002696, 40 instructions, a 48-byte frame
+   (ra/s0/s1/s2/s3).
+
+   THE CONTRACT IS STATED AT THE ONE CALL SITE THERE IS.  kerneltrap is
+   reached only from kernelvec, i.e. only on a taken S-mode interrupt, so the
+   precondition says so -- and that is what makes all THREE panic arms dead:
+
+     panic("not from supervisor mode")  refuted by [Hspp]: the trapped
+                                        mstatus has SPP = 1, which the
+                                        handler contract's [trap_ms] says;
+     panic("interrupts enabled")        refuted for free: the live SIE bit
+                                        IS the ambient arm index
+                                        ([IntrDefs.sie_arm_half_agree]), and
+                                        a handler runs at [b = false];
+     printk(...); panic("kerneltrap")   refuted by [Hsc]: scause is threaded
+                                        at a PINNED value that devintr
+                                        recognises.
+
+   THE POINT OF DOING IT THIS WAY IS THE AXIOM LEDGER.  Closing the third arm
+   with a panic instead would have been easy, but printk's general
+   (non-panic) path is UNPROVEN, so a live edge to it would put
+   [wp_printk_gen_sconf] in the cone -- proving kerneltrap would then trade
+   one sanctioned assumed contract for another.  With [Hsc] the cone is
+   devintr + myproc + yield + panic, all proven, and discharging this
+   contract removes [Kerneltrap.kerneltrap_returns] with nothing taking its
+   place.
+
+   WHY [Hsc] IS DISCHARGEABLE AT THE CALL SITE (and why it needs no [mip]
+   invariant): the dispatch set is [s_pending = s_mip_bits & mie & mideleg],
+   masked by [mie] -- and this kernel writes [sie] exactly once, in start()
+   (`w_sie(r_sie() | SIE_SEIE | SIE_STIE)`, bits 9 and 5), never writes
+   [mie], and starts from 0.  So no cause but S-external and S-timer can ever
+   be pending, which is exactly devintr's two.  See
+   [claude-notes/completed/kerneltrap.md].
+
+   HOW THE SPP FACT REACHES THE CHECK: [sret_bits], the ghost mirror of
+   mstatus.SPP and SPIE (IntrDefs).  The check runs FOUR instructions after
+   entry, and every instruction round-trips [sconf] through
+   [wp_instr_s_sconf], whose [exists ms] destroys the identity of the
+   mstatus -- so no fact ABOUT a named entry mstatus can survive, and no
+   flavour of the bundle rescues it.  What survives is the ghost, threaded
+   independently: the caller hands over the travelling half at ('1','1')
+   (the trap came from S-mode with interrupts enabled), and agreement with
+   the tie inside [sconf] recovers the fact at whatever mstatus the sstatus
+   read names.
+
+   BECAUSE OF THAT, THE POSTCONDITION IS ABSOLUTE, NOT RELATIVE.  The final
+   [csrw sstatus] writes back the saved word, so the mstatus kerneltrap
+   leaves has SPP = 1, SPIE = 1 and SIE = 0 outright -- there is no need to
+   name an entry mstatus anywhere in the contract, and the precondition
+   threads the PLAIN [sie_cap_gpr].  Only the postcondition uses the
+   mstatus-exposing flavour, and only because [sret] is what reads those
+   bits.
+
+   The travelling half CROSSES THE PARK with the other trap CSRs: on the
+   resuming hart it comes back at that hart's own values, and the final
+   [csrw sstatus] re-pins it from the word held in s1 -- a register value,
+   which migrates for free.
+
+   THE CROSSING IS REAL: [wp_next true p].  kerneltrap yields on a timer
+   interrupt when this cpu has a current process, so execution can resume on
+   a DIFFERENT hart -- and [wp_next]'s second escape hatch collapses that
+   exactly when [p = zero_reg], which is the same condition the C tests
+   (`which_dev == 2 && myproc() != 0`).  The per-hart cells therefore come
+   back at the RESUMING hart: sepc holds the epc kerneltrap put back, but
+   scause and stval are that hart's own and their values are existential.
+
+   [eb = false] THROUGHOUT, and it is not a convenience.  The trap cleared
+   SIE, so yield's own acquire records intena = 0, sched carries that across
+   the park, and the matching release does not turn interrupts back on --
+   kernelvec's sret is what restores SIE from SPIE.  This is the one place in
+   the tree that parks at [eb = false], and today's SpecYield/SpecSched
+   demand [eb = true]; see the project note for the generalization that
+   owes.                                                                    *)
+
+(* kerneltrap's own frame is 6 slots; the deepest callee is devintr at
+   [SpecDevintr.devintr_stack] = 40 (myproc wants 10, yield 20). *)
+Notation kerneltrap_stack := (58%nat) (only parsing).
+(* THE CHECK THAT KEEPS [IntrDefs.kv_frame_slots] HONEST.  That constant is
+   the stack a trap may consume below the interrupted sp, and it has to cover
+   kernelvec's own 32-slot frame PLUS this whole cone.  It is written as a
+   literal there because this file sits above IntrDefs, so nothing would stop
+   the two from drifting -- and drift is exactly the silent kind: growing
+   kerneltrap's cone still compiles and only fails deep inside the handler
+   proof, at a place that looks unrelated. *)
+Lemma kt_carve_fits : (32 + kerneltrap_stack <= kv_frame_slots)%nat.
+Proof. lia. Qed.
+
+Definition wp_kerneltrap_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γu : uart_names) (γv : disk_names) (γdk γtl : gname)
+    (γs : list gname) (pd pav pu : mword 64)
+    (m : regfile) (av : nat) (p : mword 64)
+    (ep sc tv : mword 64) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.kerneltrap in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  length γs = NPROC ->
+  (kerneltrap_stack <= av)%nat ->
+  (* the trap was taken from a cause devintr RECOGNISES *)
+  devintr_ret sc <> (mword_of_int 0 : mword 64) ->
+  (* the saved epc is instruction-aligned, so restoring it lands verbatim
+     (sepc's write legalizes through the same bit-0 clear [ret_pc] is) *)
+  ret_pc ep = ep ->
+  (* kerneltrap dispatches devintr, whose cone bottoms out at cons.lock
+     ("cons", 5) through uartintr -> consoleintr -- BELOW clockintr's
+     tickslock (8) and virtio's (9), and a bound has to be stated at the
+     minimum, since [locks_below_mono] raises but never lowers. *)
+  locks_below lks "cons" ->
+  sie_cap_gpr KT1 m av false p -∗
+  (* THE TRAP CAME FROM S-MODE WITH INTERRUPTS ENABLED: SPP = 1 and
+     SPIE = 1.  This is the [sret_bits] travelling half, which is what
+     carries the fact past the four instructions before the check. *)
+  sret_bits ('b"1" : mword 1) ('b"1" : mword 1) -∗
+  (* THE INSTALLED TRAP VECTOR AND ITS CONTRACT.  In and out, because what
+     the caller actually needs is the RESUMING hart's copy and the only thing
+     that can produce that is the crossing itself: on the two non-yield paths
+     nothing moves the hart, so this very resource IS the postcondition's; on
+     the yield path it goes into the park and the dispatch payload's takes its
+     place ([SpecYield]).  A caller gets back one about whichever hart it
+     resumed on, and never has to know which case it was in.
+
+     Why the caller needs it at all: kernelvec's [sret] flips SIE '0' -> '1',
+     and that flip needs the [intr_res] quarter -- so a returning trap cannot
+     re-enable interrupts without the handler resource in hand.  kernelvec can
+     pay this premise; the handler spec inside it, at a LATER, is exactly its
+     own Löb hypothesis, which is where the recursion in this cone is closed.
+
+     IT IS THREADED, NOT PERSISTENT.  It used to be [intr_handler_avail], a
+     duplicable credential -- but the persistence was per-hart and therefore
+     bought nothing across the one boundary (the park) that mattered.  The
+     trap CSRs beside it are threaded piecewise at PINNED values here, which
+     is why this is its own conjunct rather than folded into [trap_csrs]. *)
+  intr_res KT1 -∗
+  (* THE KPT RECEIPT, [trap_csrs]' sixth member (IntrDefs §6b), threaded for
+     EXACTLY [intr_res]'s reasons and by the same route.  kernelvec's sret
+     re-enables interrupts, and the arm it rebuilds carries the receipt, so a
+     returning trap can no more re-enable them without it than without the
+     handler resource.  It crosses the yield park inside [trap_csrs] and comes
+     back as the RESUMING hart's, which is why it is a post as well. *)
+  kpt_on cpu_id -∗
+  cpu_own 0 false p false lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  sepc ↦ᵣ ep -∗ scause ↦ᵣ sc -∗ stval ↦ᵣ tv -∗
+  devintr_caps γu γv γdk γtl γs pd pav pu -∗
+  (* THE RUNNING CLAIM, handed over by the TRAP: taking the trap cleared SIE
+     and so dismantled [sie_arm true p], and the claim was one of its
+     conjuncts.  This is what a preempting kerneltrap spends on [yield] --
+     the whole reason the claim lives in the arm rather than in a caller's
+     frame, since a preempting trap holds no frame of the thread it
+     interrupted. *)
+  cpu_claim p -∗
+  wp_next true p (fun (CID : CpuId) =>
+    ∀ (mf : regfile) (ms_f sc' tv' : mword 64),
+      ⌜ callee_saved m mf ⌝ -∗
+      (* what the sret needs, and all it needs: return to S-mode, re-enable
+         interrupts from SPIE, and they are still off until it does *)
+      ⌜ _get_Mstatus_SPP  ms_f = ('b"1" : mword 1) ⌝ -∗
+      ⌜ _get_Mstatus_SPIE ms_f = ('b"1" : mword 1) ⌝ -∗
+      ⌜ _get_Mstatus_SIE  ms_f = ('b"0" : mword 1) ⌝ -∗
+      sie_cap_gpr_at KT1 ms_f mf av false p -∗
+      sret_bits ('b"1" : mword 1) ('b"1" : mword 1) -∗
+      (* at the RESUMING hart -- see the premise *)
+      intr_res KT1 -∗
+      kpt_on cpu_id -∗
+      cpu_own 0 false p false lks -∗
+      (* sepc is RESTORED to the trapped pc; scause and stval belong to the
+         resuming hart, so their values are existential *)
+      sepc ↦ᵣ ep -∗ scause ↦ᵣ sc' -∗ stval ↦ᵣ tv' -∗
+      pc_is ret_tgt -∗
+      cpu_claim p -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type KERNELTRAP.
+  Parameter wp_kerneltrap_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γu : uart_names) (γv : disk_names) (γdk γtl : gname)
+      (γs : list gname) (pd pav pu : mword 64)
+      (m : regfile) (av : nat) (p : mword 64)
+      (ep sc tv : mword 64) (lks : gset string),
+      wp_kerneltrap_sconf_body γu γv γdk γtl γs pd pav pu
+        m av p ep sc tv lks.
+End KERNELTRAP.

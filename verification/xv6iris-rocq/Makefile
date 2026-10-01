@@ -1,0 +1,669 @@
+# ======================================================================
+# Top-level build for the xv6-on-Sail RISC-V Rocq/Iris development.
+#
+#   make            build everything needed for the proofs (== make proofs)
+#   make proofs     compile the Iris proofs (iris/) + their dependencies
+#   make vtest      regenerate the QEMU captures, then check the model
+#                   against them (needs qemu-system-riscv64 + the toolchain)
+#   make vtest-check  check the model against the CHECKED-IN captures only
+#   make vtest-check-ci  the same, but compile every test and report the
+#                   per-test result (what CI runs)
+#   make vtest-deps build just the ~14 iris/ files vtest needs (not all of iris)
+#   make hwtest     regenerate the captures from a REAL BOARD over JTAG, then
+#                   check the model against them (needs the board + OpenOCD;
+#                   read tools/vtest/README-hw.md first)
+#   make hwtest-probe  talk to the board and print what is there
+#   make vtest-table   THE TABLE: every case, its runs on QEMU and the
+#                   board, and whether each run has a passing proof
+#   make vtest-passes  build every run's proof, then print the table
+#   make toolchain-check  is $(SWITCH) exactly opam/xv6rocq.export? (tools/toolchain_check.sh)
+#   make audit      build, then Print Assumptions on the system theorem
+#   make audit-only the same audit, against an already-built tree
+#   make audit-tree / audit-tree-only  the same, for the TREE APPLICATION's
+#                   era-0 obligation -- a cone neither of the other two walks
+#   make audit-union / audit-union-only  the same, for THE APPLICATION theorem:
+#                   the UNION of the file and pipeline lines, power-cycled --
+#                   a cone the system audit never walks
+#   make audit-all / audit-all-only    system + union application, concurrently
+#   make model      compile the Sail-generated Coq model (model-xv6iris/)
+#   make kernel     build the xv6 kernel ELF (xv6-riscv/kernel/kernel)
+#   make user       build the xv6 user-space programs (xv6-riscv/user/_*)
+#   make xv6-rev-check  warn if xv6-riscv/ is not at the pinned $(XV6_REV)
+#   make dump       (re)generate kernel-rocq/*.v + user-rocq/*.v, then compile
+#   make gen-code   regenerate the KERNEL decode layer (iris/Code*.v) from the dump
+#   make check-decode  ... and fail if anything moved
+#   make gen-ucode  regenerate the USER code catalogs (iris/UCode*.v); needs a
+#                   built iris/, since it reads every AST off the model
+#   make check-ucode   ... and fail if anything moved
+#   make kernel-rocq  compile kernel-rocq/ (regenerating its .v if the ELF changed)
+#   make user-rocq  compile user-rocq/ (the dumped user programs, e.g. _sync)
+#   make dump-force force a re-dump of every image, even if the ELF is unchanged
+#   make sail-rev-check  warn if sail-riscv/ is not at the pinned $(SAIL_RISCV_REV)
+#   make model-gen  regenerate model-xv6iris/*.v from sail-riscv (needs `sail`)
+#   make clean      remove Coq build artifacts (.vo/.glob/CoqMakefile)
+#   make distclean  also `make clean` the xv6 tree
+#
+# Every Rocq command runs inside the project-local opam switch ($(SWITCH));
+# you do NOT need to `eval $(opam env ...)` first.  Override on the command
+# line if needed, e.g.  make OBJDUMP=riscv64-unknown-elf-objdump
+#
+# NOTE: regenerating the Coq model from the Sail sources needs the `sail`
+# compiler (not required for a normal build -- the model .v are checked in).
+# See README.md > "Build" > "Regenerating the Sail model".
+# ======================================================================
+
+SWITCH  ?= /shared/xv6rocq
+RUN     := opam exec --switch=$(SWITCH) --
+PYTHON  ?= python3
+OBJDUMP ?= riscv64-linux-gnu-objdump
+
+# Parallel compilation: each Coq sub-make (coq_makefile) is run with -j$(JOBS).
+# coq_makefile computes the dependency order, so independent files (e.g. the
+# WpAdd/WpAuipc/WpLoad/WpFetch siblings) compile concurrently.  Override with
+# e.g.  make JOBS=4 proofs   (JOBS=1 forces a serial build).
+JOBS ?= $(shell nproc 2>/dev/null || echo 4)
+
+MODEL := model-xv6iris
+KDUMP := kernel-rocq
+UDUMP := user-rocq
+IRIS  := iris
+
+DUMPER     := tools/dump_elf.py
+GENCODE    := tools/gen_code.py
+XV6_DIR    := xv6-riscv
+XV6_URL    ?= https://github.com/mit-pdos/xv6-riscv
+KERNEL_ELF := $(XV6_DIR)/kernel/kernel
+USER_DIR   := $(XV6_DIR)/user
+
+# THE Sail model this development is proved against.  Like $(XV6_DIR), the
+# checkout is .gitignored, so these two lines are the only record of where the
+# generated model-xv6iris/*.v came from.  It is a FORK of riscv/sail-riscv: its
+# deltas upstream are the atomic PTE A/D-bit update (an exclusive PTE read + a
+# conditional PTE write, with the tablewalk checks re-run on the freshly read
+# value), which is what the page-table proofs are stated against; the `coq:`
+# bindings on the platform hooks; and the tagging of instruction fetches /
+# page-table walks as AK_ifetch / AK_ttw at the concurrency interface (see
+# README.md > "Regenerating the Sail model").
+SAIL_RISCV_DIR ?= sail-riscv
+SAIL_RISCV_URL ?= https://github.com/zeldovich/sail-riscv
+SAIL_RISCV_REV ?= 070832a1e4b086f0c6f7635de54cc2b4cfd66993
+
+# THE xv6 revision this development is proved against.  $(XV6_DIR) is
+# .gitignored, so this is the only record of which upstream commit the tracked
+# kernel-rocq/*.v came from -- building any other revision moves symbol
+# addresses out from under every proof that names one (a few commits either
+# way already move most of them).  Verified: a kernel built here reproduces
+# kernel-rocq/*.v byte for byte and symbol for symbol.
+#
+# THE PIN IS A CLEAN TIP OF $(XV6_URL)'s `verified` BRANCH.  It was briefly a
+# local cherry-pick (ae96fd0 + 9da28f5) while the fix for kernel-defects.md D2
+# was ahead of the revision this tree was proved against; converging on the
+# branch tip retired that apparatus, and the pin has tracked the tip since
+# (…; d80e61c5: tx_lock becomes a spinlock, panic path removed; a28e94b: no
+# procdump from the console; 2691300 -> 1a70c2e: unreachable() split out of
+# panic(), rebased onto upstream 13602eb, which gives sleep() a prototype and
+# so rewrites sys_sync's call to it; 1a70c2e -> 515391a: seventeen more
+# panic() call sites become unreachable(), and gcc reorders four of fs.c's
+# functions; 4398009 -> 4aab0eb: deterministic builds (-ffile-prefix-map, so
+# every binary and fs.img is byte-identical across build trees -- what the
+# literal rocq-raw dumps depend on) plus a new usertests binary
+# (linkoverflow); no kernel/user layout change, all 20 dumps byte-identical;
+# 45071c7 -> ded23f2: fix pid wraparound/reuse -- allocpid becomes a static
+# retry scan over proc[] under pid_lock and gcc INLINES it into allocproc
+# (the <allocpid> symbol is gone), freeproc takes pid_lock around p->pid = 0,
+# everything after proc.c's allocproc moves +0x34, .eh_frame shrinks so
+# every .data/.bss symbol moves -0x30; fs.img and the user dumps unchanged;
+# ded23f2 -> 06ea57f: no console output on panic -- panic()'s two printk
+# calls are COMMENTED OUT, so panic goes 40 bytes -> 10 (gcc keeps the now
+# dead frame under -fno-omit-frame-pointer), .text shrinks and everything
+# after panic moves -0x1e (the plic/virtio/kernelvec tail -0x20, an
+# alignment boundary absorbing two more), the literals "panic: " and "%s\n"
+# leave .rodata so every string at or above 0x80007018 moves -0x10 -- etext
+# itself does NOT move, being page-aligned -- and .data/.bss move -0x10;
+# panic is the ONLY function whose shape changed, every other diff is an
+# immediate; fs.img and the user dumps unchanged; a8957838 -> 3e9926e: grep
+# skips a line too long for its buffer instead of stopping at it -- user/
+# grep.c only, the kernel dumps unchanged, the grep dumps and fs.img move).
+# 3e9926e -> 7b2c1b1: seccomp -- struct proc gains uint64 seccomp (368 B; every
+# .bss symbol after proc moves), syscall() gains the mask-check arm,
+# sys_seccomp is entry 23, userinit/kfork store the mask, user/seccomp.c is a
+# new binary (inum 23; its mask clears open, kill, link, unlink, mkdir, mknod)
+# and every user ELF gains the seccomp stub (+8 after usys).
+# Nothing here is a local commit:
+# `git -C xv6-riscv checkout --detach $(XV6_REV)` reproduces the image, and
+# that is the whole recipe.
+#
+# THAT BRANCH IS REBASED, NOT APPENDED TO, so `git -C xv6-riscv fetch` on a
+# tree pinned at the previous tip reports a FORCED UPDATE and the old pin
+# stays reachable only from your local clone -- expect the diff between two
+# consecutive pins to be an upstream commit that landed UNDER the series, not
+# on top of it.
+XV6_REV ?= d66e41cd1fce5e6c320c1d0eeed90915e16cac1c
+
+KDUMP_SRCS := $(KDUMP)/KernelInstrs.v $(KDUMP)/KernelData.v $(KDUMP)/KernelSyms.v \
+              $(KDUMP)/KernelElfRaw.v $(KDUMP)/FsImgRaw.v
+
+# User-space programs to dump into user-rocq/, as <xv6 program>:<Rocq module
+# prefix> pairs (the ELF is $(USER_DIR)/_<program>).  Adding one here also needs
+# its dumped .v files listed in user-rocq/_CoqProject (three, plus the
+# <P>ElfRaw.v where a program's whole-file raw is wanted -- cat has four).
+USER_DUMPS ?= sync:Sync echo:Echo sh:Sh init:Init cat:Cat grep:Grep seccomp:Seccomp
+
+.PHONY: all proofs model kernel user dump dump-force kernel-rocq user-rocq \
+        xv6-rev-check sail-rev-check gen-code check-decode update-decode \
+        gen-ucode check-ucode \
+        audit audit-only audit-tree audit-tree-only audit-union audit-union-only audit-all audit-all-only intr-cone-check vtest vtest-check vtest-check-ci vtest-gen vtest-deps \
+        hwtest hwtest-gen hwtest-gen-all hwtest-probe cva6test-sim cva6test-gen \
+        vtest-runs vtest-passes vtest-table \
+        clean clean-proofs distclean model-gen toolchain-check
+
+all: proofs
+
+# ---- 1. Sail-generated Coq model (rv64d_types, riscv_extras, rv64d), plus
+#         the hand-written xv6iris_extras (the platform-hook realisations) ----
+$(MODEL)/CoqMakefile: $(MODEL)/_CoqProject
+	cd $(MODEL) && $(RUN) coq_makefile -f _CoqProject -o CoqMakefile
+model: $(MODEL)/CoqMakefile
+	$(RUN) $(MAKE) -C $(MODEL) -f CoqMakefile -j$(JOBS)
+
+# ---- 2. xv6 sources, pinned at $(XV6_REV) ----
+# Detached: the checkout is a build input pinned by this Makefile, not a branch
+# to develop on.  An existing $(XV6_DIR) is left alone (see xv6-rev-check).
+$(XV6_DIR):
+	git clone $(XV6_URL) $@
+	git -C $@ fetch -q origin $(XV6_REV)
+	git -C $@ checkout --detach $(XV6_REV)
+
+# Warn when the checkout is not the revision the tracked dumps came from.
+xv6-rev-check: | $(XV6_DIR)
+	@have=`git -C $(XV6_DIR) rev-parse HEAD 2>/dev/null`; \
+	 want=`git -C $(XV6_DIR) rev-parse $(XV6_REV) 2>/dev/null`; \
+	 if [ -z "$$want" ]; then \
+	   echo "WARNING: $(XV6_DIR) does not have XV6_REV=$(XV6_REV); try 'git -C $(XV6_DIR) fetch'."; \
+	 elif [ "$$have" != "$$want" ]; then \
+	   echo "WARNING: $(XV6_DIR) is at $$have,"; \
+	   echo "         not the pinned XV6_REV=$$want."; \
+	   echo "         Images built here will NOT match the tracked kernel-rocq/*.v:"; \
+	   echo "         symbol addresses move, and every proof naming one breaks."; \
+	   echo "         Fix with: git -C $(XV6_DIR) checkout --detach $(XV6_REV)"; \
+	 fi
+
+# ---- 2a. the kernel ELF (disassembled into Rocq by the dumper) ----
+kernel: $(KERNEL_ELF)
+$(KERNEL_ELF): | $(XV6_DIR)
+	$(MAKE) -C $(XV6_DIR) kernel/kernel
+
+# ---- 2b. xv6 user-space programs (user/_sync & friends; built by fs.img) ----
+user: $(USER_DIR)/_sh
+$(USER_DIR)/_%: | $(XV6_DIR)
+	$(MAKE) -C $(XV6_DIR) fs.img
+
+# ---- 2c. the filesystem image (mkfs's packed disk: the same fs.img build
+# that produces user/_sync & friends above, dumped separately for its own
+# sake -- see kernel-rocq/FsImgRaw.v below) ----
+$(XV6_DIR)/fs.img: | $(XV6_DIR)
+	$(MAKE) -C $(XV6_DIR) fs.img
+
+# ---- 3. Dump the ELF images into Rocq and compile them ----
+#
+# The generated .v are checked in but the ELFs are not ($(XV6_DIR) is
+# .gitignored), so what keeps a dump honest is $(XV6_REV), not the build graph:
+# an image built from another revision moves every symbol address and
+# invalidates the proofs that name them.  Re-dumps themselves are cheap and
+# safe: the dumper leaves an output (and its mtime) untouched when the content
+# is unchanged, so a dumper edit that changes no output rebuilds nothing.
+$(KDUMP)/KernelInstrs.v: $(KERNEL_ELF) $(DUMPER)
+	$(PYTHON) $(DUMPER) --format rocq      --elf $< --objdump $(OBJDUMP) --out $@
+$(KDUMP)/KernelData.v:   $(KERNEL_ELF) $(DUMPER)
+	$(PYTHON) $(DUMPER) --format rocq-data --elf $< --objdump $(OBJDUMP) --out $@
+$(KDUMP)/KernelSyms.v:   $(KERNEL_ELF) $(DUMPER)
+	$(PYTHON) $(DUMPER) --format rocq-syms --elf $< --objdump $(OBJDUMP) --out $@
+$(KDUMP)/KernelElfRaw.v: $(KERNEL_ELF) $(DUMPER)
+	$(PYTHON) $(DUMPER) --format rocq-raw  --elf $< --objdump $(OBJDUMP) --out $@
+# fs.img is not an ELF (--format rocq-bin: no disassembly, no ELF parsing),
+# so this rule needs no $(OBJDUMP).
+$(KDUMP)/FsImgRaw.v:     $(XV6_DIR)/fs.img $(DUMPER)
+	$(PYTHON) $(DUMPER) --format rocq-bin  --elf $< --prefix fsimg --out $@
+$(KDUMP)/CoqMakefile: $(KDUMP)/_CoqProject
+	cd $(KDUMP) && $(RUN) coq_makefile -f _CoqProject -o CoqMakefile
+kernel-rocq: $(KDUMP_SRCS) $(KDUMP)/CoqMakefile
+	$(RUN) $(MAKE) -C $(KDUMP) -f CoqMakefile -j$(JOBS)
+
+# One dump per user program.  $(1) = xv6 program name, $(2) = Rocq module prefix
+# (so `sync:Sync` gives user-rocq/Sync{Instrs,Data,Syms}.v with names sync_bytes,
+# sync_data, syncEntry, ... — distinct from the kernel's, so a proof can Require
+# both the kernel image and the program it runs).
+define user_dump_rules
+$(UDUMP)/$(2)Instrs.v: $(USER_DIR)/_$(1) $$(DUMPER)
+	$$(PYTHON) $$(DUMPER) --format rocq      --elf $$< --prefix $(1) --objdump $$(OBJDUMP) --out $$@
+$(UDUMP)/$(2)Data.v:   $(USER_DIR)/_$(1) $$(DUMPER)
+	$$(PYTHON) $$(DUMPER) --format rocq-data --elf $$< --prefix $(1) --objdump $$(OBJDUMP) --out $$@
+$(UDUMP)/$(2)Syms.v:   $(USER_DIR)/_$(1) $$(DUMPER)
+	$$(PYTHON) $$(DUMPER) --format rocq-syms --elf $$< --prefix $(1) --objdump $$(OBJDUMP) --out $$@
+$(UDUMP)/$(2)ElfRaw.v: $(USER_DIR)/_$(1) $$(DUMPER)
+	$$(PYTHON) $$(DUMPER) --format rocq-raw  --elf $$< --prefix $(1) --objdump $$(OBJDUMP) --out $$@
+UDUMP_SRCS += $(UDUMP)/$(2)Instrs.v $(UDUMP)/$(2)Data.v $(UDUMP)/$(2)Syms.v $(UDUMP)/$(2)ElfRaw.v
+endef
+$(foreach d,$(USER_DUMPS),\
+  $(eval $(call user_dump_rules,$(word 1,$(subst :, ,$(d))),$(word 2,$(subst :, ,$(d))))))
+
+$(UDUMP)/CoqMakefile: $(UDUMP)/_CoqProject
+	cd $(UDUMP) && $(RUN) coq_makefile -f _CoqProject -o CoqMakefile
+user-rocq: $(UDUMP_SRCS) $(UDUMP)/CoqMakefile
+	$(RUN) $(MAKE) -C $(UDUMP) -f CoqMakefile -j$(JOBS)
+
+dump: kernel-rocq user-rocq
+
+# ---- 3a. Keep the iris/ decode layer in step with the image ----
+#
+# Every instr fact states an encoding word and a decoded immediate; both are
+# properties of the IMAGE, and both move when the kernel is relaid out --
+# including in functions whose own source did not change, via re-encoded call
+# targets and linker relaxation.  (The pc's themselves are symbol-relative,
+# [KernelSyms.bpin + 0x14], and survive a relayout untouched.)
+#
+# So the whole layer -- iris/KernelDecode*.v and every iris/Code*.v named in
+# tools/code_manifest.json -- is GENERATED from kernel-rocq/, never patched.
+#
+#   make gen-code        regenerate the decode layer from the tracked dump
+#   make check-decode    regenerate, then fail if anything moved
+#
+# check-decode's diff is the signal after a dump-force: a Code file that
+# changed shape (a different instruction, not just a different immediate) is a
+# real code change, and its proof needs a human.
+gen-code:
+	$(PYTHON) $(GENCODE) --iris $(IRIS) --kernel-rocq $(KDUMP)
+# The diff is scoped to the files gen_code.py actually WRITES -- the manifest's
+# outputs plus the shared decode catalogs -- not to the $(IRIS)/Code*.v glob:
+# that glob also sweeps the HAND-WRITTEN Code<F>Aux.v files, so any uncommitted
+# edit to one of those failed this target with a diff that has nothing to do
+# with the dump.  (It fired twice on unrelated work before being narrowed.)
+GENFILES := $(addprefix $(IRIS)/,$(shell $(PYTHON) -c "import json;print(' '.join(sorted(set(e[0] for e in json.load(open('tools/code_manifest.json'))))))"))
+check-decode: gen-code
+	git diff --exit-code -- $(IRIS)/KernelDecode*.v $(GENFILES)
+update-decode: gen-code
+
+# ---- 3b. ... and the USER-program catalogs, the same layer one tier up ----
+#
+# iris/UCode<Prog>.v is to a dumped user image what iris/Code<F>.v is to the
+# kernel: generated from user-rocq/, never patched.  Two differences from
+# gen-code, both of which decide how you run it:
+#
+#   - the pc SET is a policy, not the whole image.  Which functions a catalog
+#     covers (and the reason each omission is not a gap) lives in that
+#     catalog's tools/ucode_<prog>.txt; the manifest row only says which spec
+#     drives which output.
+#   - gen_ucode.py reads every AST off the MODEL rather than computing it, so
+#     it shells out to coqc -- which needs iris/ BUILT.  gen-code needs
+#     nothing but python.
+#
+#   make gen-ucode       regenerate every catalog in tools/ucode_manifest.json
+#   make check-ucode     regenerate, then fail if anything moved
+#
+# A diff here after a re-dump means the user image moved and the program
+# proofs must be replayed; a diff on an unchanged image means somebody hand
+# edited a generated file, and the edit is about to be lost.
+GENUCODE := tools/gen_ucode.py
+UCODE_MANIFEST := tools/ucode_manifest.json
+UCODEFILES := $(shell $(PYTHON) -c "import json;print(' '.join(sorted(e['out'] for e in json.load(open('$(UCODE_MANIFEST)')))))")
+gen-ucode:
+	$(RUN) $(PYTHON) $(GENUCODE) --iris $(IRIS) --user-rocq $(UDUMP) \
+	    --manifest $(UCODE_MANIFEST)
+# The first half is the sibling of the kernel layer's "a Code<F>.v with no
+# manifest row is a time bomb": an unlisted UCode<Prog>.v is regenerated by
+# nothing, so it silently stops tracking the image and no check ever says so.
+check-ucode: gen-ucode
+	@for f in $(IRIS)/UCode*.v; do \
+	  case " $(UCODEFILES) " in \
+	    *" $$f "*) ;; \
+	    *) echo "check-ucode: $$f is in no $(UCODE_MANIFEST) row --"; \
+	       echo "             nothing regenerates it, and it will drift."; \
+	       exit 1;; \
+	  esac; \
+	done
+	git diff --exit-code -- $(UCODEFILES)
+
+# Re-dump every image from the ELFs currently in xv6-riscv/, even if make
+# thinks the .v are up to date.  Check `git diff kernel-rocq/` afterwards: a
+# changed symbol address means the proofs must be replayed against the new one.
+# (Removing the outputs, rather than `make -B`, because -B would also force a
+# rebuild of the ELFs themselves -- exactly the drift this guards against.)
+dump-force: xv6-rev-check
+	rm -f $(KDUMP_SRCS) $(UDUMP_SRCS)
+	$(MAKE) $(KDUMP_SRCS) $(UDUMP_SRCS)
+
+# ---- 4. The Iris proofs (depend on the model and the kernel dump) ----
+$(IRIS)/CoqMakefile: $(IRIS)/_CoqProject
+	cd $(IRIS) && $(RUN) coq_makefile -f _CoqProject -o CoqMakefile
+proofs: model kernel-rocq user-rocq $(IRIS)/CoqMakefile
+	$(RUN) $(MAKE) -C $(IRIS) -f CoqMakefile -j$(JOBS)
+
+# ---- 4a. The toolchain check ----
+# Is $(SWITCH) exactly the switch opam/xv6rocq.export describes?  Re-exports it (full, frozen)
+# and diffs; identical means .vo built here are interchangeable with CI's and the container's.
+toolchain-check:
+	tools/toolchain_check.sh "$(SWITCH)"
+
+# ---- 4b. The assumption audit (iris/SystemAssumptions.v) ----
+# `Print Assumptions` on the system theorem -- the one check that sees through
+# every functor and seal (xv6-bump-playbook.md §7.2).  It is NOT part of `make
+# proofs` and NOT a row in iris/_CoqProject: the statement alone measured 95 s
+# of SystemAdequacy.v's 98.6 s, and that file is the serial tail of the build,
+# so it was ~30 % of a clean build's wall clock on every build.  See
+# claude-notes/optimization.md for why the command costs what it does.
+#
+# Flags come out of iris/_CoqProject so the audit compiles against exactly the
+# load paths the build uses; the -arg prefix is coq_makefile's, not coqc's, so
+# it is stripped.  -noglob is load-bearing rather than tidiness: the nightly
+# dead-import sweep shortlists candidates from whatever .glob files it finds in
+# iris/, and this file's single import is the one thing it must not lose.
+AUDIT_FLAGS = $(shell sed -n 's/^-arg //p;/^-[RQ] /p' $(IRIS)/_CoqProject)
+
+audit: proofs
+	$(MAKE) audit-only
+
+# The same audit against a tree that is already built.  This is what CI runs --
+# its iris build is driven directly rather than through `proofs`, whose
+# kernel-rocq prerequisite would pull in the (absent) kernel ELF.
+audit-only:
+	cd $(IRIS) && $(RUN) coqc $(AUDIT_FLAGS) -noglob SystemAssumptions.v
+
+# The SAME audit for the TREE APPLICATION (iris/TreeAssumptions.v): `Print
+# Assumptions` on TreeImg.tree_Happ_init, the era-0 obligation of
+# AppTree.app_tree at the literal mkfs image.  A THIRD target for the reason
+# there is a second: no two of the three cones contain each other -- the
+# system audit walks no application tier at all, and the echo audit walks
+# AppEcho/EchoOut/USh* and never AppTree/TreeView/TreeMove/TreeImg.  That
+# file's header says what it audits and why it is not yet a whole-system
+# theorem.  Same reasons for -noglob and for staying out of iris/_CoqProject.
+audit-tree: proofs
+	$(MAKE) audit-tree-only
+
+audit-tree-only:
+	cd $(IRIS) && $(RUN) coqc $(AUDIT_FLAGS) -noglob TreeAssumptions.v
+
+# The SAME audit for THE APPLICATION theorem (iris/UnionAssumptions.v): `Print
+# Assumptions` on UInitUnion.union_results -- union_adequacy_closed, the
+# whole-system theorem, paired with its corollary union_sync_cut_neg -- at
+# AppUnionRec.app_union -- the echo, echo > f and cat f lines and the pipelines
+# echo ... | cat^n and cat f | cat^n, across power cycles.  Its cone walks the
+# whole Uk*/USh*/UInit* program tier and the union stage (UnionDisc/UnionOut/
+# UnionLinks/AppUnionRec), which the system audit never does.  That file's
+# header says what it audits.  Same reasons for -noglob and for staying out of
+# iris/_CoqProject as SystemAssumptions.v.
+audit-union: proofs
+	$(MAKE) audit-union-only
+
+audit-union-only:
+	cd $(IRIS) && $(RUN) coqc $(AUDIT_FLAGS) -noglob UnionAssumptions.v
+
+# THE INTERRUPT ARM'S FUNCTOR CONE (tools/intr_cone.py; design/ni-strong-instance.md
+# R4): walks the Link-level instantiation cone of usertrap's device/timer
+# arm's two callees, Devintr and Yield, and fails if any module in it
+# implements KALLOC or KFREE.  The structural half of the strong instance
+# ("a quiet round runs no allocator"): a check of the proof tree's shape,
+# not a theorem in the logic.  Needs no build -- it reads the .v sources.
+intr-cone-check:
+	$(PYTHON) tools/intr_cone.py
+
+# BOTH audits -- the system theorem and THE APPLICATION's (the union) -- and
+# the reason this target exists rather than a habit of typing
+# `make audit-only audit-union-only`: that line SERIALISES them.  Make runs the
+# goals on its command line one after another unless it is itself parallel, so
+# the two would cost the sum of their wall clocks for no reason -- they are
+# independent single-threaded coqc processes over an already-built tree,
+# sharing nothing but the .vo they read.  The recursive `-j2` is what overlaps
+# them, and the overlap is nearly free: the pair costs about what either one
+# costs alone (claude-notes/optimization.md has the dated measurement).
+#
+# `--output-sync=target` is not tidiness either: the two Print Assumptions
+# outputs land on one stdout, and without it they interleave mid-line and both
+# lists become unreadable.  -O makes make buffer each recipe and emit it whole.
+# (CI does not use this target -- it backgrounds the two `audit-*-only` targets
+# itself, because it needs each audit's output in a log file of its own to put
+# in the step summary.  Same parallelism, different plumbing.)
+audit-all: proofs
+	$(MAKE) audit-all-only
+
+audit-all-only:
+	$(MAKE) -j2 --output-sync=target audit-only audit-union-only
+
+# ---- 5. vtest: the device semantics, differentially tested against QEMU ----
+#
+# These are NOT proofs.  The question they answer is one-directional -- is
+# what the real hardware did an execution our model ALLOWS? -- so a test only
+# has to EXHIBIT one model execution matching what QEMU produced, which is a
+# computation (a [vm_cast_no_check]d equation), not a WP.  See
+# tools/vtest/README.md and vtest-rocq/VTest.v.
+#
+# TWO TARGETS, and the split matters.  `vtest-gen` RE-RUNS QEMU and rewrites
+# the captured vtest-rocq/QEMU/*Gen.v; it needs qemu-system-riscv64 and the
+# toolchain.  `vtest-check` only checks the model against the captures already
+# checked in, so CI (and anyone without QEMU) can run it.  Neither is part of
+# `make proofs`: a red device test is a finding about the model, and it must
+# not break the proof build.
+VTEST := vtest-rocq
+
+# THE CONE vtest ACTUALLY NEEDS -- [RiscvExec] + [DevModel] + [ColdBoot] and
+# their dependencies, fourteen files, NOT all of iris/.  There is no CSL in
+# vtest-rocq: a test exhibits one execution by computation, so it needs the
+# model and the interpreter and nothing above them.  `vtest-deps` builds
+# exactly that (~2 min from cold), which is what keeps a device test from
+# ever being blocked by in-progress proof work elsewhere in the tree.
+#
+# It drives the sub-CoqMakefiles DIRECTLY rather than going through the
+# `kernel-rocq` target, whose prerequisites reach the kernel ELF: the dumped
+# .v are checked in, and vtest has no business rebuilding an image.
+VTEST_CONE := SetShrink FastSetSolver ArchReset RiscvModelBytes VirtioModel \
+              DiskImg DevModel RiscvLang HartBlock PtreeType Ktier \
+              RiscvPtsto RiscvExec ColdBoot
+
+vtest-deps: model $(KDUMP)/CoqMakefile $(IRIS)/CoqMakefile
+	$(RUN) $(MAKE) -C $(KDUMP) -f CoqMakefile -j$(JOBS) \
+	  KernelSyms.vo KernelInstrs.vo KernelData.vo
+	$(RUN) $(MAKE) -C $(IRIS) -f CoqMakefile -j$(JOBS) \
+	  $(addsuffix .vo,$(VTEST_CONE))
+
+vtest-gen:
+	$(PYTHON) tools/vtest/vtest.py gen --all
+
+$(VTEST)/CoqMakefile: $(VTEST)/_CoqProject
+	cd $(VTEST) && $(RUN) coq_makefile -f _CoqProject -o CoqMakefile
+
+# The cone this needs is RiscvExec + DevModel + ColdBoot and their
+# dependencies (~20 files), not all of iris/ -- but the iris/ .vo have to
+# exist, so build them the normal way first if the tree is cold.
+vtest-check: $(VTEST)/CoqMakefile
+	$(RUN) $(MAKE) -C $(VTEST) -f CoqMakefile -j$(JOBS)
+
+vtest: vtest-gen vtest-check
+
+# ---- 5b. hwtest: the same semantics, against a REAL BOARD over JTAG ----
+#
+# tools/vtest/board.py is vtest.py's sibling: it asks the same
+# one-directional question of a development board (currently a StarFive
+# VisionFive 2) instead of QEMU, and writes vtest-rocq/JH7110/<Name>Gen.v
+# beside vtest.py's vtest-rocq/QEMU/<Name>Gen.v.  Each carries its own run
+# module and proof; the platform is the DIRECTORY.  There is no separate
+# check target: a board capture is checked by `vtest-check` like every
+# other one.
+#
+# READ tools/vtest/README-hw.md BEFORE USING THESE.  A board run claims
+# something NARROWER than a QEMU run -- the image is not the same image, the
+# board's power-on register file is not reachable over JTAG, and the UART is
+# a different chip at a different stride -- and the reasons are not obvious.
+#
+# `hwtest-gen` needs the board attached and OpenOCD listening (gdb on 3333,
+# the command server on 4444); nothing else here does.  It is deliberately
+# NOT wired into `vtest`, which must keep working with no hardware present.
+HWTEST_BOARD ?= visionfive2
+
+hwtest-probe:
+	$(PYTHON) tools/vtest/board.py probe --board $(HWTEST_BOARD)
+
+hwtest-gen:
+	$(PYTHON) tools/vtest/board.py gen --board $(HWTEST_BOARD) $(HWTEST_TESTS)
+
+# every test that makes sense on a board with no virtio-mmio disk
+hwtest-gen-all:
+	$(PYTHON) tools/vtest/board.py gen --board $(HWTEST_BOARD) \
+	  $$($(PYTHON) tools/vtest/board.py runnable --board $(HWTEST_BOARD))
+
+hwtest: hwtest-gen-all vtest-check
+
+# ---- 5b'. cva6test: the same semantics, against the CVA6 RTL (Verilator) ----
+#
+# tools/vtest/cva6.py is the third runner: the OpenHW CVA6 core's RTL
+# (cv64a6_imafdc_sv39, inside CVA6's own corev_apu testharness), simulated
+# by Verilator, writing vtest-rocq/CVA6/<Name>{Test,Run}.v.  The image is
+# byte-for-byte QEMU's, and the simulator starts from a real reset.  See the
+# docstring of tools/vtest/cva6.py and README.md "The third platform".
+#
+# THE SIMULATOR LIVES ON THE BUILD VM.  Run the scripts there directly, not
+# through a remote top-level make (remote-build-gcp.md says why):
+#   ./gcp-rocq/run-on-gcp tools/vtest/cva6/build.py          (once per pin)
+#   ./gcp-rocq/run-on-gcp tools/vtest/cva6.py gen --all -k
+#   ./gcp-rocq/run-on-gcp --no-sync --pull vtest-rocq/CVA6/ true
+# These two targets are the same commands, for a machine that has Verilator.
+# Checking the captures is `vtest-check`, like every other platform's.
+cva6test-sim:
+	$(PYTHON) tools/vtest/cva6/build.py
+
+cva6test-gen:
+	$(PYTHON) tools/vtest/cva6.py gen --all -k
+
+# ---- 5c. the uniform test-run framework (vtest-rocq/VRun.v) ----
+#
+# ONE SET OF CASES (tools/vtest/tests/*.S), each declaring in its own
+# `vtest:` directive which PLATFORMS it is meaningful on.  A case executed
+# on a platform is a test RUN; every run is a [VRun.TEST_RUN] and is judged
+# by [VRun.TEST_PASSES_AGREE] or [VRun.TEST_PASSES_STUCK], each stated once
+# and parametric in the test.
+#
+#   make vtest-runs    rebuild the run modules from the checked-in captures
+#                      (no QEMU, no board -- a run module is a
+#                      re-presentation of a capture, not a measurement)
+#   make vtest-passes  ATTEMPT every run's proof, then
+#                      rewrite _CoqProject with the ones that held
+#   make vtest-table   THE TABLE: every case, its runs on each platform, and
+#                      whether that run has a passing proof
+vtest-runs:
+	$(PYTHON) tools/vtest/vtest.py runs
+	$(PYTHON) tools/vtest/vtest.py passes
+
+vtest-table:
+	$(PYTHON) tools/vtest/vtest.py table
+
+# A run whose proof does NOT compile is a run that does not pass, which is a
+# FINDING and not a build failure -- hence `-k` and the discarded status.
+# IT BUILDS AGAINST _CoqProject.all, not _CoqProject.  coq_makefile emits
+# rules only for the files it is given, so a Pass module that does NOT yet
+# hold -- and is therefore absent from the green project -- could not even be
+# ATTEMPTED from the green makefile, and "is this still failing?" would be
+# unanswerable.  The attempt project lists everything; the green project is
+# then rewritten from what actually produced a .vo.
+$(VTEST)/CoqMakefile.all: $(VTEST)/_CoqProject.all
+	cd $(VTEST) && $(RUN) coq_makefile -f _CoqProject.all -o CoqMakefile.all
+
+vtest-passes: $(VTEST)/CoqMakefile.all
+	rm -f $(VTEST)/*/*Pass.vo
+	-$(RUN) $(MAKE) -C $(VTEST) -f CoqMakefile.all -j$(JOBS) -k \
+	  $$(cd $(VTEST) && ls */*Pass.v | sed 's/\.v$$/.vo/')
+	$(PYTHON) tools/vtest/vtest.py project --from-build
+	$(PYTHON) tools/vtest/vtest.py table
+
+# WHAT CI RUNS, and it is `vtest-check` with the stopping rule moved.  Every
+# test must pass, here as there; what differs is that `-k` compiles them all
+# rather than stopping at the first red one, make's own status is DISCARDED
+# (the leading `-`), and `vtest.py table --check` -- THE run table, the same
+# one `make vtest-table` prints -- is what fails the target.
+#
+# THE TABLE IS THE REPORT, and there is no second one.  A run is listed in
+# _CoqProject exactly when its proof holds, and the table reads the .vo those
+# listings produced; so "did the build go green" and "what does the table say"
+# are answered by the same artefacts and cannot disagree.  The log is still
+# written, for a human reading WHY a red one is red.
+#
+# There is no list of expected-red tests, and none is wanted: a KNOWN
+# divergence from the hardware is pinned on BOTH sides and proved unequal (see
+# tools/vtest/README.md, "Recording a divergence"), which is green today and
+# goes red the day the model moves.  So every red test is news.
+#
+# IT DELETES THE .vo FIRST -- IN EVERY PLATFORM DIRECTORY, which a top-level
+# `rm $(VTEST)/*.vo` did not do once the runs moved into QEMU/, JH7110/ and
+# CVA6/, leaving every run's proof unprotected -- and that is not tidiness -- it is what makes the
+# report's "this test passed" mean anything.  The report reads the filesystem,
+# and a FAILED recompile LEAVES THE PREVIOUS .vo IN PLACE: coq_makefile's
+# .DELETE_ON_ERROR removes the .glob (which coqc had begun) but not a .vo that
+# this run never touched, so on a warm tree -- a self-hosted CI runner keeps
+# the gitignored artifacts between runs -- a newly red test would be reported
+# green off last run's output.  Measured: 117 files, ~600 s of CPU, longest
+# single file 33 s, so a clean re-check is one file's wall-clock wide on a
+# many-core machine and cheap next to the iris build it follows.  Anything
+# outside $(VTEST) (the iris/ cone, the kernel dump) is untouched and still
+# incremental.
+#
+# The log is piped through tee only so the report can quote each failure's
+# error text; `*.log` is gitignored.  Nothing here runs QEMU -- the captures
+# are checked in.
+VTEST_LOG ?= $(VTEST)/vtest-check.log
+
+vtest-check-ci: $(VTEST)/CoqMakefile
+	find $(VTEST) \( -name '*.vo' -o -name '*.vos' -o -name '*.vok' \
+	  -o -name '*.glob' \) -delete
+	-$(RUN) $(MAKE) -C $(VTEST) -f CoqMakefile -j$(JOBS) -k \
+	  --output-sync=target 2>&1 | tee $(VTEST_LOG)
+	$(PYTHON) tools/vtest/vtest.py table --check
+
+# ---- cleaning ----
+clean-proofs:
+	-$(RUN) $(MAKE) -C $(IRIS) -f CoqMakefile clean 2>/dev/null || true
+	rm -f $(IRIS)/CoqMakefile* $(IRIS)/*.vo $(IRIS)/*.vos $(IRIS)/*.vok $(IRIS)/*.glob $(IRIS)/.*.aux
+
+clean: clean-proofs
+	-$(RUN) $(MAKE) -C $(VTEST) -f CoqMakefile clean 2>/dev/null || true
+	rm -f $(VTEST)/CoqMakefile*
+	rm -rf tools/vtest/build
+	-$(RUN) $(MAKE) -C $(MODEL) -f CoqMakefile clean 2>/dev/null || true
+	-$(RUN) $(MAKE) -C $(KDUMP) -f CoqMakefile clean 2>/dev/null || true
+	-$(RUN) $(MAKE) -C $(UDUMP) -f CoqMakefile clean 2>/dev/null || true
+	rm -f $(MODEL)/CoqMakefile* $(KDUMP)/CoqMakefile* $(UDUMP)/CoqMakefile*
+
+distclean: clean
+	-$(MAKE) -C xv6-riscv clean 2>/dev/null || true
+
+# ---- the Sail sources, pinned at $(SAIL_RISCV_REV) ----
+# Same treatment as $(XV6_DIR): a build input pinned by this Makefile, cloned
+# detached, .gitignored.  An existing checkout is left alone (see
+# sail-rev-check).  Only `model-gen` needs it; a normal build uses the
+# generated .v checked into $(MODEL).
+$(SAIL_RISCV_DIR):
+	git clone $(SAIL_RISCV_URL) $@
+	git -C $@ checkout --detach $(SAIL_RISCV_REV)
+
+sail-rev-check: | $(SAIL_RISCV_DIR)
+	@have=`git -C $(SAIL_RISCV_DIR) rev-parse HEAD 2>/dev/null`; \
+	 want=`git -C $(SAIL_RISCV_DIR) rev-parse $(SAIL_RISCV_REV) 2>/dev/null`; \
+	 if [ -z "$$want" ]; then \
+	   echo "WARNING: $(SAIL_RISCV_DIR) does not have SAIL_RISCV_REV=$(SAIL_RISCV_REV);"; \
+	   echo "         try 'git -C $(SAIL_RISCV_DIR) fetch $(SAIL_RISCV_URL)'."; \
+	 elif [ "$$have" != "$$want" ]; then \
+	   echo "WARNING: $(SAIL_RISCV_DIR) is at $$have,"; \
+	   echo "         not the pinned SAIL_RISCV_REV=$$want."; \
+	   echo "         A model regenerated there is NOT the one the proofs are about."; \
+	   echo "         Fix with: git -C $(SAIL_RISCV_DIR) checkout --detach $(SAIL_RISCV_REV)"; \
+	 fi
+
+# ---- regenerating the Sail model (manual; needs the Sail toolchain) ----
+model-gen: | $(SAIL_RISCV_DIR)
+	@if command -v sail >/dev/null 2>&1; then \
+		SAIL_RISCV_URL="$(SAIL_RISCV_URL)" SAIL_RISCV_REV="$(SAIL_RISCV_REV)" \
+		  tools/regen_sail_model.sh "$(SAIL_RISCV_DIR)"; \
+	else \
+		echo "Regenerating $(MODEL)/*.v requires the 'sail' compiler (0.20.3,"; \
+		echo "sail_coq_backend) and z3 on PATH -- eval \$$(opam env) into whichever switch"; \
+		echo "has it installed, then run tools/regen_sail_model.sh directly, or"; \
+		echo "'make model-gen SAIL_RISCV_DIR=path/to/sail-riscv'."; \
+		echo "See README.md > Build > 'Regenerating the Sail model'."; \
+		false; \
+	fi

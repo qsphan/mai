@@ -1,0 +1,870 @@
+(* ProofKforkB5.v -- kfork's TWO LOCK CROSSINGS AND THE RUNNABLE PARK,
+   +0xca .. +0xfc (block ends at pc +0xfe).
+
+     +0xca  c.mv a0,s4                   (a0 = np)
+     +0xcc  jal ra,release                (release &np->lock)
+     +0xd0  auipc a0,0x10
+     +0xd4  addi a0,a0,1724              (a0 = &wait_lock)
+     +0xd8  jal ra,acquire
+     +0xdc  sd s5,56(s4)                 (np->parent = p)
+     +0xe0  auipc a0,0x10
+     +0xe4  addi a0,a0,1708              (a0 = &wait_lock)
+     +0xe8  jal ra,release
+     +0xec  c.mv a0,s4
+     +0xee  jal ra,acquire                (acquire &np->lock)
+     +0xf2  c.li a5,3                    (RUNNABLE = 3)
+     +0xf4  sw a5,24(s4)                 (np->state = RUNNABLE)
+     +0xf8  c.mv a0,s4
+     +0xfa  jal ra,release
+
+   THE DESIGN POINT (see ProcGeom.v's comment on [needs_ctx]/[USED], right
+   above [needs_ctx_USED]): [needs_ctx USED = true], not just [needs_ctx
+   RUNNABLE] -- "USED is a state a proc can be in with its lock RELEASED:
+   kfork drops p->lock after allocproc so it can take wait_lock ... During
+   that window any table scan -- wakeup, kill, wait -- can acquire the
+   slot's lock, so whatever the slot owns has to be IN the invariant, not
+   in kfork's frame.  And the record really is there: allocproc writes
+   context.ra = forkret and context.sp = the kstack top, which is exactly
+   why kfork can go live with a single store to p->state."
+
+   Consequently [SpecForkretPark.FORKRET_PARK.forkret_park] -- which turns
+   allocproc's raw saved context into the real [SchedCtx.proc_ctx] the lock
+   invariant demands whenever [needs_ctx st = true] -- has to run ONCE,
+   BEFORE THE FIRST release (the one at +0xcc), not at the second: [USED]
+   already needs a live parked context, and [RUNNABLE] needs no additional
+   one, because [needs_ctx], [not_running] and [inv_dormant] all agree
+   between [USED] and [RUNNABLE] (ProcGeom.needs_ctx_USED/_RUNNABLE,
+   not_running_USED/_RUNNABLE, inv_dormant_USED/_RUNNABLE).  So the second
+   crossing's release is a bare [SchedCtx.proc_slots_recast], and the
+   child's [proc_priv] / [fd_slots FDSPARE] are swallowed at the FIRST
+   release, not the second.
+
+   MOVE 3 (re-acquiring the child's lock and learning its state): kfork
+   never gives up the CLAIMANT's half of the state mirror
+   ([ProcGeom.pstate_at_hlf _ USED], split off [pstate_whole] by
+   [pstate_whole_split] at the first release and carried, as an ordinary
+   ghost resource, straight through the release/wait_lock/re-acquire
+   sequence) -- so at the re-acquire, [ProcGeom.pstate_lock_claimed]
+   reads [st = USED] off that retained half for free, no table invariant
+   or extra premise required.  This is exactly what
+   [ProcGeom.pstate_lock_claimed]'s own comment anticipates ("this is what
+   lets ... kfork [st = USED], without reading the cell"). *)
+From Stdlib Require Import Eqdep_dec ZArith Lia List.
+From stdpp Require Import gmap list list_monad bitvector.definitions bitvector.tactics.
+From iris.proofmode Require Import proofmode.
+From iris.algebra.lib Require Import mono_list.
+From iris.base_logic.lib Require Import ghost_var gen_heap invariants.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import SpecPrintk.
+Require Import RegFile.
+Require Import WpNext.
+Require Import WpMmodeLeafBase.
+Require Import RiscvExtras.
+Require Import CalleeSaved.
+Require Import InstrBytes.
+Require Import KernelText.
+Require Import WpSconfAlu WpSconfMem WpSconfCtl WpSmodeIntr.
+Require Import IntrDefs.
+Require Import CpuOwn.
+Require Import HartTp.
+Require Import WpLock.
+Require Import ProcGeom.
+Require Import SwtchCtx.
+Require Import FdSlots.
+Require Import FileInvDefs.
+Require Import ProcInv.
+Require Import SchedCtx.
+Require Import WaitInv.
+Require Import WaitFresh.  (* [children_inv_row_fresh] -- the freshness the
+                              deposit below publishes (design app-pipe
+                              SS4.3x, lane PIPE-GEN) *)
+Require Import SpecProcinit.
+Require Import SpecForkretPark.
+Require Import SieCapCtx.   (* [sie_cap_gpr_own_ctx_acc]: the park borrows the running token (L8) *)
+Require Import ParkCap.   (* [park_token] / [park_token_park] -- the park, as a resource *)
+Require Import UsertrapRes SyscParkEnv FsReady FileInv FirstTok DiskInv ProcDefs FsCfg.   (* the park's vocabulary *)
+Require Import SpecUsertrap.  (* [usertrap_res]'s instances: was reaching
+                                 here through UsertrapRes.v's own import *)
+Require Import UexecSlot. (* [uvis] *)
+Require Import UexecRet.  (* [uslot] / [urun_eq] / [uslot_of_urun_eq] -- the
+                             child's slot and the re-key the park does with
+                             it, both in the proofmode context here, so this
+                             Require is DIRECT *)
+Require Import SpecAcquire SpecRelease.
+Require Import CodeKfork.
+From Kernel Require KernelSyms.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Local Open Scope Z_scope.
+Require Import CtxIdDefs.
+
+Set Printing Depth 40.
+
+Notation KF := KernelSyms.kfork (only parsing).
+
+(* ------------------------------------------------------------------ *)
+(*  The two [auipc]/[addi] pairs really compute [wait_lock_addr].      *)
+(* ------------------------------------------------------------------ *)
+Lemma kfkb5_wladdr1 :
+  add_vec (add_vec (mword_of_int (KF + 0xd0) : mword 64) (auipc_off (mword_of_int 16 : mword 20)))
+          (sign_extend' 64 (mword_of_int 1670 : mword 12))
+  = SpecProcinit.wait_lock_addr.
+Proof. unfold SpecProcinit.wait_lock_addr. apply bv_eq; vm_compute; reflexivity. Qed.
+
+Lemma kfkb5_wladdr2 :
+  add_vec (add_vec (mword_of_int (KF + 0xe0) : mword 64) (auipc_off (mword_of_int 16 : mword 20)))
+          (sign_extend' 64 (mword_of_int 1654 : mword 12))
+  = SpecProcinit.wait_lock_addr.
+Proof. unfold SpecProcinit.wait_lock_addr. apply bv_eq; vm_compute; reflexivity. Qed.
+
+(* ------------------------------------------------------------------ *)
+(*  Stack budget: acquire/release want 10 below kfork's 8-slot frame.  *)
+(* ------------------------------------------------------------------ *)
+Lemma kfkb5_stack_ok (K : nat) : (18 <= K)%nat -> (10 <= K - 8)%nat.
+Proof. lia. Qed.
+
+(* ------------------------------------------------------------------ *)
+(*  [pstate_whole] at [USED], split into the piece the lock keeps and  *)
+(*  the piece the claimant (kfork) keeps -- [USED] is claimed          *)
+(*  ([unclaimed_USED : unclaimed USED = false]).                       *)
+(* ------------------------------------------------------------------ *)
+Require Import UserFd.   (* [ufdG] -- the class a minted user slot needs *)
+
+Section PstateUsedHelper.
+  Context `{!riscvGS Σ}.
+  (* NO [Context {SG : uexecSG Σ}]: this file sits ABOVE
+     [UexecExecInst], so the deposit class it speaks is that file's
+     INSTANCE, and so is the one the specs it inhabits were stated at.  A
+     section variable here would be a SECOND class of the same type, and the
+     two [UexecRet.uslot]s print identically -- the unifier does not stop. *)
+  Lemma kfkb5_pwhole_used (pa : mword 64) :
+    pstate_whole pa USED ⊣⊢ pstate_lock pa USED ∗ pstate_at_hlf pa USED.
+  Proof using . rewrite pstate_whole_split unclaimed_USED. done. Qed.
+End PstateUsedHelper.
+
+Module KforkB5 (AQ : ACQUIRE) (RL : RELEASE).
+
+Section ProofKforkB5.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, !fileG Σ}.
+
+  Context `{!ufdG Σ}.
+  Notation Rra := (mword_of_int 1 : mword 5).
+  Notation Ra0 := (mword_of_int 10 : mword 5).
+  Notation Ra5 := (mword_of_int 15 : mword 5).
+  Notation Rs1 := (mword_of_int 9 : mword 5).
+  Notation Rs3 := (mword_of_int 19 : mword 5).
+  Notation Rs4 := (mword_of_int 20 : mword 5).
+  Notation Rs5 := (mword_of_int 21 : mword 5).
+
+  Local Ltac regne := reg_ne_side.
+
+  (* =================================================================== *)
+  (*  THE BLOCK.                                                          *)
+  (* =================================================================== *)
+  Lemma kfk_b5 `{GEN : GenId} `{CID0 : CpuId} `{XI : CurCtx}
+      (γs : list gname) (γf γw γft γl : gname) (j : nat)
+      (Mt : regfile) (K lvl : nat) (eb b : bool)
+      (pme ks : mword 64) (pid_c : mword 32) (Uc : ustate)
+      (stsP : list fdstate) (csP : gset gname) (Wk : uvis)
+      (* THE PARENT'S CHILDREN ROW: its name (the parent block's
+         [ProcDefs.pv_chg] -- this block never sees the parent's [ustate],
+         so the name is a parameter) and the set it goes in at.  DISTINCT
+         from [csP], which is the CHILD's set, the one the child's key and
+         its row are at. *)
+      (gpar : gname) (csPar : gset gname)
+      (ch : mword 64) (rest : list (mword 64)) (rv : mword 64)
+      (lks : gset string) :
+    (18 <= K)%nat ->
+    (Z.of_nat lvl + 1 < 2 ^ 31)%Z ->
+    (j < NPROC)%nat ->
+    γs !! j = Some γl ->
+    length rest = 12%nat ->
+    b = match lvl with O => eb | S _ => false end ->
+    Mt !!! Regidx Rs3 = ProcGeom.proc_addr j ->
+    Mt !!! Regidx Rs5 = pme ->
+    (* THE PARENT'S ADDRESS IS A PROC SLOT'S, hence not 0 (design app-pipe
+       SS4.3x (ii), lane PIPE-GEN).  This block is stated at an opaque
+       [pme] and the comment at the deposit below used to say the fact was
+       carried by nothing on the route; it is a premise now, relayed from
+       [SpecKfork.wp_kfork_sconf_body] and discharged at the dispatcher.
+       What it buys is the FRESHNESS row on the exit continuation: at
+       [pme = 0] the parent's row is constrained by nothing and the
+       child's generation could already be in it. *)
+    pme <> (zero_reg : mword 64) ->
+    Mt !!! Regidx Rs1 = rv ->
+    (* THE CHILD'S RUN KEY.  The slot below is captured at [Wk], and [Wk]
+       agrees with the record the child is parked at on everything a slot
+       reads besides the descriptor view ([UexecRet.urun_eq]) -- which is
+       the second premise.  So the park's steady closer, which resumes at a
+       record with the parked run key, can hand that one slot back
+       ([UexecRet.uslot_of_urun_eq]).  The caller names [Wk]: kfork's is
+       [uvis_of (KforkChild.kfork_child Up) stsP], the record [SpecKfork]
+       states from the parent. *)
+    urun_eq Wk Uc ->
+    uvis_fd Wk = stsP ->
+    (* ...and the two WAIT-EXIT readings, which [urun_eq] does not read
+       either.  THE GENERATION IS NOT THE PARKER'S TO CHOOSE: the park keys
+       the child's slot at the BLOCK's own field ([ProcDefs.pv_gen], which
+       [ParkCap.park_cap] passes), so what the caller owes is that its key
+       is at that name.  The children set still is the caller's, and this
+       lane's fork arm is what makes the choice non-trivial. *)
+    uvis_gen Wk = pv_gen (us_V Uc) ->
+    uvis_ch Wk = csP ->
+    (* ...AND ITS PID, on the generation's terms: the park keys the child's
+       slot at the RESIDUE'S index ([UsertrapRes.ut_res_bare]'s, which
+       [ParkCap.park_cap] passes as [un_pid N] = allocproc's [pid_c]), so
+       what the caller owes is that its key is at that number.  This is
+       where fork's ∀-bound child pid ([SpecKfork]'s slot premise) is
+       instantiated. *)
+    uvis_pid Wk = pid_c ->
+    (* THE FRESHNESS PREMISE, AT THE LOWEST RANK THIS BLOCK TOUCHES:
+       "wait_lock" (10), acquired directly at +0xd8; "proc" (11), released
+       immediately on entry and re-acquired at +0xee, is higher and follows
+       by [locks_below_mono] at each of its two call sites. *)
+    locks_below lks "wait_lock" ->
+    (* ENTRY: np->lock is held (level [S lvl], arm [false]), so the index
+       carries the trap reserve of the arm this block will EXIT at, i.e. [b].
+       EXIT below is at [(K - 8)] with arm [b] -- same physical carve
+       [trap_res b + (K - 8)] -- so the reserve is conserved across the block;
+       the three releases and two acquires inside it each conserve it too. *)
+    sie_cap_gpr KT1 Mt (trap_res b + (K - 8))%nat false pme -∗
+    cpu_own (S lvl) eb pme false ({["proc"]} ∪ lks) -∗
+    IntrDefs.arm_pay KT1 lvl eb pme -∗
+    kernel_text -∗
+    pc_is (mword_of_int (KF + 0xca) : mword 64) -∗
+    SchedCtx.procs_inv γs -∗
+    WpLock.is_lock γw SpecProcinit.wait_lock_addr "wait_lock"%string (WaitInv.wait_res_at) -∗
+    (* THE PAID PARK'S ROWS: the open-file table, the world
+       ([SyscParkEnv.park_world] -- device complement, console, the two
+       global locks, the slot ledger, wire invariant, trampoline claim, an
+       initproc share) and the file system's steady token (only its
+       [fs_geom_ok] is read here; forkret is who pays the file system). *)
+    FileInv.is_ftable γft γf -∗
+    SpecPrintk.printk_env (FsCfg.fsc_printk) (FsCfg.fsc_uart) (FsCfg.fsc_disk) -∗
+    park_world γs -∗
+    park_token γs -∗
+    FirstTok.first_done -∗
+    SchedCtx.proc_held cpu_id j γl USED ch -∗
+    ProcGeom.hart_at_any (ProcGeom.proc_addr j) -∗
+    ProcInv.proc_priv γf (ProcGeom.proc_addr j) pid_c Uc -∗
+    (* THE CHILD'S DESCRIPTOR STATES, AT THE PARENT'S OWN TABLE.  allocproc
+       minted the bundle at [fdt0] and kfork's copy loop
+       ([ProofKforkB3.kfkb3_fd_loop]) retyped every slot at the state the
+       parent's list records, so what arrives here is that list -- and the
+       park is keyed at it, which is how a forked child's descriptors become
+       stateable at all. *)
+    FdSlots.fd_frags (ProcDefs.pv_fdg (us_V Uc)) stsP -∗
+    (* ...AND THE CHILD'S CHILDREN ROW, on the fragments' route exactly:
+       allocproc handed it out of the slot's dormant block
+       ([SpecAllocproc.allocproc_post]) and the park captures it beside
+       them ([ParkCap.park_token_park_steady]).  At [csP], the set the
+       child's key is at -- a fresh child has none, and its caller passes
+       [∅]. *)
+    WaitInv.ch_frag (ProcDefs.pv_chg (us_V Uc)) (ProcGeom.proc_addr j) csP -∗
+    (* ...AND THE PARENT'S OWN ROW, which is NOT parked: it rides the
+       forking process's trap residue in and out ([UsertrapRes.ut_own]).
+       This block is where fork MOVES it -- it holds <wait_lock> at +0xdc to
+       write [np->parent], so it holds the authority the row belongs to,
+       and the child's generation joins the parent's set there. *)
+    WaitInv.ch_frag gpar pme csPar -∗
+    (* ...AND THE CHILD'S DEPOSIT: three quarters of each of its two
+       exclusive ghosts ([SlotGen]), with the two persistent readings that
+       make them speak.  This block is where the deposit is MADE -- it holds
+       <wait_lock> at the store that fills the child's parent cell, and what
+       goes into the payload's row of shares ([WaitInv.gen_halves]) is
+       exactly an entry for that cell.  The caller kept them back at the
+       split ([SlotGen.slot_gen_quarters]) and put the quarters in the
+       child's block. *)
+    SlotGen.slot_gen (ProcGeom.proc_addr j) (DfracOwn (3/4))
+      (ProcDefs.pv_gen (us_V Uc)) -∗
+    SlotGen.pid_reg pid_c (DfracOwn (3/4)) (ProcDefs.pv_gen (us_V Uc)) -∗
+    ChildTok.gen_slot (ProcDefs.pv_gen (us_V Uc)) (ProcGeom.proc_addr j) -∗
+    ChildTok.gen_pid (ProcDefs.pv_gen (us_V Uc)) pid_c -∗
+    (* ...and the SLOT for the child, on the very same route: kfork's caller
+       supplies it ([SpecKfork]'s premise of the same name), the park
+       captures it, and the resume hands it back at the record the child
+       actually resumes with -- which has [Wk]'s run key.  LINEAR -- see
+       claude-notes/design/user-wp-slot.md. *)
+    uslot Wk -∗
+    (* the slot's ALLOCATION MARKER, minted by allocproc and carried here
+       through kfork's body: every non-UNUSED arm of the lock invariant
+       holds it, so both releases below need it ([ProcAvail.v]).
+       Persistent, so it survives the first release and serves the second. *)
+    ProcAvail.pslot_used_at (ProcGeom.proc_addr j) -∗
+    FdSlots.fd_slots FDSPARE -∗
+    IrefSlots.iref_slots IREFSPARE -∗
+    (* the child's bio units and free kernel stack: the residue's
+       [park_own] and the package's anchor *)
+    bslots 3 -∗
+    ProcDefs.kstack_free (ProcGeom.proc_addr j) -∗
+    ProcDefs.is_kstack (ProcGeom.proc_addr j) ks -∗
+    SwtchCtx.ctx_cells (ProcGeom.p_context (ProcGeom.proc_addr j))
+      (SpecForkretPark.forkret_pc :: add_vec ks (mword_of_int 4096) :: rest) -∗
+    wp_next b pme (fun (CID : CpuId) =>
+      ∀ mf : regfile,
+        ⌜callee_saved Mt mf⌝ -∗
+        sie_cap_gpr KT1 mf (K - 8)%nat b pme -∗
+        cpu_own lvl eb pme b lks -∗
+        pc_is (mword_of_int (KF + 0xfe) : mword 64) -∗
+        (* ...AND THE MOVE WAS A GROWTH BY ONE (design app-pipe SS4.3x,
+           lane PIPE-GEN): the child's generation was in NO row of the map
+           when the store below filled its parent cell, so in particular
+           not in the forking process's own
+           ([WaitFresh.children_inv_row_fresh], read off the invariant
+           with <wait_lock> held).  PURE, and it rides out to
+           [SpecKfork.kfork_post]'s success arm and from there to the U
+           tier's [UexecRet.ufork_ans]. *)
+        ⌜ ProcDefs.pv_gen (us_V Uc) ∉ csPar ⌝ -∗
+        (* THE PARENT'S ROW, BACK AND MOVED: the child's generation is in
+           the set now, which is what makes the resume key's
+           [UexecSlot.uvis_ch] a reading of the map rather than a choice. *)
+        WaitInv.ch_frag gpar pme (csPar ∪ {[ProcDefs.pv_gen (us_V Uc)]}) -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using ufdG0.
+    intros HK Hlvl Hj Hgl Hrest Hb Hm20 Hm21 Hpmenz Hm9 Hurun Hkfd Hkgn Hkch Hkpid Hfresh.
+    iIntros "Hcg Hown Hpay #Htext Hpc #Hpinv #Hwl #Hft #Hpe #Hworld #Htoken #Hfdone Hheld Hhart Hpriv Hfrag Hcrow Hprow Hsg34 Hpr34 #Hgslot #Hgpid Hjslot #Hmk
+             Hfd Hirsp Hbsl Hkfree #Hks Hctx Hcont".
+    (* -------------------------------------------------------------- *)
+    (* MOVE 1a: build [proc_lock_res γs γl (proc_addr j)] at USED, via the *)
+    (* PAID park on the raw context allocproc left, before releasing.     *)
+    (* The record [N] is the child's trap-loop environment: every file-    *)
+    (* system field ambient ([fclose_ties]), the names out of the world    *)
+    (* bundle, the slot and stack allocproc's -- exactly userinit's move   *)
+    (* ([ProofUserinit]), with the world handed down by the parent instead  *)
+    (* of by main.                                                         *)
+    (* -------------------------------------------------------------- *)
+    iDestruct (park_world_open with "Hworld") as (γtl pd pav pu)
+      "(#Hdcaps & #Hextra & #Hwire & #Htramp & #Hipx)".
+    iDestruct "Hipx" as (iv1) "[#Hip1 #Hig1]".
+    iDestruct (SchedCtx.procs_inv_len with "Hpinv") as %Hnproc.
+    iAssert (⌜FsReady.fs_geom_ok⌝)%I as %Hgeomok.
+    { iDestruct "Hfdone" as "(_ & #Hrdy & _)". iApply (FsReady.fs_ready_geom with "Hrdy"). }
+    (* <INIT>'S NUMBER IS INHERITED, not re-derived: the parent's parked
+       world carries the cell and the sealed identity together, and the
+       child's record is keyed at exactly those two (lane TRAP-ROWS-3/4,
+       T4(b)). *)
+    (* THE INCARNATION'S KEY HISTORY, born empty at its park
+       (design/ni-uhist.md D2), at the ENCODED ledger camera *)
+    iMod (own_alloc (●ML ([] : list (leibnizO positive)))) as (γuh) "Huh";
+      [apply mono_list_auth_valid |].
+    pose (N := MkUtNames γft γf γw γs j γl pd pav pu
+                 γtl
+                 iv1 DfracDiscarded
+ ks pid_c γuh).
+    assert (Hwf : ut_wf N).
+    { split_and!; [exact Hj | exact Hgl | exact Hnproc | exact (FsReady.fgo_loggeom Hgeomok)]. }
+    iAssert (park_env N) as "#Henv".
+    { iAssert (disk_geom fsc_disk pd pav pu) as "#Hgeom".
+      { iDestruct "Hdcaps" as "(_ & _ & $ & _)". }
+      rewrite /park_env /ut_park_caps.
+      iSplitL; [| iExact "Hextra"].
+      (* the two PURE rows are gone (rank 1d): [fclose_ties] and the printk
+         equation both named [fclose_names]/[ut_names] fields that no longer
+         exist. *)
+      (* L8: the initproc share the record carries is the DISCARDED one *)
+      iSplitR; [iPureIntro; reflexivity|].
+      iSplitR; [iExact "Hpinv"|].
+      iSplitR; [iExact "Hks"|].
+      iSplitR; [iExact "Hdcaps"|].
+      iSplitR; [iExact "Hpe"|].
+      iSplitR; [iExact "Hwl"|].
+      iSplitR; [iExact "Hft"|].
+      iSplitR; [iExact "Hgeom"|].
+      iSplitR; [iExact "Hworld"|].
+      iExact "Hig1". }
+    iAssert (park_own N) with "[Hbsl Huh]" as "Hown_park".
+    { rewrite /park_own. iFrame "Hbsl". iSplitR; [iExact "Hip1" | iExact "Huh"]. }
+    iDestruct (ProcDefs.kstack_free_at with "Hks Hkfree") as "Hstack".
+    (* THE CHILD'S TABLE, NAMED AT THE PARK -- and it is the PARENT's.  The
+       copy loop ([ProofKforkB3]'s [fd_st_move] at the parent's own entry,
+       one descriptor per turn) carries the partially copied table in its
+       invariant, so the list arrives here under a name and the park is
+       keyed at it. *)
+    (* L8: the park takes and returns the parker's running token; borrow it from the cap *)
+    iDestruct (sie_cap_gpr_own_ctx_acc with "Hcg") as "[Hrun Hcgb]".
+    (* THE SLOT, RE-KEYED ONTO THE RECORD THE PARK IS AT.  This parker holds
+       [FirstTok.first_done], so the child can never be resumed through
+       forkret's boot arm and the park is the STEADY one
+       ([ParkCap.park_token_park_steady]): it takes ONE slot at the parked
+       record, instead of a family over every record at this table.  The
+       caller's slot is at [Wk], which has that record's run key, and the
+       congruence is what carries it there. *)
+    iEval (rewrite (uslot_of_urun_eq Wk Uc stsP (pv_gen (us_V Uc)) csP
+                      pid_c Hurun Hkfd Hkgn Hkch Hkpid))
+      in "Hjslot".
+    iMod (park_token_park_steady N rest Uc stsP csP Hwf Hrest
+            with "Hrun Htoken Htext Hwire Htramp Hmk Hstack Henv Hown_park Hfdone Hfrag Hcrow Hjslot
+                  [Hks Hctx Hpriv Hfd Hirsp]")
+      as "[Hrun Hpctx]".
+    (* built in [park_child]'s own conjunct order rather than framed: its
+       third row is [proc_priv], whose tail is the 4096-element [tf_page],
+       so every name the frame walks past it pays a conversion
+       (claude-notes/optimization.md, "a rebuild is a construction"). *)
+    { rewrite /park_child.
+      iSplitL "Hks"; [iExact "Hks"|].
+      (* the two files each define forkret's entry; the constants are equal *)
+      iSplitL "Hctx"; [iExact "Hctx"|].
+      iSplitL "Hpriv"; [iExact "Hpriv"|].
+      iSplitL "Hfd"; [iExact "Hfd"|].
+      iExact "Hirsp". }
+    iDestruct ("Hcgb" with "Hrun") as "Hcg".
+    iDestruct "Hheld" as "(Htok & Hpstcell & Hpwhole & Hpchan & Hppub)".
+    iEval (rewrite kfkb5_pwhole_used) in "Hpwhole".
+    iDestruct "Hpwhole" as "[Hplock Hpclaim]".
+    (* the child's record is parked under THIS context, so the slot -- and
+       the payload the release below deposits -- is built at the ambient. *)
+    iDestruct (SchedCtx.proc_slots_park γs (proc_addr j) USED needs_ctx_USED
+                 with "Hpctx Hhart Hmk") as "Hslots".
+    (* -------------------------------------------------------------- *)
+    (* +0xca c.mv a0,s4  -- regime OFF (np's lock still held)            *)
+    (* -------------------------------------------------------------- *)
+    iApply (wp_cmv_s_sconf (mword_of_int (KF + 0xca)) Ra0 Rs3 Mt (trap_res b + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0ca with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    set (M1 := <[Regidx Ra0 := regval_into_reg (add_vec zero_reg (Mt !!! Regidx Rs3))]> Mt).
+    assert (HM1a0 : M1 !!! Regidx Ra0 = (proc_addr j)).
+    { rewrite /M1 upd_eq add_vec_zero_l. exact Hm20. }
+    assert (Hpp_cc : add_vec_int (mword_of_int (KF + 0xca) : mword 64) 2 = mword_of_int (KF + 0xcc))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_cc) in "Hpc".
+    (* -------------------------------------------------------------- *)
+    (* +0xcc jal ra,release  -- regime OFF                               *)
+    (* -------------------------------------------------------------- *)
+    assert (Htgt_rel1 : add_vec (mword_of_int (KF + 0xcc) : mword 64)
+                          (sign_extend' 64 (mword_of_int 2092786 : mword 21))
+                        = mword_of_int KernelSyms.release)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_jal_s_sconf (mword_of_int (KF + 0xcc)) Rra (mword_of_int 2092786 : mword 21)
+              M1 (trap_res b + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (kfk_0cc with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    iEval (rewrite Htgt_rel1) in "Hpc".
+    set (M2 := <[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xcc) : mword 64) 4)]> M1).
+    assert (HM2ra : M2 !!! Regidx Rra = add_vec_int (mword_of_int (KF + 0xcc) : mword 64) 4)
+      by (rewrite /M2; apply upd_eq).
+    assert (HM2a0 : M2 !!! Regidx Ra0 = (proc_addr j))
+      by (rewrite /M2 upd_ne; [exact HM1a0 | vm_compute; discriminate]).
+    assert (Hcs_0_2 : callee_saved Mt M2).
+    { rewrite /M2. apply callee_saved_insert_r; [vm_compute; reflexivity |].
+      rewrite /M1. apply callee_saved_insert_r; [vm_compute; reflexivity | apply callee_saved_refl]. }
+    assert (Hlka1 : add_vec (M2 !!! Regidx Ra0) (sign_extend' 64 (mword_of_int 0 : mword 12)) = (proc_addr j))
+      by (rewrite HM2a0; apply addv_sext0).
+    (* ---- release(&np->lock) ---- *)
+    (* release wants the reserve at ITS OWN exit arm [match lvl ...]; [Hb]
+       names that [b], so put [Hcg]'s index back into the spec's spelling
+       for the call.  (The [rewrite -Hb] after the call does the reverse
+       for what the release hands back.) *)
+    iEval (rewrite Hb) in "Hcg".
+    iDestruct (SchedCtx.proc_lock_res_intro γs γl (proc_addr j) USED ch
+                 with "Hpstcell Hplock Hpchan Hppub Hslots") as "HRused".
+    iApply (RL.wp_release_sconf KT1 (CID := CID0) γl (proc_addr j) "proc"%string
+              (SchedCtx.proc_lock_pay γs γl (proc_addr j)) M2 lvl eb pme (K - 8)%nat
+              ({["proc"]} ∪ lks)
+              Hlka1 (kfkb5_stack_ok K HK)
+              with "Hcg Htext Hpc [Hpinv] Htok HRused Hown Hpay").
+    { iApply (SchedCtx.procs_inv_lookup γs j γl Hgl with "Hpinv"). }
+    iIntros (CID1 Hs1 mr1) "Hcg Hpc %Hcs_2_r1 Hown".
+    assert (Hfresh_proc : locks_below lks "proc")
+      by lkbelow.
+    pose proof (locks_below_not_elem _ _ Hfresh_proc) as Hfresh_proc_ne.
+    iEval (rewrite (_ : ({["proc"]} ∪ lks) ∖ {["proc"]} = lks);
+           [| apply locks_add_del_below; lkbelow]) in "Hown".
+    assert (Hpc_c8 : ret_pc (M2 !!! Regidx Rra) = mword_of_int (KF + 0xd0)).
+    { rewrite HM2ra. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hpc_c8) in "Hpc".
+    iEval (rewrite -Hb) in "Hcg". iEval (rewrite -Hb) in "Hown".
+    assert (Hcs_0_r1 : callee_saved Mt mr1) by (eapply callee_saved_trans; [exact Hcs_0_2 | exact Hcs_2_r1]).
+    (* -------------------------------------------------------------- *)
+    (* +0xd0 / +0xd4 auipc+addi -> wait_lock_addr -- regime GENERIC     *)
+    (* -------------------------------------------------------------- *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KF + 0xd0)) Ra0 (mword_of_int 16 : mword 20)
+              mr1 (K - 8)%nat b ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0d0 with "Htext"). }
+    iIntros (CID2 Hs2) "Hcg Hpc".
+    set (M3 := <[Regidx Ra0 := regval_into_reg
+                  (add_vec (mword_of_int (KF + 0xd0) : mword 64) (auipc_off (mword_of_int 16 : mword 20)))]> mr1).
+    assert (HM3a0 : M3 !!! Regidx Ra0
+                    = add_vec (mword_of_int (KF + 0xd0) : mword 64) (auipc_off (mword_of_int 16 : mword 20)))
+      by (rewrite /M3; apply upd_eq).
+    assert (Hpp_d4 : add_vec_int (mword_of_int (KF + 0xd0) : mword 64) 4 = mword_of_int (KF + 0xd4))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_d4) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KF + 0xd4)) Ra0 Ra0 (mword_of_int 1670 : mword 12)
+              M3 (K - 8)%nat b ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0d4 with "Htext"). }
+    iIntros (CID3 Hs3) "Hcg Hpc".
+    set (M4 := <[Regidx Ra0 := regval_into_reg
+                  (add_vec (rget M3 Ra0) (sign_extend' 64 (mword_of_int 1670 : mword 12)))]> M3).
+    assert (HM4a0 : M4 !!! Regidx Ra0 = SpecProcinit.wait_lock_addr).
+    { rewrite /M4 upd_eq. rgne. rewrite HM3a0. exact kfkb5_wladdr1. }
+    assert (Hpp_d8 : add_vec_int (mword_of_int (KF + 0xd4) : mword 64) 4 = mword_of_int (KF + 0xd8))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_d8) in "Hpc".
+    (* -------------------------------------------------------------- *)
+    (* +0xd8 jal ra,acquire(&wait_lock)  -- regime GENERIC entry         *)
+    (* -------------------------------------------------------------- *)
+    assert (Htgt_acq1 : add_vec (mword_of_int (KF + 0xd8) : mword 64)
+                          (sign_extend' 64 (mword_of_int 2092638 : mword 21))
+                        = mword_of_int KernelSyms.acquire)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_jal_s_sconf (mword_of_int (KF + 0xd8)) Rra (mword_of_int 2092638 : mword 21)
+              M4 (K - 8)%nat b
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (kfk_0d8 with "Htext"). }
+    iIntros (CID4 Hs4) "Hcg Hpc".
+    iEval (rewrite Htgt_acq1) in "Hpc".
+    set (M5 := <[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xd8) : mword 64) 4)]> M4).
+    assert (HM5ra : M5 !!! Regidx Rra = add_vec_int (mword_of_int (KF + 0xd8) : mword 64) 4)
+      by (rewrite /M5; apply upd_eq).
+    assert (HM5a0 : M5 !!! Regidx Ra0 = SpecProcinit.wait_lock_addr)
+      by (rewrite /M5 upd_ne; [exact HM4a0 | vm_compute; discriminate]).
+    assert (Hcs_r1_5 : callee_saved mr1 M5).
+    { rewrite /M5. apply callee_saved_insert_r; [vm_compute; reflexivity |].
+      rewrite /M4. apply callee_saved_insert_r; [vm_compute; reflexivity |].
+      rewrite /M3. apply callee_saved_insert_r; [vm_compute; reflexivity | apply callee_saved_refl]. }
+    (* carry [cpu_own] hart-generically across the three plain leaves *)
+    iDestruct (cpu_own_transport CID1 CID4 lvl eb pme b ltac:(wp_next_chain) with "Hown") as "Hown".
+    iApply (AQ.wp_acquire_sconf KT1 (CID := CID4) γw "wait_lock"%string (WaitInv.wait_res_at)
+              M5 lvl eb pme (K - 8)%nat b lks Hlvl (kfkb5_stack_ok K HK)
+              Hfresh
+              with "Hcg Hown Htext Hpc [Hwl]").
+    all: try lkbelow.
+    { iEval (rewrite HM5a0). iExact "Hwl". }
+    iIntros (CID5 Hs5 ms mr5) "%Hms5 Hcg Hpc %Hcs_5_r5 Htokw Hwaitres _ Hown Hpay".
+    assert (Hpc_d4 : ret_pc (M5 !!! Regidx Rra) = mword_of_int (KF + 0xdc)).
+    { rewrite HM5ra. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hpc_d4) in "Hpc".
+    assert (Hcs_1_5 : callee_saved mr1 M5) by exact Hcs_r1_5.
+    assert (Hcs_1_r5 : callee_saved mr1 mr5) by (eapply callee_saved_trans; [exact Hcs_1_5 | exact Hcs_5_r5]).
+    assert (Hcs_0_r5 : callee_saved Mt mr5) by (eapply callee_saved_trans; [exact Hcs_0_r1 | exact Hcs_1_r5]).
+    assert (Hr5s5 : mr5 !!! Regidx Rs5 = pme) by (rewrite (callee_saved_lookup Hcs_0_r5 Rs5 ltac:(vm_compute; reflexivity)); exact Hm21).
+    assert (Hr5s4 : mr5 !!! Regidx Rs3 = (proc_addr j)) by (rewrite (callee_saved_lookup Hcs_0_r5 Rs3 ltac:(vm_compute; reflexivity)); exact Hm20).
+    (* -------------------------------------------------------------- *)
+    (* +0xdc sd s5,56(s4) : np->parent = p  -- regime OFF (wait_lock held) *)
+    (* -------------------------------------------------------------- *)
+    iDestruct "Hwaitres" as (ps gs mch O) "(Hpo & Hch & Ho & Hci & Hzl)".
+    iDestruct (WaitInv.parents_own_length with "Hpo") as %Hpolen.
+    destruct (lookup_lt_is_Some_2 ps j ltac:(rewrite Hpolen; exact Hj)) as [vold Hvold].
+    iDestruct (WaitInv.parents_own_acc ps j vold Hvold with "Hpo") as "[Hpcell Hpoback]".
+    assert (Hea_d4 : add_vec (rget mr5 Rs3) (sign_extend' 64 (mword_of_int 56 : mword 12)) = ProcGeom.p_parent (proc_addr j)).
+    { assert (Hr : rget mr5 Rs3 = mr5 !!! Regidx Rs3) by (rgne; reflexivity).
+      rewrite Hr Hr5s4. apply WaitInv.p_parent_sext. }
+    iApply (wp_sd_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KF + 0xdc)) Rs5 Rs3 (mword_of_int 56 : mword 12)
+              mr5 (trap_res b + (K - 8))%nat vold false with "Hcg Hpc [] [Hpcell]").
+    { iApply (kfk_0dc with "Htext"). }
+    { iEval (rewrite Hea_d4). iExact "Hpcell". }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc Hpcell".
+    iEval (rewrite Hea_d4) in "Hpcell".
+    assert (Hst_rs5 : rget mr5 Rs5 = pme) by (rewrite (rget_ne mr5 Rs5 ltac:(vm_compute; discriminate)); exact Hr5s5).
+    iEval (rewrite Hst_rs5) in "Hpcell".
+    iDestruct ("Hpoback" $! pme with "Hpcell") as "Hpo".
+    (* THE PARENT'S ROW MOVES HERE, and this is the only place it can: the
+       authority is the payload of the lock this block is holding, the
+       parent's row came in off its residue, and the child's generation --
+       [ProcDefs.pv_gen] of the block being parked -- is what joins the set.
+       NO FRESHNESS IS OWED: the move is a set union. *)
+    (* THE DEPOSIT GOES IN WITH THE CELL.  The slot had no entry -- and
+       that is a RESOURCE fact, not an assumption: the caller kept THREE
+       QUARTERS of the child's slot generation, and three quarters beside
+       three quarters do not compose ([WaitInv.children_inv_no_entry],
+       [SlotGen.slot_gen_tq_excl]), so the cell this store fills read 0.
+       THE PARENT'S ADDRESS IS A PROC SLOT'S and hence nonzero, and this
+       block now CARRIES the fact ([Hpmenz], design app-pipe SS4.3x (ii)):
+       it was stated at an opaque [pme] with nothing on the route saying
+       so, and at [pme = 0] the entry is [emp], the deposit is dropped and
+       every tie of the invariant is guarded away
+       ([WaitInv.children_inv_fork] still takes no premise on it -- the
+       INSERT is free either way).  What the premise buys is the reading
+       below it: [WaitFresh.children_inv_row_fresh], the fact that the
+       generation going in was not in the row already. *)
+    iDestruct (WaitInv.children_inv_no_entry ps gs mch O j (ProcDefs.pv_gen (us_V Uc))
+                 ltac:(rewrite Hpolen; exact Hj) with "Hci Hsg34") as %Hnoent.
+    iDestruct (WaitInv.children_own_lookup with "Hch Hprow") as %Hrowl.
+    (* ...AND THE FRESHNESS, READ OFF THE VERY SAME INVARIANT (design
+       app-pipe SS4.3x, lane PIPE-GEN).  The child's generation is at no
+       OCCUPIED slot (its [gen_slot] is persistent and the cell this store
+       fills read 0), and [WaitInv.inv_rows] says every member of a row at
+       a NONZERO address is the generation of such a slot -- so it is in
+       no row, the parent's included.  [Hpmenz] is where the premise is
+       spent, and the only place. *)
+    iDestruct (WaitFresh.children_inv_row_fresh ps gs mch O j pme
+                 (ProcDefs.pv_gen (us_V Uc)) gpar csPar Hnoent Hrowl Hpmenz
+                 with "Hci Hgslot") as %Hgfresh.
+    iApply fupd_wp.
+    iMod (WaitInv.children_own_upd mch gpar pme csPar
+            (csPar ∪ {[ProcDefs.pv_gen (us_V Uc)]}) with "Hch Hprow")
+      as "[Hch Hprow]".
+    iModIntro.
+    iDestruct (WaitInv.children_inv_fork ps gs mch O j pme
+                 (ProcDefs.pv_gen (us_V Uc)) pid_c gpar csPar Hnoent Hrowl
+                 with "Hci Hsg34 Hpr34 Hgslot Hgpid") as "Hci".
+    iAssert (WaitInv.wait_res) with "[Hpo Hch Ho Hci Hzl]" as "Hwaitres".
+    { iExists (<[j := pme]> ps), (<[j := ProcDefs.pv_gen (us_V Uc)]> gs),
+              (<[gpar := (pme, csPar ∪ {[ProcDefs.pv_gen (us_V Uc)]})]> mch), O.
+      iFrame "Hpo Hch Ho Hci Hzl". }
+    assert (Hpp_e0 : add_vec_int (mword_of_int (KF + 0xdc) : mword 64) 4 = mword_of_int (KF + 0xe0))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_e0) in "Hpc".
+    (* -------------------------------------------------------------- *)
+    (* +0xe0 / +0xe4 auipc+addi -> wait_lock_addr -- regime OFF          *)
+    (* -------------------------------------------------------------- *)
+    iApply (wp_auipc_s_sconf (mword_of_int (KF + 0xe0)) Ra0 (mword_of_int 16 : mword 20)
+              mr5 (trap_res b + (K - 8))%nat false ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0e0 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    set (M6 := <[Regidx Ra0 := regval_into_reg
+                  (add_vec (mword_of_int (KF + 0xe0) : mword 64) (auipc_off (mword_of_int 16 : mword 20)))]> mr5).
+    assert (HM6a0 : M6 !!! Regidx Ra0
+                    = add_vec (mword_of_int (KF + 0xe0) : mword 64) (auipc_off (mword_of_int 16 : mword 20)))
+      by (rewrite /M6; apply upd_eq).
+    assert (Hpp_e4 : add_vec_int (mword_of_int (KF + 0xe0) : mword 64) 4 = mword_of_int (KF + 0xe4))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_e4) in "Hpc".
+    iApply (wp_addi4_s_sconf (mword_of_int (KF + 0xe4)) Ra0 Ra0 (mword_of_int 1654 : mword 12)
+              M6 (trap_res b + (K - 8))%nat false ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0e4 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    set (M7 := <[Regidx Ra0 := regval_into_reg
+                  (add_vec (rget M6 Ra0) (sign_extend' 64 (mword_of_int 1654 : mword 12)))]> M6).
+    assert (HM7a0 : M7 !!! Regidx Ra0 = SpecProcinit.wait_lock_addr).
+    { rewrite /M7 upd_eq. rgne. rewrite HM6a0. exact kfkb5_wladdr2. }
+    assert (Hpp_e8 : add_vec_int (mword_of_int (KF + 0xe4) : mword 64) 4 = mword_of_int (KF + 0xe8))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_e8) in "Hpc".
+    (* -------------------------------------------------------------- *)
+    (* +0xe8 jal ra,release(&wait_lock)  -- regime OFF                  *)
+    (* -------------------------------------------------------------- *)
+    assert (Htgt_rel2 : add_vec (mword_of_int (KF + 0xe8) : mword 64)
+                          (sign_extend' 64 (mword_of_int 2092758 : mword 21))
+                        = mword_of_int KernelSyms.release)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_jal_s_sconf (mword_of_int (KF + 0xe8)) Rra (mword_of_int 2092758 : mword 21)
+              M7 (trap_res b + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (kfk_0e8 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    iEval (rewrite Htgt_rel2) in "Hpc".
+    set (M8 := <[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xe8) : mword 64) 4)]> M7).
+    assert (HM8ra : M8 !!! Regidx Rra = add_vec_int (mword_of_int (KF + 0xe8) : mword 64) 4)
+      by (rewrite /M8; apply upd_eq).
+    assert (HM8a0 : M8 !!! Regidx Ra0 = SpecProcinit.wait_lock_addr)
+      by (rewrite /M8 upd_ne; [exact HM7a0 | vm_compute; discriminate]).
+    assert (Hlka2 : add_vec (M8 !!! Regidx Ra0) (sign_extend' 64 (mword_of_int 0 : mword 12))
+                    = SpecProcinit.wait_lock_addr)
+      by (rewrite HM8a0; apply addv_sext0).
+    (* ---- release(&wait_lock) ---- *)
+    (* release wants the reserve at ITS OWN exit arm [match lvl ...]; [Hb]
+       names that [b], so put [Hcg]'s index back into the spec's spelling
+       for the call.  (The [rewrite -Hb] after the call does the reverse
+       for what the release hands back.) *)
+    iEval (rewrite Hb) in "Hcg".
+    iApply (RL.wp_release_sconf KT1 (CID := CID5) γw SpecProcinit.wait_lock_addr "wait_lock"%string
+              (WaitInv.wait_res_at) M8 lvl eb pme (K - 8)%nat
+              ({["wait_lock"]} ∪ lks)
+              Hlka2 (kfkb5_stack_ok K HK)
+              with "Hcg Htext Hpc Hwl Htokw Hwaitres Hown Hpay").
+    iIntros (CID6 Hs6 mr6) "Hcg Hpc %Hcs_8_r6 Hown".
+    pose proof (locks_below_not_elem _ _ Hfresh) as Hfresh_ne.
+    iEval (rewrite (_ : ({["wait_lock"]} ∪ lks) ∖ {["wait_lock"]} = lks);
+           [| apply locks_add_del_below; lkbelow]) in "Hown".
+    assert (Hpc_e4 : ret_pc (M8 !!! Regidx Rra) = mword_of_int (KF + 0xec)).
+    { rewrite HM8ra. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hpc_e4) in "Hpc".
+    iEval (rewrite -Hb) in "Hcg". iEval (rewrite -Hb) in "Hown".
+    assert (Hcs_r5_8 : callee_saved mr5 M8).
+    { rewrite /M8. apply callee_saved_insert_r; [vm_compute; reflexivity |].
+      rewrite /M7. apply callee_saved_insert_r; [vm_compute; reflexivity |].
+      rewrite /M6. apply callee_saved_insert_r; [vm_compute; reflexivity | apply callee_saved_refl]. }
+    assert (Hcs_r5_r6 : callee_saved mr5 mr6) by (eapply callee_saved_trans; [exact Hcs_r5_8 | exact Hcs_8_r6]).
+    assert (Hcs_0_r6 : callee_saved Mt mr6) by (eapply callee_saved_trans; [exact Hcs_0_r5 | exact Hcs_r5_r6]).
+    assert (Hr6s4 : mr6 !!! Regidx Rs3 = (proc_addr j)) by (rewrite (callee_saved_lookup Hcs_0_r6 Rs3 ltac:(vm_compute; reflexivity)); exact Hm20).
+    (* -------------------------------------------------------------- *)
+    (* +0xec c.mv a0,s4  -- regime GENERIC                               *)
+    (* -------------------------------------------------------------- *)
+    iApply (wp_cmv_s_sconf (mword_of_int (KF + 0xec)) Ra0 Rs3 mr6 (K - 8)%nat b
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0ec with "Htext"). }
+    iIntros (CID7 Hs7) "Hcg Hpc".
+    set (M9 := <[Regidx Ra0 := regval_into_reg (add_vec zero_reg (rget mr6 Rs3))]> mr6).
+    assert (HM9a0 : M9 !!! Regidx Ra0 = (proc_addr j)).
+    { rewrite /M9 upd_eq. rgne. rewrite Hr6s4. apply add_vec_zero_l. }
+    assert (Hpp_ee : add_vec_int (mword_of_int (KF + 0xec) : mword 64) 2 = mword_of_int (KF + 0xee))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_ee) in "Hpc".
+    (* -------------------------------------------------------------- *)
+    (* +0xee jal ra,acquire(&np->lock)  -- regime GENERIC entry          *)
+    (* -------------------------------------------------------------- *)
+    assert (Htgt_acq2 : add_vec (mword_of_int (KF + 0xee) : mword 64)
+                          (sign_extend' 64 (mword_of_int 2092616 : mword 21))
+                        = mword_of_int KernelSyms.acquire)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_jal_s_sconf (mword_of_int (KF + 0xee)) Rra (mword_of_int 2092616 : mword 21)
+              M9 (K - 8)%nat b
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (kfk_0ee with "Htext"). }
+    iIntros (CID8 Hs8) "Hcg Hpc".
+    iEval (rewrite Htgt_acq2) in "Hpc".
+    set (M10 := <[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xee) : mword 64) 4)]> M9).
+    assert (HM10ra : M10 !!! Regidx Rra = add_vec_int (mword_of_int (KF + 0xee) : mword 64) 4)
+      by (rewrite /M10; apply upd_eq).
+    assert (HM10a0 : M10 !!! Regidx Ra0 = (proc_addr j))
+      by (rewrite /M10 upd_ne; [exact HM9a0 | vm_compute; discriminate]).
+    iDestruct (cpu_own_transport CID6 CID8 lvl eb pme b ltac:(wp_next_chain) with "Hown") as "Hown".
+    iApply (AQ.wp_acquire_sconf KT1 (CID := CID8) γl "proc"%string (SchedCtx.proc_lock_pay γs γl (proc_addr j))
+              M10 lvl eb pme (K - 8)%nat b lks Hlvl (kfkb5_stack_ok K HK)
+              Hfresh_proc
+              with "Hcg Hown Htext Hpc [Hpinv]").
+    all: try lkbelow.
+    { iEval (rewrite HM10a0). iApply (SchedCtx.procs_inv_lookup γs j γl Hgl with "Hpinv"). }
+    iIntros (CID9 Hs9 ms2 mr9) "%Hms9 Hcg Hpc %Hcs_10_r9 Htok2 HR2 _ Hown Hpay".
+    assert (Hpc_ea : ret_pc (M10 !!! Regidx Rra) = mword_of_int (KF + 0xf2)).
+    { rewrite HM10ra. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hpc_ea) in "Hpc".
+    assert (Hcs_9_10 : callee_saved mr6 M10).
+    { rewrite /M10. apply callee_saved_insert_r; [vm_compute; reflexivity |].
+      rewrite /M9. apply callee_saved_insert_r; [vm_compute; reflexivity | apply callee_saved_refl]. }
+    assert (Hcs_9_r9 : callee_saved mr6 mr9) by (eapply callee_saved_trans; [exact Hcs_9_10 | exact Hcs_10_r9]).
+    assert (Hcs_0_r9 : callee_saved Mt mr9) by (eapply callee_saved_trans; [exact Hcs_0_r6 | exact Hcs_9_r9]).
+    assert (Hr9s4 : mr9 !!! Regidx Rs3 = (proc_addr j)) by (rewrite (callee_saved_lookup Hcs_0_r9 Rs3 ltac:(vm_compute; reflexivity)); exact Hm20).
+    (* -------------------------------------------------------------- *)
+    (* MOVE 3: re-acquired [proc_lock_res]; learn [st = USED] from the   *)
+    (* retained claim.                                                   *)
+    (* -------------------------------------------------------------- *)
+    iDestruct (SchedCtx.proc_lock_res_elim γs γl (proc_addr j) with "HR2")
+      as (st ch2) "(Hpst2 & Hplock2 & Hpchan2 & Hppub2 & Hslots2)".
+    iDestruct (ProcGeom.pstate_lock_claimed (proc_addr j) st USED with "Hplock2 Hpclaim") as %[Hsteq Hstunc].
+    subst st.
+    (* -------------------------------------------------------------- *)
+    (* +0xf2 c.li a5,3  -- regime OFF (np's lock re-held)                *)
+    (* -------------------------------------------------------------- *)
+    assert (Hwval3 : add_vec zero_reg (sign_extend' 64 (sign_extend' 12 (mword_of_int 3 : mword 6)))
+                     = (mword_of_int 3 : mword 64))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_cli_s_sconf (mword_of_int (KF + 0xf2)) Ra5 (mword_of_int 3 : mword 6)
+              (mword_of_int 3 : mword 64) mr9 (trap_res b + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok) Hwval3
+              with "Hcg Hpc []").
+    { iApply (kfk_0f2 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    set (M11 := <[Regidx Ra5 := regval_into_reg (mword_of_int 3 : mword 64)]> mr9).
+    assert (HM11a5 : M11 !!! Regidx Ra5 = (mword_of_int 3 : mword 64)) by (rewrite /M11; apply upd_eq).
+    assert (HM11s4 : M11 !!! Regidx Rs3 = (proc_addr j))
+      by (rewrite /M11 upd_ne; [exact Hr9s4 | vm_compute; discriminate]).
+    assert (Hpp_f4 : add_vec_int (mword_of_int (KF + 0xf2) : mword 64) 2 = mword_of_int (KF + 0xf4))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_f4) in "Hpc".
+    (* -------------------------------------------------------------- *)
+    (* +0xf4 sw a5,24(s4) : np->state = RUNNABLE  -- regime OFF          *)
+    (* -------------------------------------------------------------- *)
+    assert (Hea_ec : add_vec (rget M11 Rs3) (sign_extend' 64 (mword_of_int 24 : mword 12))
+                     = ProcGeom.p_state (proc_addr j)).
+    { assert (Hr : rget M11 Rs3 = M11 !!! Regidx Rs3) by (rgne; reflexivity).
+      rewrite Hr HM11s4. apply ProcGeom.p_state_sext. }
+    iApply (wp_sw_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KF + 0xf4)) Ra5 Rs3 (mword_of_int 24 : mword 12)
+              M11 (trap_res b + (K - 8))%nat USED false with "Hcg Hpc [] [Hpst2]").
+    { iApply (kfk_0f4 with "Htext"). }
+    { iEval (rewrite Hea_ec). iExact "Hpst2". }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc Hpst2".
+    assert (Hstored : trunc32 (rget M11 Ra5) = RUNNABLE).
+    { assert (Hr : rget M11 Ra5 = M11 !!! Regidx Ra5) by (rgne; reflexivity).
+      rewrite Hr HM11a5. rewrite /RUNNABLE. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hstored Hea_ec) in "Hpst2".
+    assert (Hpp_f8 : add_vec_int (mword_of_int (KF + 0xf4) : mword 64) 4 = mword_of_int (KF + 0xf8))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_f8) in "Hpc".
+    (* ---- reassemble [proc_lock_res] at RUNNABLE, spending the claim ---- *)
+    iMod (ProcGeom.pstate_lock_release (proc_addr j) USED RUNNABLE unclaimed_USED unclaimed_RUNNABLE
+            with "Hplock2 Hpclaim") as "Hplock3".
+    iDestruct (SchedCtx.proc_slots_recast γs (proc_addr j) USED RUNNABLE
+                 needs_ctx_RUNNABLE not_running_RUNNABLE inv_dormant_USED inv_dormant_RUNNABLE
+                 with "Hslots2") as "Hslots3".
+    iDestruct (SchedCtx.proc_lock_res_intro γs γl (proc_addr j) RUNNABLE ch2
+                 with "Hpst2 Hplock3 Hpchan2 Hppub2 Hslots3") as "HR3".
+    (* -------------------------------------------------------------- *)
+    (* +0xf8 c.mv a0,s4  -- regime OFF                                  *)
+    (* -------------------------------------------------------------- *)
+    iApply (wp_cmv_s_sconf (mword_of_int (KF + 0xf8)) Ra0 Rs3 M11 (trap_res b + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (kfk_0f8 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    set (M12 := <[Regidx Ra0 := regval_into_reg (add_vec zero_reg (M11 !!! Regidx Rs3))]> M11).
+    assert (HM12a0 : M12 !!! Regidx Ra0 = (proc_addr j)).
+    { rewrite /M12 upd_eq HM11s4. apply add_vec_zero_l. }
+    assert (Hpp_fa : add_vec_int (mword_of_int (KF + 0xf8) : mword 64) 2 = mword_of_int (KF + 0xfa))
+      by (apply bv_eq; vm_compute; reflexivity).
+    iEval (rewrite Hpp_fa) in "Hpc".
+    (* -------------------------------------------------------------- *)
+    (* +0xfa jal ra,release(&np->lock)  -- regime OFF                   *)
+    (* -------------------------------------------------------------- *)
+    assert (Htgt_rel3 : add_vec (mword_of_int (KF + 0xfa) : mword 64)
+                          (sign_extend' 64 (mword_of_int 2092740 : mword 21))
+                        = mword_of_int KernelSyms.release)
+      by (apply bv_eq; vm_compute; reflexivity).
+    iApply (wp_jal_s_sconf (mword_of_int (KF + 0xfa)) Rra (mword_of_int 2092740 : mword 21)
+              M12 (trap_res b + (K - 8))%nat false
+              ltac:(vm_compute; discriminate) ltac:(rdok) ltac:(vm_compute; reflexivity)
+              with "Hcg Hpc []").
+    { iApply (kfk_0fa with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc".
+    iEval (rewrite Htgt_rel3) in "Hpc".
+    set (M13 := <[Regidx Rra := regval_into_reg (add_vec_int (mword_of_int (KF + 0xfa) : mword 64) 4)]> M12).
+    assert (HM13ra : M13 !!! Regidx Rra = add_vec_int (mword_of_int (KF + 0xfa) : mword 64) 4)
+      by (rewrite /M13; apply upd_eq).
+    assert (HM13a0 : M13 !!! Regidx Ra0 = (proc_addr j))
+      by (rewrite /M13 upd_ne; [exact HM12a0 | vm_compute; discriminate]).
+    assert (Hlka3 : add_vec (M13 !!! Regidx Ra0) (sign_extend' 64 (mword_of_int 0 : mword 12)) = (proc_addr j))
+      by (rewrite HM13a0; apply addv_sext0).
+    assert (Hcs_9_12 : callee_saved mr9 M12).
+    { rewrite /M12. apply callee_saved_insert_r; [vm_compute; reflexivity |].
+      rewrite /M11. apply callee_saved_insert_r; [vm_compute; reflexivity | apply callee_saved_refl]. }
+    assert (Hcs_9_13 : callee_saved mr9 M13).
+    { rewrite /M13. apply callee_saved_insert_r; [vm_compute; reflexivity | exact Hcs_9_12]. }
+    assert (Hcs_0_13 : callee_saved Mt M13) by (eapply callee_saved_trans; [exact Hcs_0_r9 | exact Hcs_9_13]).
+    (* ---- release(&np->lock) : THE BLOCK'S OWN EXIT ---- *)
+    (* release wants the reserve at ITS OWN exit arm [match lvl ...]; [Hb]
+       names that [b], so put [Hcg]'s index back into the spec's spelling
+       for the call.  (The [rewrite -Hb] after the call does the reverse
+       for what the release hands back.) *)
+    iEval (rewrite Hb) in "Hcg".
+    iApply (RL.wp_release_sconf KT1 (CID := CID9) γl (proc_addr j) "proc"%string
+              (SchedCtx.proc_lock_pay γs γl (proc_addr j)) M13 lvl eb pme (K - 8)%nat
+              ({["proc"]} ∪ lks)
+              Hlka3 (kfkb5_stack_ok K HK)
+              with "Hcg Htext Hpc [Hpinv] Htok2 HR3 Hown Hpay").
+    { iApply (SchedCtx.procs_inv_lookup γs j γl Hgl with "Hpinv"). }
+    iIntros (CID10 Hs10 mr10) "Hcg Hpc %Hcs_13_r10 Hown".
+    iEval (rewrite (_ : ({["proc"]} ∪ lks) ∖ {["proc"]} = lks);
+           [| apply locks_add_del_below; lkbelow]) in "Hown".
+    assert (Hpc_f6 : ret_pc (M13 !!! Regidx Rra) = mword_of_int (KF + 0xfe)).
+    { rewrite HM13ra. apply bv_eq; vm_compute; reflexivity. }
+    iEval (rewrite Hpc_f6) in "Hpc".
+    assert (Hcs_0_r10 : callee_saved Mt mr10) by (eapply callee_saved_trans; [exact Hcs_0_13 | exact Hcs_13_r10]).
+    iEval (rewrite -Hb) in "Hcg".
+    iEval (rewrite -Hb) in "Hown".
+    rewrite <- Hb in Hs1. rewrite <- Hb in Hs6. rewrite <- Hb in Hs10.
+    iSpecialize ("Hcont" $! CID10 with "[]"); [iPureIntro; wp_next_chain|].
+    iApply ("Hcont" $! mr10 with "[%] Hcg Hown Hpc [%] Hprow");
+      [ exact Hcs_0_r10 | exact Hgfresh ].
+  Qed.
+
+End ProofKforkB5.
+
+End KforkB5.

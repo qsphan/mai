@@ -1,0 +1,35 @@
+-R . User
+SyncInstrs.v
+SyncData.v
+SyncSyms.v
+SyncElfRaw.v
+EchoInstrs.v
+EchoData.v
+EchoSyms.v
+EchoElfRaw.v
+ShInstrs.v
+ShData.v
+ShSyms.v
+ShElfRaw.v
+InitInstrs.v
+InitData.v
+InitSyms.v
+InitElfRaw.v
+# cat.  CatElfRaw.v joined the list with lane CAT-PIN: [iris/ElfUser.v] now
+# states cat's ELF theorems (the file application execs /cat), and
+# [iris/FsImgCheck.v] pins the image's inum-3 bytes to that raw.
+CatInstrs.v
+CatData.v
+CatSyms.v
+CatElfRaw.v
+GrepInstrs.v
+GrepData.v
+GrepSyms.v
+GrepElfRaw.v
+# seccomp (lane U of the seccomp bump): the binary that runs its argument
+# under a syscall mask.  [iris/ElfUser.v] states its ELF theorems and
+# [iris/FsImgCheck.v] pins the image's inum-23 bytes to SeccompElfRaw.v.
+SeccompInstrs.v
+SeccompData.v
+SeccompSyms.v
+SeccompElfRaw.v

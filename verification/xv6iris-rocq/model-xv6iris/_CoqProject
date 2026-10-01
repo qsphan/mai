@@ -1,0 +1,22 @@
+-R . Riscv
+# see iris/_CoqProject for why: SailStdpp.ConcurrencyInterfaceBuiltins and
+# SailStdpp.Base/Prompt_monad both bind ">>=" etc. to their own monad's `bind`.
+-arg -w
+-arg -notation-overridden
+# a quotation in a comment must not swallow a `*)` (tools/comment_quote_check.py)
+-arg -w
+-arg +comment-terminator-in-string
+# two notations sharing a prefix at different levels leave one unparseable
+-arg -w
+-arg +notation-incompatible-prefix
+# a nat literal of 5000+ is meant to be an of_num_uint term, not unary
+-arg -w
+-arg -abstract-large-number
+rv64d_types.v
+riscv_extras.v
+# xv6iris_extras.v is HAND-WRITTEN (everything else here is generated) and is
+# passed to sail as a second --coq-lib; it realises the platform hooks that
+# would otherwise be emitted as dangling Axioms.  It requires rv64d_types, so
+# it must compile after it and before rv64d.v.
+xv6iris_extras.v
+rv64d.v

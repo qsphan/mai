@@ -1,0 +1,103 @@
+# ucode_shk.txt -- the pc set of iris/UCodeShK.v, for tools/gen_ucode.py.
+#
+# tools/ucode_manifest.json binds this spec to iris/UCodeShK.v; `make gen-ucode`
+# rewrites that file from it, and `make check-ucode` fails if it moved.
+#
+# ONE OF THREE CATALOGS OVER THE SAME DUMP.  sh is split by STAGE, for the
+# measured reason tools/ucode_shp.txt records: this file (SH lane stages 1-2
+# and 5, plus the diagnostic subtree), tools/ucode_shm.txt (stage 3, the
+# allocator) and tools/ucode_shp.txt (stage 4, the parser).  All three are
+# on-build, so they must not collide: [--prog shk] names what this file
+# DEFINES ([shk_text_sub], [uis_shk_*], [shk_code]) while the dump maps it
+# READS stay [ShInstrs.sh_bytes] / [ShData.sh_data].
+#
+# GROWS PER STAGE.  The SH lane of claude-notes/projects/fs-syscall-specs.md
+# walks sh one stage at a time; each stage appends its functions here and
+# regenerates.  An [ui_shk_*] fact for an instruction no proof fetches is not
+# wrong, only compile time -- but a whole uncalled function would be a claim
+# about code nothing reads, so it is left out and the reason recorded.
+
+note SH LANE STAGES 1-2, 5 and the DIAGNOSTIC SUBTREE.
+note
+note THE DIAGNOSTIC SUBTREE (ask 7) adds [panic], [fprintf], [vprintf] and
+note [putc] -- the cone every one of sh's three fprintf-and-die tails runs
+note through.  It is no longer cut: iris/UkShDiag.v walks it and discharges
+note UkShRun.v's [ush_diag_leaf].  [printf] stays out because sh never calls
+note it (every diagnostic in sh.c is an [fprintf(2, ...)]), and [printint]
+note stays out because the only formats sh prints are "%s\n",
+note "exec %s failed\n" and "open %s failed\n" -- vprintf reaches printint
+note only from its %d/%u/%x arms, which those three format strings refute.
+note
+note STAGE 5 adds [runcmd] and [fork1] -- the command TREE walk -- with the
+note six further usys.S stubs they and the [cd] builtin issue: fork, exec,
+note pipe, wait, chdir and dup.  [runcmd]'s whole range is catalogued, the
+note two fprintf-and-die tails included.
+note
+note SH LANE STAGES 1-2: the ELF entry, main's console preamble, and the
+note COMMAND LOOP down to the blank-line test.  [start] calls [main]; main's
+note first act is the loop that opens "console" until it owns fd 3, then it
+note closes it and falls into the command loop, whose head reads a line with
+note [getcmd] -- write(2,"$ ",2), memset(buf,0,100), gets(buf,100) -- and
+note skips leading blanks.  open, close, exit and write take the QUIET row of
+note the syscall memory table (UsysMemOk.usys_mem_ok); [read], which [gets]
+note issues one byte at a time, takes the WINDOW row.
+note
+note The whole of [main] is catalogued, not just what is walked: the pc set is
+note per function, and main's remaining arms -- the [cd] builtin at 0x96a and
+note the fork/parse/run body at 0x908 -- are later stages over the same facts.
+
+func start
+func main
+
+# ---- stage 2: the command loop's line reader.  [getcmd] prompts, clears the
+# ---- buffer and calls [gets], which reads one byte at a time.
+func getcmd
+func memset
+func gets
+
+# ---- the syscall stubs the two stages issue (usys.S, two instructions and a
+# ---- return each; [exit]'s ecall never returns, so its [c.jr ra] is omitted)
+func open
+func close
+func exit
+func write
+func read
+
+# ---- stage 5: the command tree walk.  [runcmd] dispatches on the node type
+# ---- through the 0x1398 jump table and never returns; [fork1] is fork with
+# ---- a panic on -1.
+func runcmd
+func fork1
+
+# ---- the syscall stubs stage 5 issues, same three-instruction shape
+func fork
+func exec
+func pipe
+func wait
+func dup
+func chdir
+
+# ---- ask 7: the diagnostic subtree, walked in iris/UkShDiag.v.  [panic] is
+# ---- fprintf(2,"%s\n",s) and exit(1); the two runcmd tails are the same
+# ---- shape with a longer format.  [fprintf] marshals the varargs it will
+# ---- not read and tail-calls [vprintf], which walks the format one byte at
+# ---- a time and hands each to [putc], which is write(fd,&c,1).
+func panic
+func fprintf
+func vprintf
+func putc
+
+omit 0xc68 exit's [c.jr ra] -- the ecall at 0xc64 never returns
+
+# PAGE CROSSINGS.  An instruction may straddle a page boundary (vprintf's
+# [c.ldsp s7,24(sp)] at 0xffe since the d66e41c bump): the instruction fact
+# has no in-page clause, and the split fetch's second read is translated on
+# its own (UmodeMem §4).  Nothing is omitted for page geometry.
+
+skipfunc printf unreachable: every diagnostic in sh.c is an [fprintf(2, ...)]
+skipfunc printint unreachable: vprintf reaches it only from the %d/%u/%x
+skipfunc printint arms, and sh's only conversion is %s
+
+skipdefault not on stage 1's, 2's or 5's path: the [cd] builtin's body, the
+skipdefault parser and the allocator are later stages of the SH lane, and this
+skipdefault catalog grows to meet them

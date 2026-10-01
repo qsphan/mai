@@ -1,0 +1,3524 @@
+(* RiscvPtsto.v -- riscvGS, register/memory points-to, the regstate/heap bridge. *)
+From Stdlib Require Import Eqdep_dec ZArith.
+From stdpp Require Import gmap finite bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import gen_heap ghost_map ghost_var mono_nat
+     invariants.
+From iris.algebra Require Import csum excl agree auth gset.
+From iris.algebra.lib Require Import mono_list.
+From iris.program_logic Require Import weakestpre.
+From iris.program_logic Require Import language.
+Require Import SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import RiscvModelBytes.
+Require Import RiscvLang.
+Require Import ObsTrace.
+Require Import LogEntryDefs.  (* [log_entry]: the console input log's
+                                 vocabulary, and nothing else of its theory *)
+Require Import ConsLog.       (* [cons_ev]/[cons_step]: the console log's
+                                  step relation, which the interface's
+                                  LICENCE law below is stated over *)
+Require Import TsoMemPa TsoGhost.  (* the TSO machine ghosts (tso-machine-flip.md) *)
+Require Export DiskImg.  (* [diskImgG]/[disk_img_auth]: the disk image map *)
+(* [disk_write]/[disk_wr]/[wr_apply]: the disk image and the pure write
+   identity a crash permit is indexed by.  Safe to import here -- DiskImg.v
+   already does, and this file re-exports it. *)
+Require Import VirtioModel.
+Require Import PtreeType.   (* [ptree]: the carrier of the shared kernel table's ghost *)
+Require Export StringBytes.  (* [cstring_bytes], which [↦ₛ] resides *)
+(* [ktier]/[KtierLe]/[CurKtier]: the kernel-translation tier of a datum and
+   the ambient-tier class the family's notations elaborate through.  EXPORT
+   -- every consumer of a [↦ₘ] needs the [CurKtier] default instance in
+   scope, and a class that is not IMPORTED silently becomes a fresh section
+   VARIABLE (durable-notes.md, typeclass-sweep trap one). *)
+Require Export Ktier.
+
+(* ---- the tree-wide [set_solver] override (see FastSetSolver.v) ----      *)
+(* This file is here as a PROPAGATION HUB, not because it uses sets: it is  *)
+(* [Require Import]ed DIRECTLY by 796 of the tree's 1090 files, and         *)
+(* [Require Export] only reaches a file that imports THIS one directly (or  *)
+(* through an unbroken chain of Exports, which this tree does not have).    *)
+(* Without a hub like this, a new proof would silently get stdpp's slow     *)
+(* [set_solver] -- which is exactly the trap the override exists to remove. *)
+(* EXPORT, not Import, and deliberately "dead": the nightly dead-import     *)
+(* sweep skips [Require Export] lines.                                     *)
+Require Export FastSetSolver.
+
+Local Open Scope Z_scope.
+
+(* Name [mword] locally (qualified target) rather than [Require Import
+   SailStdpp.Values] -- the latter would leak Sail's key typeclass
+   instances into every file that imports RiscvPtsto (durable-notes).  The
+   VA-based points-to layer below ([svpn_of]/[pa_of]/[kmap_at]/↦ₘ/↦ₓ) is
+   stated over mwords, so the name has to be in scope here. *)
+Local Notation mword := SailStdpp.Values.mword.
+
+(* ===== RiscvModelIris ===== *)
+(* ====================================================================== *)
+(* RiscvModelIris.v                                                        *)
+(*                                                                         *)
+(* LAYER 2: the Iris program-logic layer over RiscvModelLang.v.            *)
+(*                                                                         *)
+(*   - register & memory [gen_heap]s, with points-to [r |->r v] / [a|->m b]*)
+(*   - state_interp that BRIDGES the model's [regstate] to per-register    *)
+(*     points-to via an existential register map + an agreement invariant  *)
+(*     (axiom-free: existT injectivity goes through Eqdep_dec, register     *)
+(*      has decidable equality; no Finite/UIP needed).                     *)
+(*   - the two bridge lemmas [reg_valid] / [reg_update] and a memory read  *)
+(*     lemma [mem_valid].                                                   *)
+(*                                                                         *)
+(* The WP for ADD *through* [try_step] (symbolic unfolding of fetch/decode/*)
+(* execute/currentlyEnabled) is the next milestone; this file provides the *)
+(* ghost-state foundation it will rest on.                                 *)
+(* ====================================================================== *)
+
+
+
+
+(* ---------------------------------------------------------------------- *)
+(* 0. Two small facts about the model's [register_beq] and [existT].       *)
+(* ---------------------------------------------------------------------- *)
+
+Lemma register_beq_true (k r : register) : register_beq k r = true -> k = r.
+Proof.
+  destruct k, r; simpl; intro E; try discriminate;
+    f_equal; autorewrite with register_beq_iffs in E; exact E.
+Qed.
+
+Lemma register_beq_false (k r : register) : k <> r -> register_beq k r = false.
+Proof.
+  intros Hne. destruct (register_beq k r) eqn:E; [|reflexivity].
+  exfalso. apply Hne. by apply register_beq_true.
+Qed.
+
+(* existT injectivity on the (decidable) index type [register]: axiom-free. *)
+Lemma reg_existT_inj (r : register) (v v' : type_of_register r) :
+  existT r v = existT r v' -> v = v'.
+Proof.
+  apply (inj_pair2_eq_dec register (fun x y => decide (x = y))).
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 1. Ghost state: a register map ([ghost_map]) and a memory heap           *)
+(*    ([gen_heap]).  The registers use [ghost_map] -- an explicitly-named   *)
+(*    authoritative gmap ([riscv_reg_name]) with per-key elements -- rather *)
+(*    than [gen_heap]; the byte memory keeps its [gen_heap].                *)
+(* ---------------------------------------------------------------------- *)
+
+(* The two kernel permission CLASSES of the etext region split (rwx-kmap):
+   text pages are mapped R|X, data/device pages R|W.  The enum lives here,
+   above [riscvGS], so the class can carry the kernel-mapping claim ghost
+   (KMap.v) over it; the PTE flag bytes and the vpn classifier are KptPt
+   §15's. *)
+Inductive kperm : Set := KP_rx | KP_rw.
+
+Global Instance kperm_eq_dec : EqDecision kperm.
+Proof. solve_decision. Defined.
+
+(* the shared kernel page table's resource algebra: one-shot agreement on
+   the A/D-canonical table. *)
+Definition kptR : cmra := csumR (exclR unitO) (agreeR (leibnizO ptree)).
+
+(* A6.53 RULING 2: the kernel PT's canon-pin PUBLICATION BOUND, one-shot
+   and then persistent, exactly [kptR]'s shape one payload over.  It is an
+   AGREEMENT and not an order for the same reason [kptR] is: the bound is
+   fixed at publication and never moves (the A/D write-back keeps the pin,
+   it does not re-mint it), so a reader that carries [kpt_bound B] and one
+   that reads [B] out of an opening are talking about the same number. *)
+Definition kptbR : cmra := csumR (exclR unitO) (agreeR (leibnizO nat)).
+
+(* THE PER-CPU HELD-LOCK SET (LockSet.v, claude-notes/design/kernel-proofs.md):
+   an authority over the set of RANKS -- lock-order levels, [LockRank.v] -- of
+   the spinlocks this hart currently holds.  The authority rides in
+   [IntrDefs.cpu_hart] -- i.e. with the running kernel thread while interrupts
+   are off, and inside [sie_arm true] while they are on -- and a HELD lock's
+   invariant keeps the matching [gset_disj] fragment, which is what makes
+   "[lk->cpu] is set to hart i" and "a lock of this rank is in i's held set"
+   one fact rather than two.
+
+   [gset_disj] rather than a plain [gset]: the fragment must be EXCLUSIVE (so
+   release, holding it, can retire the element) and it must be UNFORGEABLE (so
+   the tie means something).  What that costs is that minting one needs
+   [r ∉ S] -- which is exactly what acquire's order premise
+   [LockRank.locks_below S r] supplies, via [locks_below_not_elem].
+
+   RANKS, NOT ADDRESSES, and the element type is where all the ergonomics
+   live.  An address set would have to carry a rank alongside each element for
+   acquire's premise to be statable at all, and the address half would then
+   never be read -- xv6 never holds two locks of the same family, so the order
+   is total on every pair it can actually hold (LockRank.v).  Keying on [nat]
+   also means the element type takes stdpp's own instances: no [EqDecision] /
+   [Countable] pinning is needed (contrast [riscvF_kmapGS] below), and
+   [set_solver] WORKS -- over [gset (mword n)] it fails with "No matching
+   clauses for match", which is why the durable notes' discharge-by-named-lemma
+   rule exists and why it no longer applies here. *)
+Definition lockSetR : cmra := authR (gset_disjUR string).
+
+(* The ghost layer is SPLIT IN TWO (claude-notes/design/crash.md): the
+   FIXED layer -- [invGS] plus every functor (inG) class -- will survive
+   power cycles; the ERA layer -- every ghost NAME -- is one boot's worth
+   of ghost state, to be reallocated fresh at each power-on so that a new
+   boot's memory/register resources are independent of the previous
+   boot's.  [riscvGS] bundles both, and every proof file keeps taking
+   exactly it: the pre-split field names are preserved verbatim as
+   definitions below the class, so no statement anywhere changes. *)
+
+(* THE ERA's MIRROR OF THE DURABLE DISK (claude-notes/design/crash.md,
+   "The split crash predicate", durable-disk stage E2).  Defined HERE, not
+   in the FS layer, because the era record below needs its gname and the
+   fixed class below needs its [ghost_varG]: both sit under every FS file.
+   It carries no FS CONSTANT; it is one total block view -- the era's
+   picture of every durable block's contents, homes included.  The crash
+   layer's custody arm ([FsCrash.fs_custody]) pins it to the physical disk
+   pointwise ([FsCrash.log_mirror_ok]), which is what lets a WAL write's
+   ∅-mask permit know the committed state BY VALUE: the WAL's own writes
+   are the only writes to the durable extent, so every permit re-establishes
+   the picture at the post-write image.  Derived readings (the header's
+   [hdr_dec], the pointwise update a permit hands the era back) live in
+   [LogDefs]. *)
+Record log_mirror := MkLogMirror {
+  lm_view : Z -> list (bv 8);
+}.
+
+Record riscvEraGS := RiscvEraGS {
+  (* one register-map ghost name PER hart.  A [ghost_map] element on
+     [cpu_reg_name c] owns a register of hart [c].  The function is total (every
+     [CPU] is a real hart) and its per-hart authoritative maps are threaded by
+     [gregs_interp] below. *)
+  era_reg_name : CPU -> gname;
+  era_heap_name : gname;
+  era_meta_name : gname;
+  (* ONE NAME PER PORT (DevModel.uart_id), exactly as [era_reg_name] is one
+     name per hart: the board has two 16550s and each is its own shared
+     device state. *)
+  era_uart_name : uart_id -> gname;
+  era_plic_name : gname;
+  era_virtio_name : gname;
+  (* the kernel-mapping claim ghost (KMap.v, rwx-kmap): one global
+     vpn ↦ (ppn, class) map.  Lives here -- not as a separate class --
+     because [tlb_inv_pt] rides inside [sie_cap_gpr], and a separate
+     class would have to be threaded through every sconf-tier file;
+     like [uart_name]/[plic_name] it is global (not per-hart). *)
+  era_kmap_name : gname;
+  (* THE SHARED KERNEL PAGE TABLE's ghost (claude-notes/projects/
+     kpt-share.md): a ONE-SHOT agreement on the table's A/D-CANONICAL form
+     ([PtTree.ptree_canon]).  Adequacy mints the unset token [Cinl (Excl ())];
+     main's kvm assembly shoots it, at the tree kvminit built, to the
+     PERSISTENT [Cinr (to_agree …)] every hart then carries in its
+     translation residue.  Agreement is enough -- not an order -- because
+     the Svadu A/D write-back leaves the canonical table INVARIANT
+     ([PtTree.ptree_canon_set_leaf]), so a write-back needs no ghost update
+     at all.  Lives HERE, not in a separate class, for exactly the reason
+     [kmap_name] does: the residue rides inside [sie_cap]/[intr_frame], so a
+     class would have to be threaded through every sconf-tier file. *)
+  era_kpt_name : gname;
+  (* ...and the canon pin's publication BOUND, shot at the same moment and
+     for the same table (A6.53 ruling 2).  Beside [era_kpt_name] rather
+     than in a class, for the reason that one is here. *)
+  era_kptb_name : gname;
+  (* the S-mode translation ONE-SHOT (Bare -> kernel PT installed): a ghost
+     name tracking which arm of [strans_inv] the capability's translation
+     slot is in.  A pending half held outside the slot is the "still-Bare
+     receipt"; the kvminithart switch SHOOTS with both pending halves and
+     mints the PERSISTENT certificate [IntrDefs.kpt_on].  The three faces
+     are [strans_pending_at] / [strans_kpt_at] / [kpt_on_at] below; the
+     [mono_natG Σ] functor instance is [riscvF_genGS] (the power layer's --
+     there is only one in a [riscvFixedGS] context, which is exactly why
+     those three are definitions).  Monotone, hence safely persistent WITHIN
+     an era: kexec starts a new era with a fresh name.
+     PER-HART, like [cpu_reg_name]: satp and tlb are per-hart registers, so
+     which arm a hart's translation slot is in is a per-hart fact, and the
+     shared-kernel-table sweep (claude-notes/completed/kpt-share.md) needs
+     every hart to shoot its own at its own kvminithart. *)
+  era_strans_name : CPU -> gname;
+  (* the SIE ghost, CANONICALLY per hart -- the same shape as [strans_name],
+     and for the same reason: mstatus.SIE is a per-hart register, so which
+     value a hart's SIE choreography (1/2 live-bit tie + 1/4 kernel-code token
+     + 1/4 invariant, IntrDefs.v §2) is at is a per-hart fact.
+
+     Making the name CANONICAL rather than an explicit parameter is what lets
+     the whole sconf tier -- [sconf] / [sie_cap] / [sie_cap_gpr] / [sie_arm] /
+     [intr_count] / [intr_off_tok] / [intr_inv] / [intr_handler_avail] -- drop
+     its [γ] argument entirely: the hart determines the ghost.  In particular a
+     step's continuation then quantifies only the HART (WpNext.v), and every
+     parking contract's [∀ h g] collapses to [∀ h].
+
+     NOT canonical, and deliberately so: the per-trap ghost [ProofKernelvec.v]
+     mints for the handler's own SIE tie.  During a trap the live bit is 0
+     while the interrupted thread's half still reads 1, so those two cannot
+     share a name; [wp_kernelvec] takes a raw [ghost_var_frac γ (1/2) _] and stays
+     parameterized.  The functor instance comes from [sieG] at the use sites,
+     for the same reason spelled out for [strans_name] above. *)
+  era_sie_name : CPU -> gname;
+  (* mstatus.SPP's ghost MIRROR, canonically per hart -- the same shape as
+     [sie_name], and needed for a reason the other trap-scribbled state does
+     not have.  A trap writes sepc / scause / stval AND mstatus.SPP; the
+     first three are whole registers, so ownership of them moves by moving
+     the cell (they sit in [IntrDefs.trap_csrs], inside [sie_arm true] while
+     interrupts are enabled and in the code's hands while they are off).
+     SPP is a BIT INSIDE mstatus, and mstatus cannot leave [sconf] -- SIE
+     lives there too, and so do the well-formedness facts -- so its
+     ownership has to move as a ghost instead.
+
+     Hence TWO halves, exactly as SIE has: one TIED inside [sconf] to
+     [_get_Mstatus_SPP ms], and one that travels with [trap_csrs], held at
+     an EXISTENTIAL value by the enabled arm (a trap can rewrite SPP between
+     any two instructions) and at a PINNED value by interrupts-off code.
+     That is what lets a trap handler entered from S-mode still know, four
+     instructions later, that SPP = 1 -- the fact the funnel's [exists ms]
+     would otherwise destroy.
+
+     The [ghost_varG Σ (mword 1)] functor instance comes from [sieG] at the
+     use sites, NOT from a field here, for the same reason spelled out for
+     [strans_name]: a second instance of that class would make resolution
+     ambiguous.  SPP is one bit, so [sieG]'s instance already fits. *)
+  era_spp_name : CPU -> gname;
+  (* mstatus.SPIE's mirror, the twin of [spp_name] and travelling with it.
+     SPIE is the OTHER bit an [sret] reads (it restores SIE from it), it is
+     written by the same trap, and it is preserved by the same SIE flips --
+     so it obeys the identical discipline and the two are always held
+     together, as [IntrDefs.sret_bits].  Two names rather than one ghost over
+     a pair only because [sieG]'s [ghost_varG (mword 1)] then serves both
+     with no new class. *)
+  era_spie_name : CPU -> gname;
+  (* THE HART TAG, CANONICALLY per proc slot.  One [ghost_var_frac CPU] per entry
+     of the proc[] array, naming the hart that a RUNNING proc is running on.
+     Two halves: while the proc is RUNNING one sits in its [p->lock]'s
+     running arm ([SchedCtx.run_slot]) and the other rides the running
+     thread's [IntrDefs.cpu_claim]; otherwise both sit whole in the lock
+     ([SchedCtx.proc_slots]) and the value is meaningless.
+
+     KEYED BY THE PROC, NOT BY THE HART: that is what makes the entitlement
+     HART-FREE, so a thread carries it across a migration as a plain frame
+     (a per-hart receipt would be exactly the kind of stranded resource the
+     explicit-cpuid refactor exists to remove).
+
+     CANONICAL rather than an explicit [γk : list gname] parameter, for
+     precisely the reason spelled out for [sie_name] and [kmap_name] above:
+     the receipt is named inside [SchedCtx.proc_lock_res], hence inside
+     [procs_inv], and a parameter there would have to be threaded through
+     every one of the ~50 files that mention [procs_inv].  The function is
+     total; only indices below [NPROC] are ever owned. *)
+  era_park_name : nat -> gname;
+  (* THE PER-PROC STATE MIRROR (design/proc-struct.md, the state ghost).
+     Two halves of a [ghost_var_frac] carrying [p->state]'s value: the proc lock
+     invariant owns one, tied to the cell, and the other is lock-resident
+     except at the two states where a THREAD has claimed the proc (RUNNING,
+     USED).  Since a ghost_var_frac cannot move on half alone and the cell cannot
+     move without the ghost, the right to WRITE [p->state] is exactly
+     ownership of the second half.
+
+     Canonical for the same reason as [era_park_name] directly above: it is
+     named inside [SchedCtx.proc_lock_res], hence inside [procs_inv]. *)
+  era_pstate_name : nat -> gname;
+  (* THE DISK IMAGE MAP (claude-notes/design/crash.md, design/fs-log.md
+     stage 4): a byte-granularity ghost map mirroring [v_disk], tied to the
+     state by [disk_dur_interp] below -- ONE conjunct of this era's
+     [era_interp], hence gone when the era is.
+
+     PER-ERA, deliberately.  The image itself survives a power cycle (it is
+     the one machine component that does), but its GHOST mirror must not:
+     client-visible fragments -- bio's pool/escrow, the log's block views --
+     park in era invariants, and a FIXED map could never re-mint them at the
+     next boot ([ghost_map] cannot re-create an existing key, and auth-side
+     forgetting needs the element, which is exactly what is stranded), so a
+     fixed map cannot boot twice once the FS layer holds fragments.  A fresh
+     map per era, allocated at the PRESERVED content and handed out WHOLE
+     ([RiscvAdequacy.power_boot_res]'s boot mint), has no such problem: the
+     dead era's fragments are abandoned with everything else it owned.
+
+     The class typing it stays FIXED-layer ([riscvF_diskGS], from DiskImg.v):
+     it is the unique source of the [ghost_mapG Σ Z (bv 8)] instance in a
+     [riscvGS] context, and a second one could not interact with it. *)
+  era_disk_name : gname;
+  (* THE FS LOG-REGION MIRROR (claude-notes/design/fs-log.md stage 4 phase
+     C2b/D1): this era's [ghost_var_frac] over the physical log region's picture,
+     split 1/2 - 1/2 between the log layer ([LogInv]'s batch/lock resource)
+     and [P_fs]'s CHECKED-OUT arm.  It is what carries the WAL's physical
+     phase ACROSS bwrite calls -- "the on-disk header is clean", "the log
+     slots hold the logged values", "the header is the (n, W) I just wrote"
+     -- none of which any single call site can re-derive at its own call.
+
+     PER-ERA for exactly the reason [era_disk_name] is: the log layer's half
+     dies with the era, and a FIXED gname's stranded half could never be
+     re-paired at the next boot.  Identification of the arm's gname with the
+     AMBIENT era's is by the swap counter ([riscv_swap_name] below), squeezed
+     against the started-generations auth the DMA completion threads in. *)
+  era_mirror_name : gname;
+  (* THE HELD-LOCK SET, CANONICALLY per hart (design/kernel-proofs.md): the
+     authority of [LockSet.cpu_locks], naming the spinlocks this hart holds.
+
+     PER-HART, like [sie_name] and [strans_name]: which locks are held is a
+     property of the HART (xv6 records it in [lk->cpu], a [struct cpu]
+     pointer), not of the thread -- and a lock is taken and given back with
+     interrupts off, so it never crosses a migration.
+
+     CANONICAL rather than a parameter, for the reason spelled out at
+     [era_sie_name]: the authority lives inside [IntrDefs.cpu_hart], hence
+     inside [cpu_own] / [sie_arm] / every whole-function contract in the
+     sconf tier, and an explicit [γ] there would have to be threaded through
+     all ~312 files that name [cpu_own].  The [inG Σ lockSetR] instance is
+     [riscvF_lockSetGS] below, not a separate class, for the same reason. *)
+  era_lockset_name : CPU -> gname;
+  (* THE PER-HART RESERVATION MIRROR (design/main-cycle-port.md §3a): a ghost
+     map [CPU -> option resv] whose fragment [resv_frag c r] is the logic's
+     view of [gstate.gresv c].  ONE name with per-hart fragments, rather than
+     the [era_reg_name]-style function of names, because the auth is a single
+     map and every rule that touches it touches exactly one key.
+
+     Why the logic needs it: at its conditional write an RMW hart opens its
+     invariant, sees [x |-> v'], and must know [v'] is the value it READ -- an
+     acquire cannot take [R] without knowing the write is 0->1.  Physically
+     true (every competing writer was blocked) but no invariant carries it
+     across interference, so the reservation's SNAPSHOT plus [resv_ok] in
+     [era_interp] is what supplies it. *)
+  era_resv_name : gname;
+  (* THE TSO GHOST NAMES (tso-machine-flip.md par.4), all four PER-ERA --
+     the write log and the views die with RAM at a power edge, exactly
+     like the reservations; a fresh era re-mints them over the empty
+     log.  Their functor classes ride [riscvF_tsomemGS] below; the
+     interp conjunct is [tso_interp_at]. *)
+  era_ts_name : gname;      (* per-byte latest-write timestamps          *)
+  era_logm_name : gname;    (* the write log's entries, persisted        *)
+  era_loglen_name : gname;  (* mono-nat = length glog ([llb] receipts)   *)
+  era_view_name : gname;    (* auth of the per-agent views ([view_lb])   *)
+  (* THE ERA'S IMAGE, AS A CONSTANT (A6.131).  The image never changes
+     within an era, and a racy reader of a once-written word ([started])
+     needs to know what the image held there in order to tell the write
+     from the image; a pure tie in the interpretation ([tso_interp_at],
+     [tso_interp_of]) makes every image byte a persistent pure fact. *)
+  era_img : gmap Arch.pa (bv 8);
+  (* THE INSTRUCTION-VIEW MIRROR (claude-notes/design/icache.md): one
+     monotone counter per hart, at the machine's [gitv]; its lower bound
+     [hart_iview_lb] is the [fence.i] receipt.  Per hart like
+     [era_reg_name], and LAST so the positional mint in RiscvAdequacy only
+     grows at its tail. *)
+  era_iview_name : CPU -> gname;
+  (* THE READ-WATERMARK MIRROR (claude-notes/projects/relaxed-rr.md §4.2):
+     one monotone counter per hart, at the machine's [hr_rv (ghr c)]; its
+     lower bound [hart_rview_lb_at] is the receipt a PLAIN LOAD mints (the
+     view it read at), and an acquire fence turns it into a [view_lb].  Per
+     hart like [era_iview_name], and LAST, for the same reason. *)
+  era_rv_name : CPU -> gname
+}.
+
+(* ====================================================================== *)
+(*  THE APPLICATION'S CONSOLE INTERFACE (post-qed-redesign §3.2, R4).      *)
+(*                                                                        *)
+(*  The three things the KERNEL READS of an application: a per-history     *)
+(*  fact it files beside every received byte, a credential a kill pays     *)
+(*  with, and a claim about the console boundary.  They were three fields  *)
+(*  of [riscvFixedGS] with six companion instance fields, and every boot   *)
+(*  obligation took one EQUATION per field -- five in all, one per         *)
+(*  projection the obligation happened to read.                            *)
+(*                                                                        *)
+(*  ONE FIELD AND ONE EQUATION.  [riscv_rx_tag], [app_taint] and          *)
+(*  [riscv_cons_res] are PROJECTIONS of this record now, so the fifty-odd  *)
+(*  kernel files that name them are unchanged; what changes is that an     *)
+(*  obligation takes [riscvF_app_iface = <the application's>] and derives  *)
+(*  whichever of the three it reads.                                       *)
+(*                                                                        *)
+(*  THE INSTANCES ARE FIELDS, not side conditions at every use.  The tag   *)
+(*  is copied out of the UART invariant's column once per queued byte, the *)
+(*  credential at each party a kill touches, so both have to be duplicable *)
+(*  by construction; all three are TIMELESS because they ride invariant    *)
+(*  bodies that the device and lock leaves strip a later off.  A client    *)
+(*  whose claim needs a non-timeless part keeps it outside and hands it    *)
+(*  in.                                                                    *)
+(* ====================================================================== *)
+Record app_iface (Σ : gFunctors) := MkAppIface {
+  (* THE TAG FAMILY: what the kernel files beside a received byte, minted
+     by the rx wand at the moment of the push and copied out again by every
+     reader of the receive FIFO.  The trivial application sets it to
+     [fun _ => True]. *)
+  ai_tag : list mobs -> iProp Σ;
+  ai_tag_persistent : forall h, Persistent (ai_tag h);
+  ai_tag_timeless : forall h, Timeless (ai_tag h);
+  (* THE KILL CREDENTIAL: what a party a kill touched may keep.  An
+     application that claims nothing about a kill pays nothing. *)
+  ai_kill : iProp Σ;
+  ai_kill_persistent : Persistent ai_kill;
+  ai_kill_timeless : Timeless ai_kill;
+  (* THE CONSOLE CLAIM (redesign R2): the application's claim about the
+     whole console boundary, over one console history.  NOT persistent --
+     it holds an authority, and duplicating one would defeat the point. *)
+  ai_cons : nat -> list mobs -> LogEntryDefs.cons_hist -> iProp Σ;
+  ai_cons_timeless :
+    forall (k : nat) (h : list mobs) (H : LogEntryDefs.cons_hist),
+      Timeless (ai_cons k h H);
+  (* THE LICENCE, OFF THE TAINT (survey R1, lane SUP-ONE).  An
+     application's KILL PRICE buys the right to move its console claim:
+     whoever holds [ai_kill] may step [ai_cons] by any event.  It is the
+     law [UInitBoot] proved BY HAND at echo's instance and
+     [SystemAdequacy.init_boot_of_sup] carried as a Coq-level premise
+     ([app_sup ⊢ cons_licence]); as a FIELD of the interface the generic
+     tier reads it off the machine's own record with no equation at all,
+     which is what takes [WpUart.cons_licence] out of the generic supply
+     ([UexecExecInst.xv6_ssupply]) and out of every generic-tier
+     signature.
+
+     WHY IT IS HONEST AT EVERY APPLICATION.  The trivial console claim is
+     [emp] and every event on it is free; a constraining one prices the
+     licence at its own taint arm ([App]'s [al_sup] is the same law read
+     off the supply, and [EchoOut.ecl_sup] / [AppFileRec]'s [fecl_sup] are
+     the two discharges).  An application whose claim does NOT survive an
+     arbitrary boundary event simply cannot set this field -- and it could
+     not run the generic slot either, which is the same fact. *)
+  ai_lic : ai_kill ⊢
+    □ (∀ (k : nat) (h : list mobs) (H : LogEntryDefs.cons_hist)
+         (ev : ConsLog.cons_ev),
+         ai_cons k h H ==∗ ai_cons k h (ConsLog.cons_step H ev));
+  (* THE WILD CREDENTIAL (seccomp design §6/§9, lane S0): a PER-ERA twin
+     of the taint.  Whoever holds [ai_wild k] may step era [k]'s console
+     claim by any event -- the same law as [ai_lic], at one era only.  It
+     is what an unverified program running under a syscall mask holds
+     where a generic program holds the taint: the escrowed dirty
+     credential ([AppInv.app_rdcred]) admits it beside [app_sup], and
+     [WpUart.cons_licence_at_of_wild] reads the era's licence off it.  The
+     law covers the two PROCESS events only ([ConsLog.wild_ev]: [EvOut],
+     [EvRead] -- the echo arm's events are the interrupt's), under the
+     event's validity premise [ConsLog.cons_ev_ok] ([True] at [EvOut], so
+     a bare [WpUart.out_link] can pay it; [read_ok] at [EvRead]).  An
+     application with no such program sets it to [fun _ => False]
+     ([wild_none]). *)
+  ai_wild : nat -> iProp Σ;
+  ai_wild_persistent : forall k, Persistent (ai_wild k);
+  ai_wild_timeless : forall k, Timeless (ai_wild k);
+  ai_wild_lic : forall k, ai_wild k ⊢
+    □ (∀ (h : list mobs) (H : LogEntryDefs.cons_hist)
+         (ev : ConsLog.cons_ev),
+         ⌜ConsLog.wild_ev ev⌝ -∗ ⌜ConsLog.cons_ev_ok H ev⌝ -∗
+         ai_cons k h H ==∗ ai_cons k h (ConsLog.cons_step H ev));
+  (* THE READER-SIDE WILD CREDENTIAL (seccomp design 10.7): what a
+     tokenless reader under a mask may pay the console escrow's DIRTY arm
+     with ([AppInv.app_rdcred]).  SPLIT OFF [ai_wild]: the dirty outcome
+     hands the escrow's credential to whichever reader finds the marker
+     moved, so a credential here reaches the SHELL -- which a write
+     licence must not.  Every landed application sets it to
+     [fun _ => False] ([wild_none]); no law. *)
+  ai_rdwild : nat -> iProp Σ;
+  ai_rdwild_persistent : forall k, Persistent (ai_rdwild k);
+  ai_rdwild_timeless : forall k, Timeless (ai_rdwild k);
+}.
+Arguments MkAppIface {Σ} _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _.
+Arguments ai_tag {Σ} _ _. Arguments ai_kill {Σ} _.
+Arguments ai_cons {Σ} _ _ _ _.
+Arguments ai_tag_persistent {Σ} _ _. Arguments ai_tag_timeless {Σ} _ _.
+Arguments ai_kill_persistent {Σ} _. Arguments ai_kill_timeless {Σ} _.
+Arguments ai_cons_timeless {Σ} _ _ _ _.
+Arguments ai_lic {Σ} _.
+Arguments ai_wild {Σ} _ _.
+Arguments ai_wild_persistent {Σ} _ _. Arguments ai_wild_timeless {Σ} _ _.
+Arguments ai_wild_lic {Σ} _ _.
+Arguments ai_rdwild {Σ} _ _.
+Arguments ai_rdwild_persistent {Σ} _ _. Arguments ai_rdwild_timeless {Σ} _ _.
+
+(* THE ABSENT WILD CREDENTIAL: what an application with no masked program
+   sets [ai_wild] to.  Its law is proved from [False], at ANY claim. *)
+Definition wild_none {Σ : gFunctors} : nat -> iProp Σ := fun _ => False%I.
+Lemma wild_none_persistent {Σ : gFunctors} k :
+  Persistent (wild_none (Σ := Σ) k).
+Proof using . rewrite /wild_none. apply _. Qed.
+Lemma wild_none_timeless {Σ : gFunctors} k :
+  Timeless (wild_none (Σ := Σ) k).
+Proof using . rewrite /wild_none. apply _. Qed.
+Lemma wild_none_lic {Σ : gFunctors}
+    (C : nat -> list mobs -> LogEntryDefs.cons_hist -> iProp Σ) k :
+  wild_none k ⊢
+    □ (∀ (h : list mobs) (H : LogEntryDefs.cons_hist)
+         (ev : ConsLog.cons_ev),
+         ⌜ConsLog.wild_ev ev⌝ -∗ ⌜ConsLog.cons_ev_ok H ev⌝ -∗
+         C k h H ==∗ C k h (ConsLog.cons_step H ev)).
+Proof using . rewrite /wild_none. by iIntros "[]". Qed.
+
+Class riscvFixedGS (Σ : gFunctors) := RiscvFixedGS {
+  riscvF_invGS :: invGS Σ;
+  riscvF_regGS :: ghost_mapG Σ register (sigT type_of_register);
+  (* the device fabric (DevModel.v): one [ghost_var_frac] per device, in the
+     standard halves pattern -- [state_interp] holds one half (the "auth"),
+     the other half (the "frag") floats freely and is typically stored in an
+     invariant shared between the driver's hart and the device thread. *)
+  riscvF_uartGS :: ghost_varG Σ uart_state;
+  riscvF_plicGS :: ghost_varG Σ plic_state;
+  riscvF_virtioGS :: ghost_varG Σ virtio_state;
+  (* pinned to the SAIL key instances (Decidable_eq_mword/Countable_mword),
+     because every use site (KMap/KptPt/adequacy) imports Sail and elaborates
+     [gmap (mword 27)] with them; without pinning, this field would take
+     stdpp's bv_eq_dec/bv_countable (RiscvPtsto does not import the Sail
+     instance modules) and the ghost_mapG key-instance args would not unify. *)
+  riscvF_kmapGS :: @ghost_mapG Σ (SailStdpp.Values.mword 27) (SailStdpp.Values.mword 44 * kperm)
+                    (@SailStdpp.Instances.Decidable_eq_mword 27) (@SailStdpp.Instances.Countable_mword 27);
+  riscvF_kptGS :: inG Σ kptR;
+  riscvF_kptbGS :: inG Σ kptbR;
+  (* the per-hart held-lock set's functor (LockSet.v).  A FIELD rather than a
+     standalone class: [cpu_locks] sits inside [IntrDefs.cpu_hart], so a class
+     would have to be bound in every sconf-tier section in the tree. *)
+  riscvF_lockSetGS :: inG Σ lockSetR;
+  riscvF_parkGS :: ghost_varG Σ CPU;
+  (* the per-proc state mirror's typing (the NAME is per-era, above).  A
+     [mword 32] instance of its own -- no other ghost_var_frac in the record
+     carries one, so nothing else can be confused with it. *)
+  riscvF_pstateGS :: ghost_varG Σ (SailStdpp.Values.mword 32);
+  (* the FS log-region mirror's typing (the NAME is per-era, above) *)
+  riscvF_mirrorGS :: ghost_varG Σ log_mirror;
+  (* the byte memory's PRE-class: the era layer stores only the two heap
+     GNAMES (a [gen_heapGS] bundle would drag Σ into the era record, and
+     the era record must be Σ-FREE so it can be a [ghost_map] VALUE in
+     the generation registry -- claude-notes/completed/crash.md); the
+     full [gen_heapGS] is reconstructed below as [riscv_memGS]. *)
+  riscvF_memGpreS :: gen_heapGpreS Arch.pa (bv 8) Σ;
+  (* the power/crash layer (claude-notes/design/crash.md): the GENERATION
+     COUNTER, a mono-nat mirroring [gstate.(ggen)].  FIXED-layer -- it is
+     the one ghost that spans power cycles; [gen_dead] below is the
+     persistent death certificate the corpse arms run on. *)
+  riscvF_genGS :: mono_natG Σ;
+  riscv_gen_name : gname;
+  (* the STARTED-GENERATIONS counter (value [ggen + (if gpow then 1 else 0)],
+     monotone under both power arms because PowerOff bumps [ggen]): a
+     thread's persistent [gen_started] certificate is what refutes the
+     current-generation-but-powered-off state in the base rules. *)
+  riscv_start_name : gname;
+  (* the GENERATION REGISTRY: gen ↦ its era record (Σ-free data, see
+     [riscvEraGS] above).  A live thread's [minstret_inv] carries the
+     persistent element [gen_id ↪□ riscv_eraGS], which is what ties its
+     ambient era to the one [state_interp]'s existential holds. *)
+  riscvF_registryGS :: ghost_mapG Σ nat riscvEraGS;
+  riscv_registry_name : gname;
+  (* the reservation mirror's class (§3a); the NAME is per-era
+     ([riscvEraGS.era_resv_name] above), since reservations do not survive a
+     power cycle -- [boot_shape] mints them all at [None]. *)
+  riscvF_resvGS :: ghost_mapG Σ CPU (option resv * bool);
+  (* the TSO machine ghosts' functor bundle (TsoGhost.v); the NAMES are
+     per-era (the four [era_*_name] fields above) *)
+  riscvF_tsomemGS :: tsoMemG Σ;
+  (* THE DISK IMAGE's TYPING (claude-notes/design/crash.md): the class alone
+     -- the NAME is per-era ([riscvEraGS.era_disk_name] above), because a
+     fixed image map could not be re-minted after a crash.  This field is
+     the UNIQUE source of the [ghost_mapG Σ Z (bv 8)] instance in every
+     [riscvGS] context, which is the whole reason [DiskImg.v] exists: the
+     era auth here and the driver's fragments in DiskPtsto.v must carry the
+     same instance, and RiscvPtsto sits BELOW DiskPtsto, so neither file can
+     take the class from the other. *)
+  riscvF_diskGS :: diskImgG Σ;
+  (* THE DURABLE DISK'S NAME (claude-notes/design/crash.md, "The durable
+     disk: ONE fixed gname", ruled 2026-08-22).  A FIXED-layer [ghost_map Z
+     (bv 8)] name, typed by [riscvF_diskGS] above (the class was always
+     fixed-layer; only the name used to be per-era).  [state_interp] holds
+     its AUTH at the machine's own [v_disk] ([disk_fixed_interp] below) --
+     a fixed conjunct, because the disk is the one thing a power cycle
+     preserves, so both power arms simply frame it.  The crash predicate
+     owns the FRAGMENTS, all of them, forever: no thread that can die ever
+     holds a fragment of the durable disk (they die with the era and take
+     what they own with them).  Auth/frag agreement is therefore THE TIE
+     between the crash predicate and the real disk -- which retires the
+     [ghost_var_frac] tie halves this field replaces ([disk_tie] / [fs_tie_interp])
+     and the [dk]-indexing of the crash predicate they required.
+
+     The per-era image map ([riscvEraGS.era_disk_name]) STAYS: it is the
+     driver's in-memory picture, owned by mortals, re-minted per era; the
+     crash predicate does not depend on it. *)
+  riscv_disk_name : gname;
+  (* ...and its SIZE: every minted offset of the durable map is below it
+     ([DiskImg.disk_img_auth_sized]), which is what lets the one owner of
+     the whole [0, size) fragment -- the crash predicate -- move the image
+     under any write at all.  A machine constant of this boot (adequacy's
+     [ndisk]), fixed-layer like the name. *)
+  riscv_disk_size : nat;
+  (* THE CRASH PREDICATE (claude-notes/design/crash.md): the client's
+     durability invariant over the durable disk, sealed into [crash_inv]
+     below.  A bare [iProp Σ] again (it was [dk]-indexed while the tie was a
+     [ghost_var_frac] half beside it): the client's predicate owns the durable
+     fragments, and a DMA completion re-establishes it by running the
+     client's own view shift with the AUTH lent for the instant
+     ([disk_write_permit]).  Still an ARBITRARY predicate, and still nothing
+     between here and the device thread names it. *)
+  riscv_crash_pred : iProp Σ;
+  (* THE TWO SYNC SLOTS (claude-notes/design/sync.md §4.2, “where the WAL
+     names the application's two opaque things”).  The application's
+     durability token and the hooks a [sync] waiter hands the committer
+     live inside the LOG invariant -- the token in [log_res]'s idle arm,
+     the hooks in its helping slot -- so both need a type the WAL can write
+     and the application can match, at one place both can name.  This is
+     that place: [riscv_sync_tok k] is era [k]'s opaque token,
+     [riscv_sync_hook k Q] the family of a waiter's hooks at its promised
+     [Q].  Client slots exactly as [riscv_crash_pred] is: adequacy fills
+     them from two parameters stated at the same raw gnames and fixed part
+     ([RiscvAdequacy.riscv_power_adequacy]'s [Tk]/[Hk]), every boot learns
+     them through the record-shape equation, and the machine never reads
+     them.  An application with no sync ledger takes [True] and [Q]. *)
+  riscv_sync_tok : nat -> iProp Σ;
+  riscv_sync_hook : nat -> iProp Σ -> iProp Σ;
+  (* THE SWAP COUNTER (phase C2b/D1): a mono-nat whose FULL auth lives inside
+     [P_fs]'s checked-out arm and whose value is the generation currently in
+     custody of the FS record.  FIXED-layer, and the auth never strands
+     because it lives in a fixed-layer INVARIANT rather than era-side; an era
+     keeps only a persistent lower bound (its swap receipt).  Together with
+     the started-generations auth the completion threads in, the two bounds
+     SQUEEZE the arm's generation onto the ambient one, which is what
+     identifies the arm's mirror gname. *)
+  riscv_swap_name : gname;
+  (* THE OBSERVABLE TRACE (claude-notes/completed/uart-trace.md).  The
+     language emits console I/O and power events ([RiscvLang.mobs], §3b')
+     and Iris threads them through [state_interp]; these three fields are
+     what lets the logic READ them.  [riscv_obs_name] is a [ghost_var_frac] over
+     the HISTORY SO FAR: [state_interp] holds one half ([obs_auth], below),
+     the client's trace predicate the other ([obs_frag]), so every event is
+     appended with the client's consent -- the UART thread's proof at its
+     tx/rx arms, the power thread through the [Hobs] hook.
+     [riscv_obs_total] is the run's WHOLE trace, a constant of the run like
+     every other fixed-layer datum: [obs_interp] ties the history to the
+     future as [h ++ κs = riscv_obs_total], which is what makes the history
+     the actual trace at the end of the run.  [riscv_obs_pred] is the
+     client's TRACE PREDICATE -- the second fixed-layer named slot beside
+     [riscv_crash_pred], sealed into [obs_inv] below; the crash predicate
+     is the file system's durable record and carries no observation. *)
+  riscvF_obsGS :: ghost_varG Σ (list mobs);
+  riscv_obs_name : gname;
+  riscv_obs_total : list mobs;
+  riscv_obs_pred : iProp Σ;
+  (* HISTORIES ONLY GROW, AS A RESOURCE (app-echo.md lane CONS-CURSOR, C1).
+     The history ghost above is a [ghost_var_frac], which says what the history
+     IS and nothing about what it WAS: a proof that holds a past history
+     [h0] -- the UART's receive column holds one per queued byte -- cannot
+     compare it with the current [h] at all.  So the machine's half
+     ([obs_auth]) carries, beside the [ghost_var_frac], a MONO_LIST AUTHORITY at
+     the same history, and its persistent lower bound [obs_hist_lb h0] is
+     "[h0] is a prefix of the history the run has reached".  It is stepped
+     in lockstep with the [ghost_var_frac] -- [obs_update] takes the prefix
+     premise every append already satisfies -- so no event can move one
+     without the other, and a lower bound taken at any past event stays
+     true for ever.
+
+     WHY IT IS A MACHINE FIELD AND NOT A CLIENT ONE.  The trivial
+     application's permit ([WpUart.uart_obs_permit_triv]) has to mint the
+     column's evidence just as the ledger's does; a client-chosen family
+     could not, and the receive column is maintained by the UART thread
+     under every application.  The name rides here beside
+     [riscv_obs_name] for the same reason that one does. *)
+  riscvF_obshGS :: inG Σ (mono_listR (leibnizO mobs));
+  riscv_obs_hist : gname;
+  (* THE APPLICATION'S CONSOLE INTERFACE, as ONE field (redesign R4).
+     [riscv_rx_tag], [app_taint] and [riscv_cons_res] were three fields
+     here with six companion instance fields; they are PROJECTIONS
+     of this one now, so every kernel file that names them is unchanged and
+     every boot obligation takes ONE equation instead of five.
+
+     The application sets it at boot ([App.app_iface_of] at the run's fixed
+     part); the trivial application sets it to [app_iface_triv]. *)
+  riscvF_app_iface : app_iface Σ;
+  (* THE APPLICATION'S FIXED PART (claude-notes/projects/app-instances.md
+     §6 ruling 1, round D0).  The machine no longer owns a counter: the
+     application declares whatever [Type] its fixed part has, and its BIRTH
+     STEP ([RiscvAdequacy.riscv_power_adequacy]'s [Hbirth], run FIRST --
+     before the crash slot is allocated, so the crash predicate can name
+     the value) produces the one value of the run.  Both ride the record
+     as a dependent pair: every era can NAME the value through it, and
+     [state_interp] never reads it.  The taint counter this slot used to be
+     is now the echo application's own fixed part ([AppEcho.echo_cl]). *)
+  riscv_client_T : Type;
+  riscv_client   : riscv_client_T;
+}.
+
+(* THE THREE PROJECTIONS (redesign R4).  Every kernel file that reads the
+   application's interface names one of these, exactly as it named the
+   fields they replace; only the SITES THAT SET the interface -- the boot's
+   record literal and the obligations' equations -- see [riscvF_app_iface]
+   itself. *)
+Definition riscv_rx_tag `{!riscvFixedGS Σ} : list mobs -> iProp Σ :=
+  ai_tag riscvF_app_iface.
+(* THE TAINT.  The application's kill price, and -- by the pipe pattern
+   (design/pipe.md, "The coupling, or the taint") -- the one credential a
+   disconnected coupling is paid with: the pipe's [link ∨ taint] payments,
+   the kill rows, and the generic slot's supply all name THIS.  It is
+   PERSISTENT ([app_taint_persistent] just below), so it is written bare:
+   a [□] in front of it says nothing the instance does not already say. *)
+Definition app_taint `{!riscvFixedGS Σ} : iProp Σ :=
+  ai_kill riscvF_app_iface.
+Definition riscv_cons_res `{!riscvFixedGS Σ} :
+    nat -> list mobs -> LogEntryDefs.cons_hist -> iProp Σ :=
+  ai_cons riscvF_app_iface.
+(* THE WILD CREDENTIAL, per era (lane S0): [ai_wild] at the machine's
+   interface.  Persistent like the taint, so it too is written bare. *)
+Definition riscv_wild `{!riscvFixedGS Σ} : nat -> iProp Σ :=
+  ai_wild riscvF_app_iface.
+(* ...and the reader-side one (seccomp design 10.7) *)
+Definition riscv_rdwild `{!riscvFixedGS Σ} : nat -> iProp Σ :=
+  ai_rdwild riscvF_app_iface.
+
+(* ...and their instances, off the interface's own fields.  They are
+   [Global Instance] and not [Existing Instance] because the projections
+   above are definitions, not record components: resolution has to unfold
+   one step to find the field. *)
+Global Instance riscv_rx_tag_persistent `{!riscvFixedGS Σ} h :
+  Persistent (riscv_rx_tag h).
+Proof. rewrite /riscv_rx_tag. apply ai_tag_persistent. Qed.
+Global Instance riscv_rx_tag_timeless `{!riscvFixedGS Σ} h :
+  Timeless (riscv_rx_tag h).
+Proof. rewrite /riscv_rx_tag. apply ai_tag_timeless. Qed.
+Global Instance app_taint_persistent `{!riscvFixedGS Σ} :
+  Persistent app_taint.
+Proof. rewrite /app_taint. apply ai_kill_persistent. Qed.
+Global Instance app_taint_timeless `{!riscvFixedGS Σ} :
+  Timeless app_taint.
+Proof. rewrite /app_taint. apply ai_kill_timeless. Qed.
+Global Instance riscv_cons_res_timeless `{!riscvFixedGS Σ} k h H :
+  Timeless (riscv_cons_res k h H).
+Proof. rewrite /riscv_cons_res. apply ai_cons_timeless. Qed.
+Global Instance riscv_wild_persistent `{!riscvFixedGS Σ} k :
+  Persistent (riscv_wild k).
+Proof using . rewrite /riscv_wild. apply ai_wild_persistent. Qed.
+Global Instance riscv_wild_timeless `{!riscvFixedGS Σ} k :
+  Timeless (riscv_wild k).
+Proof using . rewrite /riscv_wild. apply ai_wild_timeless. Qed.
+Global Instance riscv_rdwild_persistent `{!riscvFixedGS Σ} k :
+  Persistent (riscv_rdwild k).
+Proof using . rewrite /riscv_rdwild. apply ai_rdwild_persistent. Qed.
+Global Instance riscv_rdwild_timeless `{!riscvFixedGS Σ} k :
+  Timeless (riscv_rdwild k).
+Proof using . rewrite /riscv_rdwild. apply ai_rdwild_timeless. Qed.
+
+Class riscvGS (Σ : gFunctors) := RiscvGS {
+  riscv_fixedGS :: riscvFixedGS Σ;
+  riscv_eraGS : riscvEraGS;
+}.
+
+(* Compatibility names: the tree references these; signatures verbatim.
+   Each is a plain definition (NOT an instance -- the [::] substructures
+   above already provide the unique resolution path), so a use site
+   elaborates to the same projection chain resolution produces. *)
+Definition riscv_kmapGS `{!riscvGS Σ} :
+  @ghost_mapG Σ (SailStdpp.Values.mword 27) (SailStdpp.Values.mword 44 * kperm)
+    (@SailStdpp.Instances.Decidable_eq_mword 27)
+    (@SailStdpp.Instances.Countable_mword 27) := riscvF_kmapGS.
+Definition riscv_kptGS `{!riscvGS Σ} : inG Σ kptR := riscvF_kptGS.
+Definition riscv_kptbGS `{!riscvGS Σ} : inG Σ kptbR := riscvF_kptbGS.
+Definition riscv_lockSetGS `{!riscvGS Σ} : inG Σ lockSetR := riscvF_lockSetGS.
+Definition riscv_parkGS `{!riscvGS Σ} : ghost_varG Σ CPU := riscvF_parkGS.
+Definition riscv_pstateGS `{!riscvGS Σ} : ghost_varG Σ (SailStdpp.Values.mword 32) :=
+  riscvF_pstateGS.
+Definition era_memGS_of `{!riscvFixedGS Σ} (E : riscvEraGS) : gen_heapGS Arch.pa (bv 8) Σ :=
+  GenHeapGS _ _ _ (era_heap_name E) (era_meta_name E).
+Global Instance riscv_memGS `{!riscvGS Σ} : gen_heapGS Arch.pa (bv 8) Σ :=
+  era_memGS_of riscv_eraGS.
+Definition cpu_reg_name `{!riscvGS Σ} : CPU -> gname := era_reg_name riscv_eraGS.
+Definition uart_name `{!riscvGS Σ} : uart_id -> gname := era_uart_name riscv_eraGS.
+Definition plic_name `{!riscvGS Σ} : gname := era_plic_name riscv_eraGS.
+Definition virtio_name `{!riscvGS Σ} : gname := era_virtio_name riscv_eraGS.
+Definition kmap_name `{!riscvGS Σ} : gname := era_kmap_name riscv_eraGS.
+Definition kpt_name `{!riscvGS Σ} : gname := era_kpt_name riscv_eraGS.
+Definition kptb_name `{!riscvGS Σ} : gname := era_kptb_name riscv_eraGS.
+Definition ts_name `{!riscvGS Σ} : gname := era_ts_name riscv_eraGS.
+Definition logm_name `{!riscvGS Σ} : gname := era_logm_name riscv_eraGS.
+Definition loglen_name `{!riscvGS Σ} : gname := era_loglen_name riscv_eraGS.
+Definition view_name `{!riscvGS Σ} : gname := era_view_name riscv_eraGS.
+Definition strans_name `{!riscvGS Σ} : CPU -> gname := era_strans_name riscv_eraGS.
+Definition sie_name `{!riscvGS Σ} : CPU -> gname := era_sie_name riscv_eraGS.
+Definition spp_name `{!riscvGS Σ} : CPU -> gname := era_spp_name riscv_eraGS.
+Definition spie_name `{!riscvGS Σ} : CPU -> gname := era_spie_name riscv_eraGS.
+Definition park_name `{!riscvGS Σ} : nat -> gname := era_park_name riscv_eraGS.
+Definition pstate_name `{!riscvGS Σ} : nat -> gname := era_pstate_name riscv_eraGS.
+(* the ambient era's per-hart held-lock authority (LockSet.v). *)
+Definition lockset_name `{!riscvGS Σ} : CPU -> gname := era_lockset_name riscv_eraGS.
+(* the AMBIENT era's disk-image gname: what [DiskPtsto.disk_names]'s [dn_img]
+   field is always constructed at ([VirtioProto.disk_ghosts_alloc]), and what
+   [RiscvExec.wp_disk_step] hands the disk thread.  The seam equation the
+   driver carries is [dn_img γd = disk_img_name]. *)
+Definition disk_img_name `{!riscvGS Σ} : gname := era_disk_name riscv_eraGS.
+(* the AMBIENT era's log-region mirror gname *)
+Definition mirror_name `{!riscvGS Σ} : gname := era_mirror_name riscv_eraGS.
+
+(* The generation counter's three faces (claude-notes/design/crash.md).
+   [gen_auth] rides in [state_interp] pinned to [gstate.(ggen)]; the lower
+   bounds are persistent.  [gen_born gen] is every generation-[gen]
+   resource bundle's birth certificate (it will ride in that era's
+   [minstret_inv]); [gen_dead gen] is the stable death certificate --
+   PowerOff bumps [ggen], so a generation once passed is dead forever. *)
+Definition gen_auth `{!riscvFixedGS Σ} (n : nat) : iProp Σ :=
+  mono_nat_auth_own_frac riscv_gen_name 1 n.
+Definition gen_born `{!riscvFixedGS Σ} (gen : nat) : iProp Σ :=
+  mono_nat_lb_own riscv_gen_name gen.
+Definition gen_dead `{!riscvFixedGS Σ} (gen : nat) : iProp Σ :=
+  mono_nat_lb_own riscv_gen_name (S gen).
+
+(* THE S-MODE TRANSLATION ONE-SHOT, at an explicit gname (the per-hart
+   [strans_name c] / era-explicit [era_strans_name HE c]).  [IntrDefs] names
+   the ambient-hart forms [strans_pending] / [strans_kpt] / [kpt_on c] on top
+   of these; the slot itself and everything it means live there.
+
+   SPELLED THROUGH A DEFINITION HERE, NOT RAW AT EACH SITE, FOR THE INSTANCE.
+   [Xv6Cameras.diskGhostG] carries a SECOND [mono_natG Σ] ([disk_nc_inG]), and
+   [BootShared]'s allocation section binds both it and [riscvGS] -- so a raw
+   [mono_nat_auth_own_frac] written there resolves to whichever instance search
+   reaches first and then fails to unify with the one [IntrDefs] used, with
+   both propositions printing identically (LogInv.v's duplicate-class trap).
+   Fixing the instance at the definition, in a context where [riscvFixedGS]'s
+   [riscv_gen_inG] is the only one, makes every site agree by construction --
+   exactly why [gen_auth] above is a definition too. *)
+Definition strans_pending_at `{!riscvFixedGS Σ} (γ : gname) : iProp Σ :=
+  mono_nat_auth_own_frac γ (1/2)%Qp 0%nat.
+Definition strans_kpt_at `{!riscvFixedGS Σ} (γ : gname) : iProp Σ :=
+  mono_nat_auth_own_frac γ 1%Qp 1%nat.
+Definition kpt_on_at `{!riscvFixedGS Σ} (γ : gname) : iProp Σ :=
+  mono_nat_lb_own γ 1%nat.
+
+(* the started-generations counter's faces.  [start_count] is the pure
+   value [state_interp] pins; [gen_started gen] says generation [gen]'s
+   PowerOn has happened. *)
+Definition start_count (g : gstate) : nat :=
+  (g.(ggen) + (if g.(gpow) then 1 else 0))%nat.
+Definition start_auth `{!riscvFixedGS Σ} (n : nat) : iProp Σ :=
+  mono_nat_auth_own_frac riscv_start_name 1 n.
+Definition gen_started `{!riscvFixedGS Σ} (gen : nat) : iProp Σ :=
+  mono_nat_lb_own riscv_start_name (S gen).
+
+(* THE SWAP COUNTER's two faces (phase C2b/D1).  [swap_auth g] rides inside
+   [P_fs]'s checked-out arm at the generation in custody; [swap_lb g] is the
+   persistent SWAP RECEIPT an era keeps after its [initlog] took custody, and
+   is what a WAL write's fupd curries to prove the arm is still its own. *)
+Definition swap_auth `{!riscvFixedGS Σ} (g : nat) : iProp Σ :=
+  mono_nat_auth_own_frac riscv_swap_name 1 g.
+Definition swap_lb `{!riscvFixedGS Σ} (g : nat) : iProp Σ :=
+  mono_nat_lb_own riscv_swap_name g.
+
+Global Instance swap_lb_persistent `{!riscvFixedGS Σ} g : Persistent (swap_lb g).
+Proof. rewrite /swap_lb. apply _. Qed.
+
+(* THE SQUEEZE, as two lemmas so no FS-layer proof touches [mono_nat]:
+   the era's receipt bounds the arm's generation from BELOW, the started
+   counter the completion threads in bounds it from ABOVE, and together they
+   pin it to the ambient generation. *)
+
+
+
+
+(* THE DISK IMAGE TIE (claude-notes/design/crash.md, design/fs-log.md): era
+   [E]'s image auth, pinned to the state's own [v_disk].  It is a conjunct of
+   [era_interp] below, hence live exactly while the era is: PowerOff drops it
+   with the rest of the era (nothing is owed -- the auth had no reader left),
+   and PowerOn allocates the NEXT era's at the preserved content, handing the
+   full fragments to the boot client.  Of the whole tree only the DISK
+   thread's DMA completion moves [v_disk], so only [wp_disk_step] hands this
+   conjunct over to its caller; the other three lifting rules frame it. *)
+Definition disk_dur_interp `{!riscvFixedGS Σ} (E : riscvEraGS) (g : gstate)
+    : iProp Σ :=
+  disk_img_auth (era_disk_name E) (v_disk (dvirtio (gdev g))).
+
+(* the registry element: generation [gen] runs era [E].  Persistent. *)
+Definition era_registered `{!riscvFixedGS Σ} (gen : nat) (E : riscvEraGS) : iProp Σ :=
+  gen ↪[riscv_registry_name]□ E.
+
+(* THE CERTIFICATE BUNDLE a generation-[gen_id] thread carries (inside
+   [minstret_inv], so no statement anywhere names it): born + started +
+   its era's registration.  The base rules take it as one persistent
+   premise and case on the current [(ggen, gpow)] against it. *)
+Definition gen_cert `{!riscvGS Σ} `{GEN : GenId} : iProp Σ :=
+  (gen_born gen_id ∗ gen_started gen_id ∗ era_registered gen_id riscv_eraGS)%I.
+
+(* ---------------------------------------------------------------------- *)
+(* THE CRASH-SPANNING INVARIANT (claude-notes/design/crash.md).             *)
+(*                                                                          *)
+(* [crash_inv] is allocated ONCE, in adequacy, over the fixed layer's        *)
+(* [riscv_crash_pred], and it spans power cycles for free: neither power arm *)
+(* opens it (the real disk image is untouched -- [virtio_reset] keeps        *)
+(* [v_disk]), so the client's durability property holds at every reachable   *)
+(* state INCLUDING the instant after a power loss.  It is opened in exactly  *)
+(* one place in the whole tree -- the disk thread's DMA completion, the one  *)
+(* step that moves [v_disk] ([WpUart.wp_disk_loop]).                         *)
+(* ---------------------------------------------------------------------- *)
+
+Definition crashN : namespace := nroot .@ "crash".
+
+(* THE CRASH INVARIANT.  The client's predicate, and nothing beside it: the
+   tie to the real disk is the auth/fragment agreement against
+   [state_interp]'s [disk_fixed_interp], available to the one opener (the
+   DMA completion, [WpUart.wp_disk_loop]) because it holds [state_interp]
+   there.  Allocated once, in adequacy, over the fixed layer's
+   [riscv_crash_pred]; it spans power cycles for free, since neither power
+   arm touches [v_disk] and neither opens it. *)
+Definition crash_inv `{!riscvFixedGS Σ} : iProp Σ :=
+  inv crashN riscv_crash_pred.
+
+(* THE TRACE INVARIANT (claude-notes/completed/uart-trace.md): the client's
+   trace predicate, in its own fixed-layer slot.  Opened by the power arms
+   (through the [Hobs] hook) and by the UART thread's tx/rx arms (through
+   [WpUart.uart_obs_permit]); [obsN], [crashN] and [devN] are pairwise
+   disjoint, so the openings compose. *)
+Definition obsN : namespace := nroot .@ "obs".
+
+(* the two halves of the history ghost: [state_interp]'s and the client's.
+   THE MACHINE'S HALF CARRIES THE GROWTH AUTHORITY TOO (the record's
+   [riscv_obs_hist] field): every mover of the history holds [obs_auth], so
+   putting the monotone authority there is what makes "the history only
+   grows" a fact no arm can sidestep.  The client's half is unchanged, which
+   is why [obs_ledger]/[obs_pred_triv] and every hook stated over
+   [obs_frag] read exactly as before. *)
+Definition obs_hist_lb `{!riscvFixedGS Σ} (h : list mobs) : iProp Σ :=
+  own riscv_obs_hist (◯ML (h : list (leibnizO mobs))).
+Definition obs_hist_auth `{!riscvFixedGS Σ} (h : list mobs) : iProp Σ :=
+  own riscv_obs_hist (●ML (h : list (leibnizO mobs))).
+(* the machine's half WITHOUT the growth authority.  A CLIENT HOOK MOVES
+   THIS ONE: the power hook is written by a client that has no
+   [riscvFixedGS] and spells [ghost_var_frac γobs (1/2) h], so the monotone
+   authority is stepped beside it by the power loop rather than by the
+   hook. *)
+Definition obs_half `{!riscvFixedGS Σ} (h : list mobs) : iProp Σ :=
+  ghost_var_frac riscv_obs_name (1/2) h.
+Definition obs_auth `{!riscvFixedGS Σ} (h : list mobs) : iProp Σ :=
+  (obs_half h ∗ obs_hist_auth h)%I.
+Definition obs_frag `{!riscvFixedGS Σ} (h : list mobs) : iProp Σ :=
+  ghost_var_frac riscv_obs_name (1/2) h.
+
+(* THE GROWTH AUTHORITY'S OWN STEP, for the one mover that does not hold
+   the client's half: the power loop, whose hook moves [obs_half] alone. *)
+Lemma obs_hist_auth_step `{!riscvFixedGS Σ} (h h' : list mobs) :
+  h `prefix_of` h' -> obs_hist_auth h ==∗ obs_hist_auth h'.
+Proof.
+  intro Hpre. rewrite /obs_hist_auth. iIntros "Ha".
+  iMod (own_update _ _ (●ML (h' : list (leibnizO mobs))) with "Ha") as "$";
+    [by apply mono_list_update | done].
+Qed.
+
+Global Instance obs_hist_lb_persistent `{!riscvFixedGS Σ} h :
+  Persistent (obs_hist_lb h).
+Proof. rewrite /obs_hist_lb. apply _. Qed.
+Global Instance obs_hist_lb_timeless `{!riscvFixedGS Σ} h :
+  Timeless (obs_hist_lb h).
+Proof. rewrite /obs_hist_lb. apply _. Qed.
+Global Instance obs_auth_timeless `{!riscvFixedGS Σ} h : Timeless (obs_auth h).
+Proof. rewrite /obs_auth. apply _. Qed.
+
+(* THE THREE MOVES ON THE LOWER BOUND.  A snapshot is free; a snapshot and
+   the authority together order the two histories; and a bound weakens to
+   any prefix of itself. *)
+Lemma obs_auth_lb `{!riscvFixedGS Σ} (h : list mobs) :
+  obs_auth h -∗ obs_auth h ∗ obs_hist_lb h.
+Proof.
+  iIntros "[Hv Ha]". rewrite /obs_auth /obs_hist_auth /obs_hist_lb.
+  iEval (rewrite {1}mono_list_auth_lb_op) in "Ha".
+  iDestruct "Ha" as "[Ha Hlb]".
+  iFrame "Hv Ha Hlb".
+Qed.
+
+Lemma obs_hist_lb_prefix `{!riscvFixedGS Σ} (h h0 : list mobs) :
+  obs_auth h -∗ obs_hist_lb h0 -∗ ⌜h0 `prefix_of` h⌝.
+Proof.
+  iIntros "[_ Ha] Hlb". rewrite /obs_hist_auth /obs_hist_lb.
+  by iDestruct (own_valid_2 with "Ha Hlb") as %?%mono_list_both_valid_L.
+Qed.
+
+(* TWO LOWER BOUNDS ON ONE MONOTONE HISTORY ARE COMPARABLE (lane OUT-FUPD).
+   The history ghost is a [mono_list], so two snapshots of it are two
+   fragments of one chain and one of them is a prefix of the other
+   ([mono_list_lb_op_valid_L]).  This is the ONE fact that lets a writer's
+   view shift place ITS byte's history against the one the UART invariant's
+   output claim is read at, without either side holding the authority. *)
+Lemma obs_hist_lb_cmp `{!riscvFixedGS Σ} (h1 h2 : list mobs) :
+  obs_hist_lb h1 -∗ obs_hist_lb h2 -∗
+    ⌜h1 `prefix_of` h2 \/ h2 `prefix_of` h1⌝.
+Proof.
+  iIntros "H1 H2". rewrite /obs_hist_lb.
+  by iDestruct (own_valid_2 with "H1 H2") as %?%mono_list_lb_op_valid_L.
+Qed.
+
+Lemma obs_hist_lb_mono `{!riscvFixedGS Σ} (h0 h1 : list mobs) :
+  h0 `prefix_of` h1 -> obs_hist_lb h1 -∗ obs_hist_lb h0.
+Proof.
+  intro Hp. rewrite /obs_hist_lb. iIntros "H".
+  iApply (own_mono with "H"). by apply mono_list_lb_mono.
+Qed.
+
+Definition obs_inv `{!riscvFixedGS Σ} : iProp Σ :=
+  inv obsN riscv_obs_pred.
+
+(* THE TRIVIAL TAG FAMILY: what an application that claims nothing about its
+   input fills the tag slot with.  Named rather than written out at each use
+   so the equations the UART thread's permit is stated over
+   ([WpUart.uart_obs_permit_triv]) have something to match. *)
+Definition rx_tag_triv {Σ : gFunctors} : list mobs -> iProp Σ :=
+  fun _ => True%I.
+Global Instance rx_tag_triv_persistent {Σ : gFunctors} (h : list mobs) :
+  Persistent (rx_tag_triv (Σ := Σ) h).
+Proof. rewrite /rx_tag_triv. apply _. Qed.
+Global Instance rx_tag_triv_timeless {Σ : gFunctors} (h : list mobs) :
+  Timeless (rx_tag_triv (Σ := Σ) h).
+Proof. rewrite /rx_tag_triv. apply _. Qed.
+
+(* THE TRIVIAL KILL CREDENTIAL: what an application that puts no price on a
+   kill fills the slot with (lane KILL-PAY, K1).  Named for the same reason
+   [rx_tag_triv] is -- the generic theorem's equations have to match on
+   something -- and [True] rather than [emp] so that the [□] every party
+   holds it under is free. *)
+Definition kill_cred_triv {Σ : gFunctors} : iProp Σ := True%I.
+Global Instance kill_cred_triv_persistent {Σ : gFunctors} :
+  Persistent (kill_cred_triv (Σ := Σ)).
+Proof. rewrite /kill_cred_triv. apply _. Qed.
+Global Instance kill_cred_triv_timeless {Σ : gFunctors} :
+  Timeless (kill_cred_triv (Σ := Σ)).
+Proof. rewrite /kill_cred_triv. apply _. Qed.
+
+(* THE TRIVIAL OUTPUT CLAIM: an application that claims nothing of the
+   console's accepted bytes.  Every writer's view shift is discharged out of
+   nothing at it and the founding is [emp].  It is also, by
+   [WpUart.chist_at]'s [match], what the KERNEL's own port carries under
+   EVERY application -- the owner's ruling that UART1's output is
+   unconstrained, made literal. *)
+(* [out_res_triv] and [in_res_triv] lived here. *)
+
+(* ...and the echo window token's (lane CONS-IO milestone F): the generic
+   application has no echo discipline to protect, so it lends the kernel
+   nothing and every route that returns the token returns [emp]. *)
+Definition cons_res_triv {Σ : gFunctors} :
+    nat -> list mobs -> LogEntryDefs.cons_hist -> iProp Σ := fun _ _ _ => emp%I.
+Global Instance cons_res_triv_timeless {Σ : gFunctors} (k : nat)
+    (h : list mobs) (H : LogEntryDefs.cons_hist) :
+  Timeless (cons_res_triv (Σ := Σ) k h H).
+Proof. rewrite /cons_res_triv. apply _. Qed.
+
+(* ...and the trivial claim's LICENCE (lane SUP-ONE): [emp] survives every
+   event, so the trivial interface pays the law for nothing. *)
+Lemma cons_res_triv_lic {Σ : gFunctors} :
+  (kill_cred_triv : iProp Σ) ⊢
+    □ (∀ (k : nat) (h : list mobs) (H : LogEntryDefs.cons_hist)
+         (ev : ConsLog.cons_ev),
+         cons_res_triv k h H ==∗ cons_res_triv k h (ConsLog.cons_step H ev)).
+Proof.
+  rewrite /cons_res_triv. iIntros "_ !>" (k h H ev) "_". by iModIntro.
+Qed.
+
+(* ...and the three of them AS AN INTERFACE (redesign R4): what the generic
+   application sets [riscvF_app_iface] to.  One value where the trivial
+   theorem used to hand over three predicates and five instances. *)
+Definition app_iface_triv (Σ : gFunctors) : app_iface Σ :=
+  MkAppIface rx_tag_triv (@rx_tag_triv_persistent Σ) (@rx_tag_triv_timeless Σ)
+             kill_cred_triv (@kill_cred_triv_persistent Σ)
+             (@kill_cred_triv_timeless Σ)
+             cons_res_triv (@cons_res_triv_timeless Σ)
+             (@cons_res_triv_lic Σ)
+             wild_none (@wild_none_persistent Σ) (@wild_none_timeless Σ)
+             (wild_none_lic cons_res_triv)
+             wild_none (@wild_none_persistent Σ) (@wild_none_timeless Σ).
+
+(* [win_res_triv] lived here. *)
+
+(* the TRIVIAL trace predicate -- the client's half and nothing about it.
+   What a client that states no trace property fills the slot with. *)
+Definition obs_pred_triv `{!riscvFixedGS Σ} : iProp Σ :=
+  (∃ h : list mobs, obs_frag h)%I.
+
+(* THE LEDGER: the trace predicate of a client with a TRACE-INDEXED RESOURCE
+   [R] (uart-trace.md) -- its half of the history ghost and [R] at that
+   history.  [R] is a resource rather than a pure fact so that a proof at
+   an event can relate the history to other ghosts (the durable state of a
+   file, a console's own picture); its pure reading is what adequacy exports.
+   Every hook that opens the ledger asks [R] to be TIMELESS (a client whose
+   [R] needs a non-timeless part keeps it outside, persistently, and hands
+   it to the wands). *)
+Definition obs_ledger `{!riscvFixedGS Σ} (R : list mobs -> iProp Σ) : iProp Σ :=
+  (∃ h : list mobs, obs_frag h ∗ R h)%I.
+
+Lemma obs_agree `{!riscvFixedGS Σ} (h1 h2 : list mobs) :
+  obs_auth h1 -∗ obs_frag h2 -∗ ⌜h1 = h2⌝.
+Proof.
+  iIntros "[H1 _] H2". by iDestruct (ghost_var_agree with "H1 H2") as %->.
+Qed.
+
+(* THE APPEND.  The prefix premise is the growth law itself, and it costs
+   nothing: every mover of the history appends ([h ++ κ] at a device event,
+   [h ++ [ObsPowerOn]] at a power one), so each supplies it by
+   [prefix_app_r]. *)
+Lemma obs_update `{!riscvFixedGS Σ} (h h' : list mobs) :
+  h `prefix_of` h' ->
+  obs_auth h -∗ obs_frag h ==∗ obs_auth h' ∗ obs_frag h'.
+Proof.
+  intro Hpre. iIntros "[H1 Ha] H2". rewrite /obs_auth /obs_half.
+  iMod (ghost_var_update_halves h' with "H1 H2") as "[$ $]".
+  iMod (obs_hist_auth_step h h' Hpre with "Ha") as "$". done.
+Qed.
+
+(* the durable disk's auth, at an image: what [state_interp] holds and what
+   a DMA completion lends a permit for the instant *)
+Definition disk_fixed_auth `{!riscvFixedGS Σ} (dk : Z -> bv 8) : iProp Σ :=
+  disk_img_auth_sized riscv_disk_name riscv_disk_size dk.
+
+Global Instance disk_fixed_auth_timeless `{!riscvFixedGS Σ} dk :
+  Timeless (disk_fixed_auth dk).
+Proof. rewrite /disk_fixed_auth. apply _. Qed.
+
+Global Instance crash_inv_persistent `{!riscvFixedGS Σ} : Persistent crash_inv.
+Proof. rewrite /crash_inv. apply _. Qed.
+
+(* THE WRITE PERMIT: what an enqueuer deposits for an OUT request (through
+   the permit channel of [PermInv.v] -- NOT through the timeless slot, which
+   cannot hold an iProp) and what the DMA completion spends to re-establish
+   the crash predicate AT THE INSTANT the on-disk image changes.
+
+   THE LOGICALLY-ATOMIC SHAPE (claude-notes/design/fs-log.md, stage 4 item 2):
+   the permit is the CLIENT's view shift over the crash predicate, returning
+   the client's own RECEIPT [Q] -- "when my write lands, the durability
+   invariant still holds, and here is what I learn from that".  The caller
+   curries the write's identity and its own abstract-state ghosts into the
+   closure at enqueue time; the completion instant is precisely when the
+   on-disk state changes, so that is when the wand must run, and [Q] is what
+   comes back to the caller.  A SERIALIZED writer -- which xv6's log is, one
+   commit at a time under the log lock -- needs nothing conditional here: no
+   "if the disk still looks like X" guard, no mask annotation (a basic update
+   goes through at whatever mask [wp_disk_loop] holds while [crashN],
+   [PermInv.permN] and [diskN] are all open). *)
+Definition disk_write_permit `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr)
+    (Q : iProp Σ) : iProp Σ :=
+  (∀ (dk : Z -> bv 8) (n : nat),
+     start_auth n -∗ ⌜n = (gd + 1)%nat⌝ -∗
+     (* THE DURABLE AUTH IS LENT FOR THE INSTANT (design/crash.md, "The
+        durable disk"): the client's predicate owns the fragments, so the
+        view shift agrees them against the auth (learning [dk], the image
+        the machine is moving FROM), moves them with the write, and hands
+        the auth back at the image the machine moved TO.  A READ is the
+        same shape at [w = None] ([wr_apply None dk = dk]): the auth is
+        lent, nothing moves, and [Q] may be stated at the bytes of [dk] --
+        which is how a reader learns something DURABLE about what it read,
+        at the only instant anybody can. *)
+     disk_fixed_auth dk -∗
+     ▷ riscv_crash_pred ={∅}=∗
+       disk_fixed_auth (wr_apply w dk) ∗
+       ▷ riscv_crash_pred ∗ start_auth n ∗ Q)%I.
+
+(* WHY A MASK-[∅] FUPD AND NOT A BASIC UPDATE.  A client whose crash
+   predicate is TIMELESS -- [FsCrash.P_fs_any] is, every conjunct of it is a
+   [ghost_map]/[mono_nat]/[own] over a discrete cmra -- has to STRIP the [▷]
+   this type hands it before it can update the record's ghosts, and a basic
+   update cannot do that: [◇] is not absorbed by [|==>] (there is no
+   [▷ |==> P ⊢ |==> ▷ P] in Iris either).  A fupd at ANY mask absorbs [◇], so
+   [∅] is the right choice: it is the weakest thing to PROVE (no invariant is
+   open inside it -- a crash permit never opens one, it is handed the
+   predicate directly), and the consumer runs it under whatever mask it holds
+   via [fupd_mask_subseteq].  Nothing else about the seam changes. *)
+
+(* WHY THE PERMIT NAMES ITS AUTHOR'S GENERATION [gd] (phase C2b/D1).  A crash
+   permit is a STATELESS view shift: it runs at the DMA completion with only
+   what its author curried at enqueue.  But the facts a WAL write's fupd needs
+   about the PHYSICAL log region are chain facts -- established by the
+   PREVIOUS writes -- so they have to be read out of a mirror the ERA holds a
+   half of, and the crash predicate's own half of that mirror sits under an
+   EXISTENTIAL (the mirror gname is per-era, because a fixed one could never
+   be re-paired after a crash).  Matching the two halves therefore needs the
+   fupd to know that the recorded custodian IS the ambient era.
+
+   THE AUTHOR'S OWN GENERATION IS THE ONLY WORKABLE INDEX, and an earlier
+   draft that quantified over the CONSUMER's generation instead
+   ([∀ g E, era_registered g E -∗ …]) is UNPROVABLE at every real call site:
+   everything a client can curry is at ITS [gen_id] -- [swap_lb (S gen_id)]
+   and the mirror half at [era_mirror_name riscv_eraGS] -- while the squeeze
+   would need both at the supplied [g].  The gap is exactly [g = gen_id], and
+   it has no source: the registry is a plain [ghost_map nat riscvEraGS] with
+   no injectivity (the base rules never need any -- [RiscvExec] identifies
+   [E = riscv_eraGS] only in the [ggen = gen_id] case and parks a stale thread
+   with [wp_dead]), and a [mono_nat] lower bound cannot be raised.  Nor MAY it
+   be derivable: a stale era's permit must fail, or the crash predicate is
+   unsound.
+
+   So the freshness certificate comes from the completion, against the
+   author's own [gd]: the completion threads in [state_interp]'s
+   started-generations auth with the live-era arithmetic [n = gd + 1] and
+   takes it back.  The client instantiates
+   [FsCrash.fs_arm_acc] at [(gen_id, riscv_eraGS)] and the squeeze closes:
+   its own [swap_lb (S gen_id)] gives [S gen_id <= c] from below, the arm's
+   [gen_started g''] against that auth gives [g'' <= gen_id] from above, so
+   [c = S gen_id] and [g'' = gen_id] -- and [era_registered] agreement AT THE
+   SHARED KEY then gives [E'' = riscv_eraGS].
+
+   WHAT MAKES THE CONSUMPTION SIDE WORK is era-locality, not per-request data:
+   [PermInv.perm_inv] is indexed by the SAME [gd], so every permit in an era's
+   channel is at that era's generation by construction, and [wp_disk_loop]
+   holds the channel at its own [gen_id].  A dead era's channel is simply
+   never opened again -- its device loop corpse-steps -- so its permits die
+   unconsumed, which is exactly the soundness story.
+
+   The IDENTITY permit ignores both remaining arguments, so a read's permit is
+   still free at an ARBITRARY crash predicate. *)
+
+(* THE IDENTITY PERMIT, and why it is still free.  A request that moves no
+   disk byte carries [w = None], and [wr_apply None] is the identity ON THE
+   NOSE, so the two occurrences of the crash predicate are syntactically the
+   same and the permit is provable for an ARBITRARY client predicate.  Every
+   READ deposits this, which is what keeps the whole read stack (bread and
+   everything above it) textually unchanged by the C2a reshape. *)
+Lemma disk_write_permit_trivial `{!riscvFixedGS Σ} (gd : nat) :
+  ⊢ disk_write_permit gd None True.
+Proof.
+  rewrite /disk_write_permit. iIntros (dk n) "Hs _ Ha HP". iModIntro.
+  rewrite wr_apply_none. iFrame "Ha HP Hs".
+Qed.
+
+(* ...and the general form: at [None] the permit IS its own receipt, which is
+   what closes every sequential chain -- the leaf hands [Q] over with nothing
+   to say about the image. *)
+Lemma disk_write_permit_intro `{!riscvFixedGS Σ} (gd : nat) (Q : iProp Σ) :
+  Q -∗ disk_write_permit gd None Q.
+Proof.
+  iIntros "HQ". rewrite /disk_write_permit. iIntros (dk n) "Hs _ Ha HP".
+  iModIntro. rewrite wr_apply_none. iFrame "Ha HP Hs HQ".
+Qed.
+
+(* THE SEQUENTIAL PERMIT (claude-notes/completed/sector-atomic-disk.md §6e).
+   A 512-byte SECTOR lands atomically and a 1024-byte BLOCK does not, so ONE
+   request has one linearization point PER SECTOR.  The request's obligation
+   is therefore not a bag of independent permits -- it is ONE object that
+   unfolds a step at a time: a conjunction over the sectors STILL TO LAND,
+   each branch a permit whose receipt is the RESIDUAL obligation for the
+   rest, and whose leaf (nothing left) is the completion's identity permit
+   delivering the client's [Q].
+
+   WHY A CONJUNCTION AND NOT A SEPARATING ONE.  The device picks the landing
+   order, so the client must be ready for every branch -- but exactly ONE is
+   ever taken, so all of them may be proved from the SAME resources.  That is
+   [∧], and it is the whole reason this shape exists: an earlier design
+   handed out one INDEPENDENT permit per sector, and then the client's
+   mirror half (an exclusive [ghost_var_frac] fragment) could be curried into only
+   one of them, with no way for the other to obtain it -- a permit is a
+   stateless view shift with no input slot and no invariant it may open at
+   mask [∅].  Here whatever a later sector needs travels DOWN THE CHAIN
+   inside the residual.
+
+   Spelled with an explicit fuel so the recursion is structural; the fuel is
+   always [size todo], which is what [sperm] fixes and what makes
+   [sperm_nil]/[sperm_cons] the only two facts anybody needs. *)
+Fixpoint sperm_aux `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr) (n : nat)
+    (todo : gset nat) (Q : iProp Σ) : iProp Σ :=
+  match n with
+  | O => disk_write_permit gd None Q
+  | S n' =>
+      (∀ i : nat, ⌜i ∈ todo⌝ -∗
+         disk_write_permit gd (wr_sector w i)
+           (sperm_aux gd w n' (todo ∖ {[ i ]}) Q))%I
+  end.
+
+Definition sperm `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr)
+    (todo : gset nat) (Q : iProp Σ) : iProp Σ :=
+  sperm_aux gd w (size todo) todo Q.
+
+(* THE REQUEST'S WHOLE OBLIGATION, and what every client hands the driver.
+   A READ has no sectors ([wr_nsectors None = 0]), so this IS the identity
+   permit for it -- the read side of the stack is textually unchanged. *)
+Definition disk_seq_permit `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr)
+    (Q : iProp Σ) : iProp Σ :=
+  sperm gd w (set_seq 0 (wr_nsectors w)) Q.
+
+(* removing one element of a finite set drops its size by exactly one *)
+Lemma size_diff_one (X : gset nat) (i : nat) :
+  i ∈ X -> S (size (X ∖ {[ i ]})) = size X.
+Proof.
+  intro Hi.
+  assert (Hsub : ({[ i ]} : gset nat) ⊆ X).
+  { intros x Hx. apply elem_of_singleton in Hx as ->. exact Hi. }
+  pose proof (subseteq_size _ _ Hsub) as Hle.
+  rewrite (size_difference _ _ Hsub) size_singleton.
+  rewrite size_singleton in Hle. lia.
+Qed.
+
+(* THE LEAF: nothing left to land, so the obligation is the completion's own
+   identity permit. *)
+Lemma sperm_nil `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr) (Q : iProp Σ) :
+  sperm gd w ∅ Q = disk_write_permit gd None Q.
+Proof. rewrite /sperm size_empty //. Qed.
+
+(* THE STEP: with sectors outstanding the obligation is the conjunction over
+   them, each branch owing the residual. *)
+Lemma sperm_cons `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr)
+    (todo : gset nat) (Q : iProp Σ) :
+  todo ≠ ∅ ->
+  sperm gd w todo Q ⊣⊢
+    (∀ i : nat, ⌜i ∈ todo⌝ -∗
+       disk_write_permit gd (wr_sector w i) (sperm gd w (todo ∖ {[ i ]}) Q)).
+Proof.
+  intro Hne. rewrite {1}/sperm.
+  destruct (set_choose_L todo Hne) as [x Hx].
+  pose proof (size_diff_one todo x Hx) as Hsx.
+  destruct (size todo) as [|k] eqn:Hs; [exfalso; lia|].
+  cbn [sperm_aux]. iSplit.
+  - iIntros "H" (i) "%Hi". rewrite /sperm.
+    rewrite (_ : size (todo ∖ {[ i ]}) = k);
+      [| pose proof (size_diff_one todo i Hi); lia].
+    by iApply "H".
+  - iIntros "H" (i) "%Hi".
+    rewrite (_ : k = size (todo ∖ {[ i ]}));
+      [| pose proof (size_diff_one todo i Hi); lia].
+    by iApply "H".
+Qed.
+
+Lemma singleton_ne_empty (i : nat) : ({[ i ]} : gset nat) ≠ ∅.
+Proof.
+  intro Hc. apply (elem_of_empty (C := gset nat) i).
+  rewrite -Hc. by apply elem_of_singleton.
+Qed.
+
+(* ONE sector outstanding: the branch and then the leaf. *)
+Lemma sperm_one `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr) (i : nat)
+    (Q : iProp Σ) :
+  sperm gd w {[ i ]} Q ⊣⊢
+    disk_write_permit gd (wr_sector w i) (disk_write_permit gd None Q).
+Proof.
+  rewrite (sperm_cons gd w {[ i ]} Q (singleton_ne_empty i)).
+  assert (Hd : ({[ i ]} : gset nat) ∖ {[ i ]} = ∅).
+  { apply set_eq. intro x. rewrite elem_of_difference elem_of_empty. tauto. }
+  iSplit.
+  - iIntros "H". iSpecialize ("H" $! i with "[%]").
+    { by apply elem_of_singleton. }
+    rewrite Hd sperm_nil. iExact "H".
+  - iIntros "H" (j) "%Hj". apply elem_of_singleton in Hj as ->.
+    rewrite Hd sperm_nil. iExact "H".
+Qed.
+
+(* the permit is MONOTONE in its receipt -- what lets a chain written in the
+   plain nested form be read as the residual [sperm] *)
+Lemma disk_write_permit_mono `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr)
+    (Q Q' : iProp Σ) :
+  (Q -∗ Q') -∗ disk_write_permit gd w Q -∗ disk_write_permit gd w Q'.
+Proof.
+  iIntros "HQ Hp". rewrite /disk_write_permit.
+  iIntros (dk n) "Hs %Hn Ha HP".
+  iMod ("Hp" $! dk n with "Hs [//] Ha HP") as "(Ha & HP & Hs & HQ0)".
+  iModIntro. iFrame "Ha HP Hs". by iApply "HQ".
+Qed.
+
+Lemma sperm_one_intro `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr) (i : nat)
+    (Q : iProp Σ) :
+  disk_write_permit gd (wr_sector w i) (disk_write_permit gd None Q)
+  ⊢ sperm gd w {[ i ]} Q.
+Proof. rewrite (sperm_one gd w i Q). done. Qed.
+
+(* A READ IS STILL FREE at the sequence level: no sector, so the sequential
+   permit IS the completion's identity permit. *)
+Lemma disk_seq_permit_none `{!riscvFixedGS Σ} (gd : nat) (Q : iProp Σ) :
+  disk_seq_permit gd None Q = disk_write_permit gd None Q.
+Proof. rewrite /disk_seq_permit /=. apply sperm_nil. Qed.
+
+(* THE TWO-SECTOR FORM -- an xv6 BLOCK ([BSIZE] = 2 * 512).  This is what the
+   FS layer builds: the two landing orders, proved from the SAME resources
+   (that is the [∧]), each order a chain of two record-level view shifts
+   ending in the completion's. *)
+Lemma disk_seq_permit_two `{!riscvFixedGS Σ} (gd : nat) (w : disk_wr)
+    (Q : iProp Σ) :
+  wr_nsectors w = 2%nat ->
+  (disk_write_permit gd (wr_sector w 0)
+     (disk_write_permit gd (wr_sector w 1) (disk_write_permit gd None Q))
+   ∧ disk_write_permit gd (wr_sector w 1)
+     (disk_write_permit gd (wr_sector w 0) (disk_write_permit gd None Q)))
+  ⊢ disk_seq_permit gd w Q.
+Proof.
+  intro Hn. rewrite /disk_seq_permit Hn.
+  assert (Hne : set_seq (C := gset nat) 0 2 ≠ ∅).
+  { intro Hc. apply (elem_of_empty (C := gset nat) 0%nat).
+    rewrite -Hc. apply elem_of_set_seq. lia. }
+  assert (Hd0 : set_seq (C := gset nat) 0 2 ∖ {[ 0%nat ]} = {[ 1%nat ]}).
+  { apply set_eq. intro x.
+    rewrite elem_of_difference elem_of_set_seq !elem_of_singleton. lia. }
+  assert (Hd1 : set_seq (C := gset nat) 0 2 ∖ {[ 1%nat ]} = {[ 0%nat ]}).
+  { apply set_eq. intro x.
+    rewrite elem_of_difference elem_of_set_seq !elem_of_singleton. lia. }
+  rewrite (sperm_cons gd w (set_seq 0 2) Q Hne).
+  iIntros "H" (i) "%Hi".
+  assert (Hi01 : i = 0%nat \/ i = 1%nat)
+    by (apply elem_of_set_seq in Hi; lia).
+  destruct Hi01 as [-> | ->].
+  - rewrite Hd0. iDestruct "H" as "[H _]".
+    iApply (disk_write_permit_mono with "[] H").
+    iIntros "Hr". iApply (sperm_one_intro gd w 1%nat Q). iExact "Hr".
+  - rewrite Hd1. iDestruct "H" as "[_ H]".
+    iApply (disk_write_permit_mono with "[] H").
+    iIntros "Hr". iApply (sperm_one_intro gd w 0%nat Q). iExact "Hr".
+Qed.
+
+(* A REAL WRITE'S PERMIT IS NOT FREE, and that is the honest content of the
+   reshape: the completion moves the crash predicate's index, so somebody has
+   to say what the predicate does under that move.  There is therefore NO
+   [Pc]-generic write permit, and no bridge lemma either: the four WAL write
+   kinds each prove their own fupd against the FS's own crash predicate
+   ([FsCrash.fs_logfill_v_seq_permit] / [_commit_named_seq_permit] /
+   [_install_v_seq_permit] / [_clear_keep_seq_permit], phase C2b/D1 stage 4).  The earlier placeholder premise
+   [crash_pred_indifferent], which said the system promises nothing about
+   durability, was DELETED when those landed rather than discharged: it is
+   FALSE at the real [P_fs], so keeping it would have made every WAL
+   contract vacuous. *)
+
+(* [reg_name] is the register-map ghost name of the AMBIENT hart [cpu_id].  It is
+   what every [r ↦ᵣ v] / [reg_interp] / [reg_valid] / [reg_update] silently talks
+   about, so those keep their single-CPU spelling: which hart they concern is
+   selected by the surrounding [CpuId] instance, never written out. *)
+Definition reg_name `{!riscvGS Σ} `{CpuId} : gname := cpu_reg_name cpu_id.
+
+(* register points-to: [r |->r v] owns register [r] (of the ambient hart)
+   holding [v].  Backed by a [ghost_map] element on [reg_name]. *)
+Definition reg_pointsto `{!riscvGS Σ} `{CpuId} (r : register) (dq : dfrac)
+    (v : type_of_register r) : iProp Σ :=
+  ghost_map_elem reg_name r dq (existT r v).
+
+Notation "r ↦ᵣ{ dq } v" := (reg_pointsto r dq v)
+  (at level 20, format "r  ↦ᵣ{ dq }  v") : bi_scope.
+Notation "r ↦ᵣ v" := (reg_pointsto r (DfracOwn 1) v)
+  (at level 20, format "r  ↦ᵣ  v") : bi_scope.
+(* discarded (persistent, duplicable) read-only register ownership.  Used for the
+   configuration registers (misa, mseccfg, the PMP/PMA config, the HTIF base, ...)
+   that the boot sequence never writes: once persisted they need not be threaded
+   through (or returned by) every WP -- see [hw_config] in RiscvFetchExec.v. *)
+Notation "r ↦ᵣ□ v" := (reg_pointsto r DfracDiscarded v)
+  (at level 20, format "r  ↦ᵣ□  v") : bi_scope.
+(* The concrete physical RAM of the platform: a single DRAM bank of
+   [ram_size] bytes based at [ram_base] (0x80000000), matching the Sail
+   model's RAM-region PMA (model-xv6iris/sail-config-rv64d.json) and the
+   xv6 memory map: 128 MiB, so that [ram_base + ram_size] = xv6's PHYSTOP
+   = 0x88000000 (kernel/memlayout.h; QEMU runs with `-m 128M`). *)
+Definition ram_base : Z := 0x80000000.       (* 2147483648 *)
+Definition ram_size : Z := 0x8000000.        (* 134217728 = 128 MiB *)
+
+(* THE MMIO BAND, the platform's other configured region: one IOMemory window
+   covering every device the kernel touches.  It is the model's OWN second PMA
+   region ([RiscvLang.pma_boot], whose value is the compiled
+   [ColdBoot.cold_boot_pma] fact), and every device window in the tree sits
+   inside it -- CLINT at 0x2000000, PLIC [plic_base, +plic_size) =
+   [0xC000000, 0xC400000), the two UARTs [uart_base i, +8) at 0x10000000 and
+   0x1000a000, virtio-mmio
+   [virtio_base, +0x1000) at 0x10001000.  Unlike RAM it is NOT readable and
+   writable by fiat: the band grants R/W but is NOT executable and does NOT
+   support PTE reads/writes or atomics, which is exactly why the PMA premise
+   the device towers take ([RiscvFetchExec.pma_allows_io]) is weaker than the
+   RAM one and why the two address classes are stated separately. *)
+Definition mmio_base : Z := 0x2000000.       (* 33554432 *)
+Definition mmio_size : Z := 0x10000000.      (* 268435456 = 256 MiB *)
+
+
+(* A physical byte address is "real" RAM iff it lies inside that DRAM bank.
+   This is STRICTLY stronger than merely being outside the platform MMIO
+   ranges: the whole bank sits above every MMIO window (CLINT ends at
+   0x20C0000, SIG at 0xC000020, both far below 0x80000000), so being RAM
+   discharges the model's [within_clint]/[within_sig] MMIO checks (see
+   [addr_is_ram_not_in_clint]/[addr_is_ram_not_in_sig] below, which feed
+   [within_clint_false]/[within_sig_false]).  Being a concrete range it also
+   pins the address's high bits (bits 63:31 are 0b1..., bits 63:39 = 0), which
+   lets the higher-level WPs discharge their per-address geometry obligations
+   (Sv39 canonicality, identity translation, PMP TOR match) purely from an
+   owned points-to rather than carrying them as explicit preconditions.
+   ([within_htif] depends on the [htif_tohost_base] register, not the address,
+   so it is handled separately by owning that register.) *)
+Definition addr_is_ram (a : Arch.pa) : Prop :=
+  (ram_base <= uint a < ram_base + ram_size)%Z.
+
+(* rwx-kmap: the RAM bank split at etext.  [text_end] is hardcoded here to
+   keep the base memory layer off the kernel dump (KernelSyms.etext =
+   0x80007000 is cross-checked by vm_compute higher up: KptExecMap's
+   [etext_vpn], KvmSpec).  Kernel TEXT [ram_base, text_end) is mapped R|X
+   by the kernel page table, kernel DATA [text_end, PHYSTOP) R|W; the
+   points-to layer records the region so stores to text are unprovable
+   and fetches carry their own R|X evidence. *)
+Definition text_end : Z := 0x80007000.
+Definition addr_is_text (a : Arch.pa) : Prop :=
+  (ram_base <= uint a < text_end)%Z.
+Definition addr_is_kdata (a : Arch.pa) : Prop :=
+  (text_end <= uint a < ram_base + ram_size)%Z.
+
+Lemma addr_is_text_ram a : addr_is_text a -> addr_is_ram a.
+Proof.
+  unfold addr_is_text, addr_is_ram, text_end, ram_base, ram_size. lia.
+Qed.
+Lemma addr_is_kdata_ram a : addr_is_kdata a -> addr_is_ram a.
+Proof.
+  unfold addr_is_kdata, addr_is_ram, text_end, ram_base, ram_size. lia.
+Qed.
+
+(* The two legacy MMIO-disjointness predicates, kept as the interface the
+   model discharges ([within_clint_false]/[within_sig_false] consume them). *)
+Definition not_in_clint (a : Arch.pa) : Prop :=
+  (uint a < uint plat_clint_base \/ uint plat_clint_base + uint plat_clint_size <= uint a)%Z.
+Definition not_in_sig (a : Arch.pa) : Prop :=
+  (uint a < uint plat_sig_base \/ uint plat_sig_base + uint plat_sig_size <= uint a)%Z.
+
+(* Being RAM implies being outside each MMIO window: the bank is above both. *)
+Lemma addr_is_ram_not_in_clint a : addr_is_ram a -> not_in_clint a.
+Proof.
+  intros [Hlo _]. right.
+  assert (uint plat_clint_base + uint plat_clint_size = 34340864)%Z as -> by (vm_compute; reflexivity).
+  unfold ram_base in Hlo. lia.
+Qed.
+
+Lemma addr_is_ram_not_in_sig a : addr_is_ram a -> not_in_sig a.
+Proof.
+  intros [Hlo _]. right.
+  assert (uint plat_sig_base + uint plat_sig_size = 201326624)%Z as -> by (vm_compute; reflexivity).
+  unfold ram_base in Hlo. lia.
+Qed.
+
+(* Being RAM also implies being off the device fabric: the bus routes only
+   sub-DRAM addresses ([dev_bound] = [ram_base]) to the UART/PLIC. *)
+Lemma addr_is_ram_not_dev a : addr_is_ram a -> dev_addr a = false.
+Proof.
+  intros [Hlo _]. apply dev_addr_false.
+  unfold dev_bound; unfold ram_base in Hlo. lia.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* The kernel-mapping CLAIM (uniform-claims): a persisted fragment of the  *)
+(* kernel-mapping ghost map -- “vpn maps to ppn at class pc, under the     *)
+(* current and all future regimes” (monotone across Bare→Sv39).  It        *)
+(* carries BOTH the permission and the va→pa mapping; the points-to facts  *)
+(* below are built on it.  Uniqueness is ghost-map library agreement.      *)
+(* The auth / static-map machinery lives in KMap.v.                        *)
+(* ---------------------------------------------------------------------- *)
+
+(* the vpn of an S-mode va (moved here from RiscvExtras; the arithmetic
+   lemmas [svpn_of_unsigned]/[svpn_of_unsigned_lo] remain there) *)
+Definition svpn_of (a : mword 64) : mword 27 :=
+  SailStdpp.TypeCasts.autocast (T := mword) (subrange_vec_dec
+     (subrange_vec_dec (bits_of_virtaddr (Virtaddr a)) (Z.sub 39 1) 0) (Z.sub 39 1) pagesize_bits).
+
+(* The mapping fragment.  The [ghost_map_elem] key instances are given
+   EXPLICITLY (fully qualified) to match the [riscv_kmapGS] field's pinning
+   -- RiscvPtsto must NOT [Import] the Sail instance modules (they would
+   clobber stdpp's bv instances for [Arch.pa]=mword 64 gen_heap keys; the
+   durable-notes leak), so we cannot rely on TC search resolving
+   [EqDecision (mword 27)] here. *)
+Definition kmap_at `{!riscvGS Σ} (vpn : mword 27) (ppn : mword 44) (pc : kperm) : iProp Σ :=
+  @ghost_map_elem Σ (mword 27) (mword 44 * kperm)
+    (@SailStdpp.Instances.Decidable_eq_mword 27)
+    (@SailStdpp.Instances.Countable_mword 27)
+    riscv_kmapGS kmap_name vpn DfracDiscarded (ppn, pc).
+
+Global Instance kmap_at_persistent `{!riscvGS Σ} vpn ppn pc :
+  Persistent (kmap_at vpn ppn pc).
+Proof. apply _. Qed.
+Global Instance kmap_at_timeless `{!riscvGS Σ} vpn ppn pc :
+  Timeless (kmap_at vpn ppn pc).
+Proof. apply _. Qed.
+
+(* UNIQUENESS: two claims for one vpn agree -- what lets split fractions
+   of a [↦ₘ] recombine (their existential ppn witnesses coincide). *)
+Lemma kmap_at_agree `{!riscvGS Σ} vpn ppn1 pc1 ppn2 pc2 :
+  kmap_at vpn ppn1 pc1 -∗ kmap_at vpn ppn2 pc2 -∗ ⌜ppn1 = ppn2 /\ pc1 = pc2⌝.
+Proof.
+  iIntros "H1 H2".
+  iDestruct (ghost_map_elem_agree with "H1 H2") as %He.
+  iPureIntro. injection He as -> ->. split; reflexivity.
+Qed.
+
+(* the pa a claim maps [va] to: the claim's ppn ++ [va]'s page offset *)
+Definition pa_of (ppn : mword 44) (va : mword 64) : mword 64 :=
+  zero_extend' 64 (concat_vec ppn (subrange_vec_dec va 11 0)).
+
+(* ---------------------------------------------------------------------- *)
+(* THE TIER PIN (claude-notes/projects/sp-migration.md design §1).  What a  *)
+(* datum at tier [kt] promises ABOUT ITS OWN MAPPING, over and above the    *)
+(* claim it carries.                                                        *)
+(*                                                                          *)
+(*   KT0 -- usable through the BOOT IDENTITY MAP: the claim's ppn takes     *)
+(*          [va] to [va] itself.  A hart running with translation OFF       *)
+(*          (Bare) reads physical [va], so this is exactly what makes the   *)
+(*          access sound there -- and it is exactly the admissibility fact  *)
+(*          the Bare arm's [SRegime.sr_adm]/[kadm_ident] asks for, which is *)
+(*          why the ~14 leaf sites that feed [sr_adm_id] read it straight   *)
+(*          out of the datum.                                               *)
+(*   KT1 -- requires the FULL KERNEL TABLE: nothing.  The va may map        *)
+(*          anywhere (KSTACK, TRAMPOLINE); driving a leaf with it needs the *)
+(*          per-hart witness [SRegime.sr_kwit] instead (phase D).           *)
+(*                                                                          *)
+(* PURE, deliberately: a tier can therefore be re-established after a       *)
+(* weakening ([mem_ktier_pin_intro], KMap.v) rather than being lost.        *)
+(* Stated as the IDENTITY rather than as [ppn = kpt_leaf_ppn (svpn_of va)]  *)
+(* -- the two are interchangeable under the datum's own canonicality        *)
+(* conjunct ([KptPt.pa_of_id]) -- because [kpt_leaf_ppn]/[kmap_static] live *)
+(* in KptPt, which sits ABOVE this file.  See the phase C findings note.    *)
+Definition ktier_pin (kt : ktier) (ppn : mword 44) (va : mword 64) : Prop :=
+  match kt with
+  | KT0 => pa_of ppn va = va
+  | KT1 => True
+  end.
+
+(* the pin weakens along the order: [KT0]'s identity implies [KT1]'s
+   nothing, and [KtierLe] rules out the one bad direction. *)
+Lemma ktier_pin_mono (kt kt' : ktier) `{Hle : !KtierLe kt kt'} ppn va :
+  ktier_pin kt ppn va -> ktier_pin kt' ppn va.
+Proof.
+  intro Hp. destruct (ktier_le_cases _ _ Hle) as [->|[-> ->]]; [exact Hp | exact I].
+Qed.
+
+(* at KT0 the pin IS the identity -- the one-line reading the leaf sites use *)
+Lemma ktier_pin_id ppn va : ktier_pin KT0 ppn va -> pa_of ppn va = va.
+Proof. exact (fun H => H). Qed.
+Lemma ktier_pin_of_id (kt : ktier) ppn va : pa_of ppn va = va -> ktier_pin kt ppn va.
+Proof. destruct kt; [exact (fun H => H) | exact (fun _ => I)]. Qed.
+
+(* memory points-to, VA-BASED (uniform-claims): owns the byte at the
+   PHYSICAL address the kernel mapping takes [va] to, bundled with the
+   claim itself.  The KP_rw class is what
+   makes stores provable ONLY through writable mappings; the R|X kernel
+   text lives at the CODE points-to [↦ₓ] below.  The canonicality
+   conjunct (positive Sv39 half) pins va ↔ (vpn, offset).  [dq] is a
+   [dfrac]: [DfracOwn 1] = full (writable) ownership, [DfracDiscarded] =
+   persistent/duplicable read-only ownership (the immutable kernel
+   globals image [kernel_data]).
+
+   THE TIER PIN CONJUNCT [ktier_pin kt ppn va] (claude-notes/projects/
+   sp-migration.md).  A KT0 datum's va IS its physical address, and that is
+   what makes a [↦ₘ] access sound under BOTH translation regimes -- a hart
+   in Bare mode translates va to va itself, so a non-identity KT0 [↦ₘ]
+   would be accessed at the WRONG page there, and no ghost resource can
+   rule that out per-hart (a secondary hart is legitimately Bare long after
+   the kernel map has grown).  So the identity is a conjunct of the
+   RESOURCE rather than a premise on every leaf: the Bare regime's
+   [sr_adm] admissibility premise (SRegime.v) is discharged from the datum
+   itself, and no leaf statement or whole-function contract mentions it.
+   A KT1 datum drops the pin entirely -- a kernel-stack byte at [KSTACK(i)]
+   or a TRAMPOLINE byte IS expressible -- and pays for it with the per-hart
+   [sr_kwit] witness at the leaf (phase D).
+
+   THE TIER IS AN AMBIENT INSTANCE ARGUMENT, not a positional one: the
+   spellings below leave [KTR] to typeclass resolution, so a file selects
+   its tier once with a [Local Instance : CurKtier := ...] (the global
+   default is KT0) and its spec text is unchanged.  Explicit-tier
+   statements use the bracket forms [a ↦ₘ[kt]{dq} v]. *)
+Definition mem_pointsto `{!riscvGS Σ} `{KTR : !CurKtier}
+    (va : Arch.pa) (dq : dfrac) (v : bv 8) : iProp Σ :=
+  (∃ ppn : mword 44,
+     kmap_at (svpn_of va) ppn KP_rw ∗
+     ⌜(uint va < 274877906944)%Z⌝ ∗          (* 2^38: canonical, positive half *)
+     ⌜addr_is_ram (pa_of ppn va)⌝ ∗
+     ⌜ktier_pin cur_ktier ppn va⌝ ∗          (* TIER PIN (see the note above) *)
+     pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn va) dq v)%I.
+Notation "a ↦ₘ{ dq } v" := (mem_pointsto a dq v)
+  (at level 20, format "a  ↦ₘ{ dq }  v") : bi_scope.
+(* discarded (persistent, duplicable) read-only ownership. *)
+Notation "a ↦ₘ□ v" := (mem_pointsto a DfracDiscarded v)
+  (at level 20, format "a  ↦ₘ□  v") : bi_scope.
+(* default: full (writable) ownership. *)
+Notation "a ↦ₘ v" := (mem_pointsto a (DfracOwn 1) v)
+  (at level 20, format "a  ↦ₘ  v") : bi_scope.
+(* ---- EXPLICIT-TIER spellings.  Every family lemma below that is not
+   generic over a section [CurKtier] variable is stated in these, never in
+   the ambient forms: an ambient-stated lemma elaborates PINNED at whatever
+   instance happens to be in scope (the KT0 default), silently losing
+   tier-genericity. ---- *)
+(* ONE notation for all four dfrac spellings, through Iris's CUSTOM
+   [dfrac] entry -- [a ↦ₘ[kt] v], [a ↦ₘ[kt]{dq} v], [a ↦ₘ[kt]□ v],
+   [a ↦ₘ[kt]{#q} v].  It MUST go through the custom entry: writing
+   the closing bracket and the brace as one notation token ("]{") makes
+   the LEXER prefer that token everywhere, and ghost_map's own
+   [k ↪[ γ ] dq v] (same shape, same custom entry) then stops parsing
+   tree-wide -- a syntax error in files that mention no [↦ₘ] at all. *)
+Notation "a ↦ₘ[ kt ] dq v" := (mem_pointsto (KTR := kt) a dq v)
+  (at level 20, kt at level 50, dq custom dfrac at level 1,
+   format "a  ↦ₘ[ kt ] dq  v") : bi_scope.
+
+(* TIMELESS -- registered, because typeclass search does not unfold the
+   [Definition] on its own: without this instance the [>] intro pattern on a
+   byte taken out of an invariant fails with "iMod: cannot eliminate modality"
+   on a hypothesis that visibly IS timeless. *)
+(* THE TIER BINDER IS A PLAIN [(KTR : CurKtier)], NOT the backtick class
+   binder [`{KTR : !CurKtier}] and NOT [(KTR : ktier)].  An instance whose
+   tier is CLASS-bound is resolved by instance SEARCH, which only ever
+   produces the KT0 default, so it silently fails to fire on a statement
+   written at a literal [KT1] ("no match, N possibilities").  Binding it at
+   [ktier] fails the other way -- [simple apply] will not unfold the class
+   and reports "Unable to unify CurKtier with ktier".  A plain binder AT THE
+   CLASS TYPE is fixed by unification and fires at every tier. *)
+Global Instance mem_pointsto_timeless `{!riscvGS Σ} (KTR : CurKtier)
+    (a : Arch.pa) (dq : dfrac) (v : bv 8) :
+  Timeless (mem_pointsto (KTR := KTR) a dq v).
+Proof. rewrite /mem_pointsto. apply _. Qed.
+
+(* ...AND ITS [ktier]-TYPED TWIN.  [simple apply] will not unfold the class,
+   so ONE instance cannot serve both a goal whose tier argument is the
+   ambient instance ([curktier_default : CurKtier]) and one written at a
+   LITERAL ([KT0 : ktier]).  Every tier-family instance below is declared
+   twice for that reason. *)
+Global Instance mem_pointsto_timeless' `{!riscvGS Σ} (ktr : ktier)
+    (a : Arch.pa) (dq : dfrac) (v : bv 8) :
+  Timeless (mem_pointsto (KTR := ktr) a dq v).
+Proof. exact (mem_pointsto_timeless ktr a dq v). Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* SHARING a byte: agreement and the fractional split.  [↦ₘ] carries a real
+   [dfrac], so a resource that is read-only-while-shared (a reference-counted
+   kernel object: [struct file]'s immutable fields, an inode's, a buf's) can
+   be handed out at a fraction and RECOMBINED when the last share comes back.
+   Agreement is what makes the value-knowledge come for free: two holders of
+   the same byte cannot disagree, so no separate [agree] ghost is needed.
+   The byte-window forms below lift straight to [↦₂]/[↦₄]/[↦₈].              *)
+Section mem_pointsto_share.
+  Context `{!riscvGS Σ}.
+  (* the section's AMBIENT tier: every lemma below whose two sides share a
+     tier is thereby generic in it, with its statement unchanged. *)
+  Context `{KTR : !CurKtier}.
+
+  (* the WEAKENING along the tier order.  The pin is the only tier-dependent
+     conjunct and it weakens ([ktier_pin_mono]); at KT1 there is nothing to
+     prove.  Strengthening back is [KMap.mem_ktier_pin_intro] -- possible
+     precisely because the pin is PURE. *)
+  Lemma mem_ktier_mono (kt kt' : ktier) `{!KtierLe kt kt'} a dq v :
+    a ↦ₘ[kt]{dq} v ⊢ a ↦ₘ[kt']{dq} v.
+  Proof using .
+    rewrite /mem_pointsto. iIntros "H". iDestruct "H" as (ppn) "(#Hk & %Hc & %Hd & %Hp & Hpt)".
+    iExists ppn. iFrame "Hk Hpt". iPureIntro.
+    split; [exact Hc | split; [exact Hd | exact (ktier_pin_mono kt kt' ppn a Hp)]].
+  Qed.
+
+  (* two owners of the same byte, at ANY two dfracs -- AND AT ANY TWO TIERS,
+     agreement running through [kmap_at_agree] + [pointsto_agree], neither of
+     which looks at the pin -- agree on its value. *)
+  Lemma mem_pointsto_agree {kt1 kt2 : ktier} a dq1 b1 dq2 b2 :
+    a ↦ₘ[kt1]{dq1} b1 -∗ a ↦ₘ[kt2]{dq2} b2 -∗ ⌜b1 = b2⌝.
+  Proof using .
+    rewrite /mem_pointsto. iIntros "H1 H2".
+    iDestruct "H1" as (ppn1) "(Hk1 & _ & _ & _ & Hp1)".
+    iDestruct "H2" as (ppn2) "(Hk2 & _ & _ & _ & Hp2)".
+    iDestruct (kmap_at_agree with "Hk1 Hk2") as %[-> _].
+    by iDestruct (pointsto_agree with "Hp1 Hp2") as %->.
+  Qed.
+
+  (* ...and the DUAL of agreement: full ownership of a byte is EXCLUSIVE, so an
+     address owned outright cannot be an address owned at any dfrac at all.
+     This is what makes SEPARATION carry the disjointness of two buffers -- a
+     function whose contract takes two byte ranges as separate conjuncts never
+     needs a pure non-aliasing side condition; the aliasing case is refuted from
+     the resources themselves (see [mem_bytes_notin]). *)
+  Lemma mem_pointsto_ne {kt1 kt2 : ktier} a1 a2 dq b1 b2 :
+    a1 ↦ₘ[kt1] b1 -∗ a2 ↦ₘ[kt2]{dq} b2 -∗ ⌜a1 ≠ a2⌝.
+  Proof using .
+    rewrite /mem_pointsto. iIntros "H1 H2".
+    iDestruct "H1" as (ppn1) "(Hk1 & _ & _ & _ & Hp1)".
+    iDestruct "H2" as (ppn2) "(Hk2 & _ & _ & _ & Hp2)".
+    destruct (decide (a1 = a2)) as [->|Hne]; [| by iPureIntro ].
+    iDestruct (kmap_at_agree with "Hk1 Hk2") as %[-> _].
+    by iDestruct (pointsto_ne with "Hp1 Hp2") as %Hne.
+  Qed.
+
+  (* the fractional split.  [kmap_at] is persistent, so the claim and the two
+     pure conjuncts ride along on both halves at no cost. *)
+  Lemma mem_pointsto_frac_split a q1 q2 b :
+    a ↦ₘ{DfracOwn (q1 + q2)} b ⊣⊢ a ↦ₘ{DfracOwn q1} b ∗ a ↦ₘ{DfracOwn q2} b.
+  Proof using .
+    rewrite /mem_pointsto. iSplit.
+    - iIntros "H". iDestruct "H" as (ppn) "(#Hk & %Hc & %Hd & %Hi & Hp)".
+      rewrite -dfrac_op_own pointsto_fractional.
+      iDestruct "Hp" as "[Hp1 Hp2]".
+      iSplitL "Hp1"; iExists ppn.
+      + by iFrame "Hk Hp1".
+      + by iFrame "Hk Hp2".
+    - iIntros "[H1 H2]".
+      iDestruct "H1" as (ppn1) "(#Hk1 & %Hc & %Hd & %Hi & Hp1)".
+      iDestruct "H2" as (ppn2) "(#Hk2 & _ & _ & _ & Hp2)".
+      iDestruct (kmap_at_agree with "Hk1 Hk2") as %[-> _].
+      iDestruct (pointsto_combine with "Hp1 Hp2") as "[Hp _]".
+      rewrite dfrac_op_own. iExists ppn2. by iFrame "Hk1 Hp".
+  Qed.
+
+  (* ---- the same two facts over a WINDOW of bytes, which is the form the
+     [↦₂]/[↦₄]/[↦₈] bundles are built from.  Stated over an arbitrary start
+     index [k] so the induction goes through. ---- *)
+
+  Lemma mem_bytes_agree {m : N} {kt1 kt2 : ktier} (a : Arch.pa) (k n : nat) (dq1 dq2 : dfrac) (w1 w2 : bv m) :
+    ([∗ list] j ∈ seq k n, (pa_add a j) ↦ₘ[kt1]{dq1} nth_byte w1 j) -∗
+    ([∗ list] j ∈ seq k n, (pa_add a j) ↦ₘ[kt2]{dq2} nth_byte w2 j) -∗
+    ⌜forall j, (k <= j < k + n)%nat -> nth_byte w1 j = nth_byte w2 j⌝.
+  Proof using .
+    revert k. induction n as [|n IH]; intros k; simpl.
+    - iIntros "_ _". iPureIntro. intros j Hj. lia.
+    - iIntros "[Hh1 Ht1] [Hh2 Ht2]".
+      iDestruct (mem_pointsto_agree with "Hh1 Hh2") as %Heq.
+      iDestruct (IH (S k) with "Ht1 Ht2") as %Hrest.
+      iPureIntro. intros j Hj.
+      destruct (decide (j = k)) as [->|Hne]; [exact Heq|].
+      apply Hrest. lia.
+  Qed.
+
+  (* an address held SEPARATELY from a byte buffer lies OUTSIDE that buffer.
+     The two-buffer disjointness a copy loop needs ([memmove]'s src vs dst)
+     follows by peeling one byte off the second buffer and applying this. *)
+  Lemma mem_bytes_notin {kt1 kt2 : ktier} (a c : Arch.pa) (k n : nat) (dq : dfrac) (f : nat -> bv 8) (v : bv 8) :
+    ([∗ list] j ∈ seq k n, (pa_add a j) ↦ₘ[kt1] f j) -∗
+    c ↦ₘ[kt2]{dq} v -∗
+    ⌜forall j, (k <= j < k + n)%nat -> pa_add a j <> c⌝.
+  Proof using .
+    revert k. induction n as [|n IH]; intros k; simpl.
+    - iIntros "_ _". iPureIntro. intros j Hj. lia.
+    - iIntros "[Hh Ht] Hc".
+      iDestruct (mem_pointsto_ne with "Hh Hc") as %Hne0.
+      iDestruct (IH (S k) with "Ht Hc") as %Hrest.
+      iPureIntro. intros j Hj.
+      destruct (decide (j = k)) as [->|Hjk]; [exact Hne0|].
+      apply Hrest. lia.
+  Qed.
+
+  (* THE MIRROR IMAGE, for a buffer that is only READ and therefore rides the
+     caller's fraction.  [mem_bytes_notin] refutes aliasing from the RUN's
+     exclusivity; once the run is fractional that argument is gone, and the
+     single byte on the other side is the exclusive one.  Same induction, with
+     [mem_pointsto_ne] applied the other way round -- the exclusive byte FIRST
+     -- and the disequality flipped back.  [ProofMemmove] needs exactly this:
+     its source is now at the caller's dfrac while every destination byte is
+     still owned outright. *)
+  Lemma mem_bytes_notin_r {kt1 kt2 : ktier} (a c : Arch.pa) (k n : nat) (dq : dfrac) (f : nat -> bv 8) (v : bv 8) :
+    ([∗ list] j ∈ seq k n, (pa_add a j) ↦ₘ[kt1]{dq} f j) -∗
+    c ↦ₘ[kt2] v -∗
+    ⌜forall j, (k <= j < k + n)%nat -> pa_add a j <> c⌝.
+  Proof using .
+    revert k. induction n as [|n IH]; intros k; simpl.
+    - iIntros "_ _". iPureIntro. intros j Hj. lia.
+    - iIntros "[Hh Ht] Hc".
+      iDestruct (mem_pointsto_ne with "Hc Hh") as %Hne0.
+      iDestruct (IH (S k) with "Ht Hc") as %Hrest.
+      iPureIntro. intros j Hj.
+      destruct (decide (j = k)) as [->|Hjk]; [exact (fun H => Hne0 (eq_sym H))|].
+      apply Hrest. lia.
+  Qed.
+
+  Lemma mem_bytes_frac_split {m : N} (a : Arch.pa) (k n : nat) (q1 q2 : Qp) (w : bv m) :
+    ([∗ list] j ∈ seq k n, (pa_add a j) ↦ₘ{DfracOwn (q1 + q2)} nth_byte w j) ⊣⊢
+    ([∗ list] j ∈ seq k n, (pa_add a j) ↦ₘ{DfracOwn q1} nth_byte w j) ∗
+    ([∗ list] j ∈ seq k n, (pa_add a j) ↦ₘ{DfracOwn q2} nth_byte w j).
+  Proof using .
+    rewrite -big_sepL_sep. apply big_sepL_proper. intros ? j _.
+    apply mem_pointsto_frac_split.
+  Qed.
+
+End mem_pointsto_share.
+
+(* CODE points-to, VA-BASED (uniform-claims): the KP_rx analogue -- the
+   claim + ownership of the mapped physical byte; identity for the static
+   kernel-text fragments, non-identity for the TRAMPOLINE va once its
+   fragment is minted at the boot switch.  [↦ₓ□] is the form the immutable
+   kernel image lives at ([kernel_text]/[instr_bytes]).
+
+   THE TIER PIN CONJUNCT, exactly as for [mem_pointsto] above and for the
+   same reason (claude-notes/projects/sp-migration.md, K5): a KT0 code byte
+   promises that its va IS its physical address, which is what makes a
+   FETCH at it sound under BOTH translation regimes -- a Bare hart fetches
+   physical [va].  Every byte of the static kernel-text image is KT0 and
+   nothing about it changes.  A KT1 code byte drops the pin and is
+   therefore expressible at the TRAMPOLINE va (whose page is the SAME
+   kernel-text page, mapped high); driving a fetch with it needs the
+   per-hart witness [SRegime.sr_kwit] instead, which is what
+   [SRegime.sr_absorb_ktier] dispatches on.
+
+   THE TIER IS AN AMBIENT INSTANCE ARGUMENT (phase C's convention): the
+   three spellings below leave [KTR] to typeclass resolution -- the global
+   default is KT0, so every existing text fact means exactly what it meant
+   -- and an explicit tier is written [a ↦ₓ[kt]{dq} v]. *)
+(* THE TIMESTAMP CONJUNCT (tso-machine-flip.md's rewritten RULING 1, and
+   A6.10's pristine tier).  Post-overruling an instruction FETCH takes the
+   same nondeterministic-view arm as a plain data load, so a fetch site owes
+   a view-indexed [tso_read_bytes] fact and a bare points-to cannot pay it.
+   What pays it for kernel TEXT is that a text byte's latest write IS the era
+   image -- timestamp 0, visible at every agent and every view -- and the
+   RESOURCE that says so is the DISCARDED timestamp element.  It is carried
+   HERE, inside [text_pointsto], rather than threaded as a premise, and that
+   is the whole reason nothing above the fetch leaves moves: [kernel_text] is
+   a big-op of [↦ₓ□], [KernelText.kernel_window_pc] cuts a window out of it,
+   [InstrBytes.instr_bytes] holds the window, and all ~135 leaf sites are
+   textually unchanged.  DISCARDED is also exactly the right strength: it
+   says the byte can never be STORED to again (a store must UPDATE the
+   element), which is what "read-only forever" and "readable from anywhere"
+   both mean here -- one resource for both, and W^X for the text region as a
+   consequence rather than as an assumption.  THE ONE NEW OBLIGATION is at
+   the single place [↦ₓ] is born from raw memory ([KMap.phys_ident_text],
+   through [BootCarve.boot_text_persist]); the era's initial-state ghost
+   allocation is its supplier, the same one A6.10/A6.34 already name. *)
+(* NAMED so the [Arch.pa] key instances are fixed once.  A file that imports
+   [SailStdpp.Base] elaborates a FRESH binder of type [mword 64] at the Sail
+   key instances and it will not unify with the stdpp-keyed one (the binder
+   trap in durable-notes; the same reason [TsoMemPa.bytemap] exists). *)
+Definition pristine_elem `{!riscvGS Σ} (a : Arch.pa) : iProp Σ :=
+  (a ↪[ts_name]□ (0%nat, ts_pay_none))%I.
+
+Global Instance pristine_elem_persistent `{!riscvGS Σ} a :
+  Persistent (pristine_elem a).
+Proof. rewrite /pristine_elem. apply _. Qed.
+Global Instance pristine_elem_timeless `{!riscvGS Σ} a :
+  Timeless (pristine_elem a).
+Proof. rewrite /pristine_elem. apply _. Qed.
+
+Definition text_pointsto `{!riscvGS Σ} `{KTR : !CurKtier}
+    (va : Arch.pa) (dq : dfrac) (v : bv 8) : iProp Σ :=
+  (∃ ppn : mword 44,
+     kmap_at (svpn_of va) ppn KP_rx ∗
+     ⌜(uint va < 274877906944)%Z⌝ ∗          (* 2^38: canonical, positive half *)
+     ⌜addr_is_text (pa_of ppn va)⌝ ∗
+     ⌜ktier_pin cur_ktier ppn va⌝ ∗          (* TIER PIN (see the note above) *)
+     pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn va) dq v ∗
+     pristine_elem (pa_of ppn va))%I.         (* the pristine element *)
+Notation "a ↦ₓ{ dq } v" := (text_pointsto a dq v)
+  (at level 20, format "a  ↦ₓ{ dq }  v") : bi_scope.
+(* discarded (persistent, duplicable) read-only code ownership. *)
+Notation "a ↦ₓ□ v" := (text_pointsto a DfracDiscarded v)
+  (at level 20, format "a  ↦ₓ□  v") : bi_scope.
+(* full ownership (pre-persist, e.g. at adequacy init). *)
+Notation "a ↦ₓ v" := (text_pointsto a (DfracOwn 1) v)
+  (at level 20, format "a  ↦ₓ  v") : bi_scope.
+(* ---- EXPLICIT-TIER spelling, ONE notation for all four dfrac forms, via
+   Iris's CUSTOM [dfrac] entry.  It MUST go through that entry: spelling
+   the closing bracket and the brace as one token ("]{") makes the lexer
+   prefer it everywhere and [ghost_map]'s [k ↪[ γ ] dq v] stops parsing
+   tree-wide (phase C's finding; the rule is "never write []{] or []□] in
+   a notation string"). ---- *)
+Notation "a ↦ₓ[ kt ] dq v" := (text_pointsto (KTR := kt) a dq v)
+  (at level 20, kt at level 50, dq custom dfrac at level 1,
+   format "a  ↦ₓ[ kt ] dq  v") : bi_scope.
+
+(* ---------------------------------------------------------------------- *)
+(* PHYSICAL points-to (uniform-claims PHYSICAL TIER): ownership of the byte
+   at the PHYSICAL address [pa], with no kernel-mapping claim -- the form for
+   memory that is accessed UNTRANSLATED (the kernel page-table's own slots,
+   read physically by the hardware walker; M-mode data/fetch, which has no
+   translation).  This is the OLD pa-era [mem_pointsto] body verbatim.  The
+   VA-based [↦ₘ]/[↦ₓ] above are for TRANSLATED kernel-variable/instruction
+   access; a static (identity) va bridges the two tiers via the [pa_of_id]
+   assembly/disassembly lemmas (KptPt/KMap). *)
+Definition phys_pointsto `{!riscvGS Σ} (pa : Arch.pa) (dq : dfrac) (b : bv 8) : iProp Σ :=
+  (pointsto (L:=Arch.pa) (V:=bv 8) pa dq b ∗ ⌜addr_is_ram pa⌝)%I.
+Notation "a ↦ₚ{ dq } b" := (phys_pointsto a dq b)
+  (at level 20, format "a  ↦ₚ{ dq }  b") : bi_scope.
+Notation "a ↦ₚ□ b" := (phys_pointsto a DfracDiscarded b)
+  (at level 20, format "a  ↦ₚ□  b") : bi_scope.
+Notation "a ↦ₚ b" := (phys_pointsto a (DfracOwn 1) b)
+  (at level 20, format "a  ↦ₚ  b") : bi_scope.
+
+(* ---------------------------------------------------------------------- *)
+(* word points-to: an 8-byte (doubleword) value [w] stored little-endian at a
+   DOUBLEWORD-ALIGNED address [a].  Bundling the 8 byte points-to facts with
+   the alignment lets an 8-byte load/store WP take a single [a ↦₈ w] hypothesis
+   instead of a byte window PLUS a separate [is_aligned_paddr ... 8 = true]
+   side condition -- the alignment travels with the ownership.  Both the paddr
+   and (definitionally identical) vaddr alignment forms are recoverable.       *)
+Definition word_pointsto `{!riscvGS Σ} `{KTR : !CurKtier}
+    (a : Arch.pa) (dq : dfrac) (w : bv 64) : iProp Σ :=
+  (⌜is_aligned_paddr (Physaddr a) 8 = true⌝ ∗
+   [∗ list] j ∈ seq 0 8, mem_pointsto (pa_add a j) dq (nth_byte w j))%I.
+Notation "a ↦₈{ dq } w" := (word_pointsto a dq w)
+  (at level 20, format "a  ↦₈{ dq }  w") : bi_scope.
+Notation "a ↦₈ w" := (word_pointsto a (DfracOwn 1) w)
+  (at level 20, format "a  ↦₈  w") : bi_scope.
+(* discarded (persistent, duplicable) read-only ownership of the doubleword. *)
+Notation "a ↦₈□ w" := (word_pointsto a DfracDiscarded w)
+  (at level 20, format "a  ↦₈□  w") : bi_scope.
+(* ONE notation for all four dfrac spellings, through Iris's CUSTOM
+   [dfrac] entry -- [a ↦₈[kt] w], [a ↦₈[kt]{dq} w], [a ↦₈[kt]□ w],
+   [a ↦₈[kt]{#q} w].  It MUST go through the custom entry: writing
+   the closing bracket and the brace as one notation token ("]{") makes
+   the LEXER prefer that token everywhere, and ghost_map's own
+   [k ↪[ γ ] dq v] (same shape, same custom entry) then stops parsing
+   tree-wide -- a syntax error in files that mention no [↦₈] at all. *)
+Notation "a ↦₈[ kt ] dq w" := (word_pointsto (KTR := kt) a dq w)
+  (at level 20, kt at level 50, dq custom dfrac at level 1,
+   format "a  ↦₈[ kt ] dq  w") : bi_scope.
+
+Section word_pointsto.
+  Context `{!riscvGS Σ}.
+  Context `{KTR : !CurKtier}.
+
+  Lemma word_pointsto_aligned_p a dq w :
+    word_pointsto a dq w ⊢ ⌜is_aligned_paddr (Physaddr a) 8 = true⌝.
+  Proof using . iIntros "[$ _]". Qed.
+  Lemma word_pointsto_bytes a dq w :
+    word_pointsto a dq w ⊢ [∗ list] j ∈ seq 0 8, (pa_add a j) ↦ₘ{dq} nth_byte w j.
+  Proof using . iIntros "[_ $]". Qed.
+  (* repackage a byte window + its alignment fact into a word points-to *)
+  Lemma word_pointsto_intro a dq w :
+    is_aligned_paddr (Physaddr a) 8 = true ->
+    ([∗ list] j ∈ seq 0 8, (pa_add a j) ↦ₘ{dq} nth_byte w j) ⊢ word_pointsto a dq w.
+  Proof using . iIntros (Hal) "H". by iFrame. Qed.
+  Lemma word_pointsto_unfold a dq w :
+    word_pointsto a dq w ⊣⊢
+    ⌜is_aligned_paddr (Physaddr a) 8 = true⌝ ∗
+    ([∗ list] j ∈ seq 0 8, (pa_add a j) ↦ₘ{dq} nth_byte w j).
+  Proof using . reflexivity. Qed.
+
+  (* ---- sharing (see [mem_pointsto_share]) ---- *)
+  Lemma word_pointsto_agree {kt1 kt2 : ktier} a dq1 w1 dq2 w2 :
+    a ↦₈[kt1]{dq1} w1 -∗ a ↦₈[kt2]{dq2} w2 -∗ ⌜w1 = w2⌝.
+  Proof using .
+    iIntros "[_ H1] [_ H2]".
+    iDestruct (mem_bytes_agree with "H1 H2") as %Hb.
+    iPureIntro. apply (bv_eq_of_bytes (n:=8)). intros j Hj. apply Hb. lia.
+  Qed.
+  Lemma word_pointsto_frac_split a q1 q2 w :
+    a ↦₈{DfracOwn (q1 + q2)} w ⊣⊢ a ↦₈{DfracOwn q1} w ∗ a ↦₈{DfracOwn q2} w.
+  Proof using .
+    rewrite /word_pointsto mem_bytes_frac_split.
+    iSplit; [iIntros "[#$ [$ $]]" | iIntros "[[#$ $] [_ $]]"].
+  Qed.
+
+  Lemma word_ktier_mono (kt kt' : ktier) `{!KtierLe kt kt'} a dq w :
+    a ↦₈[kt]{dq} w ⊢ a ↦₈[kt']{dq} w.
+  Proof using .
+    iIntros "[$ Hbs]". iApply (big_sepL_mono with "Hbs").
+    iIntros (k j _) "H". iApply (mem_ktier_mono kt kt' with "H").
+  Qed.
+End word_pointsto.
+
+(* ---------------------------------------------------------------------- *)
+(* PHYSICAL 8-byte word points-to [↦ₚ₈]: the [↦₈] body over the PHYSICAL
+   [↦ₚ] tier -- an 8-byte doubleword owned at physical addresses, for the
+   page-table slots and M-mode.  Kept SEPARATE from the VA-based [↦₈]. *)
+Definition phys_word_pointsto `{!riscvGS Σ} (a : Arch.pa) (dq : dfrac) (w : bv 64) : iProp Σ :=
+  (⌜is_aligned_paddr (Physaddr a) 8 = true⌝ ∗
+   [∗ list] j ∈ seq 0 8, phys_pointsto (pa_add a j) dq (nth_byte w j))%I.
+Notation "a ↦ₚ₈{ dq } w" := (phys_word_pointsto a dq w)
+  (at level 20, format "a  ↦ₚ₈{ dq }  w") : bi_scope.
+Notation "a ↦ₚ₈ w" := (phys_word_pointsto a (DfracOwn 1) w)
+  (at level 20, format "a  ↦ₚ₈  w") : bi_scope.
+Notation "a ↦ₚ₈□ w" := (phys_word_pointsto a DfracDiscarded w)
+  (at level 20, format "a  ↦ₚ₈□  w") : bi_scope.
+
+Section phys_word_pointsto.
+  Context `{!riscvGS Σ}.
+
+  Lemma phys_word_pointsto_aligned_p a dq w :
+    phys_word_pointsto a dq w ⊢ ⌜is_aligned_paddr (Physaddr a) 8 = true⌝.
+  Proof using . iIntros "[$ _]". Qed.
+  Lemma phys_word_pointsto_bytes a dq w :
+    phys_word_pointsto a dq w ⊢ [∗ list] j ∈ seq 0 8, (pa_add a j) ↦ₚ{dq} nth_byte w j.
+  Proof using . iIntros "[_ $]". Qed.
+  Lemma phys_word_pointsto_intro a dq w :
+    is_aligned_paddr (Physaddr a) 8 = true ->
+    ([∗ list] j ∈ seq 0 8, (pa_add a j) ↦ₚ{dq} nth_byte w j) ⊢ phys_word_pointsto a dq w.
+  Proof using . iIntros (Hal) "H". by iFrame. Qed.
+End phys_word_pointsto.
+
+(* ---------------------------------------------------------------------- *)
+(* 2-byte halfword points-to: a 2-byte value [w] stored little-endian at a
+   HALFWORD-ALIGNED address [a].  The exact 2-byte analogue of [word4_pointsto]
+   ([↦₄]) -- what an [lh]/[sh] to a C [short] field takes (e.g. [struct
+   file]'s [major]).                                                          *)
+Definition word2_pointsto `{!riscvGS Σ} `{KTR : !CurKtier}
+    (a : Arch.pa) (dq : dfrac) (w : bv 16) : iProp Σ :=
+  (⌜is_aligned_paddr (Physaddr a) 2 = true⌝ ∗
+   [∗ list] j ∈ seq 0 2, mem_pointsto (pa_add a j) dq (nth_byte w j))%I.
+Notation "a ↦₂{ dq } w" := (word2_pointsto a dq w)
+  (at level 20, format "a  ↦₂{ dq }  w") : bi_scope.
+Notation "a ↦₂ w" := (word2_pointsto a (DfracOwn 1) w)
+  (at level 20, format "a  ↦₂  w") : bi_scope.
+(* discarded (persistent, duplicable) read-only ownership of the halfword. *)
+Notation "a ↦₂□ w" := (word2_pointsto a DfracDiscarded w)
+  (at level 20, format "a  ↦₂□  w") : bi_scope.
+(* ONE notation for all four dfrac spellings, through Iris's CUSTOM
+   [dfrac] entry -- [a ↦₂[kt] w], [a ↦₂[kt]{dq} w], [a ↦₂[kt]□ w],
+   [a ↦₂[kt]{#q} w].  It MUST go through the custom entry: writing
+   the closing bracket and the brace as one notation token ("]{") makes
+   the LEXER prefer that token everywhere, and ghost_map's own
+   [k ↪[ γ ] dq v] (same shape, same custom entry) then stops parsing
+   tree-wide -- a syntax error in files that mention no [↦₂] at all. *)
+Notation "a ↦₂[ kt ] dq w" := (word2_pointsto (KTR := kt) a dq w)
+  (at level 20, kt at level 50, dq custom dfrac at level 1,
+   format "a  ↦₂[ kt ] dq  w") : bi_scope.
+
+Section word2_pointsto.
+  Context `{!riscvGS Σ}.
+  Context `{KTR : !CurKtier}.
+
+  Lemma word2_pointsto_bytes a dq w :
+    word2_pointsto a dq w ⊢ [∗ list] j ∈ seq 0 2, (pa_add a j) ↦ₘ{dq} nth_byte w j.
+  Proof using . iIntros "[_ $]". Qed.
+  Lemma word2_pointsto_intro a dq w :
+    is_aligned_paddr (Physaddr a) 2 = true ->
+    ([∗ list] j ∈ seq 0 2, (pa_add a j) ↦ₘ{dq} nth_byte w j) ⊢ word2_pointsto a dq w.
+  Proof using . iIntros (Hal) "H". by iFrame. Qed.
+
+  (* ---- sharing (see [mem_pointsto_share]) ---- *)
+  Lemma word2_pointsto_agree {kt1 kt2 : ktier} a dq1 w1 dq2 w2 :
+    a ↦₂[kt1]{dq1} w1 -∗ a ↦₂[kt2]{dq2} w2 -∗ ⌜w1 = w2⌝.
+  Proof using .
+    iIntros "[_ H1] [_ H2]".
+    iDestruct (mem_bytes_agree with "H1 H2") as %Hb.
+    iPureIntro. apply (bv_eq_of_bytes (n:=2)). intros j Hj. apply Hb. lia.
+  Qed.
+  Lemma word2_pointsto_frac_split a q1 q2 w :
+    a ↦₂{DfracOwn (q1 + q2)} w ⊣⊢ a ↦₂{DfracOwn q1} w ∗ a ↦₂{DfracOwn q2} w.
+  Proof using .
+    rewrite /word2_pointsto mem_bytes_frac_split.
+    iSplit; [iIntros "[#$ [$ $]]" | iIntros "[[#$ $] [_ $]]"].
+  Qed.
+
+End word2_pointsto.
+
+(* ---------------------------------------------------------------------- *)
+(* 4-byte word points-to: a 4-byte (word) value [w] stored little-endian at a
+   WORD-ALIGNED address [a].  The exact 4-byte analogue of [word_pointsto]
+   ([↦₈]): bundling the 4 byte points-to facts with the 4-byte alignment lets
+   a 4-byte load/store WP take a single [a ↦₄ w] hypothesis instead of a byte
+   window PLUS a separate [is_aligned_paddr ... 4 = true] side condition.      *)
+Definition word4_pointsto `{!riscvGS Σ} `{KTR : !CurKtier}
+    (a : Arch.pa) (dq : dfrac) (w : bv 32) : iProp Σ :=
+  (⌜is_aligned_paddr (Physaddr a) 4 = true⌝ ∗
+   [∗ list] j ∈ seq 0 4, mem_pointsto (pa_add a j) dq (nth_byte w j))%I.
+Notation "a ↦₄{ dq } w" := (word4_pointsto a dq w)
+  (at level 20, format "a  ↦₄{ dq }  w") : bi_scope.
+Notation "a ↦₄ w" := (word4_pointsto a (DfracOwn 1) w)
+  (at level 20, format "a  ↦₄  w") : bi_scope.
+(* discarded (persistent, duplicable) read-only ownership of the word. *)
+Notation "a ↦₄□ w" := (word4_pointsto a DfracDiscarded w)
+  (at level 20, format "a  ↦₄□  w") : bi_scope.
+(* ONE notation for all four dfrac spellings, through Iris's CUSTOM
+   [dfrac] entry -- [a ↦₄[kt] w], [a ↦₄[kt]{dq} w], [a ↦₄[kt]□ w],
+   [a ↦₄[kt]{#q} w].  It MUST go through the custom entry: writing
+   the closing bracket and the brace as one notation token ("]{") makes
+   the LEXER prefer that token everywhere, and ghost_map's own
+   [k ↪[ γ ] dq v] (same shape, same custom entry) then stops parsing
+   tree-wide -- a syntax error in files that mention no [↦₄] at all. *)
+Notation "a ↦₄[ kt ] dq w" := (word4_pointsto (KTR := kt) a dq w)
+  (at level 20, kt at level 50, dq custom dfrac at level 1,
+   format "a  ↦₄[ kt ] dq  w") : bi_scope.
+
+(* TIMELESS, for the same reason as [mem_pointsto_timeless] above: this is what
+   lets an invariant over a 4-byte cell ([StartedInv.started_body], the panic
+   flags) hand the cell out from under the [▷]. *)
+Global Instance word4_pointsto_timeless `{!riscvGS Σ} (KTR : CurKtier)
+    (a : Arch.pa) (dq : dfrac) (w : bv 32) :
+  Timeless (word4_pointsto (KTR := KTR) a dq w).
+Proof. rewrite /word4_pointsto. apply _. Qed.
+
+Global Instance word4_pointsto_timeless' `{!riscvGS Σ} (ktr : ktier)
+    (a : Arch.pa) (dq : dfrac) (w : bv 32) :
+  Timeless (word4_pointsto (KTR := ktr) a dq w).
+Proof. exact (word4_pointsto_timeless ktr a dq w). Qed.
+
+Section word4_pointsto.
+  Context `{!riscvGS Σ}.
+  Context `{KTR : !CurKtier}.
+
+  Lemma word4_pointsto_aligned_p a dq w :
+    word4_pointsto a dq w ⊢ ⌜is_aligned_paddr (Physaddr a) 4 = true⌝.
+  Proof using . iIntros "[$ _]". Qed.
+  Lemma word4_pointsto_bytes a dq w :
+    word4_pointsto a dq w ⊢ [∗ list] j ∈ seq 0 4, (pa_add a j) ↦ₘ{dq} nth_byte w j.
+  Proof using . iIntros "[_ $]". Qed.
+  (* repackage a byte window + its alignment fact into a word points-to *)
+  Lemma word4_pointsto_intro a dq w :
+    is_aligned_paddr (Physaddr a) 4 = true ->
+    ([∗ list] j ∈ seq 0 4, (pa_add a j) ↦ₘ{dq} nth_byte w j) ⊢ word4_pointsto a dq w.
+  Proof using . iIntros (Hal) "H". by iFrame. Qed.
+  Lemma word4_pointsto_unfold a dq w :
+    word4_pointsto a dq w ⊣⊢
+    ⌜is_aligned_paddr (Physaddr a) 4 = true⌝ ∗
+    ([∗ list] j ∈ seq 0 4, (pa_add a j) ↦ₘ{dq} nth_byte w j).
+  Proof using . reflexivity. Qed.
+
+  (* ---- sharing (see [mem_pointsto_share]) ---- *)
+  Lemma word4_pointsto_agree {kt1 kt2 : ktier} a dq1 w1 dq2 w2 :
+    a ↦₄[kt1]{dq1} w1 -∗ a ↦₄[kt2]{dq2} w2 -∗ ⌜w1 = w2⌝.
+  Proof using .
+    iIntros "[_ H1] [_ H2]".
+    iDestruct (mem_bytes_agree with "H1 H2") as %Hb.
+    iPureIntro. apply (bv_eq_of_bytes (n:=4)). intros j Hj. apply Hb. lia.
+  Qed.
+  Lemma word4_pointsto_frac_split a q1 q2 w :
+    a ↦₄{DfracOwn (q1 + q2)} w ⊣⊢ a ↦₄{DfracOwn q1} w ∗ a ↦₄{DfracOwn q2} w.
+  Proof using .
+    rewrite /word4_pointsto mem_bytes_frac_split.
+    iSplit; [iIntros "[#$ [$ $]]" | iIntros "[[#$ $] [_ $]]"].
+  Qed.
+
+  (* THE 1/2 + 1/2 SPLIT, which is the fraction a shared 4-byte cell is
+     actually held at all over the kernel: [p->pid]'s permanent half in the
+     scheduler invariant against allocproc's (ProcInv.v), and the bio layer's
+     [b->dev] / [b->blockno], whose bcache half and escrow half are joined for
+     every write and re-split after it.  Stated with the fractions PINNED --
+     [rewrite -(Qp.div_2 1)] would also match the [1] inside a [1/2] already in
+     the goal and produce [(1/2 + 1/2)/2] -- and given in all three shapes,
+     because the join direction is used as a wand and the split as a rewrite. *)
+  Lemma word4_pointsto_half a w :
+    a ↦₄ w ⊣⊢ a ↦₄{DfracOwn (1/2)} w ∗ a ↦₄{DfracOwn (1/2)} w.
+  Proof using . rewrite -word4_pointsto_frac_split Qp.div_2. reflexivity. Qed.
+
+  Lemma word4_pointsto_half_split a w :
+    a ↦₄ w -∗ a ↦₄{DfracOwn (1/2)} w ∗ a ↦₄{DfracOwn (1/2)} w.
+  Proof using . rewrite word4_pointsto_half. iIntros "$". Qed.
+
+  Lemma word4_pointsto_half_join a w :
+    a ↦₄{DfracOwn (1/2)} w -∗ a ↦₄{DfracOwn (1/2)} w -∗ a ↦₄ w.
+  Proof using . iIntros "H1 H2". rewrite word4_pointsto_half. iFrame "H1 H2". Qed.
+
+End word4_pointsto.
+
+(* ---------------------------------------------------------------------- *)
+(* string points-to: a NUL-terminated C string [s] resident byte-by-byte at
+   consecutive addresses starting at [a].  Built DIRECTLY on the single-byte
+   memory points-to [↦ₘ] -- character [j] of [s] at [a+j], the terminating NUL
+   at [a+|s|] -- with no alignment side condition, a C string being
+   byte-addressed (this is what distinguishes it from [↦₈]/[↦₄]).
+
+   THIS IS THE KIT-TIER (below-Sigma) FACT.  Above the seam the [↦ₛ]
+   spellings mean [TsoCtx.ctx_string_pointsto] -- the context-indexed tower
+   over the same byte shape, flipped by M1 stage 3 (tso-port.md §0.21′)
+   because the kernel has RUNTIME-WRITTEN strings ([p->name], written by
+   safestrcpy) and a tier that covers only rodata literals is not the string
+   tier.  Nothing above the seam uses the definition below; it stays for the
+   same reason [word4_pointsto] does, as the raw shape the twin is measured
+   against.
+
+   [DfracDiscarded] is the fraction a rodata literal is held at, so [a ↦ₛ□ s]
+   is PERSISTENT and hence freely DUPLICABLE.  What a persistent LOCK HANDLE
+   carries is not this fact, though, but its ∀-context derived form
+   ([TsoCtx.ctx_string_all]) -- see [WpLock.lock_name].                      *)
+(* ---------------------------------------------------------------------- *)
+
+Definition string_pointsto `{!riscvGS Σ} `{KTR : !CurKtier} (a : Arch.pa) (dq : dfrac)
+    (s : string) : iProp Σ :=
+  ([∗ list] j ↦ b ∈ cstring_bytes s, mem_pointsto (pa_add a j) dq b)%I.
+Notation "a ↦ₛ{ dq } s" := (string_pointsto a dq s)
+  (at level 20, format "a  ↦ₛ{ dq }  s") : bi_scope.
+(* discarded (persistent, duplicable) read-only ownership -- the default for a
+   kernel string literal. *)
+Notation "a ↦ₛ□ s" := (string_pointsto a DfracDiscarded s)
+  (at level 20, format "a  ↦ₛ□  s") : bi_scope.
+Notation "a ↦ₛ s" := (string_pointsto a (DfracOwn 1) s)
+  (at level 20, format "a  ↦ₛ  s") : bi_scope.
+(* ONE notation for all four dfrac spellings, through Iris's CUSTOM
+   [dfrac] entry -- [a ↦ₛ[kt] s], [a ↦ₛ[kt]{dq} s], [a ↦ₛ[kt]□ s],
+   [a ↦ₛ[kt]{#q} s].  It MUST go through the custom entry: writing
+   the closing bracket and the brace as one notation token ("]{") makes
+   the LEXER prefer that token everywhere, and ghost_map's own
+   [k ↪[ γ ] dq v] (same shape, same custom entry) then stops parsing
+   tree-wide -- a syntax error in files that mention no [↦ₛ] at all. *)
+Notation "a ↦ₛ[ kt ] dq s" := (string_pointsto (KTR := kt) a dq s)
+  (at level 20, kt at level 50, dq custom dfrac at level 1,
+   format "a  ↦ₛ[ kt ] dq  s") : bi_scope.
+
+Section string_pointsto.
+  Context `{!riscvGS Σ}.
+  Context `{KTR : !CurKtier}.
+
+  Global Instance string_pointsto_persistent (ktr : CurKtier) a s :
+    Persistent (string_pointsto (KTR := ktr) a DfracDiscarded s).
+  Proof using . rewrite /string_pointsto /mem_pointsto. apply _. Qed.
+
+  Global Instance string_pointsto_persistent' (ktr : ktier) a s :
+    Persistent (string_pointsto (KTR := ktr) a DfracDiscarded s).
+  Proof using . exact (string_pointsto_persistent ktr a s). Qed.
+
+End string_pointsto.
+
+(* ---------------------------------------------------------------------- *)
+(* 2. The bridge: an existential register map agreeing with [regstate].    *)
+(* ---------------------------------------------------------------------- *)
+
+Definition reg_agree (m : gmap register (sigT type_of_register))
+    (rs : regstate) : Prop :=
+  forall r dv, m !! r = Some dv -> dv = existT r (register_lookup r rs).
+
+(* the register bridge for a GIVEN hart's ghost name [γ]. *)
+Definition reg_interp_at `{!riscvFixedGS Σ} (γ : gname) (rs : regstate) : iProp Σ :=
+  (∃ m, ghost_map_auth_frac γ 1 m ∗ ⌜reg_agree m rs⌝)%I.
+
+(* the bridge for the AMBIENT hart -- what the WPs manipulate.  Original arity
+   ([rs] only): the hart is [cpu_id], carried by [reg_name]. *)
+Definition reg_interp `{!riscvGS Σ} `{CpuId} (rs : regstate) : iProp Σ :=
+  reg_interp_at reg_name rs.
+
+(* ---------------------------------------------------------------------- *)
+(* device-fabric ownership: the halves pattern over two [ghost_var_frac]s.       *)
+(* [uart_auth]/[plic_auth] live inside [state_interp]; [uart_frag]/         *)
+(* [plic_frag] are the user-facing halves.  Agreement + joint update are    *)
+(* the two bridge lemmas, mirroring [reg_valid]/[reg_update].               *)
+(* ---------------------------------------------------------------------- *)
+
+(* THE PORTS' HALVES, at an explicit name FUNCTION.  A named wrapper rather
+   than the big-op written out at each site: the two ends (this conjunct and
+   the boot resource) then agree on the HEAD symbol, so the era's name
+   function unifies as an ARGUMENT instead of under the big-op's binder --
+   which is where [iFrame] and [iExact] give up. *)
+Definition era_uarts_half `{!riscvFixedGS Σ} (γf : uart_id -> gname)
+    (f : uart_id -> uart_state) : iProp Σ :=
+  ([∗ list] i ∈ enum uart_id, ghost_var_frac (γf i) (1/2) (f i))%I.
+
+(* ALLOCATE ONE HALVES PAIR PER PORT, and hand back the name FUNCTION the
+   era record carries.  Spelled at the two ports rather than folded over
+   [enum], because the function it returns has to be a [match] the era
+   record can store. *)
+Lemma uarts_alloc `{!riscvFixedGS Σ} (f : uart_id -> uart_state) :
+  ⊢ |==> ∃ γf : uart_id -> gname, era_uarts_half γf f ∗ era_uarts_half γf f.
+Proof.
+  rewrite /era_uarts_half.
+  iMod (ghost_var_alloc (f Uart0)) as (γ0) "H0".
+  iMod (ghost_var_alloc (f Uart1)) as (γ1) "H1".
+  iEval (rewrite -Qp.half_half) in "H0".
+  iEval (rewrite -Qp.half_half) in "H1".
+  iDestruct (ghost_var_split with "H0") as "[H0a H0b]".
+  iDestruct (ghost_var_split with "H1") as "[H1a H1b]".
+  iModIntro.
+  iExists (fun i => match i with Uart0 => γ0 | Uart1 => γ1 end).
+  rewrite /enum /uart_id_finite /=. iFrame.
+Qed.
+
+
+Definition uart_auth `{!riscvGS Σ} (i : uart_id) (u : uart_state) : iProp Σ :=
+  ghost_var_frac (uart_name i) (1/2) u.
+Definition uart_frag `{!riscvGS Σ} (i : uart_id) (u : uart_state) : iProp Σ :=
+  ghost_var_frac (uart_name i) (1/2) u.
+Definition plic_auth `{!riscvGS Σ} (p : plic_state) : iProp Σ :=
+  ghost_var_frac plic_name (1/2) p.
+Definition plic_frag `{!riscvGS Σ} (p : plic_state) : iProp Σ :=
+  ghost_var_frac plic_name (1/2) p.
+Definition virtio_auth `{!riscvGS Σ} (v : virtio_state) : iProp Σ :=
+  ghost_var_frac virtio_name (1/2) v.
+Definition virtio_frag `{!riscvGS Σ} (v : virtio_state) : iProp Σ :=
+  ghost_var_frac virtio_name (1/2) v.
+
+(* the state_interp conjunct for the shared device state *)
+(* ONE HALF PER PORT.  A big-op over [enum uart_id] rather than a pair, so
+   a third port would cost nothing here and every rule that focuses a port
+   goes through the one accessor [uarts_auth_acc] below. *)
+Definition uarts_auth `{!riscvGS Σ} (f : uart_id -> uart_state) : iProp Σ :=
+  era_uarts_half uart_name f.
+
+Definition dev_interp `{!riscvGS Σ} (d : dev_state) : iProp Σ :=
+  (uarts_auth d.(duart) ∗ plic_auth d.(dplic) ∗ virtio_auth d.(dvirtio))%I.
+
+Section DevBridge.
+  Context `{!riscvGS Σ}.
+
+  Lemma uart_agree i u u' : uart_auth i u -∗ uart_frag i u' -∗ ⌜u' = u⌝.
+  Proof using .
+    iIntros "Ha Hf". by iDestruct (ghost_var_agree with "Ha Hf") as %->.
+  Qed.
+  Lemma uart_update i u u' u'' :
+    uart_auth i u -∗ uart_frag i u' ==∗ uart_auth i u'' ∗ uart_frag i u''.
+  Proof using . iApply ghost_var_update_halves. Qed.
+
+  (* FOCUS ONE PORT out of the fabric's bundle: its half comes out, and
+     putting a half back at a (possibly different) state rebuilds the
+     bundle at the updated function.  This is the ONLY way a rule reaches a
+     port's authority, so no proof has to know how many ports there are. *)
+  Lemma uarts_auth_acc (f : uart_id -> uart_state) (i : uart_id) :
+    uarts_auth f -∗
+      uart_auth i (f i) ∗ (∀ u, uart_auth i u -∗ uarts_auth (uupd f i u)).
+  Proof using .
+    rewrite /uarts_auth /era_uarts_half /enum /uart_id_finite /=.
+    iIntros "(H0 & H1 & _)". destruct i.
+    - iFrame "H0". iIntros (u) "H0".
+      rewrite (uupd_eq f Uart0 u) (uupd_ne f Uart0 Uart1 u ltac:(done)). iFrame.
+    - iFrame "H1". iIntros (u) "H1".
+      rewrite (uupd_eq f Uart1 u) (uupd_ne f Uart1 Uart0 u ltac:(done)). iFrame.
+  Qed.
+
+  (* agreement straight out of the bundle, so a client that holds the whole
+     fabric's authority never has to focus a port by hand *)
+  Lemma uarts_agree (f : uart_id -> uart_state) (i : uart_id) (u : uart_state) :
+    uarts_auth f -∗ uart_frag i u -∗ ⌜u = f i⌝.
+  Proof using .
+    iIntros "Ha Hf". iDestruct (uarts_auth_acc _ i with "Ha") as "[Hi _]".
+    by iDestruct (uart_agree with "Hi Hf") as %->.
+  Qed.
+
+
+  Lemma plic_agree p p' : plic_auth p -∗ plic_frag p' -∗ ⌜p' = p⌝.
+  Proof using .
+    iIntros "Ha Hf". by iDestruct (ghost_var_agree with "Ha Hf") as %->.
+  Qed.
+  Lemma plic_update p p' p'' :
+    plic_auth p -∗ plic_frag p' ==∗ plic_auth p'' ∗ plic_frag p''.
+  Proof using . iApply ghost_var_update_halves. Qed.
+
+  Lemma virtio_agree v v' : virtio_auth v -∗ virtio_frag v' -∗ ⌜v' = v⌝.
+  Proof using .
+    iIntros "Ha Hf". by iDestruct (ghost_var_agree with "Ha Hf") as %->.
+  Qed.
+  Lemma virtio_update v v' v'' :
+    virtio_auth v -∗ virtio_frag v' ==∗ virtio_auth v'' ∗ virtio_frag v''.
+  Proof using . iApply ghost_var_update_halves. Qed.
+End DevBridge.
+
+(* one hart's view (its registers + the shared memory + the shared device
+   fabric); the single-CPU [state_interp σ ns κs nt] of the leaf lemmas is
+   replaced by [mstate_interp σ].  The device conjunct rides in LAST
+   position: a leaf that only touches registers/memory frames it through
+   untouched (an exec over set_reg/write_bytes preserves [mdev]
+   definitionally). *)
+Definition mstate_interp `{!riscvGS Σ} `{CpuId} (σ : mstate) : iProp Σ :=
+  (reg_interp σ.(sregs) ∗ gen_heap_interp σ.(mem) ∗ dev_interp σ.(mdev))%I.
+
+(* the GLOBAL register bridge: one authoritative map per hart, over the whole
+   finite [CPU] set.  [gregs] is a total function, so there is no membership
+   side condition -- [gregs_interp_acc] focuses any [cpu_id] unconditionally. *)
+Definition gregs_interp `{!riscvGS Σ} (gr : CPU -> regstate) : iProp Σ :=
+  ([∗ set] cpu ∈ (fin_to_set CPU : gset CPU), reg_interp_at (cpu_reg_name cpu) (gr cpu))%I.
+
+
+(* ---------------------------------------------------------------------- *)
+(* THE RESERVATION MIRROR (design §3a).  [gresv] is a total function and     *)
+(* [ghost_map_auth_frac] wants a map, so this is the one conversion -- via         *)
+(* [map_imap] over [fin_to_set CPU], which makes the lookup lemma three       *)
+(* rewrites with no [NoDup] obligation (the [list_to_map] spelling costs one).*)
+(* ---------------------------------------------------------------------- *)
+(* THE ACQUIRE BIT RIDES BESIDE THE RESERVATION (relaxed-rr.md §2.2, the .aq
+   knob): the mirror's value is the pair [(gresv c, hr_acq (ghr c))], so the
+   fragment a hart holds across an AMO's two halves pins whether the pair is
+   an acquire -- the conditional write's view move depends on it, and the
+   lock leaves must be able to name it ([resv_fragb]).  [resv_frag] stays the
+   bit-agnostic spelling every other consumer holds. *)
+Definition resv_map (f : CPU -> option resv) (a : CPU -> hread)
+    : gmap CPU (option resv * bool) :=
+  map_imap (fun c _ => Some (f c, hr_acq (a c)))
+    (gset_to_gmap () (fin_to_set CPU : gset CPU)).
+
+Lemma resv_map_lookup (f : CPU -> option resv) (a : CPU -> hread) (c : CPU) :
+  resv_map f a !! c = Some (f c, hr_acq (a c)).
+Proof.
+  rewrite /resv_map map_lookup_imap lookup_gset_to_gmap.
+  rewrite option_guard_True; [ reflexivity | apply elem_of_fin_to_set ].
+Qed.
+
+Lemma resv_map_insert (f : CPU -> option resv) (a : CPU -> hread) (c : CPU)
+    (r : option resv) (hr : hread) :
+  resv_map (<[c := r]> f) (<[c := hr]> a) = <[c := (r, hr_acq hr)]> (resv_map f a).
+Proof.
+  apply map_eq. intros c'. rewrite resv_map_lookup.
+  destruct (decide (c' = c)) as [->|Hne].
+  - rewrite lookup_insert_eq /insert /gresv_insert /ghr_insert. by rewrite !decide_True.
+  - rewrite lookup_insert_ne // resv_map_lookup /insert /gresv_insert /ghr_insert.
+    by rewrite !decide_False.
+Qed.
+
+(* the all-[None] map (every era begins there): what the boot allocation
+   hands out, one [(None, false)] fragment per hart *)
+Lemma resv_map_none (f : CPU -> option resv) (a : CPU -> hread) :
+  (forall c, f c = None) -> (forall c, hr_acq (a c) = false) ->
+  resv_map f a = gset_to_gmap (None, false) (fin_to_set CPU : gset CPU).
+Proof.
+  intros Hf Ha. apply map_eq. intros c.
+  rewrite resv_map_lookup lookup_gset_to_gmap option_guard_True;
+    [ by rewrite Hf Ha | apply elem_of_fin_to_set ].
+Qed.
+
+(* THE PRESERVING CASE, which is what lets the rules whose arms never touch
+   the reservation (register nodes, announces, plain and MMIO READS) keep
+   [wp_hart_step]'s reservation-agnostic form: writing back the value that is
+   already there leaves the auth's map alone, so no fragment is needed.  Only
+   the arms that CHANGE it -- every RAM/MMIO write, the exclusive read, and the
+   [Ret] boundary -- have to carry [resv_frag]. *)
+Lemma resv_map_insert_id (f : CPU -> option resv) (a : CPU -> hread) (c : CPU)
+    (r : option resv) (hr : hread) :
+  f c = r -> hr_acq (a c) = hr_acq hr ->
+  resv_map (<[c := r]> f) (<[c := hr]> a) = resv_map f a.
+Proof.
+  intros Hfc Hac. apply map_eq. intros c'.
+  rewrite !resv_map_lookup /insert /gresv_insert /ghr_insert.
+  case_decide as Hc; [ by rewrite Hc Hfc Hac | reflexivity ].
+Qed.
+
+(* the authoritative half, held by [era_interp]; and the per-hart fragment,
+   which [pc_is] carries at [None] on every instruction boundary.  The
+   bit-carrying spelling [resv_fragb] is what the AMO chain holds between the
+   exclusive read and the conditional write; [resv_frag] is its existential. *)
+Definition resv_auth_at `{!riscvFixedGS Σ} (E : riscvEraGS)
+    (f : CPU -> option resv) (a : CPU -> hread) : iProp Σ :=
+  ghost_map_auth_frac (era_resv_name E) 1 (resv_map f a).
+
+Definition resv_fragb `{!riscvGS Σ} (c : CPU) (r : option resv) (b : bool) : iProp Σ :=
+  (c ↪[era_resv_name riscv_eraGS] (r, b))%I.
+
+Definition resv_frag `{!riscvGS Σ} (c : CPU) (r : option resv) : iProp Σ :=
+  (∃ b : bool, resv_fragb c r b)%I.
+
+Lemma resv_frag_of_fragb `{!riscvGS Σ} (c : CPU) (r : option resv) (b : bool) :
+  resv_fragb c r b -∗ resv_frag c r.
+Proof. iIntros "H". by iExists b. Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* THE INSTRUCTION-VIEW MIRROR (claude-notes/design/icache.md).             *)
+(* [iview_auth_at E f] is the era's authority over every hart's instruction *)
+(* view [gitv]; the lifting rule lends the focused hart's counter to the    *)
+(* node's callback as [hart_iview_auth] (the fetch rule reads it, the       *)
+(* fence.i arm raises it) and takes it back; [hart_iview_lb] is the         *)
+(* persistent lower bound -- monotone because the view only ever grows      *)
+(* ([RiscvLang.mnode_step]'s Barrier arm takes a [Nat.max]).                *)
+(* ---------------------------------------------------------------------- *)
+Definition iview_auth_at `{!riscvFixedGS Σ} (E : riscvEraGS)
+    (f : CPU -> nat) : iProp Σ :=
+  ([∗ set] c ∈ (fin_to_set CPU : gset CPU),
+     mono_nat_auth_own_frac (era_iview_name E c) 1 (f c))%I.
+
+Definition hart_iview_auth `{!riscvGS Σ} (c : CPU) (v : nat) : iProp Σ :=
+  mono_nat_auth_own_frac (era_iview_name riscv_eraGS c) 1 v.
+
+Definition hart_iview_lb_at `{!riscvGS Σ} (c : CPU) (K : nat) : iProp Σ :=
+  mono_nat_lb_own (era_iview_name riscv_eraGS c) K.
+
+Global Instance hart_iview_lb_at_persistent `{!riscvGS Σ} c K :
+  Persistent (hart_iview_lb_at c K).
+Proof. apply _. Qed.
+
+Lemma hart_iview_lb_at_get `{!riscvGS Σ} (c : CPU) (v : nat) :
+  hart_iview_auth c v -∗ hart_iview_lb_at c v.
+Proof. iIntros "H". by iDestruct (mono_nat_lb_own_get with "H") as "#$". Qed.
+
+Lemma hart_iview_lb_at_valid `{!riscvGS Σ} (c : CPU) (v K : nat) :
+  hart_iview_auth c v -∗ hart_iview_lb_at c K -∗ ⌜(K <= v)%nat⌝.
+Proof.
+  iIntros "Ha Hl". by iDestruct (mono_nat_auth_lb_own_valid with "Ha Hl") as %[_ ?].
+Qed.
+
+Lemma hart_iview_auth_update `{!riscvGS Σ} (c : CPU) (v v' : nat) :
+  (v <= v')%nat -> hart_iview_auth c v ==∗ hart_iview_auth c v'.
+Proof. intros Hle. iIntros "H". by iMod (mono_nat_own_update v' with "H") as "[$ _]". Qed.
+
+Lemma iview_interp_acc `{!riscvGS Σ} (c : CPU) (f : CPU -> nat) :
+  iview_auth_at riscv_eraGS f ⊢ hart_iview_auth c (f c) ∗
+    (∀ v, hart_iview_auth c v -∗ iview_auth_at riscv_eraGS (<[c := v]> f)).
+Proof.
+  rewrite /iview_auth_at /hart_iview_auth.
+  iIntros "H".
+  iDestruct (big_sepS_delete _ _ c with "H") as "[Hcur Hrest]";
+    [ apply elem_of_fin_to_set |].
+  iFrame "Hcur".
+  iIntros (v) "Hv".
+  iApply (big_sepS_delete _ _ c); [ apply elem_of_fin_to_set |].
+  rewrite /insert /gtv_insert decide_True //.
+  iFrame "Hv".
+  iApply (big_sepS_mono with "Hrest").
+  intros c' Hc'. apply elem_of_difference in Hc' as [_ Hne].
+  rewrite decide_False; [ done | ].
+  intros ->. apply Hne, elem_of_singleton. reflexivity.
+Qed.
+
+(* the insert at the SAME value is the identity, pointwise -- what a node
+   that leaves the instruction view alone hands back *)
+Lemma iview_auth_at_insert_id `{!riscvFixedGS Σ} (E : riscvEraGS)
+    (f : CPU -> nat) (c : CPU) :
+  iview_auth_at E (<[c := f c]> f) ⊣⊢ iview_auth_at E f.
+Proof.
+  rewrite /iview_auth_at. apply big_sepS_proper. intros c' _.
+  rewrite /insert /gtv_insert. case_decide as Hd; [by subst|done].
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* THE READ-WATERMARK MIRROR (claude-notes/projects/relaxed-rr.md §4.2).    *)
+(* [rview_auth_at E f] is the era's authority over every hart's read        *)
+(* watermark [hr_rv (ghr c)]; the lifting rule lends the focused hart's     *)
+(* counter to the node's callback as [hart_rview_auth] (the plain-read rule *)
+(* raises it to the view it read at and mints [hart_rview_lb_at] there, the *)
+(* AMO arm takes it to the top) and takes it back.  Monotone because the    *)
+(* watermark only ever grows ([mnode_step]'s read arms take a [Nat.max]).   *)
+(* The coherence floors [hr_coh] have NO ghost mirror: no proof consumes    *)
+(* them, they only bound the machine's choice of view, and the lifting rule *)
+(* hands the callback the whole [hread] as a pure value.                    *)
+(* ---------------------------------------------------------------------- *)
+Definition rview_auth_at `{!riscvFixedGS Σ} (E : riscvEraGS)
+    (f : CPU -> hread) : iProp Σ :=
+  ([∗ set] c ∈ (fin_to_set CPU : gset CPU),
+     mono_nat_auth_own_frac (era_rv_name E c) 1 (hr_rv (f c)))%I.
+
+Definition hart_rview_auth `{!riscvGS Σ} (c : CPU) (v : nat) : iProp Σ :=
+  mono_nat_auth_own_frac (era_rv_name riscv_eraGS c) 1 v.
+
+Definition hart_rview_lb_at `{!riscvGS Σ} (c : CPU) (K : nat) : iProp Σ :=
+  mono_nat_lb_own (era_rv_name riscv_eraGS c) K.
+
+Global Instance hart_rview_lb_at_persistent `{!riscvGS Σ} c K :
+  Persistent (hart_rview_lb_at c K).
+Proof. apply _. Qed.
+
+Global Instance hart_rview_lb_at_timeless `{!riscvGS Σ} c K :
+  Timeless (hart_rview_lb_at c K).
+Proof. apply _. Qed.
+
+Lemma hart_rview_lb_at_get `{!riscvGS Σ} (c : CPU) (v : nat) :
+  hart_rview_auth c v -∗ hart_rview_lb_at c v.
+Proof. iIntros "H". by iDestruct (mono_nat_lb_own_get with "H") as "#$". Qed.
+
+Lemma hart_rview_lb_at_valid `{!riscvGS Σ} (c : CPU) (v K : nat) :
+  hart_rview_auth c v -∗ hart_rview_lb_at c K -∗ ⌜(K <= v)%nat⌝.
+Proof.
+  iIntros "Ha Hl". by iDestruct (mono_nat_auth_lb_own_valid with "Ha Hl") as %[_ ?].
+Qed.
+
+Lemma hart_rview_lb_at_le `{!riscvGS Σ} (c : CPU) (K K' : nat) :
+  (K' <= K)%nat -> hart_rview_lb_at c K -∗ hart_rview_lb_at c K'.
+Proof. intros Hle. iIntros "H". by iApply (mono_nat_lb_own_le with "H"). Qed.
+
+Lemma hart_rview_auth_update `{!riscvGS Σ} (c : CPU) (v v' : nat) :
+  (v <= v')%nat -> hart_rview_auth c v ==∗ hart_rview_auth c v'.
+Proof. intros Hle. iIntros "H". by iMod (mono_nat_own_update v' with "H") as "[$ _]". Qed.
+
+(* the accessor hands the closing wand an [hread], so the write-back's
+   [<[c := hr']> ghr] is matched without projecting *)
+Lemma rview_interp_acc `{!riscvGS Σ} (c : CPU) (f : CPU -> hread) :
+  rview_auth_at riscv_eraGS f ⊢ hart_rview_auth c (hr_rv (f c)) ∗
+    (∀ hr, hart_rview_auth c (hr_rv hr) -∗ rview_auth_at riscv_eraGS (<[c := hr]> f)).
+Proof.
+  rewrite /rview_auth_at /hart_rview_auth.
+  iIntros "H".
+  iDestruct (big_sepS_delete _ _ c with "H") as "[Hcur Hrest]";
+    [ apply elem_of_fin_to_set |].
+  iFrame "Hcur".
+  iIntros (hr) "Hv".
+  iApply (big_sepS_delete _ _ c); [ apply elem_of_fin_to_set |].
+  rewrite /insert /ghr_insert decide_True //.
+  iFrame "Hv".
+  iApply (big_sepS_mono with "Hrest").
+  intros c' Hc'. apply elem_of_difference in Hc' as [_ Hne].
+  rewrite decide_False; [ done | ].
+  intros ->. apply Hne, elem_of_singleton. reflexivity.
+Qed.
+
+Lemma rview_auth_at_insert_id `{!riscvFixedGS Σ} (E : riscvEraGS)
+    (f : CPU -> hread) (c : CPU) :
+  rview_auth_at E (<[c := f c]> f) ⊣⊢ rview_auth_at E f.
+Proof.
+  rewrite /rview_auth_at. apply big_sepS_proper. intros c' _.
+  rewrite /insert /ghr_insert. case_decide as Hd; [by subst|done].
+Qed.
+
+(* the frag at SOME value: what a hart owns between instructions.  A leaf
+   that leaves a dangling reservation (an AMOCAS mismatch, an A/D re-read
+   that found the bits set) ends at [Some]; the boundary drops it.  This is
+   the shape [pc_is] carries and every cycle wrapper threads. *)
+Definition resv_any `{!riscvGS Σ} (c : CPU) : iProp Σ :=
+  (∃ r : option resv, resv_frag c r)%I.
+
+Lemma resv_any_intro `{!riscvGS Σ} (c : CPU) (r : option resv) :
+  resv_frag c r -∗ resv_any c.
+Proof. iIntros "H". by iExists r. Qed.
+
+Lemma resv_any_of_fragb `{!riscvGS Σ} (c : CPU) (r : option resv) (b : bool) :
+  resv_fragb c r b -∗ resv_any c.
+Proof. iIntros "H". iExists r. by iApply resv_frag_of_fragb. Qed.
+
+Lemma resv_fragb_agree `{!riscvGS Σ} (f : CPU -> option resv) (a : CPU -> hread)
+    (c : CPU) (r : option resv) (b : bool) :
+  resv_auth_at riscv_eraGS f a -∗ resv_fragb c r b -∗
+  ⌜f c = r /\ hr_acq (a c) = b⌝.
+Proof.
+  iIntros "Ha Hf".
+  iDestruct (ghost_map_lookup with "Ha Hf") as %Hl.
+  rewrite resv_map_lookup in Hl. injection Hl as Hl. by inversion Hl.
+Qed.
+
+Lemma resv_frag_agree `{!riscvGS Σ} (f : CPU -> option resv) (a : CPU -> hread)
+    (c : CPU) (r : option resv) :
+  resv_auth_at riscv_eraGS f a -∗ resv_frag c r -∗ ⌜f c = r⌝.
+Proof.
+  iIntros "Ha Hf". iDestruct "Hf" as (b) "Hf".
+  iDestruct (resv_fragb_agree with "Ha Hf") as %[? _]. done.
+Qed.
+
+(* the update moves the reservation AND the acquire bit to the node's
+   write-back ([hr'] is the read side the arm produced) *)
+Lemma resv_fragb_update `{!riscvGS Σ} (f : CPU -> option resv) (a : CPU -> hread)
+    (c : CPU) (r : option resv) (b : bool) (r' : option resv) (hr' : hread) :
+  resv_auth_at riscv_eraGS f a -∗ resv_fragb c r b ==∗
+  resv_auth_at riscv_eraGS (<[c := r']> f) (<[c := hr']> a) ∗
+  resv_fragb c r' (hr_acq hr').
+Proof.
+  iIntros "Ha Hf".
+  iMod (ghost_map_update (r', hr_acq hr') with "Ha Hf") as "[Ha Hf]".
+  iModIntro. rewrite /resv_auth_at resv_map_insert. iFrame.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 3. irisGS instance (claude-notes/design/crash.md).  [state_interp] is    *)
+(*    defined over the FIXED layer ALONE and holds the CURRENT era          *)
+(*    existentially: [wp] is sealed over the whole [irisGS] record, so     *)
+(*    threads of different generations share a WP connective only if the   *)
+(*    instance never mentions the era.  The ambient era of a thread's      *)
+(*    [riscvGS] reappears at the base rules, where the registry element    *)
+(*    in its [gen_cert] ties it to the existential.                        *)
+(* ---------------------------------------------------------------------- *)
+
+(* the state_interp conjuncts of an ARBITRARY era.  The ambient forms
+   ([gregs_interp]/[gen_heap_interp (hG := riscv_memGS)]/[dev_interp]) are
+   these at [riscv_eraGS], definitionally. *)
+Definition gregs_interp_at `{!riscvFixedGS Σ} (E : riscvEraGS)
+    (gr : CPU -> regstate) : iProp Σ :=
+  ([∗ set] cpu ∈ (fin_to_set CPU : gset CPU),
+     reg_interp_at (era_reg_name E cpu) (gr cpu))%I.
+Definition dev_interp_at `{!riscvFixedGS Σ} (E : riscvEraGS)
+    (d : dev_state) : iProp Σ :=
+  (era_uarts_half (era_uart_name E) d.(duart) ∗
+   ghost_var_frac (era_plic_name E) (1/2) d.(dplic) ∗
+   ghost_var_frac (era_virtio_name E) (1/2) d.(dvirtio))%I.
+(* the era's four conjuncts.  The DISK IMAGE rides here, in LAST position,
+   rather than beside the fixed conjuncts: it is per-era (see
+   [era_disk_name]), so when the power is off there is no disk conjunct at
+   all -- the era, and its image map, are gone. *)
+(* THE PER-AGENT VIEW FUNCTION of a machine state: harts at their [gtv],
+   every device agent pinned to the top (strongly-ordered DMA,
+   tso-machine-flip.md RULING 2). *)
+Definition avf (g : gstate) : agent -> nat :=
+  fun h => match lt_dec h NCPU with
+           | left H => g.(gtv) (nat_to_fin H)
+           | right _ => length g.(glog)
+           end.
+
+Lemma avf_hart (g : gstate) (c : CPU) : avf g (hart_agent c) = g.(gtv) c.
+Proof.
+  rewrite /avf /hart_agent.
+  destruct (lt_dec (fin_to_nat c) NCPU) as [H|H].
+  - f_equal. apply (inj fin_to_nat). by rewrite fin_to_nat_to_fin.
+  - exfalso. pose proof (fin_to_nat_lt c). lia.
+Qed.
+
+Lemma avf_disk (g : gstate) : avf g disk_agent = length g.(glog).
+Proof.
+  rewrite /avf /disk_agent. destruct (lt_dec NCPU NCPU); [lia|done].
+Qed.
+
+(* THE TSO MACHINE GHOSTS' INTERP (tso-machine-flip.md par.4): the
+   timestamp map, tied per-address to the LATEST write over the log; the
+   persisted log entries; the log length; and the per-agent view
+   authority.  [mm_ok] rides as the pure conjunct exactly like
+   [resv_ok].  gen_heap (the conjunct above it in [era_interp]) still
+   interprets [gmem] -- the FLAT cache -- so a [pointsto] fragment keeps
+   meaning "the flat byte" and the timestamp fragment beside it (inside
+   [TsoCtx.ctx_pointsto]) is what adds the justification axis. *)
+Definition tso_interp_at `{!riscvFixedGS Σ} (E : riscvEraGS) (g : gstate)
+    : iProp Σ :=
+  (∃ (TM : gmap Arch.pa ts_elem) (LM : gmap nat pwmsg),
+     ghost_map_auth_frac (era_ts_name E) 1 TM ∗
+     ⌜dom TM = dom g.(gmem)⌝ ∗
+     (* THE ELEMENT'S TIE, one conjunct (tso-pin-memo.md §5.1): the LATEST
+        half is the old statement verbatim at [e.1]; the PIN half is
+        vacuous at [None] and is [TsoMemPa.pin_ok] -- the walk's discharge
+        CONCLUSION, stored where the step relation can maintain it. *)
+     ⌜∀ a e, TM !! a = Some e →
+        ts_ok g.(gimg) g.(gmem) g.(glog) a e⌝ ∗
+     ghost_map_auth_frac (era_logm_name E) 1 LM ∗
+     ⌜∀ i, LM !! i = g.(glog) !! i⌝ ∗
+     mono_nat_auth_own_frac (era_loglen_name E) 1 (length g.(glog)) ∗
+     view_auth (era_view_name E) (avf g) ∗
+     ⌜mm_ok g /\ g.(gimg) = era_img E⌝)%I.
+
+Lemma tso_interp_at_img `{!riscvFixedGS Σ} (E : riscvEraGS) (g : gstate) :
+  tso_interp_at E g -∗ ⌜g.(gimg) = era_img E⌝.
+Proof.
+  iIntros "H". iDestruct "H" as (TM LM) "(_ & _ & _ & _ & _ & _ & _ & %Hmm)".
+  iPureIntro. exact (proj2 Hmm).
+Qed.
+
+Lemma tso_interp_at_mm_ok `{!riscvFixedGS Σ} (E : riscvEraGS) (g : gstate) :
+  tso_interp_at E g -∗ ⌜mm_ok g⌝.
+Proof.
+  iIntros "H". iDestruct "H" as (TM LM) "(_ & _ & _ & _ & _ & _ & _ & %Hmm)".
+  iPureIntro. exact (proj1 Hmm).
+Qed.
+
+Definition era_interp `{!riscvFixedGS Σ} (E : riscvEraGS) (g : gstate) : iProp Σ :=
+  (gregs_interp_at E g.(gregs) ∗
+   gen_heap_interp (hG := era_memGS_of E) g.(gmem) ∗
+   dev_interp_at E g.(gdev) ∗
+   disk_dur_interp E g ∗
+   tso_interp_at E g ∗
+   (* the reservation mirror and its snapshot invariant (design §3a).  The
+      pure conjunct is a STEP invariant of the language, so every arm
+      re-establishes it and no rule has to carry it. *)
+   resv_auth_at E g.(gresv) g.(ghr) ∗ ⌜resv_ok g⌝ ∗
+   (* the instruction-view mirror and its bound (icache.md) *)
+   iview_auth_at E g.(gitv) ∗ ⌜itv_ok g⌝ ∗
+   (* the read-watermark mirror and the read side's bound (relaxed-rr.md),
+      LAST per the new-conjunct rule *)
+   rview_auth_at E g.(ghr) ∗ ⌜hr_ok g⌝)%I.
+
+(* THE DURABLE DISK's MACHINE SIDE: the fixed gname's AUTH, always at the
+   machine's own disk image.  A FIXED conjunct, NOT part of [era_interp]: the
+   disk is the one thing a power cycle preserves, so its authority must
+   survive PowerOff -- both power arms simply FRAME it ([boot_shape]
+   preserves [v_disk]).  Of the whole machine only the DMA completion moves
+   [v_disk], so only [RiscvExec.wp_disk_step] hands this conjunct to its
+   callback (it lends it to the client's permit for the instant); the hart,
+   UART and PLIC rules frame it through their own [v_disk]-preservation
+   lemmas. *)
+Definition disk_fixed_interp `{!riscvFixedGS Σ} (g : gstate) : iProp Σ :=
+  disk_fixed_auth (v_disk (dvirtio (gdev g))).
+
+Definition power_interp `{!riscvFixedGS Σ} (g : gstate) : iProp Σ :=
+  (gen_auth g.(ggen) ∗ start_auth (start_count g) ∗ disk_fixed_interp g ∗
+   (∃ R : gmap nat riscvEraGS,
+      ghost_map_auth_frac riscv_registry_name 1 R ∗
+      ⌜dom R = set_seq 0 (start_count g)⌝ ∗
+      (if g.(gpow) then (∃ E, ⌜R !! g.(ggen) = Some E⌝ ∗ era_interp E g)%I
+       else True%I)))%I.
+
+(* THE TRACE CONJUNCT OF [state_interp] (claude-notes/completed/uart-trace.md).
+   [κs] is Iris's FUTURE observation list; [h] is the PAST.  Three facts:
+   the two concatenate to the run's whole trace (heap_lang's prophecy-interp
+   trick, applied to the past: at the end of the run [κs = []] and the
+   history IS the trace); the history is well-formed for the machine
+   ([ObsTrace.obs_wf] -- the power alternation, the boot count, and the WIRE
+   TIE [obs_wire i (open_seg h) = u_wire of port i], a pure step invariant of the
+   language exactly like [resv_ok]); and the machine's half of the history
+   ghost.  A silent step ([κ = []]) re-packs at the same [h]
+   ([obs_interp_silent]); an observed one re-packs at [h ++ κ] after the
+   client has moved the ghost ([obs_interp_close]). *)
+Definition obs_interp `{!riscvFixedGS Σ} (g : gstate) (κs : list mobs)
+    : iProp Σ :=
+  (∃ h : list mobs,
+     ⌜(h ++ κs)%list = riscv_obs_total⌝ ∗ ⌜obs_wf h g⌝ ∗ obs_auth h)%I.
+
+Lemma obs_interp_silent `{!riscvFixedGS Σ} e g e' g' efs (κs : list mobs) :
+  prim_step e g [] e' g' efs ->
+  obs_interp g κs ⊢ obs_interp g' κs.
+Proof.
+  intros Hstep. iDestruct 1 as (h) "(%Htot & %Hwf & Hauth)".
+  iExists h. iFrame "Hauth". iPureIntro. split; [exact Htot|].
+  pose proof (prim_step_obs_wf _ _ _ _ _ _ _ Hstep Hwf) as Hwf'.
+  by rewrite app_nil_r in Hwf'.
+Qed.
+
+Lemma obs_interp_close `{!riscvFixedGS Σ} e g κ e' g' efs (h κs : list mobs) :
+  prim_step e g κ e' g' efs ->
+  obs_wf h g ->
+  (h ++ (κ ++ κs))%list = riscv_obs_total ->
+  obs_auth (h ++ κ)%list ⊢ obs_interp g' κs.
+Proof.
+  intros Hstep Hwf Htot. iIntros "Hauth". iExists (h ++ κ)%list. iFrame "Hauth".
+  iPureIntro. split; [by rewrite -app_assoc|].
+  exact (prim_step_obs_wf _ _ _ _ _ _ _ Hstep Hwf).
+Qed.
+
+Global Program Instance riscv_irisGS `{!riscvFixedGS Σ} : irisGS riscv_lang Σ := {
+  iris_invGS := riscvF_invGS;
+  state_interp g _ κs _ := (power_interp g ∗ obs_interp g κs)%I;
+  fork_post _ := True%I;
+  num_laters_per_step _ := 0%nat;
+}.
+Next Obligation. intros. iIntros "H". by iModIntro. Qed.
+
+(* [to_val] is unconditionally [None] for every [expr riscv_lang] (there are
+   no values -- [mval := Empty_set]), so the [Some v] case of [wp_pre] is
+   dead code and a WP never actually inspects its postcondition: any two
+   postconditions give provably equivalent WPs ([wp_mono] discharged by a
+   vacuous case analysis on [Empty_set]). [wp_triv] pins the postcondition to
+   the canonical [True], and the notations below drop the now-pointless
+   [{{ Φ }}] clause entirely -- every WP in this project is over riscv_lang,
+   so a postcondition position never needs to be written at all.  They are
+   spelled [mWP], not [WP]: sharing Iris's [WP] prefix at a different level
+   leaves Iris's own [WP ... {{ ... }}] notations unparseable (the build
+   makes [notation-incompatible-prefix] an error). *)
+Lemma wp_post_irrel `{!irisGS riscv_lang Σ} s E (e : expr riscv_lang) (Φ1 Φ2 : mval -> iProp Σ) :
+  WP e @ s; E {{ Φ1 }} ⊢ WP e @ s; E {{ Φ2 }}.
+Proof. iApply wp_mono. iIntros ([]). Qed.
+
+Definition wp_triv `{!irisGS riscv_lang Σ} (E : coPset) (e : expr riscv_lang) : iProp Σ :=
+  WP e @ E {{ _, True%I }}.
+
+
+Notation "'mWP' e @ E" := (wp_triv E e%E) (at level 20, e at level 20) : bi_scope.
+Notation "'mWP' e" := (wp_triv ⊤ e%E) (at level 20, e at level 20) : bi_scope.
+
+(* Focus the ambient hart's register bridge out of the global one, with a
+   frame-preserving update handle to put an updated bridge back.  This is the
+   single point where per-hart framing happens; leaf WPs never see it. *)
+Lemma gregs_interp_acc `{!riscvGS Σ} `{CpuId} (gr : CPU -> regstate) :
+  gregs_interp gr ⊢ reg_interp (gr cpu_id) ∗
+    (∀ rs', reg_interp rs' -∗ gregs_interp (<[cpu_id := rs']> gr)).
+Proof.
+  rewrite /gregs_interp /reg_interp /reg_name.
+  iIntros "H".
+  iDestruct (big_sepS_delete _ _ cpu_id with "H") as "[Hcur Hrest]";
+    [ apply elem_of_fin_to_set |].
+  iFrame "Hcur".
+  iIntros (rs') "Hrs'".
+  iApply (big_sepS_delete _ _ cpu_id); [ apply elem_of_fin_to_set |].
+  rewrite /insert /greg_insert decide_True //.
+  iFrame "Hrs'".
+  iApply (big_sepS_mono with "Hrest").
+  intros cpu Hcpu. apply elem_of_difference in Hcpu as [_ Hne].
+  rewrite decide_False; [ done | ].
+  intros ->. apply Hne, elem_of_singleton. reflexivity.
+Qed.
+
+(* ---------------------------------------------------------------------- *)
+(* 3b. Per-hart register ownership for an EXPLICIT (non-ambient) hart:      *)
+(*     [reg_pointsto_at c r] is the [↦ᵣ]-analogue for hart [c], with its    *)
+(*     bridge lemmas against [reg_interp_at] and the explicit-hart focusing  *)
+(*     lemma [gregs_interp_acc_at].  Needed by any proof that touches        *)
+(*     ANOTHER hart's registers -- e.g. the device thread's wire step        *)
+(*     writes hart [c]'s [sig_seip] pin (WpUart.v), and the wire invariant   *)
+(*     (WireInv.v) owns every hart's interrupt pins.                          *)
+(* ---------------------------------------------------------------------- *)
+
+Section RegAt.
+  Context `{!riscvGS Σ}.
+
+  (* [r ↦ᵣ v] for an EXPLICIT hart [c] (the ambient-[CpuId] [reg_pointsto]
+     is [reg_pointsto_at cpu_id]). *)
+  Definition reg_pointsto_at (c : CPU) (r : register) (dq : dfrac)
+      (v : type_of_register r) : iProp Σ :=
+    ghost_map_elem (cpu_reg_name c) r dq (existT r v).
+
+  Global Instance reg_pointsto_at_timeless c r dq v :
+    Timeless (reg_pointsto_at c r dq v).
+  Proof using . rewrite /reg_pointsto_at. apply _. Qed.
+
+
+  Lemma reg_update_at (c : CPU) rs r v v' :
+    reg_interp_at (cpu_reg_name c) rs -∗ reg_pointsto_at c r (DfracOwn 1) v ==∗
+      reg_interp_at (cpu_reg_name c) (register_set r v' rs) ∗
+      reg_pointsto_at c r (DfracOwn 1) v'.
+  Proof using .
+    rewrite /reg_pointsto_at /reg_interp_at.
+    iIntros "Hi Hr". iDestruct "Hi" as (m) "[Hm %Hag]".
+    iMod (ghost_map_update (existT r v') with "Hm Hr") as "[Hm $]".
+    iModIntro. iExists (<[r := existT r v']> m). iFrame "Hm".
+    iPureIntro. intros k dv Hk.
+    destruct (decide (k = r)) as [->|Hne].
+    - rewrite lookup_insert_eq in Hk. injection Hk as <-.
+      by rewrite register_lookup_set.
+    - rewrite lookup_insert_ne in Hk; [|done].
+      rewrite (Hag k dv Hk).
+      by rewrite (irrelevant_register_set k r rs v' (register_beq_false k r Hne)).
+  Qed.
+
+  (* focus an ARBITRARY hart [c]'s register bridge out of the global one
+     (the ambient [gregs_interp_acc] fixed [c := cpu_id]). *)
+  Lemma gregs_interp_acc_at (c : CPU) (gr : CPU -> regstate) :
+    gregs_interp gr ⊢ reg_interp_at (cpu_reg_name c) (gr c) ∗
+      (∀ rs', reg_interp_at (cpu_reg_name c) rs' -∗ gregs_interp (<[c := rs']> gr)).
+  Proof using .
+    rewrite /gregs_interp.
+    iIntros "H".
+    iDestruct (big_sepS_delete _ _ c with "H") as "[Hcur Hrest]";
+      [ apply elem_of_fin_to_set |].
+    iFrame "Hcur".
+    iIntros (rs') "Hrs'".
+    iApply (big_sepS_delete _ _ c); [ apply elem_of_fin_to_set |].
+    rewrite /insert /greg_insert decide_True //.
+    iFrame "Hrs'".
+    iApply (big_sepS_mono with "Hrest").
+    intros cpu Hcpu. apply elem_of_difference in Hcpu as [_ Hne].
+    rewrite decide_False; [ done | ].
+    intros ->. apply Hne, elem_of_singleton. reflexivity.
+  Qed.
+End RegAt.
+
+(* ---------------------------------------------------------------------- *)
+(* 4. Bridge lemmas.                                                       *)
+(* ---------------------------------------------------------------------- *)
+
+Section Bridge.
+  Context `{!riscvGS Σ}.
+  Context `{GEN : GenId} `{CID : CpuId}.
+  (* the ambient TIER (NOT [GEN] -- that is the kexec era index).  Every
+     [↦ₘ] lemma below is thereby generic in the tier, at its old spelling. *)
+  Context `{KTR : !CurKtier}.
+
+  (* reading a register cell agrees with the model's [register_lookup]. *)
+  Lemma reg_valid rs r v :
+    reg_interp rs -∗ r ↦ᵣ v -∗ ⌜register_lookup r rs = v⌝.
+  Proof using .
+    rewrite /reg_pointsto /reg_interp /reg_interp_at.
+    iIntros "Hi Hr". iDestruct "Hi" as (m) "[Hm %Hag]".
+    iDestruct (ghost_map_lookup with "Hm Hr") as %Hlk.
+    iPureIntro. symmetry. by apply reg_existT_inj, (Hag r _ Hlk).
+  Qed.
+
+  (* writing a register cell tracks the model's [register_set]. *)
+  Lemma reg_update rs r v v' :
+    reg_interp rs -∗ r ↦ᵣ v ==∗
+      reg_interp (register_set r v' rs) ∗ r ↦ᵣ v'.
+  Proof using .
+    rewrite /reg_pointsto /reg_interp /reg_interp_at.
+    iIntros "Hi Hr". iDestruct "Hi" as (m) "[Hm %Hag]".
+    iMod (ghost_map_update (existT r v') with "Hm Hr") as "[Hm $]".
+    iModIntro. iExists (<[r := existT r v']> m). iFrame "Hm".
+    iPureIntro. intros k dv Hk.
+    destruct (decide (k = r)) as [->|Hne].
+    - rewrite lookup_insert_eq in Hk. injection Hk as <-.
+      by rewrite register_lookup_set.
+    - rewrite lookup_insert_ne in Hk; [|done].
+      rewrite (Hag k dv Hk).
+      by rewrite (irrelevant_register_set k r rs v' (register_beq_false k r Hne)).
+  Qed.
+
+  (* A WRITE THAT CHANGES NOTHING needs no cell to update: the interpretation
+     absorbs it, because [register_set r (its own value) rs] has the same
+     lookups as [rs] and the agreement map is untouched.  This is what lets a
+     stretch write a PERSISTENTLY PINNED register with the value it already
+     holds -- MRET's elp reset and the trap handler's [reset_elp] both do
+     exactly that, and no full-ownership cell for elp exists to update. *)
+  Lemma reg_interp_set_same (rs : regstate) (r : register)
+      (v : type_of_register r) :
+    register_lookup r rs = v ->
+    reg_interp rs -∗ (reg_interp (register_set r v rs) : iProp Σ).
+  Proof using .
+    iIntros (Hlk) "Hi". iDestruct "Hi" as (mp) "[Hm %Hag]".
+    iExists mp. iFrame "Hm". iPureIntro.
+    intros k dv Hk.
+    destruct (decide (k = r)) as [->|Hne].
+    - rewrite (Hag r dv Hk) register_lookup_set Hlk. reflexivity.
+    - rewrite (Hag k dv Hk)
+        (irrelevant_register_set k r rs v (register_beq_false k r Hne)).
+      reflexivity.
+  Qed.
+
+  (* reading a register cell at ANY fraction -- in particular a persistent
+     [r ↦ᵣ□ v].  ([reg_valid] is the [DfracOwn 1] special case.) *)
+  Lemma reg_valid_dq rs r dq v :
+    reg_interp rs -∗ reg_pointsto r dq v -∗ ⌜register_lookup r rs = v⌝.
+  Proof using .
+    rewrite /reg_pointsto /reg_interp /reg_interp_at.
+    iIntros "Hi Hr". iDestruct "Hi" as (m) "[Hm %Hag]".
+    iDestruct (ghost_map_lookup with "Hm Hr") as %Hlk.
+    iPureIntro. symmetry. by apply reg_existT_inj, (Hag r _ Hlk).
+  Qed.
+
+  (* a discarded (read-only) register cell is persistent -- hence duplicable and
+     never consumed, so a WP that only READS it need neither take a fresh copy nor
+     hand one back. *)
+  Global Instance reg_pointsto_discarded_persistent r v : Persistent (r ↦ᵣ□ v).
+  Proof using . rewrite /reg_pointsto. apply _. Qed.
+
+  (* KEEP-UNREFERENCED: public bridge API (fraction-discard / duplication).  Kept
+     for downstream use even though currently unreferenced -- do not delete. *)
+  (* discard the fraction: turn an owned register cell into the persistent one. *)
+  Lemma reg_pointsto_persist r dq v : reg_pointsto r dq v ==∗ r ↦ᵣ□ v.
+  Proof using . rewrite /reg_pointsto. iIntros "Hr". by iMod (ghost_map_elem_persist with "Hr"). Qed.
+
+  (* ---- the VA-based ↦ₘ ACCESSOR (uniform-claims) ---- *)
+  (* THE primitive the ↦ₘ suite rests on: expose the mapping claim, the
+     canonicality/kdata facts, and OWNERSHIP of the mapped PHYSICAL byte
+     [pa_of ppn a], with a re-fold wand.  A tower does its gen_heap op at
+     [pa_of ppn a] (the pa its regime absorbs [a] to) and re-folds. *)
+  Lemma mem_pointsto_acc a dq b :
+    a ↦ₘ{dq} b -∗ ∃ ppn : mword 44,
+      kmap_at (svpn_of a) ppn KP_rw ∗
+      ⌜(uint a < 274877906944)%Z⌝ ∗
+      ⌜addr_is_ram (pa_of ppn a)⌝ ∗
+      ⌜ktier_pin cur_ktier ppn a⌝ ∗
+      pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn a) dq b ∗
+      (pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn a) dq b -∗ a ↦ₘ{dq} b).
+  Proof using .
+    rewrite /mem_pointsto. iIntros "H". iDestruct "H" as (ppn) "(#Hk & %Hc & %Hd & %Hi & Hp)".
+    iExists ppn. iFrame "Hk Hp".
+    iSplit; [iPureIntro; exact Hc|]. iSplit; [iPureIntro; exact Hd|].
+    iSplit; [iPureIntro; exact Hi|].
+    iIntros "Hp". iExists ppn. by iFrame "Hk Hp".
+  Qed.
+
+  (* the canonicality conjunct (positive Sv39 half): pins [a ↔ (vpn,off)]. *)
+  Lemma mem_canonical a dq b : a ↦ₘ{dq} b -∗ ⌜(uint a < 274877906944)%Z⌝.
+  Proof using .
+    rewrite /mem_pointsto. iIntros "H". iDestruct "H" as (ppn) "(_ & %Hc & _ & _ & _)".
+    iPureIntro; exact Hc.
+  Qed.
+
+  (* PA-SIDE region fact: the byte's PHYSICAL address is in RAM (the
+     claim ppn identifies the page).  Identity consumers recover the va-side
+     fact via [pa_of_id] (KptPt). *)
+
+  (* reading a memory byte agrees with the byte heap AT ITS PHYSICAL address. *)
+  Lemma mem_valid (mm : gmap Arch.pa (bv 8)) a dq b :
+    gen_heap_interp (hG:=riscv_memGS) mm -∗ a ↦ₘ{dq} b -∗ ∃ ppn : mword 44,
+      kmap_at (svpn_of a) ppn KP_rw ∗ ⌜addr_is_ram (pa_of ppn a)⌝ ∗
+      ⌜mm !! (pa_of ppn a) = Some b⌝.
+  Proof using .
+    rewrite /mem_pointsto. iIntros "Hm H". iDestruct "H" as (ppn) "(#Hk & _ & %Hd & _ & Hp)".
+    iDestruct (gen_heap_valid with "Hm Hp") as %Hlk.
+    iExists ppn. iFrame "Hk". iPureIntro. split; [exact Hd | exact Hlk].
+  Qed.
+
+  (* a discarded (read-only) memory byte is persistent — hence FREELY duplicable.
+     This is what makes [kernel_text] (built from [↦ₓ□] code bytes) duplicable. *)
+  Global Instance mem_pointsto_discarded_persistent (ktr : CurKtier) a b :
+    Persistent (mem_pointsto (KTR := ktr) a DfracDiscarded b).
+  Proof using . rewrite /mem_pointsto. apply _. Qed.
+
+  Global Instance mem_pointsto_discarded_persistent' (ktr : ktier) a b :
+    Persistent (mem_pointsto (KTR := ktr) a DfracDiscarded b).
+  Proof using . exact (mem_pointsto_discarded_persistent ktr a b). Qed.
+
+  (* discard the fraction: turn any memory byte into the persistent read-only one. *)
+  Lemma mem_pointsto_persist a dq b : a ↦ₘ{dq} b ==∗ a ↦ₘ□ b.
+  Proof using .
+    rewrite /mem_pointsto. iIntros "H". iDestruct "H" as (ppn) "(#Hk & %Hc & %Hd & %Hi & Hp)".
+    iMod (pointsto_persist with "Hp") as "Hp". iModIntro. iExists ppn.
+    iFrame "Hk Hp". iPureIntro. split; [exact Hc | split; [exact Hd | exact Hi]].
+  Qed.
+
+  (* KEEP-UNREFERENCED: public bridge API (kept though currently unreferenced).
+     a persistent (discarded) byte can be handed out repeatedly. *)
+  Lemma mem_pointsto_dup a b : a ↦ₘ□ b -∗ a ↦ₘ□ b ∗ a ↦ₘ□ b.
+  Proof using . iIntros "#H". by iSplitR. Qed.
+
+  (* ---- the CODE points-to bridge (rwx-kmap; mirrors the ↦ₘ suite) ---- *)
+
+  Lemma text_pointsto_acc a dq b :
+    a ↦ₓ{dq} b -∗ ∃ ppn : mword 44,
+      kmap_at (svpn_of a) ppn KP_rx ∗
+      ⌜(uint a < 274877906944)%Z⌝ ∗
+      ⌜addr_is_text (pa_of ppn a)⌝ ∗
+      ⌜ktier_pin cur_ktier ppn a⌝ ∗
+      pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn a) dq b ∗
+      pristine_elem (pa_of ppn a) ∗
+      (pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn a) dq b -∗ a ↦ₓ{dq} b).
+  Proof using .
+    rewrite /text_pointsto. iIntros "H".
+    iDestruct "H" as (ppn) "(#Hk & %Hc & %Hd & %Hi & Hp & #Hts)".
+    iExists ppn. iFrame "Hk Hp Hts".
+    iSplit; [iPureIntro; exact Hc|]. iSplit; [iPureIntro; exact Hd|].
+    iSplit; [iPureIntro; exact Hi|].
+    iIntros "Hp". iExists ppn. by iFrame "Hk Hp Hts".
+  Qed.
+
+  Lemma text_canonical a dq b : a ↦ₓ{dq} b -∗ ⌜(uint a < 274877906944)%Z⌝.
+  Proof using .
+    rewrite /text_pointsto. iIntros "H". iDestruct "H" as (ppn) "(_ & %Hc & _ & _ & _ & _)".
+    iPureIntro; exact Hc.
+  Qed.
+
+  (* PA-SIDE: the byte's PHYSICAL address is kernel TEXT ... (and the third
+     conjunct is the datum's TIER PIN -- at the KT0 default it is the
+     identity [pa_of ppn a = a] by conversion, which is what lets the fetch
+     engine hand it straight to [sr_adm_id]). *)
+  Lemma code_text a dq b :
+    a ↦ₓ{dq} b -∗ ∃ ppn : mword 44,
+      kmap_at (svpn_of a) ppn KP_rx ∗ ⌜addr_is_text (pa_of ppn a)⌝ ∗
+      ⌜ktier_pin cur_ktier ppn a⌝.
+  Proof using .
+    rewrite /text_pointsto. iIntros "H". iDestruct "H" as (ppn) "(#Hk & _ & %Hd & %Hi & _ & _)".
+    iExists ppn. iFrame "Hk". iPureIntro; split; [exact Hd | exact Hi].
+  Qed.
+
+  (* ... and hence real RAM (what the M-mode no-perm-check fetch path and
+     the PMP/MMIO geometry facts consume, at the physical address). *)
+  Lemma code_ram a dq b :
+    a ↦ₓ{dq} b -∗ ∃ ppn : mword 44,
+      kmap_at (svpn_of a) ppn KP_rx ∗ ⌜addr_is_ram (pa_of ppn a)⌝.
+  Proof using .
+    rewrite /text_pointsto. iIntros "H". iDestruct "H" as (ppn) "(#Hk & _ & %Hd & %Hi & _ & _)".
+    iExists ppn. iFrame "Hk". iPureIntro; exact (addr_is_text_ram _ Hd).
+  Qed.
+
+  Lemma text_valid (mm : gmap Arch.pa (bv 8)) a dq b :
+    gen_heap_interp (hG:=riscv_memGS) mm -∗ a ↦ₓ{dq} b -∗ ∃ ppn : mword 44,
+      kmap_at (svpn_of a) ppn KP_rx ∗ ⌜addr_is_text (pa_of ppn a)⌝ ∗
+      ⌜mm !! (pa_of ppn a) = Some b⌝.
+  Proof using .
+    rewrite /text_pointsto. iIntros "Hm H". iDestruct "H" as (ppn) "(#Hk & _ & %Hd & _ & Hp & _)".
+    iDestruct (gen_heap_valid with "Hm Hp") as %Hlk.
+    iExists ppn. iFrame "Hk". iPureIntro. split; [exact Hd | exact Hlk].
+  Qed.
+
+  (* DECLARED TWICE, at [CurKtier] and at [ktier] -- [simple apply] does not
+     unfold the definitional class, so one instance cannot serve both a goal
+     whose tier came from the ambient instance and one written at a literal
+     (F3's structural finding; the whole tier family is declared this way). *)
+  Global Instance text_pointsto_discarded_persistent (ktr : CurKtier) a b :
+    Persistent (text_pointsto (KTR := ktr) a DfracDiscarded b).
+  Proof using . rewrite /text_pointsto. apply _. Qed.
+
+  Global Instance text_pointsto_discarded_persistent' (ktr : ktier) a b :
+    Persistent (text_pointsto (KTR := ktr) a DfracDiscarded b).
+  Proof using . exact (text_pointsto_discarded_persistent ktr a b). Qed.
+
+  (* discard the fraction: turn any code byte into the persistent read-only
+     one (adequacy init persists the whole sub-etext image this way). *)
+  Lemma text_pointsto_persist a dq b : a ↦ₓ{dq} b ==∗ a ↦ₓ□ b.
+  Proof using .
+    rewrite /text_pointsto. iIntros "H".
+    iDestruct "H" as (ppn) "(#Hk & %Hc & %Hd & %Hi & Hp & #Hts)".
+    iMod (pointsto_persist with "Hp") as "Hp". iModIntro. iExists ppn.
+    iFrame "Hk Hp Hts". iPureIntro. split; [exact Hc | split; [exact Hd | exact Hi]].
+  Qed.
+
+  (* ---- the TIER algebra of the code family, mirroring [↦ₘ]'s ---- *)
+
+  (* WEAKENING along the tier order: the pin is the only tier-dependent
+     conjunct and it weakens ([ktier_pin_mono]); at KT1 there is nothing
+     left to prove. *)
+  Lemma text_ktier_mono (kt kt' : ktier) `{!KtierLe kt kt'} a dq b :
+    a ↦ₓ[kt]{dq} b ⊢ a ↦ₓ[kt']{dq} b.
+  Proof using .
+    rewrite /text_pointsto. iIntros "H".
+    iDestruct "H" as (ppn) "(#Hk & %Hc & %Hd & %Hp & Hpt & #Hts)".
+    iExists ppn. iFrame "Hk Hpt Hts". iPureIntro.
+    split; [exact Hc | split; [exact Hd | exact (ktier_pin_mono kt kt' ppn a Hp)]].
+  Qed.
+
+  (* two holders of the same code byte, at ANY two dfracs and ANY two tiers,
+     agree on its value: agreement runs through [kmap_at_agree] +
+     [pointsto_agree], neither of which looks at the pin.  This is what lets
+     a TRAMPOLINE-va (KT1) code byte be reconciled with the identity (KT0)
+     image byte it is minted from. *)
+  Lemma text_pointsto_agree {kt1 kt2 : ktier} a dq1 b1 dq2 b2 :
+    a ↦ₓ[kt1]{dq1} b1 -∗ a ↦ₓ[kt2]{dq2} b2 -∗ ⌜b1 = b2⌝.
+  Proof using .
+    rewrite /text_pointsto. iIntros "H1 H2".
+    iDestruct "H1" as (ppn1) "(Hk1 & _ & _ & _ & Hp1 & _)".
+    iDestruct "H2" as (ppn2) "(Hk2 & _ & _ & _ & Hp2 & _)".
+    iDestruct (kmap_at_agree with "Hk1 Hk2") as %[-> _].
+    by iDestruct (pointsto_agree with "Hp1 Hp2") as %->.
+  Qed.
+
+  (* ---- the PHYSICAL points-to bridge (the OLD pa-era [mem_*] bodies) ---- *)
+
+  Lemma phys_valid (mm : gmap Arch.pa (bv 8)) a dq b :
+    gen_heap_interp (hG:=riscv_memGS) mm -∗ a ↦ₚ{dq} b -∗ ⌜mm !! a = Some b⌝.
+  Proof using .
+    iIntros "Hm [Ha _]". by iDestruct (gen_heap_valid with "Hm Ha") as %?.
+  Qed.
+
+  Lemma phys_ram a dq b : a ↦ₚ{dq} b -∗ ⌜addr_is_ram a⌝.
+  Proof using . by iIntros "[_ %H]". Qed.
+
+  (* the PHYSICAL word cell (a PT slot post-flip) sits in RAM -- trivial from
+     [phys_ram] at byte 0.  Beside [phys_word_pointsto]'s suite; consumed by the
+     walk's "slot address is nonzero because it is RAM" argument. *)
+  Lemma phys_word_pointsto_ram a dq w : a ↦ₚ₈{dq} w ⊢ ⌜addr_is_ram a⌝.
+  Proof using .
+    iIntros "Hw". iDestruct (phys_word_pointsto_bytes with "Hw") as "Hbs".
+    iDestruct (big_sepL_lookup _ _ 0%nat 0%nat with "Hbs") as "Hb0".
+    { rewrite lookup_seq_lt; [reflexivity | lia]. }
+    iDestruct (phys_ram with "Hb0") as %Hram0.
+    (* [pa_add a 0 = a] (RiscvExtras' [pa_add_0]/[avi0] cannot be imported here
+       -- it depends on RiscvPtsto -- so its proof is inlined). *)
+    assert (Hpa0 : pa_add a 0 = a).
+    { unfold pa_add. change (Z.of_nat 0) with 0%Z.
+      unfold add_vec_int, add_vec, Operators_mwords.word_binop,
+             SailStdpp.Values.mword_of_int,
+             MachineWord.MachineWord.add, MachineWord.MachineWord.Z_to_word.
+      apply bv_eq. rewrite bv_add_unsigned Z_to_bv_unsigned.
+      rewrite bv_wrap_0 Z.add_0_r. apply bv_wrap_small. apply bv_unsigned_in_range. }
+    rewrite Hpa0 in Hram0. iPureIntro. exact Hram0.
+  Qed.
+
+  (* ...AND ITS LAST BYTE.  The cell owns all eight bytes, so this is the
+     same read at index 7 -- and it is what the PMA RAM class needs: the
+     platform's DRAM region ends at PHYSTOP, so an 8-byte access is inside it
+     only if its END is ([RiscvExtras.pma_access_ram]). *)
+  Lemma phys_word_pointsto_ram7 a dq w : a ↦ₚ₈{dq} w ⊢ ⌜addr_is_ram (pa_add a 7)⌝.
+  Proof using .
+    iIntros "Hw". iDestruct (phys_word_pointsto_bytes with "Hw") as "Hbs".
+    iDestruct (big_sepL_lookup _ _ 7%nat 7%nat with "Hbs") as "Hb7".
+    { rewrite lookup_seq_lt; [reflexivity | lia]. }
+    iDestruct (phys_ram with "Hb7") as %Hram7. iPureIntro. exact Hram7.
+  Qed.
+
+  (* ...AND ITS LAST BYTE.  The cell owns all eight bytes, so this is the
+     same read at index 7 -- and it is what the PMA RAM class needs: the
+     platform's DRAM region ends at PHYSTOP, so an 8-byte access is inside it
+     only if its END is ([RiscvExtras.pma_access_ram]). *)
+
+  Global Instance phys_pointsto_discarded_persistent a b : Persistent (a ↦ₚ□ b).
+  Proof using . rewrite /phys_pointsto. apply _. Qed.
+
+  Lemma phys_pointsto_persist a dq b : a ↦ₚ{dq} b ==∗ a ↦ₚ□ b.
+  Proof using .
+    iIntros "[Ha %Hr]". iMod (pointsto_persist with "Ha") as "Ha".
+    iModIntro. by iFrame.
+  Qed.
+
+
+  Lemma phys_update (mm : _) (a : Arch.pa) (b b' : bv 8) :
+    gen_heap_interp (hG:=riscv_memGS) mm -∗ a ↦ₚ{DfracOwn 1} b ==∗
+      gen_heap_interp (hG:=riscv_memGS) (<[a := b']> mm) ∗ a ↦ₚ{DfracOwn 1} b'.
+  Proof using .
+    iIntros "Hm [Ha %Hr]". iMod (gen_heap_update with "Hm Ha") as "[Hm Ha]".
+    iModIntro. iFrame "Hm Ha". iPureIntro. exact Hr.
+  Qed.
+
+  (* ---- the agreement CORE of the tier bridge (uniform-claims PHYSICAL
+     TIER): given a claim for [pa]'s vpn, the VA-based [↦ₘ]'s existential ppn
+     is PINNED to that claim's ppn -- so its byte sits at [pa_of ppn0 pa].
+     The [pa_of ppn0 pa = pa] step (identity, via [pa_of_id] with ppn0 =
+     [kpt_leaf_ppn]) is done by the KptPt/KMap assembly lemmas built on
+     this.  Only [kmap_at_agree] is needed here, so it stays in RiscvPtsto. *)
+  Lemma mem_pointsto_pin (pa : mword 64) dq b (ppn0 : mword 44) :
+    kmap_at (svpn_of pa) ppn0 KP_rw -∗ pa ↦ₘ{dq} b -∗
+      ⌜(uint pa < 274877906944)%Z⌝ ∗ ⌜addr_is_ram (pa_of ppn0 pa)⌝ ∗
+      ⌜ktier_pin cur_ktier ppn0 pa⌝ ∗
+      pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn0 pa) dq b ∗
+      (pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn0 pa) dq b -∗ pa ↦ₘ{dq} b).
+  Proof using .
+    iIntros "#Hk0 H".
+    iDestruct (mem_pointsto_acc with "H") as (ppn) "(#Hk & %Hc & %Hd & %Hi & Hp & Hcl)".
+    iDestruct (kmap_at_agree with "Hk0 Hk") as %[<- _].
+    iFrame "Hp Hcl". iPureIntro. split; [exact Hc | split; [exact Hd | exact Hi]].
+  Qed.
+
+  (* CLAIM-KEYED VA-tier introduction: a physical byte sitting at
+     [pa_of ppn va] -- the pa the claim [kmap_at (svpn_of va) ppn KP_rw] takes
+     [va] to -- IS the [↦ₘ] byte at [va].  This is the primary form of the
+     [↦ₚ -> ↦ₘ] direction; the claim carries the translation and the caller
+     supplies the RAM/canonicality facts about the physical target plus the
+     TIER PIN.  ONE lemma serves both tiers: at KT1 the pin premise is
+     trivially [I], at KT0 it is the identity [pa_of ppn va = va] (see the
+     [mem_pointsto] header: a non-identity KT0 [↦ₘ] would be unsound under
+     a Bare hart).  The tier is EXPLICIT and leading -- this is a
+     constructor, so it is the one place the caller chooses. *)
+  Lemma phys_to_mem_map (kt : ktier) (va : mword 64) (ppn : mword 44) dq b :
+    addr_is_ram (pa_of ppn va) -> (uint va < 274877906944)%Z ->
+    ktier_pin kt ppn va ->
+    kmap_at (svpn_of va) ppn KP_rw -∗ (pa_of ppn va) ↦ₚ{dq} b -∗ va ↦ₘ[kt]{dq} b.
+  Proof using .
+    intros Hram Hcan Hpin. iIntros "#Hk [Hp _]".
+    rewrite /mem_pointsto. iExists ppn. iFrame "Hk Hp".
+    iPureIntro. split; [exact Hcan | split; [exact Hram | exact Hpin]].
+  Qed.
+
+  (* Claim-keyed byte conversions ↦ₚ ⇄ ↦ₘ for an IDENTITY-mapped kdata va
+     ([pa_of ppn pa = pa]): the [kmap_at] supplies the mapping, the caller the
+     pure kdata/canonical facts.  These are what let a physical PT-slot cell
+     ([↦ₚ₈], owned by [ptree_own]) become a VA-tier [↦₈] for a software walk's
+     S-mode load, carrying NOTHING but the node's own claim
+     ([pt_node_claim] = this [kmap_at] + [node_kdata]).  [phys_to_mem_claim] is
+     now a RESTATEMENT of the general [phys_to_mem_map] above (the identity
+     premise [pa_of ppn pa = pa] specializes [pa_of ppn pa] to [pa]). *)
+  (* TIER-GENERIC: an identity-mapped va satisfies the pin at EVERY tier
+     ([ktier_pin_of_id]), so this keeps its exact old signature and serves
+     whatever tier the caller's ambient instance selects. *)
+  Lemma phys_to_mem_claim (pa : mword 64) (ppn : mword 44) dq b :
+    pa_of ppn pa = pa -> addr_is_ram pa -> (uint pa < 274877906944)%Z ->
+    kmap_at (svpn_of pa) ppn KP_rw -∗ pa ↦ₚ{dq} b -∗ pa ↦ₘ{dq} b.
+  Proof using .
+    intros Hid Hkd Hcan. iIntros "#Hk Hp".
+    iApply (phys_to_mem_map cur_ktier pa ppn dq b with "Hk [Hp]").
+    { rewrite Hid. exact Hkd. }
+    { exact Hcan. }
+    { exact (ktier_pin_of_id cur_ktier ppn pa Hid). }
+    { rewrite Hid. iExact "Hp". }
+  Qed.
+
+  Lemma mem_to_phys_claim (pa : mword 64) (ppn : mword 44) dq b :
+    pa_of ppn pa = pa ->
+    kmap_at (svpn_of pa) ppn KP_rw -∗ pa ↦ₘ{dq} b -∗ pa ↦ₚ{dq} b.
+  Proof using .
+    intros Hid. iIntros "#Hk H".
+    iDestruct (mem_pointsto_pin pa dq b ppn with "Hk H") as "(%Hc & %Hd & _ & Hp & _)".
+    rewrite Hid in Hd. iEval (rewrite Hid) in "Hp".
+    rewrite /phys_pointsto. iFrame "Hp". iPureIntro. exact Hd.
+  Qed.
+
+  Lemma text_pointsto_pin (pa : mword 64) dq b (ppn0 : mword 44) :
+    kmap_at (svpn_of pa) ppn0 KP_rx -∗ pa ↦ₓ{dq} b -∗
+      ⌜(uint pa < 274877906944)%Z⌝ ∗ ⌜addr_is_text (pa_of ppn0 pa)⌝ ∗
+      ⌜ktier_pin cur_ktier ppn0 pa⌝ ∗
+      pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn0 pa) dq b ∗
+      pristine_elem (pa_of ppn0 pa) ∗
+      (pointsto (L:=Arch.pa) (V:=bv 8) (pa_of ppn0 pa) dq b -∗ pa ↦ₓ{dq} b).
+  Proof using .
+    iIntros "#Hk0 H".
+    iDestruct (text_pointsto_acc with "H")
+      as (ppn) "(#Hk & %Hc & %Hd & %Hi & Hp & #Hts & Hcl)".
+    iDestruct (kmap_at_agree with "Hk0 Hk") as %[<- _].
+    iFrame "Hp Hts Hcl". iPureIntro. split; [exact Hc | split; [exact Hd | exact Hi]].
+  Qed.
+
+End Bridge.
+
+(* ---------------------------------------------------------------------- *)
+(* Persisting a MULTI-byte cell: [mem_pointsto_persist] lifted over the byte
+   windows of [↦₈] / [↦₄] / [↦ₛ].  Discarding the fraction turns a cell
+   read-only forever and hence duplicable -- how a freshly-initialised
+   immutable structure (a lock's name field, a string) becomes a persistent
+   resource that no longer has to be threaded through every WP.              *)
+(* ---------------------------------------------------------------------- *)
+Section pointsto_persist.
+  Context `{!riscvGS Σ}.
+  Context `{KTR : !CurKtier}.
+
+  Global Instance word_pointsto_discarded_persistent (ktr : CurKtier) a w :
+    Persistent (word_pointsto (KTR := ktr) a DfracDiscarded w).
+  Proof using . rewrite /word_pointsto. apply _. Qed.
+
+  Global Instance word_pointsto_discarded_persistent' (ktr : ktier) a w :
+    Persistent (word_pointsto (KTR := ktr) a DfracDiscarded w).
+  Proof using . exact (word_pointsto_discarded_persistent ktr a w). Qed.
+  Global Instance word4_pointsto_discarded_persistent (ktr : CurKtier) a w :
+    Persistent (word4_pointsto (KTR := ktr) a DfracDiscarded w).
+  Proof using . rewrite /word4_pointsto. apply _. Qed.
+
+  Global Instance word4_pointsto_discarded_persistent' (ktr : ktier) a w :
+    Persistent (word4_pointsto (KTR := ktr) a DfracDiscarded w).
+  Proof using . exact (word4_pointsto_discarded_persistent ktr a w). Qed.
+
+  Lemma word_pointsto_persist a dq w : a ↦₈{dq} w ==∗ a ↦₈□ w.
+  Proof using .
+    iIntros "[%Hal Hbs]".
+    iAssert (|==> [∗ list] j ∈ seq 0 8,
+               (pa_add a j) ↦ₘ□ nth_byte w j)%I with "[Hbs]" as ">Hbs".
+    { iApply big_sepL_bupd. iApply (big_sepL_mono with "Hbs").
+      iIntros (k j _) "H". by iApply mem_pointsto_persist. }
+    iModIntro. by iFrame.
+  Qed.
+
+  Lemma word4_pointsto_persist a dq w : a ↦₄{dq} w ==∗ a ↦₄□ w.
+  Proof using .
+    iIntros "[%Hal Hbs]".
+    iAssert (|==> [∗ list] j ∈ seq 0 4,
+               (pa_add a j) ↦ₘ□ nth_byte w j)%I with "[Hbs]" as ">Hbs".
+    { iApply big_sepL_bupd. iApply (big_sepL_mono with "Hbs").
+      iIntros (k j _) "H". by iApply mem_pointsto_persist. }
+    iModIntro. by iFrame.
+  Qed.
+
+
+  Global Instance phys_word_pointsto_discarded_persistent a w : Persistent (a ↦ₚ₈□ w).
+  Proof using . rewrite /phys_word_pointsto. apply _. Qed.
+
+End pointsto_persist.
+
+(* Seal [mem_pointsto] for typeclass (Frame) resolution: without this, [iFrame]
+   over a large memory region unfolds every [a ↦ₘ v] into its [pointsto ∗ ⌜..⌝]
+   conjunction and recursively re-searches the [Frame] instance per byte.  Making
+   it typeclass-opaque keeps each [a ↦ₘ v] an atomic frameable unit (~37% off the
+   big region [iFrame]s).  Placed AFTER [End Bridge] so the bridge lemmas above,
+   which destruct the raw conjunction, still typecheck.  [Typeclasses Opaque]
+   (not [Opaque]) leaves [rewrite /mem_pointsto] / [unfold] working. *)
+Typeclasses Opaque mem_pointsto.
+Typeclasses Opaque text_pointsto.
+Typeclasses Opaque phys_pointsto.
+
+(* ... and re-supply the TIMELESS instances the seals hide.  A page-table
+   node's ownership must be timeless for the SHARED kernel table to live in
+   an Iris [inv] (KptShare.v): opening the invariant yields the body under a
+   [▷], and the Svadu A/D write-back needs the slot NOW. *)
+Global Instance text_pointsto_timeless `{!riscvGS Σ} (KTR : CurKtier) a dq b :
+  Timeless (text_pointsto (KTR := KTR) a dq b).
+Proof. rewrite /text_pointsto. apply _. Qed.
+(* ...and its [ktier]-typed twin (see the note on [mem_pointsto_timeless']). *)
+Global Instance text_pointsto_timeless' `{!riscvGS Σ} (ktr : ktier) a dq b :
+  Timeless (text_pointsto (KTR := ktr) a dq b).
+Proof. exact (text_pointsto_timeless ktr a dq b). Qed.
+Global Instance phys_pointsto_timeless `{!riscvGS Σ} a dq b :
+  Timeless (phys_pointsto a dq b).
+Proof. rewrite /phys_pointsto. apply _. Qed.
+Global Instance phys_word_pointsto_timeless `{!riscvGS Σ} a dq w :
+  Timeless (phys_word_pointsto a dq w).
+Proof. rewrite /phys_word_pointsto. apply _. Qed.
+
+(* The instances a consumer would otherwise re-derive BY UNFOLDING, declared
+   here so the seal below does not cost them.  Without these, three files fail
+   with "Cannot infer this placeholder of type Timeless (...)" -- the seal
+   stops [apply _] from reaching the [mem_pointsto]s underneath. *)
+Global Instance word_pointsto_timeless `{!riscvGS Σ} (ktr : CurKtier)
+    (a : Arch.pa) (dq : dfrac) (w : bv 64) :
+  Timeless (word_pointsto (KTR := ktr) a dq w).
+Proof. rewrite /word_pointsto. apply _. Qed.
+
+(* the [ktier]-spelled twin, for the same reason [word_pointsto_discarded_
+   persistent'] has one: a goal that names the tier directly does not go
+   through [CurKtier]. *)
+Global Instance word_pointsto_timeless' `{!riscvGS Σ} (ktr : ktier)
+    (a : Arch.pa) (dq : dfrac) (w : bv 64) :
+  Timeless (word_pointsto (KTR := ktr) a dq w).
+Proof. exact (word_pointsto_timeless ktr a dq w). Qed.
+
+(* ======================================================================= *)
+(* THE WORD POINTS-TO IS SEALED FOR EVERY FILE ABOVE THIS ONE.             *)
+(*                                                                         *)
+(* [word_pointsto] is [[∗ list] j ∈ seq 0 8, mem_pointsto ...] under a      *)
+(* transparent name, and it is the most widely named such constant in the   *)
+(* tree (110 files) -- so [iFrame]'s [Frame] search unfolds it and tries    *)
+(* every candidate hypothesis against all eight bytes.  Sealing it alone    *)
+(* took [SpecKexecB2] from 11.6 s to 7.8 s.                                 *)
+(*                                                                         *)
+(* AT THE END OF THE FILE, not beside the definition: this file's own       *)
+(* lemmas take the word APART ([iAndDestructChoice: cannot destruct] if the *)
+(* seal is in scope for them), and they are exactly the lemmas every        *)
+(* consumer should be using instead of unfolding it by hand.  [rewrite      *)
+(* /word_pointsto] and [unfold] are unaffected by the seal, so a site that  *)
+(* genuinely needs the bytes still has them.                                *)
+(* ======================================================================= *)
+Global Typeclasses Opaque word_pointsto.
+
+(* A BIG-OP UNDER A TRANSPARENT NAME IS AN [iFrame] BOMB (optimization.md):
+   the ↦₄ sibling of [word_pointsto], same shape ([∗ list] over 4).
+   AT THE END OF THE FILE, so this file's own lemmas -- the accessors every
+   consumer should be using -- can still take it apart. *)
+Global Typeclasses Opaque word4_pointsto.

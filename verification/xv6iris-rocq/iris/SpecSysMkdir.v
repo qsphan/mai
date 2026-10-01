@@ -1,0 +1,593 @@
+(* SpecSysMkdir.v -- the public interface of sys_mkdir(), stated
+   independently of its proof.  Requires only the definitional layer --
+   never a whole-function proof file -- so every function proof can be
+   checked in parallel.
+
+     uint64 sys_mkdir(void) {
+       char path[MAXPATH];
+       struct inode *ip;
+
+       begin_op();
+       if (argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0) {
+         end_op();
+         return -1;
+       }
+       iunlockput(ip);
+       end_op();
+       return 0;
+     }
+
+   @ KernelSyms.sys_mkdir, 72 bytes / 26 instructions (CodeSysMkdir.v).
+   An EIGHTEEN-slot frame: ra@136 (slot 1), s0@128 (slot 2, the frame
+   pointer) and the low SIXTEEN slots -- slot 18 down to slot 3 -- being the
+   [char path[128]] local.  [addi aN,s0,-144] is that buffer's address, and
+   it is also the pushed sp.  **No callee-saved register beyond ra/s0 is
+   touched at all**: [ip] never leaves a0 (create returns it there and
+   iunlockput's argument is already in place), so there is no [s1] to save,
+   and the epilogue is three instructions.
+
+   ==== WHAT THIS CONTRACT IS ABOUT =====================================
+
+   sys_mkdir is the FIRST of the two syscall-level consumers of the sealed
+   [SpecCreate.wp_create_sconf] (sys_mknod is the other, and is this file's
+   twin).  It contributes nothing of its own: it opens a log transaction,
+   fetches one string, hands it to create with [ty := T_DIR] and
+   [major = minor = 0], and drops the LOCKED inode create hands back.  So
+   the whole contract is create's own, with the process block and the two
+   ledgers threaded around it and everything inode-shaped consumed inside.
+
+   THE C SHORT-CIRCUIT COMPILES TO ONE SHARED FAILURE ARM.  Both
+   disjuncts -- the [bltz] at +0x1a on argstr's return and the [c.beqz] at
+   +0x2c on create's -- branch to the SAME block at +0x40 (end_op, [a0 =
+   -1], jump to the epilogue), with no intermediate rejoin and no register
+   to restore.  There are therefore exactly TWO arms, not the four
+   sys_chdir has.
+
+   ==== THE LOG LEDGER, AND THE FLOOR IT RESTS ON =======================
+
+   begin_op mints [LogInv.log_op g MAXOPBLOCKS] = ten units, create takes
+   the whole reservation in SET form ([LogInv.log_opS], because its own
+   distinct-block set is at most six against a counted sum far past ten --
+   SpecCreate.v's header), and end_op retires whatever is left.  So nothing
+   log-shaped crosses this interface.
+
+   What does NOT close on its own is the [iunlockput(ip)] at +0x2e, which
+   runs BEFORE end_op and wants [SpecIput.iput_units] = three in hand.
+   Nothing between create's return and that call mints a unit, so the call
+   is payable only out of create's own residue -- and create's post offers
+   a CEILING ([u' <= u]) that says nothing about it.  The clause that makes
+   this function provable is the [ok = true] floor
+   [(iput_units <= u')%nat], added to [SpecCreate]'s post for exactly these
+   two callers.  It is guarded on [ok] and the guard is forced (create's
+   [fail:] tail cannot pay it -- see SpecCreate.v's header); [ok = true] is
+   precisely when this function runs its [iunlockput], so the guard costs
+   nothing here.  On the mkdir arm the floor is ATTAINED, with zero slack
+   ([CreateBudget.cr_budget_mkdir]'s [u6 = 3]).
+
+   ==== THE REFERENCE LEDGER ============================================
+
+   create is entered with [iref_slots ns] for [create_slots <= ns] and, on
+   success, keeps exactly ONE out -- the reference to the inode it returns
+   -- which its post now states as the equation [S ns' = ns].
+   [iunlockput(ip)] spends that reference and hands the slot back, so the
+   success arm ends at [ns' + 1 = ns]; the failure arms never made a
+   reference and create's post gives [ns' = ns] outright; and the argstr
+   arm never reached create.  All three therefore end at [ns], which is
+   what this contract says.
+
+   IT USED TO SAY THE INTERVAL [ns - create_slots <= ns2 <= ns], on the
+   grounds that create's own figure was an interval and this was the
+   tightest thing statable.  That was true of the STATEMENT and not of the
+   function: all nine of create's continuation sites already computed the
+   exact figure and then weakened it.  Saying it outright is what lets a
+   caller re-establish [create_slots <= ns] and go round again, and what
+   lets [SpecSyscall]'s dispatch hand [iref_slots IREFSPARE] back
+   unchanged -- which it must, because [UsertrapRes.ut_own] carries the
+   allowance at that literal.
+
+   NO COLOUR-LEDGER RESOURCE APPEARS HERE (design/fs-icache.md 20.18
+   ruling 1).  Every directory record this syscall writes is written
+   INSIDE create, whose contract owns that accounting.
+
+   ==== WHAT ITS CALLER MUST HOLD ======================================
+
+   Strictly more than sys_chdir's, and all of it is create's rather than
+   this function's: the printk credential pair ([printk_env] and the pure
+   superblock cells rather than two ([sb_ninodes] and [sb_size] beside
+   [sb_inodestart] and [sb_bmapstart]), and mkfs's inode geometry
+   ([1 < ninodes <= 16 * nib < 2^31] plus the [ushort] tie
+   [16 * nib <= 2^16] create's [lw a2,4(s3)] consumes).
+
+   [eb = true] is create's premise, inherited verbatim.  The
+   [trap_csrs_ext] / [cpu_claim_ext] complement is threaded anyway,
+   uniformly with begin_op / iunlockput / end_op, and is [emp] there --
+   create itself does not take the pair, so the walk drops it and re-mints
+   per callee (ProofNamex's device).
+
+   THE CROSSING IS THE LITERAL [true]: this function sleeps in all four of
+   its callees, so it may return on a hart other than the one it was called
+   on.
+
+   DETERMINISM: none is claimed, and none is available.  Which of the two
+   arms runs is a function of the FILE SYSTEM and of the user string, and
+   no caller of this contract knows either.  The postcondition is therefore
+   the honest disjunction on the returned a0. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText KernelDataInv.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import FdSlots.
+Require Import ProcGeom.
+Require Export SwtchCtx.
+Require Import CpuOwn.
+Require Import SchedCtx.
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import LogInv.
+Require Import FsCrash.
+Require Import BitmapInv.
+Require Import InodeInv.
+Require Import InodeRegion.
+Require Import IrefSlots.
+Require Import IcacheRefDefs.
+Require Import IcacheInv.
+Require Import IcacheEscrow.
+Require Import KvmSpec.
+Require Import FileInvDefs.
+Require Import UserPtTree.
+Require Import ProcPtOwn.
+Require Import ProcInv.
+Require Import SpecPrintk.      (* [printk_env] *)
+Require Import SpecDirlink.     (* [ic_sleeplocks], [ireg_blocks_ok] *)
+Require Import SpecDirlookup.   (* [T_DIR]: the type mkdir's create is at *)
+Require Import SpecCreate.      (* [create_slots], [create_units], [K_create],
+                                   the create bundle [cre_commits] with the
+                                   two receipt arms [cre_ok_arms] /
+                                   [cre_fail_arms], and their units *)
+Require Import FsBlocks.        (* [fs_names] *)
+Require Import AppInv.          (* [appE], [app_sup] *)
+Require Import FsAbsEra.        (* [ep_start_triv] *)
+Require Import FsAbsMknodFire.  (* [npar_walk_pre_era], the walk premise *)
+Require Import SysMknodDefs.    (* [npar_elems], [npar_cur]: the path-fixed
+                                   bundle's cursor (lane TL-3C)            *)
+Require Import ArgPath.         (* [arg_path_of] / [arg_path_of_uniq]      *)
+Require Import FsTree.          (* [fname]: the parent-leg receipt's name *)
+Require Import FsBytesGamma.    (* [fs_gamma_L]: the live Γ *)
+Require Import PieceFam.        (* [pfam]: a one-shot piece's receipt beside its refund *)
+Require Import FsAbsDefs.       (* [aview]: the receipts' view argument *)
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Import Defs.
+Require Import TsoCtx.
+
+Local Open Scope Z_scope.
+
+(* sys_mkdir's own frame is 144 bytes -- EIGHTEEN slots ([c.addi16sp sp,-144]
+   at +0x00), of which sixteen are the [path] buffer.  Its deepest callee is
+   create (128); iunlockput wants 82, end_op 80, argstr 60, begin_op 26. *)
+Notation K_sys_mkdir := (146%nat) (only parsing).
+Section SpecSysMkdir.
+  Context `{!riscvGS Σ, FSC : fscfg}.
+
+  (* sys_mkdir's result: 0, or -1.  Nothing else reaches the caller -- the
+     inode create returned was iunlockput inside, and [proc_priv] comes back
+     at the SAME record (only the page table may have grown, which is
+     argstr's report and is relayed separately). *)
+  Definition sys_mkdir_ret (r : mword 64) : Prop :=
+    r = (zero_reg : mword 64) \/ r = (mword_of_int (-1) : mword 64).
+
+End SpecSysMkdir.
+
+(* THE LEGS' RECEIPTS AT sys_mkdir'S TWO ANSWERS (round E2, lane E2-C;
+   owner ruling Q-c: [wp_sys_mkdir_sconf] is strengthened IN PLACE, since
+   the dispatcher is its only consumer).  A ZERO return means create MADE
+   the directory: its ARM fired, its two interior [dirlink]s fired the DOTS
+   commit, and its PARENT leg fired.  A -1 means either that NOTHING fired
+   -- argstr failed, or create's walk/guards refused before the claim -- or
+   the do-then-undo PAIR (ruling Q-h): the row appeared and disappeared.
+   mkdir's create is at [T_DIR] with both device halfwords zero, which is
+   what pins the type index of the two arms.
+
+   THE FAMILIES ARE THE CALLER'S, as they are for sys_mknod: the walk's
+   cursor pair and the exists observation come in beside the four legs and
+   the arms report them, so the AU form IS the contract and nothing here is
+   pinned at [True].  The FETCHED STRING stays existential in the arms --
+   argstr picks it, not the caller. *)
+
+(* ===================================================================== *)
+(*  THE PATH-FIXED BUNDLE (lane TL-3C, design/user-tree.md section 7.6's   *)
+(*  item (M)) -- [SpecSysMknod.mknod_au_pre] / [mknod_au_at]'s TWIN.       *)
+(*                                                                        *)
+(*  TL-3K threaded the walk's terminal cursor into the parent leg's commit *)
+(*  ([FsAbsCreateFire.acre_commit_at_gen]'s [Pd]) and found that mkdir     *)
+(*  COULD NOT CARRY ONE: its bundle took the [forall pl] one-shot          *)
+(*  ([npar_walk_pre_era]), so there was no ONE path for a cursor to name   *)
+(*  and the leg was handed in at [Pd := fun _ => True].  That is what a    *)
+(*  constraining application cannot supply -- at a [d] inside a stranger's *)
+(*  subtree it has no step at all ([TreeMove.v] section 4's WALL A).  So   *)
+(*  mkdir now takes the bundle AT THE PATH ARGUMENT 0 NAMES, exactly as    *)
+(*  sys_mknod and open(O_CREATE) do:                                       *)
+(*    [mkdir_au_pre] -- at ONE fetched path [pl]: the parent-prefix walk   *)
+(*      one-shot there ([FsAbsEra.ep_start]) and the four legs at the      *)
+(*      cursor [P (length (npar_elems pl))];                               *)
+(*    [mkdir_au_at]  -- the SYSCALL tier: the same, under the reading of   *)
+(*      trapframe argument 0 ([ArgPath.arg_path_of]).  THE COMMITS STAY    *)
+(*      OUTSIDE THE WALK'S WAND, because argstr can fail and then no [pl]  *)
+(*      satisfies the reading at all -- the failure fold has to hand the   *)
+(*      bundle back on the nose.  The cursor rides under the SAME guard    *)
+(*      ([SysMknodDefs.npar_cur]), still a BARE resource.                  *)
+(*  mkdir's create is at [T_DIR] with both device halfwords zero, which is *)
+(*  what pins the type index of the bundle and of the two arms below.      *)
+(* ===================================================================== *)
+
+Definition mkdir_au_pre
+    `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId}
+    (Γ : fs_view_names Σ) (γfs : fs_names) (cw : Z) (pl : list (bv 8))
+    (P Pmiss : nat -> Z -> iProp Σ)
+    (Farm : pfam Σ (aview -> Z -> iProp Σ))
+    (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+    (Fun : pfam Σ (aview -> Z -> iProp Σ))
+    (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+    (Fex : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ)) : iProp Σ :=
+  (ep_start γfs cw P Pmiss pl
+   ∗ pf_at (dlookup_commit_at Γ appE) Fex
+   ∗ cre_commits Γ
+       (bv_unsigned (SpecDirlookup.T_DIR : mword 16))
+       (bv_unsigned (mword_of_int 0 : mword 16))
+       (bv_unsigned (mword_of_int 0 : mword 16))
+       (fun _ : fname => True%type) (fun _ : absnode => True%type)
+       (P (length (npar_elems pl)))
+       Farm Fdots Fun Fok)%I.
+
+Definition mkdir_au_at
+    `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId}
+    (Γ : fs_view_names Σ) (γfs : fs_names) (cw : Z)
+    (M : gmap Z (bv 8)) (pv : mword 64)
+    (P Pmiss : nat -> Z -> iProp Σ)
+    (Farm : pfam Σ (aview -> Z -> iProp Σ))
+    (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+    (Fun : pfam Σ (aview -> Z -> iProp Σ))
+    (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+    (Fex : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ)) : iProp Σ :=
+  ((∀ pl : list (bv 8), ⌜arg_path_of M pv pl⌝ -∗ ep_start γfs cw P Pmiss pl)
+   ∗ pf_at (dlookup_commit_at Γ appE) Fex
+   ∗ cre_commits Γ
+       (bv_unsigned (SpecDirlookup.T_DIR : mword 16))
+       (bv_unsigned (mword_of_int 0 : mword 16))
+       (bv_unsigned (mword_of_int 0 : mword 16))
+       (fun _ : fname => True%type) (fun _ : absnode => True%type)
+       (npar_cur M pv P)
+       Farm Fdots Fun Fok)%I.
+
+(* THE CURSOR'S TWO READINGS, as one move ([SpecSysMknod.mknod_acre_inst]'s
+   twin at the whole four-leg bundle): once argstr has answered, the
+   syscall-tier cursor IS the path-fixed one, in BOTH directions
+   ([ArgPath.arg_path_of_uniq]). *)
+Lemma mkdir_cre_inst
+    `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId}
+    (Γ : fs_view_names Σ)
+    (M : gmap Z (bv 8)) (pv : mword 64) (pl : list (bv 8))
+    (P : nat -> Z -> iProp Σ)
+    (Farm : pfam Σ (aview -> Z -> iProp Σ))
+    (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+    (Fun : pfam Σ (aview -> Z -> iProp Σ))
+    (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ)) :
+  arg_path_of M pv pl ->
+  cre_commits Γ
+    (bv_unsigned (SpecDirlookup.T_DIR : mword 16))
+    (bv_unsigned (mword_of_int 0 : mword 16))
+    (bv_unsigned (mword_of_int 0 : mword 16))
+    (fun _ : fname => True%type) (fun _ : absnode => True%type)
+    (npar_cur M pv P) Farm Fdots Fun Fok -∗
+  cre_commits Γ
+    (bv_unsigned (SpecDirlookup.T_DIR : mword 16))
+    (bv_unsigned (mword_of_int 0 : mword 16))
+    (bv_unsigned (mword_of_int 0 : mword 16))
+    (fun _ : fname => True%type) (fun _ : absnode => True%type)
+    (P (length (npar_elems pl))) Farm Fdots Fun Fok.
+Proof.
+  intros Hpl. iIntros "Hcre".
+  iApply (cre_commits_mono Γ _ _ _ _ _ (npar_cur M pv P)
+            (P (length (npar_elems pl))) Farm Fdots Fun Fok with "[] [] Hcre").
+  - iApply (npar_cur_out M pv pl P Hpl).
+  - iApply (npar_cur_in M pv pl P Hpl).
+Qed.
+
+Lemma mkdir_au_at_inst
+    `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId}
+    (Γ : fs_view_names Σ) (γfs : fs_names) (cw : Z)
+    (M : gmap Z (bv 8)) (pv : mword 64) (pl : list (bv 8))
+    (P Pmiss : nat -> Z -> iProp Σ)
+    (Farm : pfam Σ (aview -> Z -> iProp Σ))
+    (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+    (Fun : pfam Σ (aview -> Z -> iProp Σ))
+    (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+    (Fex : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ)) :
+  arg_path_of M pv pl ->
+  mkdir_au_at Γ γfs cw M pv P Pmiss Farm Fdots Fun Fok Fex -∗
+  mkdir_au_pre Γ γfs cw pl P Pmiss Farm Fdots Fun Fok Fex.
+Proof.
+  intros Hpl. iIntros "(Hw & Hex & Hcre)". rewrite /mkdir_au_pre.
+  iSplitL "Hw".
+  { iApply ("Hw" $! pl with "[%]"). exact Hpl. }
+  iFrame "Hex".
+  iApply (mkdir_cre_inst Γ M pv pl P Farm Fdots Fun Fok Hpl with "Hcre").
+Qed.
+
+(* THE GENERIC SUPPLIER'S ONE LINE ([SpecSysMknod.mknod_au_at_of_all]'s
+   twin): a family that tracks nothing owes the walk at EVERY string, and
+   that form instantiates to the one-path bundle. *)
+Lemma mkdir_au_at_of_all
+    `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId}
+    (Γ : fs_view_names Σ) (γfs : fs_names) (cw : Z)
+    (M : gmap Z (bv 8)) (pv : mword 64)
+    (P Pmiss : nat -> Z -> iProp Σ)
+    (Farm : pfam Σ (aview -> Z -> iProp Σ))
+    (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+    (Fun : pfam Σ (aview -> Z -> iProp Σ))
+    (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+    (Fex : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ)) :
+  npar_walk_pre_era γfs cw P Pmiss -∗
+  pf_at (dlookup_commit_at Γ appE) Fex -∗
+  cre_commits Γ
+    (bv_unsigned (SpecDirlookup.T_DIR : mword 16))
+    (bv_unsigned (mword_of_int 0 : mword 16))
+    (bv_unsigned (mword_of_int 0 : mword 16))
+    (fun _ : fname => True%type) (fun _ : absnode => True%type)
+    (npar_cur M pv P) Farm Fdots Fun Fok -∗
+  mkdir_au_at Γ γfs cw M pv P Pmiss Farm Fdots Fun Fok Fex.
+Proof.
+  iIntros "Hw Hex Hcre". rewrite /mkdir_au_at. iFrame "Hex Hcre".
+  iIntros (pl) "_". iApply (np_start_of_mknod γfs cw P Pmiss pl with "Hw").
+Qed.
+
+(* SATISFIABILITY, and what the dispatcher and the friendly packaging hand
+   down: the generic application asks nothing of mkdir's walk or its legs,
+   so every hop says yes, every cursor is [True] and every commit is its own
+   unit, paid off the SUPPLY.  It sits here rather than in
+   [FsAbsInvFire]'s [fsabs_*] family because both consumers reach this file
+   and only one of them reaches that one. *)
+Lemma mkdir_au_at_unit
+    `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId}
+    (γfs : fs_names) (cw : Z) (M : gmap Z (bv 8)) (pv : mword 64) :
+  app_sup -∗
+  mkdir_au_at (fs_gamma_L γfs) γfs cw M pv (fun _ _ => True%I) (fun _ _ => True%I)
+    (pfam_triv (fun _ _ => True%I)) (pfam_triv (fun _ _ _ _ => True%I)) (pfam_triv (fun _ _ => True%I)) (pfam_triv (fun _ _ _ _ => True%I))
+    (pfam_triv (fun _ _ _ _ => True%I)).
+Proof.
+  iIntros "#Hsup".
+  iApply (mkdir_au_at_of_all (fs_gamma_L γfs) γfs cw M pv with "[] [] [Hsup]").
+  { rewrite /npar_walk_pre_era. iIntros (pl r) "_". iModIntro.
+    iSplit; [done |]. iApply ax_hops_triv. }
+  { iApply cre_dlookup_unit. }
+  iApply (cre_commits_unit γfs with "Hsup").
+Qed.
+
+Definition mkdir_arms
+    `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId}
+    (Γ : fs_view_names Σ) (γfs : fs_names) (cw : Z)
+    (P Pmiss : nat -> Z -> iProp Σ)
+    (Farm : pfam Σ (aview -> Z -> iProp Σ))
+    (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+    (Fun : pfam Σ (aview -> Z -> iProp Σ))
+    (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+    (Fex : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+    (M : gmap Z (bv 8)) (pv : mword 64)
+    (r : mword 64) : iProp Σ :=
+  ((⌜r = (zero_reg : mword 64)⌝ ∗
+      ∃ (pl : list (bv 8)) (i : Z),
+        cre_ok_arms Γ
+          (bv_unsigned (SpecDirlookup.T_DIR : mword 16))
+          (bv_unsigned (mword_of_int 0 : mword 16))
+          (bv_unsigned (mword_of_int 0 : mword 16))
+          (fun _ : fname => True%type) (fun _ : absnode => True%type)
+          P Farm Fdots Fun Fok Fex pl true i)
+   ∨ (⌜r = (mword_of_int (-1) : mword 64)⌝ ∗
+        (* argstr failed and create never ran, so the WHOLE bundle comes
+           back; or create refused and its own failure fold is the payout *)
+        (mkdir_au_at Γ γfs cw M pv P Pmiss Farm Fdots Fun Fok Fex
+         ∨ ∃ pl : list (bv 8),
+             cre_fail_arms Γ γfs
+               (bv_unsigned (SpecDirlookup.T_DIR : mword 16))
+               (bv_unsigned (mword_of_int 0 : mword 16))
+               (bv_unsigned (mword_of_int 0 : mword 16))
+               (fun _ : fname => True%type) (fun _ : absnode => True%type)
+               P Pmiss Farm Fdots Fun Fok Fex pl)))%I.
+
+Global Typeclasses Opaque mkdir_au_pre mkdir_au_at mkdir_arms.
+
+Definition wp_sys_mkdir_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+      !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γf : gname)             (* ftable, kalloc, printk *)
+    (gs : list gname) (j : nat) (gl : gname)            (* the running process *)
+    (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+    (ns : nat)                                          (* the iref ledger     *)
+    (dqb dqs dqbs dqn : dfrac)
+    (v : mword 64)                                      (* syscall argument 0  *)
+    (pid : mword 32) (U : ustate)
+    (m : regfile) (K : nat) (eb : bool)
+    (b : bool) (lks : gset string)
+    (* ---- THE APPLICATION'S SIDE ---- *)
+    (P Pmiss : nat -> Z -> iProp Σ)
+    (Farm : pfam Σ (aview -> Z -> iProp Σ))
+    (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+    (Fun : pfam Σ (aview -> Z -> iProp Σ))
+    (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+    (Fex : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ)) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.sys_mkdir in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (K_sys_mkdir <= K)%nat ->
+  icfg_dev = ROOTDEV ->
+  (0 < icfg_nib)%nat ->
+  (* ---- the block-layer geometry, threaded verbatim to create / iunlockput ---- *)
+  log_geom_ok fsc_cov fsc_logst ->
+  0 < fsc_size <= BPB ->
+  0 <= fsc_bmapstart ->
+  fsc_bmapstart ∈ fsc_cov ->
+  ~ (fsc_bmapstart ∈ log_region_set fsc_logst) ->
+  0 <= icfg_ist ->
+  cov_below fsc_cov fsc_size ->
+  bitmap_geom_ok fsc_cov fsc_logst fsc_bmapstart fsc_size ->
+  ireg_blocks_ok icfg_ist icfg_nib fsc_cov fsc_logst ->
+  (* ---- ialloc's three geometry premises, and mkfs's [ushort] tie ---- *)
+  1 < fsc_ninodes ->
+  fsc_ninodes <= 16 * Z.of_nat icfg_nib ->
+  fsc_ninodes < 2 ^ 31 ->
+  16 * Z.of_nat icfg_nib <= 2 ^ 16 ->
+  (* ---- ialloc's no-inodes arm calls printk, not panic ---- *)
+  (* ---- the reference allowance create's walk needs ---- *)
+  (create_slots <= ns)%nat ->
+  (j < NPROC)%nat ->
+  gs !! j = Some gl ->
+  (* create's own premise, inherited: the body runs with the base enabled *)
+  eb = true ->
+  (* argstr reads syscall argument 0 out of the trapframe page [proc_priv]
+     carries *)
+  pv_tf (us_V U) !! tf_arg_idx 0 = Some v ->
+  sie_cap_gpr KT1 m K b pj -∗
+  (* ENTERED WITH NO LOCK HELD, exactly as sys_chdir: the depth is pinned at
+     ZERO, so [CpuOwn.cpu_own_zero_empty] DERIVES [lks = ∅] and every order
+     goal the four callees raise is [locks_below ∅ _]. *)
+  cpu_own 0 eb pj b lks -∗
+  (* THE TRAP-CSR COMPLEMENT, THREADED.  [emp] at [eb = true] -- which this
+     contract's own premise forces -- so no caller gains an obligation. *)
+  trap_csrs_ext KT1 eb -∗
+  cpu_claim_ext eb pj -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  (* ---- the two persistent credentials ialloc's printk arm needs ---- *)
+  printk_env fsc_printk fsc_uart fsc_disk -∗
+  (* ---- the block layer ---- *)
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  fs_crash_seam fsc_cov fsc_logst -∗
+  gen_cert -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  bslots 3 -∗
+  (* ---- the inode cache, and the region ialloc claims out of ---- *)
+  is_itable2 fsc_itlock fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst icfg_nib icfg_dev -∗
+  itable_inv -∗
+  ic_escrows fsc_ic fsc_fs fsc_ireg fsc_cov fsc_logst -∗
+  ic_sleeplocks fsc_ic -∗
+  ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  (* ...AND THE SEALED REGIME (iclaim-ledger.md §3.2, RULING B).  Persistent,
+     borrowed and never spent; it rides the SAME channel [ireg_inv] does,
+     down to [SpecCreate] -> [SpecIalloc] -> [InodeRegion.ireg_claim_au],
+     the one mover that mints a [c] column.  Its producer is the boot
+     chain's ([IcacheRefDefs.ity_shoot] on fsinit's returned [ireg_boot]), which
+     terminates at the EXISTING [LinkForkretNF.wp_forkret_nf_ax] IOU -- no
+     new axiom, and a premise pulls nothing into [Print Assumptions]. *)
+  ireg_open -∗
+  (* ---- the FOUR superblock cells (create reads all of them) ---- *)
+  sb_ninodes ↦₄{dqn} (mword_of_int fsc_ninodes : mword 32) -∗
+  sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+  sb_size ↦₄{dqbs} (mword_of_int fsc_size : mword 32) -∗
+  sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+  bitmap_inv fsc_fs fsc_bmapstart fsc_cov fsc_logst fsc_size -∗
+  (* argstr's page-table side, and create's (iget's ipool arm allocates) *)
+  kalloc_env fsc_kalloc None -∗
+  (* the running-thread bundle *)
+  procs_inv gs -∗
+  (* ---- the process, whole, and the reference allowance ---- *)
+  iref_slots ns -∗
+  proc_priv γf pj pid U -∗
+  (* ---- THE APPLICATION'S SIDE: the walk's cursor pair, the exists
+     observation and the four commits create's legs fire, at mkdir's own
+     type index ---- *)
+  mkdir_au_at (fs_gamma_L fsc_fs) fsc_fs (pv_cwi (us_V U)) (us_M U) v
+    P Pmiss Farm Fdots Fun Fok Fex -∗
+  (* THE CROSSING IS THE LITERAL [true], NOT [b]: sys_mkdir sleeps (begin_op,
+     argstr's fault path, create and end_op all park), so it can return on
+     another hart whatever SIE was doing. *)
+  wp_next true pj (fun (CID : CpuId) =>
+  (* THE IMAGE DOES NOT MOVE.  This syscall only READS user memory (argstr,
+     through fetchstr and copyinstr); the pages it faults in on the way were
+     already in the block's view, as lazy pages reading 0, so vmfault does
+     not move it either.  Only the DESCRIPTOR grows, and the block comes
+     back at the image it was handed. *)
+  ∀ (mf : regfile) (ns' : nat) (P' : uptd) (k' : nat),
+      ⌜callee_saved m mf⌝ -∗
+      (* the page table may have GROWN: argstr's fetchstr faults user pages
+         in.  [uptd_ext_sz] is argstr's own report, relayed. *)
+      ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+      (* THE EVENT COUNTER (permit sweep L1b): argstr lends the block's
+         counter to copyinstr, which may step it, so the block comes back
+         at a count at least the one it left at *)
+      ⌜(pv_ev (us_V U) <= k')%nat⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      trap_csrs_ext KT1 eb -∗
+      cpu_claim_ext eb pj -∗
+      pc_is ret_tgt -∗
+      bslots 3 -∗
+      sb_ninodes ↦₄{dqn} (mword_of_int fsc_ninodes : mword 32) -∗
+      sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+      sb_size ↦₄{dqbs} (mword_of_int fsc_size : mword 32) -∗
+      sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+      (* NO ORDERING on the free pool: create both ALLOCATES (balloc under
+         dirlink) and FREES (itrunc under its fail arm's iunlockput of a
+         link-count-zero inode), and the two do not cancel. *)
+      (* the allowance, spend-at-most: see the header's reference ledger *)
+      (* THE LEDGER CLOSES, EXACTLY.  This used to be create's interval
+         passed through; create states its figure exactly now (every failure
+         arm returns the ledger whole, every success arm keeps ONE out), and
+         this function's [iunlockput] is what hands that one back -- so all
+         three arms end where they started.  A client can therefore
+         re-establish its own [create_slots <= ns] and call again, which the
+         interval could not support (FsSyscalls.v's note (S3)). *)
+      ⌜ns' = ns⌝ -∗
+      iref_slots ns' -∗
+      proc_priv γf pj pid (us_upt (upd_usV U (upd_ev (us_V U) k')) P') -∗
+      ⌜sys_mkdir_ret (mf !!! Regidx (mword_of_int 10 : mword 5))⌝ -∗
+      (* ...and the legs' receipts, keyed on that answer *)
+      mkdir_arms (fs_gamma_L fsc_fs) fsc_fs (pv_cwi (us_V U))
+        P Pmiss Farm Fdots Fun Fok Fex (us_M U) v
+        (mf !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type SYSMKDIR.
+  Parameter wp_sys_mkdir_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γf : gname)
+      (gs : list gname) (j : nat) (gl : gname)
+      (pd pav pu : mword 64)
+      (ns : nat)
+      (dqb dqs dqbs dqn : dfrac)
+      (v : mword 64)
+      (pid : mword 32) (U : ustate)
+      (m : regfile) (K : nat) (eb : bool)
+      (b : bool) (lks : gset string)
+      (P Pmiss : nat -> Z -> iProp Σ)
+      (Farm : pfam Σ (aview -> Z -> iProp Σ))
+      (Fdots : pfam Σ (aview -> Z -> Z -> bool -> iProp Σ))
+      (Fun : pfam Σ (aview -> Z -> iProp Σ))
+      (Fok : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ))
+      (Fex : pfam Σ (aview -> Z -> fname -> Z -> iProp Σ)),
+      wp_sys_mkdir_sconf_body γf gs j gl pd pav pu
+
+ ns dqb dqs dqbs dqn v
+                              pid U m K eb b lks
+                              P Pmiss Farm Fdots Fun Fok Fex.
+End SYSMKDIR.

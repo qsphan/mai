@@ -1,0 +1,2071 @@
+(* SpecUsertrap.v -- the public interface of usertrap() (trap.c), stated
+   ahead of its proof.  Everything the five cones below it consume is the
+   ABSTRACT per-process predicate [usertrap_res] of the module type, which
+   the proof will define concretely -- consumers thread it opaquely, so
+   refining it does not churn the boundary.
+
+     uint64 usertrap(void)   @ KernelSyms.usertrap, 262 bytes / 90 instrs
+
+   ==== THIS CONTRACT IS IN THE KERNEL TIER, NOT THE TRAMPOLINE'S ========
+
+   The first statement of this file (10892e92) read the boundary off the two
+   trampoline halves: it took [tlb_inv_pt kroot], the parked user table, the
+   36 trapframe words at the PHYSICAL tier, and [user_cfg].  That is uservec's
+   postcondition verbatim, and it cannot be usertrap's precondition, because
+   every function usertrap CALLS describes the same objects one tier up and
+   the two descriptions are not merely different -- together they are
+   UNSATISFIABLE.  Three collisions, one shape (see
+   claude-notes/projects/usertrap.md for the long form):
+
+   * THE KERNEL PAGE TABLE.  [tlb_inv_pt kroot] owns [ptree_own 2 1] of the
+     kernel tree; the kernel cone reaches the same tree through
+     [IntrDefs.sie_cap]'s [strans_inv], whose KPT arm is
+     [KptShare.tlb_res_pt], which carries the INVARIANT [kpt_inv root] that
+     holds it.  Hold both and one [iInv kptN] gives two exclusive owners of
+     one tree, i.e. [False] -- and every leaf's [sr_absorb] opens [kptN], so
+     the interior would go through BY ABSURDITY.  usertrap never writes satp
+     (only the trampoline halves do), so it has no business owning a tree:
+     the kernel table reaches it the way it reaches every other kernel
+     function, inside [usertrap_res].  The exclusive/shared seam belongs to
+     uservec/userret, which is the only code that needs exclusivity, and
+     closing it is completed/kpt-share.md's named follow-up.
+   * THE TRAPFRAME PAGE.  [ProcInv.proc_priv] -- which every callee below
+     takes, and which usertrap itself needs for [p->trapframe->epc] -- owns
+     that page as [tf_page] at the VA tier.  So the words are NOT in this
+     contract; the physical<->VA crossing belongs on the trampoline side,
+     where the mapping is in scope.
+   * [user_cfg]'s mie/mideleg/menvcfg cells ARE [sconf]'s cells, so they ride
+     inside [usertrap_res] too.  The one config cell that stays here is the
+     one usertrap WRITES: [stvec].
+
+   ==== THE ENTRY PAYLOAD IS prepare_return'S EXIT PAYLOAD ===============
+
+   What is left once those three are out is exactly the state
+   [SpecPrepareReturn.v]'s postcondition hands over, with the trap's own
+   writes applied -- which is the check that this boundary is the right one:
+
+     stvec at TRAMPOLINE with NO [intr_res] (no kernel handler installed);
+     the [sie_gname] 1/4 that lived in [intr_res] still DANGLING; the KPT
+     receipt loose; the sret mirror at (SPP = User, SPIE = 1) -- prepare_return
+     wrote that pair, the [sret] set SIE := SPIE = 1, and the trap set
+     SPP := User, SPIE := SIE = 1, so it comes back UNCHANGED; mstatus with
+     SIE = 0 again (prepare_return's [intr_off] cleared it, the sret set it,
+     the trap cleared it); scause/stval/sepc at whatever the trap wrote.
+
+   EVERY GHOST FRACTION IS WHERE prepare_return LEFT IT, and the two mstatus
+   bits the mirror tracks return to the same values -- so the excursion
+   through userret / user mode / uservec moves no ghost at all and
+   [usertrap_res] simply carries the mirror halves across it.  That is why
+   this contract mentions no ghost variable of its own.
+
+   AND usertrap'S FIRST ACT CLOSES THE LOOP: the [csrw stvec, kernelvec] at
+   +0x1e folds the dangling quarter + the stvec cell + [intr_handler_spec
+   kernelvec] into a real [IntrDefs.intr_res], hence [trap_csrs] -- precisely
+   the [intr_res] prepare_return's [csrci] will unfold again on the way out.
+   The C comment ("send interrupts and exceptions to kerneltrap(), since
+   we're now in the kernel") IS that fold, and the order is forced: before
+   +0x1e this hart has no kernel handler, so nothing there may enable
+   interrupts.
+
+   ==== THE POST CROSSES ================================================
+
+   usertrap PARKS -- yield on the timer arm, and every sleeping syscall
+   through [SpecSyscall]'s own [wp_next true pj] -- so it may return on a
+   different hart and the post has to be a crossing.  The consequence is on
+   the CALLER (see eb-generic-sweep.md on [wp_next]'s polarity): the trap-loop
+   composition must build its continuation hart-generically.
+
+   ==== WHAT IS STILL OWED (the trampoline dovetail) =====================
+
+   This statement moves the trampoline seam rather than closing it: composing
+   uservec -> usertrap -> userret (the Loeb theorem that discharges
+   [UserExec.stvec_handler_wp]) owes three conversions -- the kernel table
+   exclusive<->shared, the trapframe page physical<->VA, and
+   [user_cfg] <-> [sconf]'s cells (which needs [uc_mie C = MIE_S]; sconf pins
+   mie and [ucfg] only constrains [mie & ~mideleg = 0]).  All three are
+   trampoline-side work and all three are tracked in
+   claude-notes/projects/usertrap.md.  [usertrap_ret_ms] and [satp_rooted]
+   stay here: they are the shared vocabulary that seam will be stated in, and
+   SpecPrepareReturn's post already spells [satp_rooted]'s three conjuncts out
+   longhand rather than importing it (this file has no [Require]ing consumer
+   yet -- the two Specs that name it, name it in prose). *)
+From Stdlib Require Import ZArith.
+From stdpp Require Import bitvector.definitions gmap.
+From iris.proofmode Require Import proofmode.
+(* [gname] -- the key's generation and children readings are ghost NAMES *)
+From iris.base_logic.lib Require Import own.
+From iris.program_logic Require Import language lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto RiscvFetchExec.
+Require Import RegFile HartTp WpNext.
+Require Import MinstretInv.
+Require Import InstrBytes.
+Require Import WpGpr.
+Require Import KernelText MstatusBits.
+Require Import RiscvExtras.
+Require Import CalleeSaved.
+Require Import IntrDefs.
+Require Import FdSlots.
+Require Import FileInvDefs.
+Require Import ProcDefs.
+Require Import ProcInv.   (* [us_tf] / [us_upt] -- the residue index's updaters *)
+Require Import ProcPtOwn.   (* [proc_pt] / [ud_norm] -- the bare residue's vocabulary *)
+(* the classes the module type's [usertrap_res] parameter needs -- see the
+   note above [Module Type USERTRAP] at the foot of this file *)
+Require Import IrefSlots.
+Require Import ProcGeom.
+Require Import TrampPt UptTree.
+Require Import KptShare.   (* [tlb_res_pt] -- the translation slot the parked residue drops *)
+Require Import UserPtTree UserExec.
+Require Import UexecRound. (* [uround_ok] -- the trap round, on the user-visible state *)
+Require Import UexecSlot.  (* [tf_resume_pc] *)
+Require Import TfUser.     (* [tf_ueq] *)
+Require Import UserPerm.   (* [perm_of] -- the per-page permission view *)
+Require Import UsysMemOk.  (* [uecall_scause] *)
+Require Import UexecRet.   (* [tf_ueq_resume_gpr0] / [tf_ueq_resume_pc] -- the exec rows' congruences *)
+Require Import ChildTok.   (* [child_tok] -- fork's answer to the parent *)
+Require Import UexecSG.        (* [uexecSG]: [sbundle] / [spost] / [skey_eq] *)
+Require Import UexecApply.     (* [uslot_key_cong] -- the slot across the re-key *)
+Require Import UhistDefs.      (* [uhist_auth] / [uhist_wf] -- the residue's key history *)
+Require Import UexecExecInst.  (* the class INSTANCE: the process's exec bundle *)
+Require Import SpecSysRead.    (* [sys_rw_count] -- the read's count, for [ut_live_out] *)
+Require Import Xv6Cameras.
+Require Import ConsoleInv.     (* [CONSOLE] -- the device the read row is about *)
+Require Import StackOwn.       (* [uint_zero_reg] *)
+Require Import FirstTok.       (* [fsabs_env] -- what the loop mints the bundle from *)
+From Kernel Require KernelSyms.
+Require Import ProcAvail.
+Require Import TimerCap.   (* [sstc_enabled]: the residue's mcounteren pin *)
+Local Open Scope Z_scope.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Import Defs.
+Require Import TsoCtx.
+
+
+(* [usertrap_ret_ms] MOVED DOWN to MstatusBits.v: it is a predicate on an
+   mstatus word and nothing else, and [UsertrapRes.v] -- the definitional
+   layer below this file -- needs it, which a contract file may not own
+   (design/code-organization.md). *)
+
+(* the satp-value facts both trampoline switches need, shared spec
+   vocabulary: [v] is a Sv39, asid-0 satp value rooted at [root]. *)
+Definition satp_rooted (v : mword 64) (root : mword 44) : Prop :=
+  _get_Satp64_Mode (Mk_Satp64 v) = ('b"1000" : mword 4) /\
+  zero_extend' 16 (satp_to_asid (autocast (T := mword) v : mword 64)) = (mword_of_int 0 : mword 16) /\
+  autocast (T := mword) (satp_to_ppn (autocast (T := mword) v : mword 64)) = root.
+
+(* WHAT THE TRAP DELIVERED, in the vocabulary the two tiers meet in.
+
+   [trap_mstatus_ok] is the trampoline's pin set (UserExec.v: SIE = 0,
+   SPP = User, MPRV = MXR = 0, SXL = 64, TVM = TSR = 0) -- what uservec's
+   own [csrw satp] / [sfence] gates need.  [sconf_ms_facts] is the kernel
+   tier's (IntrDefs.v), which additionally pins the FS/VS/XS extension
+   states, SD and a nominal MPP: it is what [IntrDefs.sconf] carries, so
+   usertrap cannot assemble the bundle its callees take without it.  The two
+   overlap and neither implies the other.
+
+   [SPIE = 1] is the third: it is what the mirror half inside
+   [usertrap_res] agrees with ([IntrDefs.sret_tie]), and it is a fact about
+   the code rather than an assumption about the user -- userret's [sret] set
+   SPIE := 1, so user mode ran with SIE = 1, so the trap copied SIE into
+   SPIE.  Nothing user mode can execute changes it. *)
+Definition usertrap_entry_ms (ms : mword 64) : Prop :=
+  trap_mstatus_ok ms /\
+  sconf_ms_facts ms /\
+  _get_Mstatus_SPIE ms = ('b"1" : mword 1).
+
+(* ... AND [trap_mstatus_ok] NOW IMPLIES THE OTHER TWO.  [UserExec.v]'s
+   trap predicate carries FS/VS/XS/SD/MPP and SPIE = 1 since 2026-08-21 --
+   the user tier preserves them (mstatus is never written in user mode) from
+   what userret's sret left.  Before that, uservec's contract had to take
+   this implication as a ∀-premise, which was unsatisfiable
+   (claude-notes/projects/forkret-park.md §4). *)
+Lemma usertrap_entry_ms_of_trap (ms : mword 64) :
+  trap_mstatus_ok ms -> usertrap_entry_ms ms.
+Proof.
+  intro H. pose proof H as H'.
+  destruct H' as (HSXL & HMPRV & HMXR & HSPP & HSIE & HTVM & HTSR &
+                  HFS & HVS & HXS & HSD & HMPP & HSPIE).
+  split; [exact H |]. split; [| exact HSPIE].
+  unfold sconf_ms_facts. split_and!; try assumption.
+  unfold WpGprCsrwCommon.have_nom_val.
+  destruct (eq_vec (_get_Mstatus_MPP ms) ('b"00")); [reflexivity |].
+  destruct (eq_vec (_get_Mstatus_MPP ms) ('b"01")); [reflexivity |].
+  rewrite HMPP. reflexivity.
+Qed.
+
+(* ===================================================================== *)
+(* THE TRAP ROUND, as the boundary states it (milestone J1a).             *)
+(*                                                                         *)
+(* [U] is the process's state AS USERTRAP WAS ENTERED -- the record        *)
+(* uservec's save walk left, whose epc word is still the PREVIOUS round's; *)
+(* [sepc_v] is the faulting pc the trap delivered and [sc_v] the cause.    *)
+(* [tf0] is therefore the entry trapframe as usertrap's own prologue       *)
+(* leaves it: the +0x28..+0x2e block writes [p->trapframe->epc =           *)
+(* r_sepc()] and nothing else, so [pv_tf] of the record the entry hands on *)
+(* IS [tf0] by reflexivity.  ([ret_pc] is [WpGprCsrwA.mepc_val] -- the same *)
+(* term under two names; this file already has [ret_pc] in scope.)         *)
+(*                                                                         *)
+(* THERE IS NO ESCAPE LEFT (stage S8b).  Every ecall is proved for real:   *)
+(* exec by [uround_ok]'s own left disjunct, the other twenty-two by the    *)
+(* bump plus [UsysMemOk.usys_mem_ok] -- sbrk included, now that the        *)
+(* dispatcher's row names the address space's move as a FUNCTION of the    *)
+(* two sizes ([SpecSyscall.sysc_sbrk_ok]) and both directions of its       *)
+(* permission relation are derivable                                       *)
+(* ([UsysMemOkSpec.usys_sbrk_perm_of_row], over                            *)
+(* [UsysMemOkSpec.perm_of_grow] and [UserPerm.perm_of_del_run]).           *)
+(* ===================================================================== *)
+(* ...and the cwd's inum on both sides, READ OFF THE BLOCKS: unlike the
+   descriptor states, which the block names only by ghost name, the inum
+   is a field ([ProcDefs.pv_cwi]), so the round states it without a new
+   binder in any post. *)
+Definition ut_round (sepc_v sc_v : mword 64) (U U' : ustate) : Prop :=
+  uround_ok sc_v
+    (<[tf_epc_idx := ret_pc sepc_v]> (pv_tf (us_V U)))
+    (us_M U) (perm_of (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U))))
+    (uint (pv_sz (us_V U))) (pv_cwi (us_V U)) (pv_lazy (us_V U)) (pv_secc (us_V U))
+    (pv_tf (us_V U')) (us_M U')
+    (perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))))
+    (uint (pv_sz (us_V U'))) (pv_cwi (us_V U')) (pv_lazy (us_V U')) (pv_secc (us_V U')).
+
+(* THE DESCRIPTOR HALF OF THE ROUND, and the reason it is CONDITIONAL.
+   [ut_round] speaks the trapframe, image, permission map and break; it says
+   nothing about [p->ofile[]], because for every cause but one there is
+   nothing to say -- a page fault or an interrupt runs no kernel code that
+   can retype a descriptor, so the states come back on the nose.  The one
+   exception is the ecall, where open/close/dup/pipe are exactly the entries
+   that move them.
+
+   WHY THE CALLER NEEDS THIS AND NOT MERELY THE RESIDUE'S INDEX.  The loop
+   resumes the process at a key, and the key names the descriptor view
+   ([UexecSlot.uvis_fd]).  On a transparent trap it must resume at the view
+   that TRAPPED -- [UexecApply.uexec_ret_round_slot]'s transparent arm hands
+   back the process's own continuation at the same key, and a key with a
+   different fd view is a different contract.  So "the kernel did not move
+   them" is a fact the loop has to be TOLD; it cannot read it off the
+   fragments it holds ([FdSlots.fd_st_agree] against the authority only ever
+   says the fragments agree with themselves). *)
+Definition ut_fd_kept (sc_v : mword 64) (sts sts' : list fdstate) : Prop :=
+  sc_v <> uecall_scause -> sts' = sts.
+
+(* ...AND THE CHILDREN SET'S ROW, guarded off the TWO ENTRIES THAT MOVE IT
+   rather than off the cause.  Every other entry keeps the reading, and
+   neither of those two moves is a pure fact: fork's carries the child's
+   token ([ut_fork_out] below) and wait's carries the escrow the reap
+   redeems.  The guard is [UexecApply.uexec_ret_round_slot]'s own, so the
+   premise travels to the loop verbatim. *)
+Definition ut_ch_kept (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64))
+    (cs cs' : gset gname) : Prop :=
+  ~ (sc_v = uecall_scause /\
+     (usys_eff secc tf = USYS_fork \/ usys_eff secc tf = USYS_wait)) -> cs' = cs.
+
+(* ...AND THE GENERATION'S, WITH NO GUARD AT ALL.  A round never
+   re-incarnates the process it runs: the generation is minted once, at
+   [allocproc], and exec keeps it ([KexecOkQ] states [pv_gen V' = pv_gen V]).
+   The loop needs it TOLD because the slot it resumes is keyed at
+   [UexecSlot.uvis_gen] while the kernel's block names [ProcDefs.pv_gen], and
+   the exit deposit is the one row that has to travel from one to the other
+   -- [SpecKexit]'s escrow is built out of the BLOCK's quarter and the
+   PROCESS's payload, so the two names must be one.  [ut_fd_kept]'s mould,
+   without the cause guard. *)
+Definition ut_gen_kept (U U' : ustate) : Prop :=
+  pv_gen (us_V U') = pv_gen (us_V U).
+
+(* ...across any two frames the save walk leaves agreeing on the syscall
+   number, which is how it travels from usertrap's post to uservec's --
+   [ut_fd_ecall_in]'s route exactly. *)
+Lemma ut_ch_kept_cong (sc_v : mword 64) (secc : mword 64) (tf1 tf2 : list (mword 64))
+    (cs cs' : gset gname) :
+  usys_num tf1 = usys_num tf2 ->
+  ut_ch_kept sc_v secc tf1 cs cs' -> ut_ch_kept sc_v secc tf2 cs cs'.
+Proof.
+  intros Hn0 H Hg. pose proof (usys_eff_num_cong secc _ _ Hn0) as Hn. apply H. intros [He Hf]. apply Hg. split; [exact He |].
+  rewrite <- Hn. exact Hf.
+Qed.
+
+
+(* ...AND THE ECALL'S OWN HALF, which used to be missing.  [ut_fd_kept]
+   above is the whole statement for four of the five causes and says
+   NOTHING for the fifth -- so "close(3) closed slot 3" was proved inside
+   sys_close, carried by the dispatcher, and then dropped at this frame.
+   This is the row that carries it out, and it is the same table
+   [SpecSyscall.sysc_fd_ok] states the dispatch against
+   ([UsysMemOk.usys_fd_ok]): eighteen entries move nothing, and open,
+   close, dup and pipe each say which slot they changed and to what.
+
+   BOTH TRAPFRAMES ARE READ, AND AT DIFFERENT WORDS.  The number and the
+   argument come from the ENTRY trapframe [tf] -- a0 as the kernel FOUND it
+   -- and the return value from the OUTGOING one [tf'], whose a0 word is
+   what the dispatch's [sd a0,112(s2)] stored over it.  Neither reading is
+   disturbed by the epc, which usertrap's prologue rewrites and its
+   epilogue bumps ([UsysMemOk.usys_fd_ok_epc]).
+
+   THE TWO HALVES ARE KEPT APART rather than fused into one [if]: the four
+   transparent arms prove [ut_fd_kept] by [reflexivity] and have no
+   trapframe pair to speak of, while the ecall arm proves this one and
+   nothing else.  A fused definition would make every arm carry both
+   trapframes to say the half it does not use. *)
+Definition ut_fd_ecall (sc_v : mword 64) (secc : mword 64) (tf tf' : list (mword 64))
+    (sts sts' : list fdstate) : Prop :=
+  sc_v = uecall_scause ->
+  UsysMemOk.usys_fd_ok (UsysMemOk.usys_eff secc tf) tf
+    (tf' !!! tf_arg_idx 0) sts sts'.
+
+(* THE ROW READS THE OUTGOING TRAPFRAME AT ONE WORD ONLY, so a tail that
+   parks a DIFFERENT record -- prepare_return re-arms the four kernel words
+   on the way out -- carries the row across by agreeing at that word.
+   [TfUser.tf_ueq_arg] is what supplies the agreement. *)
+(* ...and the ENTRY trapframe likewise, at the TWO words the row reads: a7
+   for the number and a0 for the argument.  Nothing else about the frame
+   matters, which is why this is stated at two lookups rather than at
+   [TfUser.tf_ueq] -- the caller that wants it (uservec, restating the row
+   at [tf_of g] after the save walk) has an epc rewrite in between, and
+   [tf_ueq] is not blind to the epc. *)
+Lemma ut_fd_ecall_in (sc_v : mword 64) (secc : mword 64) (tf1 tf2 tf' : list (mword 64))
+    (sts sts' : list fdstate) :
+  tf1 !!! tf_arg_idx 7 = tf2 !!! tf_arg_idx 7 ->
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  ut_fd_ecall sc_v secc tf1 tf' sts sts' -> ut_fd_ecall sc_v secc tf2 tf' sts sts'.
+Proof.
+  intros H7 H0 H Hc.
+  rewrite <- (UsysMemOk.usys_eff_arg_cong secc _ _ H7).
+  exact (UsysMemOk.usys_fd_ok_arg_cong _ tf1 tf2 _ _ _ H0 (H Hc)).
+Qed.
+
+Lemma ut_fd_ecall_out (sc_v : mword 64) (secc : mword 64) (tf tf1 tf2 : list (mword 64))
+    (sts sts' : list fdstate) :
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  ut_fd_ecall sc_v secc tf tf1 sts sts' -> ut_fd_ecall sc_v secc tf tf2 sts sts'.
+Proof. intros He H Hc. rewrite <- He. exact (H Hc). Qed.
+
+(* ...AND GETPID'S ANSWER, carried out of the ecall arm on [ut_fd_ecall]'s
+   own footing.  The dispatcher proves it ([SpecSyscall.sysc_ret_pid], off
+   [SpecSysGetpid]'s [mf a0 = sign_extend' 64 pid]); without this row it
+   would be dropped at this frame and the user-execution round could not
+   say what getpid(2) returned.  [pid] is the contract's own index -- the
+   number in the kernel's [p->pid] cell, which [ProcInv.proc_priv] carries
+   and the resume key records ([UexecSlot.uvis_pid]).
+
+   BOTH TRAPFRAMES ARE READ, at different words and for [ut_fd_ecall]'s
+   reasons: the NUMBER off the entry frame [tf], the ANSWER off the a0 word
+   of the outgoing one.  There is no non-ecall half: an interrupt or a page
+   fault answers nothing, and the process's own row is quiet there. *)
+Definition ut_ret_pid (sc_v : mword 64) (secc : mword 64) (tf tf' : list (mword 64))
+    (pid : mword 32) : Prop :=
+  sc_v = uecall_scause ->
+  UsysMemOk.usys_ret_pid (UsysMemOk.usys_eff secc tf)
+    (tf' !!! tf_arg_idx 0) pid.
+
+(* the entry frame is read at ONE word, a7 -- the number -- so the row
+   crosses uservec's save walk exactly as [ut_fd_ecall_in] does *)
+Lemma ut_ret_pid_in (sc_v : mword 64) (secc : mword 64) (tf1 tf2 tf' : list (mword 64))
+    (pid : mword 32) :
+  tf1 !!! tf_arg_idx 7 = tf2 !!! tf_arg_idx 7 ->
+  ut_ret_pid sc_v secc tf1 tf' pid -> ut_ret_pid sc_v secc tf2 tf' pid.
+Proof.
+  intros H7 H Hc. rewrite <- (UsysMemOk.usys_eff_arg_cong secc _ _ H7).
+  exact (H Hc).
+Qed.
+
+(* ...and the outgoing frame at a0, [ut_fd_ecall_out]'s twin *)
+Lemma ut_ret_pid_out (sc_v : mword 64) (secc : mword 64) (tf tf1 tf2 : list (mword 64))
+    (pid : mword 32) :
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  ut_ret_pid sc_v secc tf tf1 pid -> ut_ret_pid sc_v secc tf tf2 pid.
+Proof. intros He H Hc. rewrite <- He. exact (H Hc). Qed.
+
+(* ...and the row at a non-getpid number, which is how every other arm
+   pays it *)
+Lemma ut_ret_pid_ne (sc_v : mword 64) (secc : mword 64) (tf tf' : list (mword 64))
+    (pid : mword 32) :
+  UsysMemOk.usys_eff secc tf <> UsysMemOk.USYS_getpid -> ut_ret_pid sc_v secc tf tf' pid.
+Proof. intros Hne _. exact (UsysMemOk.usys_ret_pid_ne _ _ _ Hne). Qed.
+
+(* ...AND PIPE'S JOIN, carried out of the ecall arm beside the row above.
+   [ut_fd_ecall] says pipe opened two free slots and [ut_round]'s image half
+   says it wrote up to eight bytes at a0; ONLY THIS says the bytes name the
+   slots, which is the whole of pipe() to the program that called it.  Same
+   two trapframes, read at the same two words, so the two travel together
+   and cross the prologue's epc rewrite by the same lemma
+   ([UsysMemOk.usys_pipe_ok_epc]).  See [UsysMemOk.v]'s SS2c. *)
+Definition ut_pipe_ecall (sc_v : mword 64) (secc : mword 64) (tf tf' : list (mword 64))
+    (M M' : gmap Z (bv 8)) (sts sts' : list fdstate) : Prop :=
+  sc_v = uecall_scause ->
+  UsysMemOk.usys_pipe_ok (UsysMemOk.usys_eff secc tf) tf
+    (tf' !!! tf_arg_idx 0) M M' sts sts'.
+
+(* the two congruences, in the shapes [ut_fd_ecall] has them: the entry
+   frame at a7 and a0, the outgoing frame at a0. *)
+Lemma ut_pipe_ecall_in (sc_v : mword 64) (secc : mword 64) (tf1 tf2 tf' : list (mword 64))
+    (M M' : gmap Z (bv 8)) (sts sts' : list fdstate) :
+  tf1 !!! tf_arg_idx 7 = tf2 !!! tf_arg_idx 7 ->
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  ut_pipe_ecall sc_v secc tf1 tf' M M' sts sts' ->
+  ut_pipe_ecall sc_v secc tf2 tf' M M' sts sts'.
+Proof.
+  intros H7 H0 H Hc.
+  rewrite <- (UsysMemOk.usys_eff_arg_cong secc _ _ H7).
+  exact (UsysMemOk.usys_pipe_ok_arg_cong _ tf1 tf2 _ _ _ _ _ H0 (H Hc)).
+Qed.
+
+Lemma ut_pipe_ecall_out (sc_v : mword 64) (secc : mword 64) (tf tf1 tf2 : list (mword 64))
+    (M M' : gmap Z (bv 8)) (sts sts' : list fdstate) :
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  ut_pipe_ecall sc_v secc tf tf1 M M' sts sts' ->
+  ut_pipe_ecall sc_v secc tf tf2 M M' sts sts'.
+Proof. intros He H Hc. rewrite <- He. exact (H Hc). Qed.
+
+(* the quiet reading, for the four non-ecall causes: they never reach the
+   dispatch, so the guard is unreachable through [sc_v]. *)
+Lemma ut_pipe_ecall_quiet (sc_v : mword 64) (secc : mword 64) (tf tf' : list (mword 64))
+    (M M' : gmap Z (bv 8)) (sts sts' : list fdstate) :
+  sc_v <> uecall_scause -> ut_pipe_ecall sc_v secc tf tf' M M' sts sts'.
+Proof. intros Hne Hc. contradiction (Hne Hc). Qed.
+
+(* ===================================================================== *)
+(* THE SYSCALL CHANNEL THROUGH USERTRAP.  Two readers, and the loop picks   *)
+(* by number.                                                              *)
+(*                                                                          *)
+(* [ut_sys_in n f] / [ut_sys_out n f] are the PER-NUMBER pair, AT THE       *)
+(* DEPOSIT'S OWN FAMILIES: the process deposits its bundle for the number   *)
+(* it trapped at ([UexecSG.sbundle_at], which at [UexecExecInst]'s instance *)
+(* is that syscall's landed AU input) and gets the syscall's                *)
+(* armed post back under the arm's own return value ([UexecSG.spost_at]) at *)
+(* THE SAME [f] -- the contract takes it once and both rows read it, which  *)
+(* is what makes the post worth anything to the depositor.  This is the     *)
+(* shape                                                                    *)
+(* [UexecRet.uexec_ret_F]'s returning arm is stated at, and the shape the   *)
+(* next round fills as each syscall's contract is turned on.                *)
+(*                                                                          *)
+(* [ut_exec_out] is EXEC'S OWN out-shape and stays beside them: exec is the *)
+(* one entry whose round says nothing, because the record it leaves is a    *)
+(* DIFFERENT program's.  Its two disjuncts -- the failure facts, and the    *)
+(* new image's slot as a WAND FROM THE EXIT PAYLOAD, which the process's    *)
+(* own exec deposit pays on BOTH of [SpecKexec.exec_post_ok]'s success      *)
+(* arms -- have no per-number reading.  The payload is [ut_pay_out]'s own   *)
+(* resource: the arms are exclusive, so the row that resumes the OLD key    *)
+(* and the wand that completes the NEW one are two readings of one          *)
+(* payment.                                                                *)
+(*                                                                          *)
+(* All three are guarded on the CAUSE and the NUMBER, so the four           *)
+(* transparent arms discharge them by refuting the guard.                   *)
+(*                                                                          *)
+(* THE FAILURE ARM IS DELIBERATELY [UexecRound.uround_ok]'s returning       *)
+(* disjunct at [r = -1] -- the bump plus [UsysMemOk.usys_mem_ok]'s exec     *)
+(* row -- so the U-mode loop pays it with the returning-arm proof it        *)
+(* already has ([UexecApply.uexec_ret_round_slot]).  It is stated at        *)
+(* the round's OWN entry trapframe (the prologue's epc rewrite applied,    *)
+(* exactly [ut_round]'s) because the bump reads the epc.                   *)
+(* ===================================================================== *)
+(* THE GUARD IS [UexecRet.uexec_dep_F]'s OWN CASE ANALYSIS, spelled out:
+   the cause is an ecall, the number is [n], and [n] is a RETURNING one --
+   exit deposits nothing at all, and fork's deposit is a SLOT on its own
+   row ([ut_fork_in] below), so at those two this row must not ask for a
+   bundle. *)
+Definition ut_sys_in `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (n : Z) (f : sfam) (sc_v : mword 64) (tf : list (mword 64)) (U : ustate)
+    (* [gn] and [cs] ride beside [sts] for its reason: the key carries the
+       process's generation and its live children's, [ustate] carries
+       neither, and the party that holds the kernel cells they are read off
+       is the party that builds the key. *)
+    (* ...and [pid] beside them, off the same kind of thing: the key
+       carries it, [ustate] does not (it is [ProcInv.proc_priv]'s index),
+       and the party holding the block names it. *)
+    (sts : list fdstate) (gn : gname) (cs : gset gname) (pid : mword 32)
+    : iProp Σ :=
+  (* ...AND EXIT DEPOSITS LIKE ANY RETURNING NUMBER (design/pipe.md, "The
+     exit path"): its row is the table's close payments. *)
+  (⌜sc_v = uecall_scause /\ usys_eff (pv_secc (us_V U)) tf = n /\ n <> USYS_fork⌝ -∗
+     sbundle_at uslot n f (uvis_of U sts gn cs pid))%I.
+
+(* ...AND THE ARMED POST BACK, at the same key, THE SAME FAMILIES and the
+   round's return value.  [f] is the deposit's own: the trap contract takes
+   it once and both rows read it, which is what makes the post worth
+   anything to the process that deposited ([UexecSG.v]'s header).
+   A ROW OF [usertrap_post], beside [ut_exec_out]: the dispatcher hands the
+   armed post back ([SpecSyscall.sysc_sys_out]), the four tails relay it
+   untouched, and the loop's consumer
+   ([UexecApply.uexec_ret_round_slot_of]'s premise) is discharged FROM IT.
+   Eight numbers make it non-trivial ([UexecExecInst.xv6_spost]); at the
+   rest it is [emp] and every arm pays it for free.
+   ...AND AT THE RESUME VIEW, which is why [M'], [sts'] and [cw'] ride
+   beside the entry key: read's receipt is about the bytes the round left
+   in the caller's buffer, chdir's about the working directory the round
+   leaves and open's about one row of the descriptor view it leaves, and
+   none is a projection of the entry frame ([UexecSG.spost_at]).  They are
+   the same components [ut_exec_out] already takes off the exit side. *)
+Definition ut_sys_out `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (n : Z) (f : sfam) (sc_v : mword 64) (tf : list (mword 64)) (U : ustate)
+    (sts : list fdstate) (gn : gname) (cs : gset gname) (pid : mword 32)
+    (r : mword 64)
+    (M' : gmap Z (bv 8))
+    (sts' : list fdstate) (cw' : Z) (cs' : gset gname)
+    : iProp Σ :=
+  (⌜sc_v = uecall_scause /\ usys_eff (pv_secc (us_V U)) tf = n
+    /\ n <> USYS_exit /\ n <> USYS_fork⌝ -∗
+     spost_at uslot n f (uvis_of U sts gn cs pid) r M' sts' cw' cs')%I.
+
+(* THE SUCCESS ARM IS A WAND FROM THE PAYLOAD (EXEC-PAY), and [f] rides
+   beside the cause for that: exec keeps the process, so the image the
+   kernel loaded runs at THIS process's payload and its run needs
+   [UkRun.ukn_pay] at the kill status like any other
+   ([UkRun.uslot_of_urun_all]).  The only copy is the one the trap route is
+   holding ([ut_pay_in]), so the slot comes back WAITING on it and
+   [ut_pay_out] is what pays it -- on the failure arm the process resumes
+   at its old key and keeps that row instead.  The two arms are exclusive,
+   so nothing is duplicated. *)
+Definition ut_exec_out `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam)
+    (sc_v : mword 64) (tf : list (mword 64)) (M : gmap Z (bv 8))
+    (π : gmap (mword 27) uperm) (szv : Z) (lz : bool) (secc : mword 64)
+    (U' : ustate) (sts sts' : list fdstate) (gn : gname) (cs : gset gname)
+    (pid : mword 32)
+    : iProp Σ :=
+  (⌜sc_v = uecall_scause /\ usys_eff secc tf = USYS_exec⌝ -∗
+     (⌜exists r : mword 64,
+         uround_bump_ok tf (pv_tf (us_V U')) r
+         /\ usys_mem_ok USYS_exec tf r M π szv lz (us_M U')
+              (perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))))
+              (uint (pv_sz (us_V U'))) (pv_lazy (us_V U'))
+         /\ sts' = sts⌝                       (* failed: the returning shape at r = -1 *)
+      ∨ uslot (uvis_of U' sts' gn cs pid)))%I.         (* succeeded: the new image's slot *)
+
+(* ===================================================================== *)
+(* FORK'S ANSWER, COMING BACK: the parent's quarter of the child's        *)
+(* generation.                                                            *)
+(*                                                                        *)
+(* fork is the second entry (after exec) whose round says more than a     *)
+(* relation on the key.  The kernel CREATED a process, and what it hands  *)
+(* the parent is [ChildTok.child_tok] -- the quarter of that child's      *)
+(* generation, at the payload the process's own families chose            *)
+(* ([UexecSG.sfork_pay f]) -- together with the generation the parent's   *)
+(* children reading grew by.  The pid the token carries is tied to the a0 *)
+(* word the round left, which is what the process reads.                  *)
+(*                                                                        *)
+(* Guarded on the cause and the number, like [ut_exec_out], so the four   *)
+(* transparent arms and every other entry discharge it by refuting the    *)
+(* guard ([ut_fork_out_quiet]).                                           *)
+(* ===================================================================== *)
+(* THE SET THE PARENT RESUMES AT IS THIS ROW'S, not the loop's choice: the
+   caller's children row rides the residue ([UsertrapRes.ut_own]'s
+   [WaitInv.ch_frag]) and kfork moved it under <wait_lock>, so the kernel
+   both names the generation and says what the set became.  That is
+   [UexecRet.ufork_ans] exactly, which is what the loop's fork answer
+   wants, so the row IS it. *)
+Definition ut_fork_out `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam) (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64)) (r : mword 64)
+    (cs cs' : gset gname)
+    : iProp Σ :=
+  (⌜sc_v = uecall_scause /\ usys_eff secc tf = USYS_fork⌝ -∗
+     ufork_ans (sfork_pay f) (sfork_lend f) r cs cs')%I.
+
+(* THE ROW READS THE FRAME ONLY THROUGH ITS a7 WORD, so it transports
+   across any two frames the save walk leaves agreeing on the number --
+   which is what carries it from usertrap's post to uservec's. *)
+Lemma ut_fork_out_cong `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam) (sc_v : mword 64) (secc : mword 64) (tf1 tf2 : list (mword 64)) (r1 r2 : mword 64)
+    (cs cs' : gset gname) :
+  usys_num tf1 = usys_num tf2 -> r1 = r2 ->
+  ut_fork_out f sc_v secc tf1 r1 cs cs' -∗ ut_fork_out f sc_v secc tf2 r2 cs cs'.
+Proof.
+  intros Hn0 Hr. pose proof (usys_eff_num_cong secc _ _ Hn0) as Hn.
+  rewrite /ut_fork_out. subst r2. iIntros "H %Hc".
+  iApply "H". iPureIntro. split; [exact (proj1 Hc) |].
+  rewrite Hn. exact (proj2 Hc).
+Qed.
+
+Lemma ut_fork_out_quiet `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam) (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64)) (r : mword 64)
+    (cs cs' : gset gname) :
+  sc_v <> uecall_scause -> ⊢ ut_fork_out f sc_v secc tf r cs cs'.
+Proof.
+  intros Hne. rewrite /ut_fork_out. iIntros "%Hc". exfalso.
+  exact (Hne (proj1 Hc)).
+Qed.
+
+(* ===================================================================== *)
+(* ...AND WAIT'S, on fork's footing exactly: the reap took the reaped      *)
+(* generation out of the caller's children reading, and what the loop      *)
+(* hands the process is what the set became ([UexecRet.uwait_ans]) --      *)
+(* together, on the reaping arm, with the reaped child's escrow and the    *)
+(* pid uniqueness that names its generation.                               *)
+(* ===================================================================== *)
+(* ...AND THE WINDOW RIDES WITH IT (lane RD-7): the image the round
+   entered at and the one it left at, so that the status the escrow is
+   keyed at and the bytes the reap wrote stay ONE binder all the way to
+   the process ([UexecRet.uwait_ans_at_m]). *)
+Definition ut_wait_out `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64)) (M M' : gmap Z (bv 8))
+    (r : mword 64)
+    (cs cs' : gset gname) (gn : gname) (pidv : mword 32)
+    : iProp Σ :=
+  (⌜sc_v = uecall_scause /\ usys_eff secc tf = USYS_wait⌝ -∗
+     uwait_ans_at_m r M M' (tf !!! tf_arg_idx 0) cs cs' gn
+       (bool_decide (tf !!! tf_arg_idx 0 = (zero_reg : mword 64))) pidv)%I.
+
+Lemma ut_wait_out_cong `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (sc_v : mword 64) (secc : mword 64) (tf1 tf2 : list (mword 64)) (M M' : gmap Z (bv 8))
+    (r1 r2 : mword 64)
+    (cs cs' : gset gname) (gn : gname) (pidv : mword 32) :
+  usys_num tf1 = usys_num tf2 -> r1 = r2 ->
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  ut_wait_out sc_v secc tf1 M M' r1 cs cs' gn pidv -∗
+  ut_wait_out sc_v secc tf2 M M' r2 cs cs' gn pidv.
+Proof.
+  intros Hn0 Hr Ha0. pose proof (usys_eff_num_cong secc _ _ Hn0) as Hn.
+  rewrite /ut_wait_out. subst r2. rewrite Ha0.
+  iIntros "H %Hc".
+  iApply "H". iPureIntro. split; [exact (proj1 Hc) |].
+  rewrite Hn. exact (proj2 Hc).
+Qed.
+
+(* ...AND WHAT THE PROCESS IS HANDED.  The U tier cannot name the
+   incarnation ([UexecRet.uwait_ans]'s header), so the reason is absorbed
+   here -- it is delivered instead as the resume's own pure row
+   ([ut_live_out]).  (lane TRAP-ROWS, T4) *)
+Lemma ut_wait_out_forget `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64)) (M M' : gmap Z (bv 8))
+    (r : mword 64)
+    (cs cs' : gset gname) (gn : gname) (pidv : mword 32) :
+  ut_wait_out sc_v secc tf M M' r cs cs' gn pidv -∗
+  (⌜sc_v = uecall_scause /\ usys_eff secc tf = USYS_wait⌝ -∗
+     uwait_ans r cs cs').
+Proof.
+  rewrite /ut_wait_out. iIntros "H %Hc".
+  iDestruct ("H" with "[%]") as "H"; [exact Hc |].
+  iApply uwait_ans_of. iApply (uwait_ans_at_m_forget with "H").
+Qed.
+
+(* ...AND THE FORM THE RESUME ACTUALLY DELIVERS (lane TRAP-ROWS-4, B1b).
+   The pid is NOT absorbed any more: [UexecRet.uexec_wait_F] is stated at
+   [UexecRet.uwait_ans_pid] at the key's own pid, because a process that
+   can name its pid ([UkRun.ukn_pid]) is what makes the reaping arm's
+   disjunct spendable.  The generation and the status-pointer guard are
+   still absorbed -- those the U tier genuinely cannot name. *)
+Lemma ut_wait_out_pid `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64)) (M M' : gmap Z (bv 8))
+    (r : mword 64)
+    (cs cs' : gset gname) (gn : gname) (pidv : mword 32) :
+  ut_wait_out sc_v secc tf M M' r cs cs' gn pidv -∗
+  (⌜sc_v = uecall_scause /\ usys_eff secc tf = USYS_wait⌝ -∗
+     uwait_ans_pid_m r M M' (tf !!! tf_arg_idx 0) cs cs' pidv).
+Proof.
+  rewrite /ut_wait_out. iIntros "H %Hc".
+  iDestruct ("H" with "[%]") as "H"; [exact Hc |].
+  iExists gn, (bool_decide (tf !!! tf_arg_idx 0 = (zero_reg : mword 64))).
+  iExact "H".
+Qed.
+
+(* ===================================================================== *)
+(* WHAT THE RESUMING PROCESS LEARNS FROM ITS OWN SURVIVAL (lane            *)
+(* TRAP-ROWS, T2(iii) and T4).                                            *)
+(* ===================================================================== *)
+(* A PURE row, and it has to be: what the two kernel rows carry is the
+   incarnation's kill one-shot, and [UkRun.urun] binds the process's own
+   generation with no resource beside it -- the U tier cannot name it, so
+   the reason is absorbed at this boundary
+   ([ut_wait_out_forget], [UexecRet.uwait_ans]'s header) and what comes out
+   instead is what the shot's REFUTATION proves.
+     THE REFUTATION HAPPENS AT +0xa6.  usertrap's second [killed] check is
+   the one place a shot can be contradicted: at a zero flag <p->lock>'s row
+   holds the UNFIRED one-shot ([SchedCtx.kill_paid_shot_nz]), and
+   [ChildTok.kill_pend] is linear, so no refuter can be carried out of that
+   critical section.  A process that RESUMES therefore knows the shot was
+   never fired, and each of the two rows collapses to its other disjunct:
+
+     * THE READ.  At an open readable CONSOLE descriptor and a non-negative
+       count, [SpecFileread.console_receipt]'s -1 arm has exactly two
+       exits -- fileread's [n < 0] sign guard and consoleread's [killed]
+       test.  The shot is gone and the guard is refuted by the count, so
+       the surviving -1 cause AT AN OPEN READABLE CONSOLE FD IS [n < 0],
+       NOT A CLOSED FD: the arm is unreachable and the answer is not -1.
+     * WAIT.  At a NULL status pointer the failing arm's reason
+       ([UserChildren.wait_why]) has three disjuncts and the null pointer
+       kills the copyout one, so with the shot gone a -1 means the caller's
+       children column was EMPTY.
+
+   Both are read at the ENTRY trapframe and the ENTRY descriptor index --
+   the key the deposit went down at -- because that is what the process's
+   own returning arm is indexed by. *)
+(* WAIT'S HALF IS HERE NOW (lane TRAP-ROWS-3, T4(c)).  It was written as a
+   gap: refuting [r = -1] on [UserChildren.wait_ans]'s REAPING arm needs the
+   reaped child's pid to be something other than -1, and the block's
+   registration carried only [bv_unsigned pid <> 0].  The registration now
+   carries the RANGE <allocpid> hands out ([SlotGen.gen_halves_at],
+   [1 <= pid <= PIDMAX]), so [UserChildren.sext32_rng_not_neg1] kills the
+   reaping arm at a -1 return and [UserChildren.wait_ans_m1] hands back the
+   failing arm's reason.  With the null status pointer killing the copyout
+   exit and +0xa6's unfired one-shot killing the killed exit, a -1 means the
+   caller's children column was EMPTY -- and the reap-nothing arm's set did
+   not move, so the caller's own reading is [∅]. *)
+Definition ut_live_out (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64))
+    (sts : list fdstate) (r : mword 64) (cs' : gset gname) : Prop :=
+  (sc_v = uecall_scause -> usys_eff secc tf = USYS_read ->
+   (0 <= sys_rw_count (tf !!! tf_arg_idx 2))%Z ->
+   forall rb : bool,
+     fd_st_of_key (tf !!! tf_arg_idx 0) sts
+       = FdOpen true rb (FdDevice CONSOLE) ->
+     r <> (mword_of_int (-1) : mword 64))
+  /\
+  (sc_v = uecall_scause -> usys_eff secc tf = USYS_wait ->
+   uint (tf !!! tf_arg_idx 0) = 0%Z ->
+   r = (mword_of_int (-1) : mword 64) ->
+   cs' = (∅ : gset gname)).
+
+(* THE TWO GUARDS, NAMED AND DECIDABLE.  usertrap's +0xa6 block proves the
+   row by REFUTING each guard against the unfired one-shot, and a refutation
+   needs the guard as a Coq case, not as an Iris hypothesis -- see
+   [ProofUsertrapTail.ut_a6]. *)
+Definition ut_live_fd_g (tf : list (mword 64)) (sts : list fdstate) : Prop :=
+  exists rb : bool,
+    fd_st_of_key (tf !!! tf_arg_idx 0) sts = FdOpen true rb (FdDevice CONSOLE).
+
+Global Instance ut_live_fd_g_dec (tf : list (mword 64)) (sts : list fdstate) :
+  Decision (ut_live_fd_g tf sts).
+Proof.
+  rewrite /ut_live_fd_g.
+  destruct (decide (fd_st_of_key (tf !!! tf_arg_idx 0) sts
+                    = FdOpen true true (FdDevice CONSOLE))) as [H1 | H1];
+    [ left; exists true; exact H1 | ].
+  destruct (decide (fd_st_of_key (tf !!! tf_arg_idx 0) sts
+                    = FdOpen true false (FdDevice CONSOLE))) as [H2 | H2];
+    [ left; exists false; exact H2 | ].
+  right. intros [rb Hrb]. destruct rb; [ exact (H1 Hrb) | exact (H2 Hrb) ].
+Defined.
+
+Definition ut_live_read_g (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64))
+    (sts : list fdstate) (r : mword 64) : Prop :=
+  sc_v = uecall_scause /\ usys_eff secc tf = USYS_read
+  /\ (0 <= sys_rw_count (tf !!! tf_arg_idx 2))%Z
+  /\ ut_live_fd_g tf sts
+  /\ r = (mword_of_int (-1) : mword 64).
+
+Global Instance ut_live_read_g_dec sc_v secc tf sts r :
+  Decision (ut_live_read_g sc_v secc tf sts r).
+Proof. rewrite /ut_live_read_g. apply _. Defined.
+
+(* ...AND WAIT'S GUARD, the same way: the four facts +0xa6 has to have as
+   Coq cases before it can spend the unfired one-shot on the wait clause. *)
+Definition ut_live_wait_g (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64))
+    (r : mword 64) : Prop :=
+  sc_v = uecall_scause /\ usys_eff secc tf = USYS_wait
+  /\ uint (tf !!! tf_arg_idx 0) = 0%Z
+  /\ r = (mword_of_int (-1) : mword 64).
+
+Global Instance ut_live_wait_g_dec sc_v secc tf r :
+  Decision (ut_live_wait_g sc_v secc tf r).
+Proof. rewrite /ut_live_wait_g. apply _. Defined.
+
+(* ...and the row, out of the two refutations *)
+Lemma ut_live_out_of (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64))
+    (sts : list fdstate) (r : mword 64) (cs' : gset gname) :
+  ~ ut_live_read_g sc_v secc tf sts r ->
+  (ut_live_wait_g sc_v secc tf r -> cs' = (∅ : gset gname)) ->
+  ut_live_out sc_v secc tf sts r cs'.
+Proof.
+  intros Hr Hw. split.
+  - intros He Hn Hc rb Hfd Hm1. apply Hr.
+    split_and!; [ exact He | exact Hn | exact Hc | exists rb; exact Hfd | exact Hm1 ].
+  - intros He Hn Ha0 Hm1. apply Hw.
+    split_and!; [ exact He | exact Hn | exact Ha0 | exact Hm1 ].
+Qed.
+
+(* ...AND THE SAME ROW AT THE U TIER'S SPELLING (lane TRAP-ROWS, T2(iii)).
+   [UexecRet.uexec_live_ok] names the descriptor by INDEX, the form a
+   program holding its table wants; this is the one hop between that and
+   [FdSlots.fd_st_of_key], and it is the [decide] in [fd_st_of_key]
+   itself. *)
+Lemma uexec_live_ok_of_live (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64))
+    (sts : list fdstate) (r : mword 64) (cs' : gset gname) :
+  sc_v = uecall_scause ->
+  ut_live_out sc_v secc tf sts r cs' ->
+  UexecRet.uexec_live_ok (usys_eff secc tf) tf sts r cs'.
+Proof.
+  intros He H. split.
+  - intros Hn Hc rb Hlt Hfd.
+    refine (proj1 H He Hn Hc rb _).
+    rewrite /fd_st_of_key. rewrite decide_True; [| exact Hlt].
+    rewrite Hfd. reflexivity.
+  - intros Hn Ha0 Hm1. exact (proj2 H He Hn Ha0 Hm1).
+Qed.
+
+(* the row is FREE at a non-ecall cause: both clauses are guarded on it *)
+Lemma ut_live_out_ne (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64))
+    (sts : list fdstate) (r : mword 64) (cs' : gset gname) :
+  sc_v <> uecall_scause -> ut_live_out sc_v secc tf sts r cs'.
+Proof.
+  intro Hne. split; [intro Hc | intro Hc]; exfalso; exact (Hne Hc).
+Qed.
+
+(* ...and at any number that is neither the read nor the wait *)
+Lemma ut_live_out_num (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64))
+    (sts : list fdstate) (r : mword 64) (cs' : gset gname) :
+  usys_eff secc tf <> USYS_read -> usys_eff secc tf <> USYS_wait ->
+  ut_live_out sc_v secc tf sts r cs'.
+Proof.
+  intros Hr Hw. split.
+  - intros _ Hn. exfalso. exact (Hr Hn).
+  - intros _ Hn. exfalso. exact (Hw Hn).
+Qed.
+
+(* the two readings the row is stated at do not move across the save walk,
+   so the row transports like [ut_wait_out_cong] does *)
+Lemma ut_live_out_cong (sc_v : mword 64) (secc : mword 64) (tf1 tf2 : list (mword 64))
+    (sts : list fdstate) (r1 r2 : mword 64) (cs' : gset gname) :
+  usys_num tf1 = usys_num tf2 -> r1 = r2 ->
+  tf1 !!! tf_arg_idx 0 = tf2 !!! tf_arg_idx 0 ->
+  tf1 !!! tf_arg_idx 2 = tf2 !!! tf_arg_idx 2 ->
+  ut_live_out sc_v secc tf1 sts r1 cs' -> ut_live_out sc_v secc tf2 sts r2 cs'.
+Proof.
+  intros Hn0 Hr Ha0 Ha2 H1. pose proof (usys_eff_num_cong secc _ _ Hn0) as Hn.
+  subst r2. split.
+  - intros He Hnum Hcnt rb Hfd. rewrite <- Ha0 in Hfd. rewrite <- Ha2 in Hcnt.
+    exact (proj1 H1 He ltac:(rewrite Hn; exact Hnum) Hcnt rb Hfd).
+  - intros He Hnum Ha Hm1. rewrite <- Ha0 in Ha.
+    exact (proj2 H1 He ltac:(rewrite Hn; exact Hnum) Ha Hm1).
+Qed.
+
+(* [uint a1 = 0] is the null pointer the wait clause is conditioned on, in
+   the form the kernel's own row reads it at *)
+Lemma zero_reg_of_uint (x : mword 64) : uint x = 0%Z -> x = (zero_reg : mword 64).
+Proof.
+  intro H. apply bv_eq. rewrite <- !uint_unsigned.
+  rewrite uint_zero_reg. exact H.
+Qed.
+
+Lemma ut_wait_out_quiet `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64)) (M M' : gmap Z (bv 8))
+    (r : mword 64)
+    (cs cs' : gset gname) (gn : gname) (pidv : mword 32) :
+  sc_v <> uecall_scause -> ⊢ ut_wait_out sc_v secc tf M M' r cs cs' gn pidv.
+Proof.
+  intros Hne. rewrite /ut_wait_out. iIntros "%Hc". exfalso.
+  exact (Hne (proj1 Hc)).
+Qed.
+
+Lemma ut_wait_out_quiet_n `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64)) (M M' : gmap Z (bv 8))
+    (r : mword 64)
+    (cs cs' : gset gname) (gn : gname) (pidv : mword 32) :
+  usys_eff secc tf <> USYS_wait -> ⊢ ut_wait_out sc_v secc tf M M' r cs cs' gn pidv.
+Proof.
+  intros Hne. rewrite /ut_wait_out. iIntros "%Hc". exfalso.
+  exact (Hne (proj2 Hc)).
+Qed.
+
+Lemma ut_fork_out_quiet_n `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam) (sc_v : mword 64) (secc : mword 64) (tf : list (mword 64)) (r : mword 64)
+    (cs cs' : gset gname) :
+  usys_eff secc tf <> USYS_fork -> ⊢ ut_fork_out f sc_v secc tf r cs cs'.
+Proof.
+  intros Hne. rewrite /ut_fork_out. iIntros "%Hc". exfalso.
+  exact (Hne (proj2 Hc)).
+Qed.
+
+(* [uvis_of] of a trapframe-rewritten record, spelled out: the key is the
+   new frame over the record's own image, permission projection, break and
+   working directory.  [KforkChild.uvis_of_kfork_child] is the same fact at
+   the dispatcher's own record. *)
+Lemma uvis_of_us_tf (U : ustate) (ws : list (mword 64)) (sts : list fdstate)
+    (gn : gname) (cs : gset gname) (pid : mword 32) :
+  uvis_of (us_tf U ws) sts gn cs pid
+  = MkUvis ws (us_M U)
+           (perm_of (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U))))
+           (uint (pv_sz (us_V U))) sts (pv_cwi (us_V U)) gn cs pid
+           (pv_lazy (us_V U)) (pv_secc (us_V U)).
+Proof. reflexivity. Qed.
+
+(* ===================================================================== *)
+(* FORK'S DEPOSIT: THE CHILD'S CONTINUATION, GOING DOWN.                  *)
+(*                                                                        *)
+(* [UexecRet.uexec_dep_F] at fork is a SLOT, not a bundle -- the WP the    *)
+(* forked child will run, at the one record it resumes at -- and this row  *)
+(* is how it reaches the dispatcher.  It is NOT [UexecSG.sbundle_at]'s     *)
+(* shape and cannot be: the key mentions the epc through                   *)
+(* [UsysMemOk.bump_tf], which [UexecSG.skey_eq] does not fix, so the       *)
+(* deposit class's congruence would be FALSE of it.  Hence its own row,    *)
+(* moulded on [ut_exec_out] -- guarded on the cause and the number, with   *)
+(* the four transparent arms discharging it by refuting the guard.         *)
+(*                                                                        *)
+(* THE TRAPFRAME IS THE PROLOGUE'S, NOT THE ENTRY RECORD'S.  The child     *)
+(* resumes past the ecall, so the record is [tf] BUMPED -- a0 := 0 and     *)
+(* epc + 4 -- and [tf] therefore has to be the frame whose epc word is     *)
+(* the faulting pc, i.e. the one usertrap's +0x28..+0x2e block leaves      *)
+(* ([ut_pro]).  The record [U]'s own epc word is still the PREVIOUS        *)
+(* round's, which is why [tf] rides beside it exactly as it does for       *)
+(* [ut_exec_out].  Everything else -- image, permission map, break,        *)
+(* descriptor table, working directory -- is the parent's, which is what   *)
+(* makes this record [KforkChild.kfork_child]'s at the dispatcher.         *)
+(* ===================================================================== *)
+Definition ut_fork_in `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam)
+    (sc_v : mword 64) (tf : list (mword 64)) (U : ustate)
+    (sts : list fdstate) : iProp Σ :=
+  (⌜sc_v = uecall_scause /\ usys_eff (pv_secc (us_V U)) tf = USYS_fork⌝ -∗
+     (* THE CHILD'S GENERATION IS ∀-BOUND HERE, and its children set is [∅]
+        on the nose.  allocproc mints a FRESH generation for the child's
+        slot, so the depositing process cannot name it and undertakes to be
+        safe at whichever one the kernel mints; the round learns the actual
+        name from kfork's post.  A newly created process has no children.
+        ([UexecRet.uexec_fork_child_F]'s own shape.) *)
+     (* ...AND THE CHILD IS OWED ITS OWN PAYLOAD.  The slot is deposited
+        UNDER [ChildTok.my_pay] of what the depositing process's families
+        chose ([UexecSG.sfork_pay]): the parent undertakes that its child
+        is safe knowing what the child's exit will owe, and the kernel
+        pays that knowledge out of the generation it minted.  It is why
+        this row now carries [f]: the payload the child is told about and
+        the payload the parent's token is at are the same one, and [f] is
+        what carries it past the excursion. *)
+     (* ...AND SO IS THE CHILD'S PID, on the generation's terms exactly:
+        <allocpid> chooses it inside the call and the depositing process
+        cannot name it ([UexecRet.uexec_fork_child_F]). *)
+     (* ...AND HOW A KILLER PAYS FOR THE CHILD (lane SELF-KILL, §4b'): the
+        child's killed row publishes a wand from the application's TAINT
+        ([RiscvPtsto.app_taint]) to the child's exit payload at -1,
+        allocproc founds it, and the FORKING PROCESS is the only party that
+        can supply it -- so it rides the deposit beside the slot.  A
+        generic child's payload is [fun _ => True] and the wand is free. *)
+     □ (app_taint -∗ sfork_pay f (-1)) ∗
+     (* ...AND WHAT THE PARENT LENDS ITS CHILD (lane FORK-REFUND): the
+        resource the forking process hands the child to run with
+        ([UexecSG.sfork_lend]), carried BESIDE the continuation because
+        the kernel must be able to take it back without building the
+        child -- fork's failing arm refunds it ([ut_fork_out]). *)
+     sfork_lend f ∗
+     ∀ (g' : gname) (pidc : mword 32),
+       (* THE CHILD IS NOT <INIT> -- see [SpecSyscall]'s fork row *)
+       ⌜pidc <> (mword_of_int 1 : mword 32)⌝ -∗
+       my_pay g' (sfork_pay f) -∗
+       sfork_lend f -∗
+       uslot (uvis_of (us_tf U (bump_tf tf (mword_of_int 0))) sts g' ∅ pidc))%I.
+
+(* THE ROW'S CONGRUENCE, and it is [TfUser.tf_ueq]-shaped rather than
+   [UexecSG.skey_eq]-shaped: the payload reads the resume register file and
+   the resume PC of the BUMPED frame, so the two frames have to agree on
+   the epc word and on all thirty-one restorable registers -- which is
+   exactly what [tf_ueq] says, and exactly what uservec's save walk and
+   prepare_return's re-arm leave.  The two LENGTH premises are the bump's
+   own readers' ([UexecRet.tf_resume_gpr_bump] /
+   [UexecRet.tf_resume_pc_bump]); [ut_exec_out_ueq] needs neither because
+   its bump is a pure relation and never computed.  Everything else is
+   read off the record: image, permission projection, break, cwd. *)
+Lemma ut_fork_in_ueq `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam)
+    (sc_v : mword 64) (tf tf' : list (mword 64)) (U U' : ustate)
+    (sts : list fdstate) :
+  length tf = TFWORDS ->
+  length tf' = TFWORDS ->
+  tf_ueq tf tf' ->
+  us_M U' = us_M U ->
+  perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U')))
+    = perm_of (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U))) ->
+  pv_sz (us_V U') = pv_sz (us_V U) ->
+  pv_cwi (us_V U') = pv_cwi (us_V U) ->
+  (* ...and the lazy bit, which fork's child key reads *)
+  pv_lazy (us_V U') = pv_lazy (us_V U) ->
+  (* ...and the mask, which the child key and the guard read *)
+  pv_secc (us_V U') = pv_secc (us_V U) ->
+  ut_fork_in f sc_v tf U sts -∗ ut_fork_in f sc_v tf' U' sts.
+Proof.
+  intros Hl Hl' Hu HM Hpi Hsz Hcw Hlzq Hscq.
+  assert (Hla : (tf_arg_idx 0 < length tf)%nat)
+    by (rewrite Hl; unfold tf_arg_idx, TFWORDS; lia).
+  assert (Hla' : (tf_arg_idx 0 < length tf')%nat)
+    by (rewrite Hl'; unfold tf_arg_idx, TFWORDS; lia).
+  assert (Hle : (tf_epc_idx < length tf)%nat)
+    by (rewrite Hl; unfold tf_epc_idx, TFWORDS; lia).
+  assert (Hle' : (tf_epc_idx < length tf')%nat)
+    by (rewrite Hl'; unfold tf_epc_idx, TFWORDS; lia).
+  assert (Hg : tf_resume_gpr0 (bump_tf tf (mword_of_int 0))
+               = tf_resume_gpr0 (bump_tf tf' (mword_of_int 0))).
+  { rewrite (tf_resume_gpr0_bump tf (mword_of_int 0) Hla).
+    rewrite (tf_resume_gpr0_bump tf' (mword_of_int 0) Hla').
+    rewrite (tf_ueq_resume_gpr0 tf tf' Hu). reflexivity. }
+  assert (Hp : tf_resume_pc (bump_tf tf (mword_of_int 0))
+               = tf_resume_pc (bump_tf tf' (mword_of_int 0))).
+  { rewrite (tf_resume_pc_bump tf (mword_of_int 0) Hle).
+    rewrite (tf_resume_pc_bump tf' (mword_of_int 0) Hle').
+    unfold tf_w. rewrite (tf_ueq_epc tf tf' Hu). reflexivity. }
+  rewrite /ut_fork_in. iIntros "H %Hc".
+  iDestruct ("H" with "[%]") as "H";
+    [ split; [ exact (proj1 Hc)
+             | rewrite -Hscq (usys_eff_num_cong _ tf tf' (tf_ueq_num tf tf' Hu));
+               exact (proj2 Hc) ] |].
+  iDestruct "H" as "(#Hkw & HRc & H)". iSplitR; [ iExact "Hkw" | ].
+  iFrame "HRc". iIntros (g' pidc) "%Hne Hp HRc".
+  iSpecialize ("H" $! g' pidc). iSpecialize ("H" with "[%] Hp HRc");
+    [ exact Hne | ].
+  rewrite !uvis_of_us_tf.
+  iEval (rewrite (uslot_key_cong
+                    (MkUvis (bump_tf tf (mword_of_int 0)) (us_M U)
+                       (perm_of (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U))))
+                       (uint (pv_sz (us_V U))) sts (pv_cwi (us_V U)) g' ∅ pidc
+                       (pv_lazy (us_V U)) (pv_secc (us_V U)))
+                    (MkUvis (bump_tf tf' (mword_of_int 0)) (us_M U')
+                       (perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))))
+                       (uint (pv_sz (us_V U'))) sts (pv_cwi (us_V U')) g' ∅ pidc
+                       (pv_lazy (us_V U')) (pv_secc (us_V U')))
+                    Hg Hp (eq_sym HM) (eq_sym Hpi)
+                    (f_equal uint (eq_sym Hsz)) eq_refl (eq_sym Hcw)
+                    eq_refl eq_refl eq_refl (eq_sym Hlzq) (eq_sym Hscq))) in "H".
+  iExact "H".
+Qed.
+
+(* ===================================================================== *)
+(* THE PAYMENT: THE PAYLOAD, GOING DOWN AT EVERY TRAP.                    *)
+(*                                                                        *)
+(* [UexecRet.uexec_pay_dep] is what the process hands over at a kernel     *)
+(* entry -- its own knowledge of the payload its exit owes                 *)
+(* ([ChildTok.my_pay]) and that payload PAID -- and this row is how it     *)
+(* reaches the arms and, at the exit number, [SpecSysExit] and             *)
+(* [SpecKexit], which park it as the ZOMBIE escrow.                        *)
+(*                                                                        *)
+(* UNGATED: AT EVERY CAUSE AND EVERY NUMBER.  usertrap's killed check runs *)
+(* on every arm -- at +0xca before [syscall()], at the device arm's        *)
+(* +0xf6, and at the tail's +0xa6 -- and each of those calls [exit(-1)],   *)
+(* which owes [kexit] the payload at -1.  A process torn down at a timer   *)
+(* interrupt pays out of the same deposit as one torn down at a syscall,   *)
+(* so the row cannot be guarded on the ecall cause.                        *)
+(*                                                                        *)
+(* TWO-ARMED ONLY AT EXIT, and the ∧ is the ADDITIVE conjunction: the kill *)
+(* check at +0xca runs BEFORE [syscall()], so a process that trapped with  *)
+(* the exit number may still be torn down at -1 rather than at the status  *)
+(* it asked for.  Whichever conjunct the arm needs is the one it takes.    *)
+(*                                                                        *)
+(* AT THE BLOCK'S OWN GENERATION [ProcDefs.pv_gen], not at the key's       *)
+(* [gn]: the party that spends this is kexit, which holds the private      *)
+(* block and whose kernel quarter is keyed there ([ProcInv.               *)
+(* proc_priv_core]), and the loop -- which BUILDS the key, at the very     *)
+(* field the park keyed it by ([ParkCap.park_cap]) -- is the one party     *)
+(* that has the identification in hand.                                    *)
+(*                                                                        *)
+(* AT THE DEPOSIT'S OWN FAMILIES [f], for [ut_sys_in]'s reason and         *)
+(* [ut_fork_in]'s: the payload is a field of them ([UexecSG.sexit_pay]),   *)
+(* so the payment that goes down and the payment that comes back out       *)
+(* ([ut_pay_out], a row of [usertrap_post]) are at ONE predicate.          *)
+(* ===================================================================== *)
+Definition ut_pay_in `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam) (sc_v : mword 64) (tf : list (mword 64)) (U : ustate) : iProp Σ :=
+  upay_at (pv_gen (us_V U)) sc_v (pv_secc (us_V U)) tf f.
+
+(* the row's congruence: it reads the number and argument 0, both of which
+   [TfUser.tf_ueq] carries (its second clause covers indices 5..35, and
+   [tf_arg_idx 0] is 14). *)
+Lemma ut_pay_in_ueq `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam) (sc_v : mword 64) (tf tf' : list (mword 64)) (U U' : ustate) :
+  tf_ueq tf tf' ->
+  pv_gen (us_V U') = pv_gen (us_V U) ->
+  (* ...and the mask, which the row's number reads *)
+  pv_secc (us_V U') = pv_secc (us_V U) ->
+  ut_pay_in f sc_v tf U -∗ ut_pay_in f sc_v tf' U'.
+Proof.
+  intros Hu Hg Hsc. rewrite /ut_pay_in. rewrite Hsc.
+  iApply (upay_at_ueq _ _ sc_v _ tf tf' f
+            (tf_ueq_num tf tf' Hu)
+            (proj2 Hu (tf_arg_idx 0) ltac:(unfold tf_arg_idx; lia))
+            (eq_sym Hg)).
+Qed.
+
+(* ...AND THE KILL ROW BESIDE IT (app-echo.md, lane KILL-PAY, K3(b)).
+   UNGATED on the cause the way [ut_pay_in] is, and for the same reason:
+   the route that carries it does not know which cause it is on.  But it is
+   READ only at a [UexecRet.ukill_sc] cause -- anything but the ecall and
+   the two delegated S-mode interrupts -- and it is [emp] everywhere else,
+   so the three arms that never reach setkilled owe nothing.
+     WHAT IT IS: the kill row of the trapping process's own deposit
+   ([UexecRet.uexec_dep_F]'s non-ecall branch).  WHO SPENDS IT: the
+   dispatcher's unexpected-scause arm, which calls setkilled -- and
+   [SpecSetkilled] charges the price of a kill.
+     TWO-SIDED, AND THEREFORE LINEAR (lane SELF-KILL, P6b): the LEFT side
+   is the application's taint, which every generic process holds out of
+   the supply, and the RIGHT is the process's OWN exit payload at -1
+   ([ChildTok.kill_owed]) -- what a verified program deposits when it
+   faults on purpose.  Indexed by the trapping incarnation's GENERATION,
+   because that is what the right side's payment is keyed at.
+   [xv6G] is bound rather than [ctokG] itself: the bundle carries the
+   class as a FIELD instance and two of them in one scope print
+   identically (durable-notes). *)
+(* ...AND IT IS THE WHOLE PAIR NOW (lane TRAP-ROWS, T3; the owner's ruling
+   of 2026-09-16).  What comes down is not the deposit alone but the
+   ADDITIVE conjunction the process offered at the trap -- the -1 deposit
+   AND the resume slot -- because the two are proved from one copy of the
+   process's resources and the KERNEL is the party that decides which one
+   it takes: setkilled takes the left, a served vmfault takes the right and
+   hands it back through [ut_kill_out].  At the ecall cause there is no
+   pair and nothing is owed. *)
+Definition ut_kill_in `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam) (sc_v : mword 64) (W : uvis) (gn : gname) (sts : list fdstate)
+    : iProp Σ :=
+  (* ...AND THE KEY'S GENERATION IS THE BLOCK'S, carried as a PURE conjunct
+     rather than a Coq premise: the key is opaque to the kernel, and this is
+     the one thing setkilled has to know about it -- which row its charge
+     lands on.  AND THE KEY'S TABLE IS THE TRAP'S (design/pipe.md, "The exit
+     path"): the owed side of the pair pays the tear-down's closes at the
+     key's table, and kexit spends them at the trap's. *)
+  (⌜uvis_gen W = gn /\ uvis_fd W = sts⌝ ∗
+   (if decide (sc_v = uecall_scause) then emp
+    else uexec_kill_arm sc_v W f))%I.
+
+(* ...AND WHAT COMES BACK ON THE RESUME PATH: the slot the kernel did NOT
+   take.  The twin of [ut_exec_out]'s success disjunct, at the key the pair
+   was handed over at -- the U-mode loop's round transports it to the
+   resumed key the same way it used to transport the arm's
+   ([UexecApply.uslot_key_cong]). *)
+Definition ut_kill_out `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (sc_v : mword 64) (W : uvis) : iProp Σ :=
+  (if decide (sc_v = uecall_scause) then emp else uslot W)%I.
+
+(* ...AND WHAT AN ARM ON THE WAY TO THE RESUME MUST STILL HOLD: the slot it
+   owes the process if it resumes -- OR the fact that it cannot resume.
+   The second disjunct is what [setkilled] leaves behind: the unexpected-
+   scause arm spends the pair's LEFT side on the kill and keeps the
+   incarnation's one-shot instead ([SpecSetkilled] returns it), and the
+   killed check the arm falls into is then refuted against the row
+   ([SchedCtx.kill_paid_shot_nz]).  Without this disjunct that arm would
+   owe a slot it has just paid away. *)
+Definition ut_resume_in `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (sc_v : mword 64) (W : uvis) (gn : gname) : iProp Σ :=
+  (if decide (sc_v = uecall_scause) then emp
+   else (uslot W ∨ ChildTok.kill_shot gn))%I.
+
+Section UtKillRows.
+  Context `{!riscvGS Σ, !xv6G Σ, !fileG Σ}.
+  Context `{GEN : GenId} `{XI : CurCtx} {SG : uexecSG Σ}.
+
+  Lemma ut_kill_in_ecall (f : sfam) (W : uvis) (gn : gname) (sts : list fdstate) :
+    uvis_gen W = gn -> uvis_fd W = sts -> ⊢ ut_kill_in f uecall_scause W gn sts.
+  Proof using .
+    intros Hg Hfd. rewrite /ut_kill_in. iSplitR; [ by iPureIntro | ].
+    case_decide as Hc; [ done | exfalso; by apply Hc ].
+  Qed.
+
+  Lemma ut_kill_out_ecall (W : uvis) : ⊢ ut_kill_out uecall_scause W.
+  Proof using . rewrite /ut_kill_out. case_decide as Hc; [ done | exfalso; by apply Hc ]. Qed.
+
+  Lemma ut_resume_in_ecall (W : uvis) (gn : gname) :
+    ⊢ ut_resume_in uecall_scause W gn.
+  Proof using . rewrite /ut_resume_in. case_decide as Hc; [ done | exfalso; by apply Hc ]. Qed.
+
+  (* the pair's two sides, at the cause that has one *)
+  Lemma ut_kill_in_pair (f : sfam) (sc_v : mword 64) (W : uvis) (gn : gname)
+      (sts : list fdstate) :
+    sc_v <> uecall_scause ->
+    ut_kill_in f sc_v W gn sts -∗
+    ⌜uvis_gen W = gn /\ uvis_fd W = sts⌝ ∗ (ukill_cred_at uslot gn sc_v W f ∧ uslot W).
+  Proof using .
+    intro Hne. rewrite /ut_kill_in.
+    destruct (decide (sc_v = uecall_scause)) as [Hc | _]; [ by exfalso | ].
+    iIntros "[%Hg H]". iSplitR; [ by iPureIntro | ].
+    destruct Hg as [Hg _]. rewrite -Hg. rewrite /uexec_kill_arm /uexec_kill_arm_F. iExact "H".
+  Qed.
+
+  (* ...and the resume row, built from either of the two things an arm may
+     be carrying *)
+  Lemma ut_resume_in_of_slot (sc_v : mword 64) (W : uvis) (gn : gname) :
+    sc_v <> uecall_scause -> uslot W -∗ ut_resume_in sc_v W gn.
+  Proof using .
+    intro Hne. rewrite /ut_resume_in.
+    destruct (decide (sc_v = uecall_scause)) as [Hc | _];
+      [ exfalso; exact (Hne Hc) | ]. iIntros "H". iLeft. iExact "H".
+  Qed.
+
+  Lemma ut_resume_in_of_shot (sc_v : mword 64) (W : uvis) (gn : gname) :
+    ChildTok.kill_shot gn -∗ ut_resume_in sc_v W gn.
+  Proof using .
+    rewrite /ut_resume_in.
+    destruct (decide (sc_v = uecall_scause)) as [_ | _];
+      [ by iIntros "_" | ]. iIntros "H". iRight. iExact "H".
+  Qed.
+
+  Lemma ut_kill_out_of_slot_ne (sc_v : mword 64) (W : uvis) :
+    sc_v <> uecall_scause -> uslot W -∗ ut_kill_out sc_v W.
+  Proof using .
+    intro Hne. rewrite /ut_kill_out.
+    destruct (decide (sc_v = uecall_scause)) as [Hc | _];
+      [ exfalso; exact (Hne Hc) | ]. by iIntros "$".
+  Qed.
+
+  (* ...and the resume row, out of the two things an arm may be carrying *)
+  Lemma ut_kill_out_of_slot (sc_v : mword 64) (W : uvis) (gn : gname) :
+    ut_resume_in sc_v W gn -∗
+    (ChildTok.kill_shot gn -∗ False) -∗
+    ut_kill_out sc_v W.
+  Proof using .
+    rewrite /ut_resume_in /ut_kill_out. case_decide as Hc; [ by iIntros "_ _" | ].
+    iIntros "[H | Hs] Hno"; [ iExact "H" | iDestruct ("Hno" with "Hs") as %[] ].
+  Qed.
+End UtKillRows.
+
+(* THERE IS NOTHING COMING BACK (lane SELF-KILL, P6b).  The payload at the
+   kill status is the KILLER's price, paid into <p->lock>'s own killed row
+   ([SchedCtx.kill_row]) -- so [ut_pay_in] is the PERSISTENT pay fact
+   beside the exit ecall's payment, no arm is handed anything to give back,
+   and [usertrap_post] carries no payment row. *)
+
+(* the quiet readings, for the four non-ecall causes.  Only the OUT rows
+   need one: a deposit going DOWN is simply dropped by an arm that owes
+   nothing ([ProofUsertrap]'s device demultiplexer), so [ut_sys_in] and
+   [ut_fork_in] have no quiet reading at all. *)
+Lemma ut_sys_out_quiet `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (n : Z) (f : sfam) (sc_v : mword 64) (tf : list (mword 64)) (U : ustate)
+    (sts : list fdstate) (r : mword 64) (M' : gmap Z (bv 8))
+    (sts' : list fdstate) (cw' : Z) (gn : gname) (cs cs' : gset gname)
+    (pid : mword 32) :
+  sc_v <> uecall_scause ->
+  ⊢ ut_sys_out n f sc_v tf U sts gn cs pid r M' sts' cw' cs'.
+Proof.
+  intros Hne. rewrite /ut_sys_out. iIntros "%Hc". exfalso. exact (Hne (proj1 Hc)).
+Qed.
+
+Lemma ut_exec_out_quiet `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam)
+    (sc_v : mword 64) (tf : list (mword 64)) (M : gmap Z (bv 8))
+    (π : gmap (mword 27) uperm) (szv : Z) (lz : bool) (secc : mword 64)
+    (U' : ustate) (sts sts' : list fdstate) (gn : gname) (cs : gset gname)
+    (pid : mword 32) :
+  sc_v <> uecall_scause -> ⊢ ut_exec_out f sc_v tf M π szv lz secc U' sts sts' gn cs pid.
+Proof.
+  intros Hne. rewrite /ut_exec_out. iIntros "%Hc". exfalso. exact (Hne (proj1 Hc)).
+Qed.
+
+(* the pre row's key congruence: the bundle reads its key at
+   [UexecSG.skey_eq]'s six rows and the guard reads the number -- which is
+   what carries it across the prologue's epc rewrite and uservec's save
+   walk ([UexecSG.sbundle_at_cong]) *)
+Lemma ut_sys_in_cong `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (n : Z) (f : sfam) (sc_v : mword 64) (tf tf' : list (mword 64))
+    (U U' : ustate) (sts : list fdstate) (gn : gname) (cs : gset gname)
+    (pid : mword 32) :
+  usys_num tf = usys_num tf' ->
+  us_M U = us_M U' ->
+  tf_w (pv_tf (us_V U)) (tf_arg_idx 0) = tf_w (pv_tf (us_V U')) (tf_arg_idx 0) ->
+  tf_w (pv_tf (us_V U)) (tf_arg_idx 1) = tf_w (pv_tf (us_V U')) (tf_arg_idx 1) ->
+  tf_w (pv_tf (us_V U)) (tf_arg_idx 2) = tf_w (pv_tf (us_V U')) (tf_arg_idx 2) ->
+  pv_cwi (us_V U) = pv_cwi (us_V U') ->
+  (* ...AND THE PERMISSION MAP AND THE SIZE, which read(2)'s receipt row
+     reads ([UexecExecInst.xv6_spost] at 5 names the table its key projects
+     from, lane CONS-SWALLOW W4).  Stated at the projection rather than at
+     the descriptor, because that is what the key holds; a caller whose two
+     states share a table and a size discharges both with [eq_refl]. *)
+  perm_of (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))
+    = perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))) ->
+  uint (pv_sz (us_V U)) = uint (pv_sz (us_V U')) ->
+  (* ...AND THE LAZY BIT, which the same receipt row reads beside them
+     (lane LAZY-FLAG): the two records store the same bit. *)
+  pv_lazy (us_V U) = pv_lazy (us_V U') ->
+  (* ...AND THE MASK, which the guard's effective number reads *)
+  pv_secc (us_V U) = pv_secc (us_V U') ->
+  ut_sys_in n f sc_v tf U sts gn cs pid -∗
+  ut_sys_in n f sc_v tf' U' sts gn cs pid.
+Proof.
+  intros Hn HM Ha0 Ha1 Ha2 Hcw Hpi Hsz Hlz Hsc. rewrite /ut_sys_in. iIntros "H %Hc".
+  destruct Hc as (Hce & Hcn & Hcf).
+  iDestruct ("H" with "[%]") as "H";
+    [ split_and!; [ exact Hce | rewrite Hsc (usys_eff_num_cong _ _ _ Hn); exact Hcn | exact Hcf ] |].
+  iEval (rewrite (sbundle_at_cong uslot n f (uvis_of U sts gn cs pid)
+                    (uvis_of U' sts gn cs pid)
+                    ltac:(rewrite /skey_eq; split_and!;
+                          [ exact HM | exact Ha0 | exact Ha1 | exact Ha2
+                          | reflexivity | exact Hcw
+                          | reflexivity | reflexivity
+                          | reflexivity | exact Hpi | exact Hsz
+                          | exact Hlz | exact Hsc ]))) in "H".
+  iExact "H".
+Qed.
+
+(* ...and the post row's, at the same six rows: what comes back is read at
+   the same key ([UexecSG.spost_at_cong]) *)
+Lemma ut_sys_out_cong `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (n : Z) (f : sfam) (sc_v : mword 64) (tf tf' : list (mword 64))
+    (U U' : ustate) (sts : list fdstate) (gn : gname) (cs : gset gname)
+    (pid : mword 32) (r : mword 64)
+    (M' : gmap Z (bv 8)) (sts' : list fdstate) (cw' : Z) (cs' : gset gname) :
+  usys_num tf' = usys_num tf ->
+  us_M U = us_M U' ->
+  tf_w (pv_tf (us_V U)) (tf_arg_idx 0) = tf_w (pv_tf (us_V U')) (tf_arg_idx 0) ->
+  tf_w (pv_tf (us_V U)) (tf_arg_idx 1) = tf_w (pv_tf (us_V U')) (tf_arg_idx 1) ->
+  tf_w (pv_tf (us_V U)) (tf_arg_idx 2) = tf_w (pv_tf (us_V U')) (tf_arg_idx 2) ->
+  pv_cwi (us_V U) = pv_cwi (us_V U') ->
+  (* ...AND THE PERMISSION MAP AND THE SIZE, which read(2)'s receipt row
+     reads ([UexecExecInst.xv6_spost] at 5 names the table its key projects
+     from, lane CONS-SWALLOW W4).  Stated at the projection rather than at
+     the descriptor, because that is what the key holds; a caller whose two
+     states share a table and a size discharges both with [eq_refl]. *)
+  perm_of (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U)))
+    = perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))) ->
+  uint (pv_sz (us_V U)) = uint (pv_sz (us_V U')) ->
+  pv_lazy (us_V U) = pv_lazy (us_V U') ->
+  pv_secc (us_V U) = pv_secc (us_V U') ->
+  ut_sys_out n f sc_v tf U sts gn cs pid r M' sts' cw' cs' -∗
+  ut_sys_out n f sc_v tf' U' sts gn cs pid r M' sts' cw' cs'.
+Proof.
+  intros Hn HM Ha0 Ha1 Ha2 Hcw Hpi Hsz Hlz Hsc. rewrite /ut_sys_out. iIntros "H %Hc".
+  destruct Hc as (Hce & Hcn & Hcx & Hcf).
+  iDestruct ("H" with "[%]") as "H";
+    [ split_and!; [ exact Hce | rewrite Hsc -(usys_eff_num_cong _ _ _ Hn); exact Hcn | exact Hcx | exact Hcf ] |].
+  iEval (rewrite (spost_at_cong uslot n f (uvis_of U sts gn cs pid)
+                    (uvis_of U' sts gn cs pid) r
+                    M' sts' cw' cs'
+                    ltac:(rewrite /skey_eq; split_and!;
+                          [ exact HM | exact Ha0 | exact Ha1 | exact Ha2
+                          | reflexivity | exact Hcw
+                          | reflexivity | reflexivity
+                          | reflexivity | exact Hpi | exact Hsz
+                          | exact Hlz | exact Hsc ]))) in "H".
+  iExact "H".
+Qed.
+
+(* ...and the post row's: across a tail that re-keys the parked record in
+   the four kernel words (prepare_return) or the descriptor's derived
+   field (uservec's renormalisation), and across uservec's save walk on the
+   entry side.  The row reads the entry frame at the number, the epc and
+   the resume projections, the exit record at its resume projections, its
+   a0 word, image, permission map and break -- all inside [tf_ueq]'s
+   reach. *)
+Lemma ut_exec_out_ueq `{!riscvGS Σ, !xv6G Σ, !fileG Σ} `{GEN : GenId} `{XI : CurCtx}
+    {SG : uexecSG Σ}
+    (f : sfam)
+    (sc_v : mword 64) (tf tf' : list (mword 64)) (M : gmap Z (bv 8))
+    (π : gmap (mword 27) uperm) (szv : Z) (lz : bool) (secc : mword 64)
+    (U' U'' : ustate) (sts sts' : list fdstate) (gn : gname)
+    (cs : gset gname) (pid : mword 32) :
+  tf_ueq tf tf' ->
+  tf_ueq (pv_tf (us_V U')) (pv_tf (us_V U'')) ->
+  us_M U'' = us_M U' ->
+  perm_of (ud_um (pv_upt (us_V U''))) (uint (pv_sz (us_V U'')))
+    = perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))) ->
+  pv_sz (us_V U'') = pv_sz (us_V U') ->
+  (* ...and the cwd's inum, which the loadable arm's key carries *)
+  pv_cwi (us_V U'') = pv_cwi (us_V U') ->
+  (* ...and the lazy bit, which the exec row reads beside the break *)
+  pv_lazy (us_V U'') = pv_lazy (us_V U') ->
+  (* ...and the mask *)
+  pv_secc (us_V U'') = pv_secc (us_V U') ->
+  ut_exec_out f sc_v tf M π szv lz secc U' sts sts' gn cs pid -∗
+  ut_exec_out f sc_v tf' M π szv lz secc U'' sts sts' gn cs pid.
+Proof.
+  intros Hu Hu' HM Hpi Hsz Hcwi Hlzq Hscq. rewrite /ut_exec_out. iIntros "H %Hc".
+  iDestruct ("H" with "[%]") as "[%Hf | Hs]";
+    [ split; [exact (proj1 Hc) | rewrite (usys_eff_num_cong _ tf tf' (tf_ueq_num tf tf' Hu)); exact (proj2 Hc)]
+    | | ].
+  - iLeft. iPureIntro. destruct Hf as (r & [Hb1 Hb2] & Hm & Hst).
+    exists r. split; [split |].
+    + rewrite <- (tf_ueq_resume_gpr0 _ _ Hu'). rewrite <- (tf_ueq_resume_gpr0 _ _ Hu).
+      exact Hb1.
+    + rewrite <- (tf_ueq_resume_pc _ _ Hu'). unfold tf_w.
+      rewrite <- (tf_ueq_epc _ _ Hu). exact Hb2.
+    + split; [| exact Hst]. rewrite HM Hpi Hsz Hlzq.
+      exact (usys_mem_ok_ueq _ _ _ _ _ _ _ _ _ _ _ _ Hu Hm).
+  - iRight.
+    iEval (rewrite (uslot_key_cong (uvis_of U' sts' gn cs pid)
+                      (uvis_of U'' sts' gn cs pid)
+                      (tf_ueq_resume_gpr0 _ _ Hu') (tf_ueq_resume_pc _ _ Hu')
+                      (eq_sym HM) (eq_sym Hpi) (f_equal uint (eq_sym Hsz)) eq_refl
+                      (eq_sym Hcwi) eq_refl eq_refl eq_refl (eq_sym Hlzq)
+                      (eq_sym Hscq)))
+      in "Hs".
+    iExact "Hs".
+Qed.
+
+(* THE PROLOGUE'S OWN MOVE: [U'] is [U] with the epc word rewritten, which
+   is what usertrap's +0x28..+0x2e block does and all it does.  Every block
+   below the entry carries this (or the round it grows into) as a premise. *)
+Definition ut_pro (sepc_v : mword 64) (U U' : ustate) : Prop :=
+  pv_tf (us_V U') = <[tf_epc_idx := ret_pc sepc_v]> (pv_tf (us_V U))
+  /\ pv_upt (us_V U') = pv_upt (us_V U)
+  /\ pv_sz (us_V U') = pv_sz (us_V U)
+  /\ us_M U' = us_M U
+  (* ...and the cwd's inum, which the prologue's one store does not touch *)
+  /\ pv_cwi (us_V U') = pv_cwi (us_V U)
+  (* ...AND THE GENERATION, on the same footing: the prologue writes ONE
+     trapframe word, so the record it hands on is the same incarnation --
+     which is what the payment row ([ut_pay_in]) and the post's
+     [ut_gen_kept] are keyed by. *)
+  /\ pv_gen (us_V U') = pv_gen (us_V U)
+  (* ...AND THE LAZY BIT, on the generation's footing exactly: the prologue
+     writes ONE trapframe word and no block field ([ProcDefs.pv_lazy]). *)
+  /\ pv_lazy (us_V U') = pv_lazy (us_V U)
+  (* ...and the mask, likewise ([ProcDefs.pv_secc]) *)
+  /\ pv_secc (us_V U') = pv_secc (us_V U).
+
+Lemma ut_pro_secc (sepc_v : mword 64) (U U' : ustate) :
+  ut_pro sepc_v U U' -> pv_secc (us_V U') = pv_secc (us_V U).
+Proof. intros (_ & _ & _ & _ & _ & _ & _ & Hsc). exact Hsc. Qed.
+
+(* THE ENTRY INSTANCE: at the record the prologue hands on, the round has
+   done nothing yet, so every arm of the relation is an identity. *)
+Lemma ut_round_entry (sepc_v sc_v : mword 64) (U U' : ustate) :
+  (* the entry instance is available only where the dispatch has already
+     ruled the ecall arm out -- which is exactly the four arms that take
+     it; on the ecall arm the round has real content from the first step. *)
+  sc_v <> uecall_scause ->
+  ut_pro sepc_v U U' -> ut_round sepc_v sc_v U U'.
+Proof.
+  intros Hne (Htf & Hupt & Hsz & HM & Hcwi & Hgn & Hlz & Hsc).
+  unfold ut_round, uround_ok.
+  destruct (decide (sc_v = uecall_scause)) as [Heq | _]; [ contradiction (Hne Heq) | ].
+  rewrite Htf Hupt Hsz HM Hcwi Hlz Hsc. unfold uround_id_ok.
+  split_and!; reflexivity.
+Qed.
+
+(* A BLOCK THAT DOES NOT MOVE THE USER-VISIBLE STATE relays the round. *)
+Lemma ut_round_same (sepc_v sc_v : mword 64) (U U' U'' : ustate) :
+  pv_tf (us_V U'') = pv_tf (us_V U') ->
+  perm_of (ud_um (pv_upt (us_V U''))) (uint (pv_sz (us_V U'')))
+    = perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))) ->
+  us_M U'' = us_M U' ->
+  (* the break is user-visible now, so "does not move the user-visible
+     state" has to say so *)
+  pv_sz (us_V U'') = pv_sz (us_V U') ->
+  (* ...and the cwd's inum, now that the key carries it *)
+  pv_cwi (us_V U'') = pv_cwi (us_V U') ->
+  (* ...and the lazy bit, which the block stores ([ProcDefs.pv_lazy]) and
+     which no block-preserving step writes *)
+  pv_lazy (us_V U'') = pv_lazy (us_V U') ->
+  (* ...and the mask, likewise *)
+  pv_secc (us_V U'') = pv_secc (us_V U') ->
+  ut_round sepc_v sc_v U U' -> ut_round sepc_v sc_v U U''.
+Proof.
+  intros H1 H2 H3 H4 H5 H6 H7 H. unfold ut_round in H |- *.
+  rewrite H1 H2 H3 H4 H5 H6 H7. exact H.
+Qed.
+
+(* ...and one that moves it only in the four KERNEL words (prepare_return). *)
+Lemma ut_round_ueq (sepc_v sc_v : mword 64) (U U' U'' : ustate) :
+  tf_ueq (pv_tf (us_V U')) (pv_tf (us_V U'')) ->
+  perm_of (ud_um (pv_upt (us_V U''))) (uint (pv_sz (us_V U'')))
+    = perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))) ->
+  us_M U'' = us_M U' ->
+  pv_sz (us_V U'') = pv_sz (us_V U') ->
+  pv_cwi (us_V U'') = pv_cwi (us_V U') ->
+  pv_lazy (us_V U'') = pv_lazy (us_V U') ->
+  pv_secc (us_V U'') = pv_secc (us_V U') ->
+  ut_round sepc_v sc_v U U' -> ut_round sepc_v sc_v U U''.
+Proof.
+  intros Hu H2 H3 H4 H5 H6 H7 H. unfold ut_round in H |- *.
+  rewrite H2 H3 H4 H5 H6 H7.
+  eapply uround_ok_ueq_r; [ exact Hu | exact H ].
+Qed.
+
+(* The statement, parameterized over the abstract kernel-internal resource
+   [R : uptd -> mword 64 -> iProp Σ]: [R pt ksp] is everything usertrap needs
+   beyond the machine state above, for the process whose user page table is
+   [pt] and whose kernel stack top is [ksp].  The module type instantiates it
+   with its own [usertrap_res].
+
+   The key is (pt, ksp) and not the process's ghost names because those are
+   the only two the TRAMPOLINE knows: the proof's definition existentially
+   packages the rest (the fd-table name, the slot index, the pid, the private
+   record [V] with [pv_upt V = pt], the stack budget, the per-cpu frame) --
+   see claude-notes/projects/usertrap.md.  [ksp] appears because [sie_cap] is
+   keyed on sp, which is what the [m !!! sp = ksp] premise below licenses. *)
+Definition usertrap_post `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (R : uptd -> mword 64 -> ustate -> list fdstate -> gset gname -> mword 32 -> iProp Σ)
+    (pt : uptd) (ksp : mword 64) (m : regfile)
+    (mie_v menvcfg0 : mword 64)
+    (* THE ROUND'S ENTRY STATE (milestone J1a).  [U] is the process's state
+       AS USERTRAP WAS ENTERED -- the record uservec's save walk left, whose
+       epc word is still the PREVIOUS round's; [sepc_v] is the faulting pc
+       the trap delivered and [sc_v] the cause.  [tf0] below is therefore the
+       entry trapframe as usertrap's own prologue leaves it (the
+       +0x28..+0x2e block writes [epc := r_sepc()]), which is the user-visible
+       trapframe the round starts from. *)
+    (U : ustate) (sts : list fdstate)
+    (* the two WAIT-EXIT readings the key is built at, beside [sts]: this
+       lane's rows keep both, so the post hands them back unchanged. *)
+    (gn : gname) (cs : gset gname)
+    (* ...and the process's PID, the third reading of the same kind: the
+       key carries it, the block holds the cell, and the caller -- which is
+       holding the block -- names it.  No row moves it. *)
+    (pid : mword 32) (sepc_v sc_v : mword 64)
+    (* THE DEPOSIT'S FAMILIES, read by the syscall channel's out row below:
+       what comes back is a post at the very receipts the process deposited
+       at ([UexecSG.v]'s header). *)
+    (f : sfam)
+    (* THE KEY THE KILL PAIR WAS HANDED AT (lane TRAP-ROWS, T3).  OPAQUE:
+       the kernel never reads it, it only gives back the side it did not
+       take, and the party that knows which key its own arm was at is the
+       U-mode loop -- the save walk's trapframe is not that key. *)
+    (Wk : uvis) : iProp Σ :=
+  let ret_tgt : mword 64 := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  ( ∀ (pt' : uptd) (mf : regfile)
+      (ms' usatp uepc sc' stval' mdv0 : mword 64) (U' : ustate)
+      (* THE ROUND MAY HAVE MOVED THE DESCRIPTOR STATES, and the post names
+         where they landed -- open/close/dup/pipe are the entries that do.
+         ∃-bound with [U'] for the same reason: the round chooses. *)
+      (sts' : list fdstate)
+      (* ...AND THE CHILDREN SET, on the same terms: fork is the one entry
+         that moves it, and what it moved to is READ off the residue the
+         post hands back ([UsertrapRes.ut_own]'s [WaitInv.ch_frag]), not
+         chosen by the loop. *)
+      (cs' : gset gname),
+    (* ---- THE ROUND, as a relation on the user-visible state -------------
+       [UexecRound.uround_ok] keyed on the cause, exactly as the dispatch's
+       own [c.li a5,8; bne] is: an ecall either was exec (whose successor WP
+       is a kernel MINT, so the row says nothing) or bumped the trapframe and
+       moved the image/permission map by what the entry's own syscall row
+       allows; anything else resumes the trapped state on the nose.
+       J1a's temporary escape for the ecall arm (S7), narrowed to sbrk at
+       S8, is GONE at S8b: every entry, sbrk included, proves the row.
+       The third premise is prepare_return's [csrw sepc, p->trapframe->epc]
+       read back through [tf_resume_pc]: the pc the sret lands at IS the
+       resume trapframe's own. *)
+    ⌜pv_upt (us_V U') = pt'⌝ -∗
+    ⌜ut_round sepc_v sc_v U U'⌝ -∗
+    (* ...and its descriptor half, on both sides of the cause: nothing moved
+       unless this was an ecall, and if it was, the syscall table says what
+       did. *)
+    ⌜ut_fd_kept sc_v sts sts'⌝ -∗
+    (* ...and the children set's, guarded off fork -- see [ut_ch_kept] *)
+    ⌜ut_ch_kept sc_v (pv_secc (us_V U)) (pv_tf (us_V U)) cs cs'⌝ -∗
+    (* ...and the generation's, unguarded -- see [ut_gen_kept] *)
+    ⌜ut_gen_kept U U'⌝ -∗
+    ⌜ut_fd_ecall sc_v (pv_secc (us_V U)) (pv_tf (us_V U)) (pv_tf (us_V U')) sts sts'⌝ -∗
+    (* ...and pipe's join, off the same pair -- see [ut_pipe_ecall] *)
+    ⌜ut_pipe_ecall sc_v (pv_secc (us_V U)) (pv_tf (us_V U)) (pv_tf (us_V U'))
+                   (us_M U) (us_M U') sts sts'⌝ -∗
+    (* ...and GETPID'S ANSWER, off the same pair of frames -- see
+       [ut_ret_pid].  It is the row that makes the user-execution round
+       able to say what getpid(2) returned. *)
+    ⌜ut_ret_pid sc_v (pv_secc (us_V U)) (pv_tf (us_V U)) (pv_tf (us_V U')) pid⌝ -∗
+    ⌜ret_pc uepc = tf_resume_pc (pv_tf (us_V U'))⌝ -∗
+    (* [mideleg]'s VALUE is not pinned to whatever usertrap was handed at
+       entry -- unlike [mie_v]/[menvcfg0] (each a unique architectural
+       constant, so their exit value provably equals the entry one),
+       [mideleg] is a genuine existential inside [IntrDefs.sconf], and
+       nothing tracks "the same witness" across usertrap's internal
+       instruction-step lemmas (which carry [sconf] opaquely, never
+       re-destructuring it) -- so the caller only gets a FRESH value
+       satisfying the same mask, discovered at the exit. *)
+    ⌜and_vec mie_v (not_vec mdv0) = zeros' 64⌝ -∗
+    (* THE TRAPFRAME PAGE IS THE ONE THING THAT CANNOT MOVE, and the ROOT IS
+       NOT.  The first draft promised [ud_root pt' = ud_root pt] as well, on
+       the strength of the vmfault arm (which only inserts leaves).  It is
+       FALSE on the syscall arm: exec() replaces the address space wholesale,
+       so [SpecSyscall]'s post pins [ud_tfp] and nothing else, and no proof of
+       the stronger conjunct exists.  Nothing wanted it either -- what the
+       trampoline needs is that the satp usertrap RETURNS is rooted at the
+       table it hands over, which is [satp_rooted usatp (ud_root pt')]
+       below. *)
+    ⌜ud_tfp pt' = ud_tfp pt⌝ -∗
+    (* the pure facts the trampoline halves need about it, which the process
+       block's [proc_pt_at] carries -- and there are TWO of them, not three.
+       [udata_cov (ud_um pt') (ud_data pt')] used to be here and is NOT
+       provable: [ProcPtOwn] deliberately retired the field-to-field coupling
+       between [ud_um] and [ud_data] ("the footprint derived from [um]", its
+       §1), so [proc_pt] says nothing about [ud_data]; and on the syscall arm
+       the descriptor is whatever the table entry left, of which
+       [SpecSyscall]'s post pins only [ud_tfp].  Nor is it usertrap's fact to
+       state: the trampoline needs it beside the process's memory, and
+       the conversion that BUILDS that resource -- the page-footprint side of
+       the dovetail, conversion 2 -- derives the footprint from [ud_um] and so
+       establishes the coverage by construction ([ProcPtOwn.ud_pas_cov]).
+       Asking for it here would be asking usertrap to prove a property of a
+       resource it never holds. *)
+    ⌜upt_acc_wf (ud_um pt')⌝ -∗
+    ⌜upt_map_wf (ud_um pt')⌝ -∗
+    (* sret-ready, and still a legal S-mode configuration *)
+    ⌜usertrap_ret_ms ms'⌝ -∗
+    ⌜sconf_ms_facts ms'⌝ -∗
+    ⌜callee_saved m mf⌝ -∗
+    ⌜mf !!! Regidx (mword_of_int 4 : mword 5) = cid_word⌝ -∗
+    (* the return value: MAKE_SATP(p->pagetable) *)
+    ⌜mf !!! Regidx (mword_of_int 10 : mword 5) = usatp⌝ -∗
+    ⌜satp_rooted usatp (ud_root pt')⌝ -∗
+    hart_state ↦ᵣ HART_ACTIVE tt -∗
+    cur_privilege ↦ᵣ Supervisor -∗
+    mstatus ↦ᵣ ms' -∗
+    scause ↦ᵣ sc' -∗
+    stval ↦ᵣ stval' -∗
+    (* the user pc to resume, which prepare_return's [csrw sepc] wrote *)
+    sepc ↦ᵣ uepc -∗
+    (* THE VECTOR IS BACK AT uservec, and still owned outright: after
+       prepare_return this hart has no kernel handler installed, which is
+       what forbids re-enabling interrupts before the sret. *)
+    stvec ↦ᵣ (mword_of_int TRAMPOLINE : mword 64) -∗
+    pc_is ret_tgt -∗
+    gpr_file mf -∗
+    (* the three [sconf] cells usertrap borrowed for its own call and hands
+       back UNCHANGED (usertrap never writes them) -- see [wp_usertrap_body]'s
+       matching entry premise. *)
+    mie ↦ᵣ mie_v -∗
+    mideleg ↦ᵣ mdv0 -∗
+    menvcfg ↦ᵣ menvcfg0 -∗
+    (* [hw_config]/[minstret_inv], AT THE RESUMING HART.  Both are persistent
+       and ride at the head of [sconf] -- [wp_usertrap_body]'s own entry
+       premise hands them in as a free borrow (see its comment) on the
+       strength that "persistent costs the caller nothing", but that is only
+       true AT ONE HART: usertrap may cross to a different hart before it
+       returns (the whole reason [R] above is hart-indexed), and a caller's
+       pre-crossing copy is a DIFFERENT resource from the post-crossing one
+       (same shape, different hart index, indistinguishable on the page).
+       The proof already has the resuming hart's own copies on hand at this
+       exact point -- [ut_ret2] unpacks them straight out of [sconf] just
+       like [ut_dup_hw] does -- so exposing them here costs nothing new to
+       prove, only to thread through. *)
+    hw_config -∗
+    minstret_inv -∗
+    R pt' ksp U' sts' cs' pid -∗
+    (* THE EXEC CHANNEL'S ANSWER, at the round's entry trapframe and the
+       record the round left -- see [ut_exec_out] *)
+    ut_exec_out f sc_v (<[tf_epc_idx := ret_pc sepc_v]> (pv_tf (us_V U)))
+      (us_M U) (perm_of (ud_um (pv_upt (us_V U))) (uint (pv_sz (us_V U))))
+      (uint (pv_sz (us_V U))) (pv_lazy (us_V U)) (pv_secc (us_V U)) U' sts sts' gn cs pid -∗
+    (* ...AND FORK'S: the parent's child token -- see [ut_fork_out] *)
+    ut_fork_out f sc_v (pv_secc (us_V U)) (<[tf_epc_idx := ret_pc sepc_v]> (pv_tf (us_V U)))
+      (pv_tf (us_V U') !!! tf_arg_idx 0) cs cs' -∗
+    (* ...AND WAIT'S: what the reap left the caller's reading -- see
+       [ut_wait_out] *)
+    ut_wait_out sc_v (pv_secc (us_V U)) (<[tf_epc_idx := ret_pc sepc_v]> (pv_tf (us_V U)))
+      (us_M U) (us_M U')
+      (pv_tf (us_V U') !!! tf_arg_idx 0) cs cs' gn pid -∗
+    (* ...AND WHAT A RESUME ITSELF PROVES (lane TRAP-ROWS, T2(iii) / T4):
+       the two rows above answer at the incarnation, the process cannot
+       name it, and this is what survives the refutation -- see
+       [ut_live_out]. *)
+    ⌜ut_live_out sc_v (pv_secc (us_V U)) (<[tf_epc_idx := ret_pc sepc_v]> (pv_tf (us_V U)))
+        sts (pv_tf (us_V U') !!! tf_arg_idx 0) cs'⌝ -∗
+    (* ...AND THE UNTAKEN CONTINUATION (lane TRAP-ROWS, T3): at a non-ecall
+       cause the process handed the kernel the additive pair, and a resume
+       means the kernel took the RIGHT side and owes it back -- at the key
+       it was handed at, which the U-mode round transports. *)
+    ut_kill_out sc_v Wk -∗
+    (* ...AND THE SYSCALL CHANNEL'S, at the same entry frame and read at the
+       a0 word the round left -- [ut_sys_out].  The dispatcher produces it,
+       the four tails relay it, and the U-mode loop hands it to the
+       process's own returning arm. *)
+    (∀ n : Z,
+       ut_sys_out n f sc_v (pv_tf (us_V U)) U sts gn cs pid
+         (pv_tf (us_V U') !!! tf_arg_idx 0) (us_M U') sts'
+         (pv_cwi (us_V U')) cs') -∗
+    mWP (Loop : expr riscv_lang)).
+
+(* [R] IS A HART-INDEXED FAMILY, AND IT HAS TO BE.  usertrap is handed the
+   kernel-side bundle at the hart the TRAP came in on and gives it back at the
+   hart it RESUMES on -- the two are different whenever the function parks
+   (yield, and every sleeping syscall through [SpecSyscall]'s own crossing),
+   and everything inside [UsertrapRes.ut_res] except the stack is per-hart
+   ([sie_arm], [cpu_own], [cpu_claim], the [sconf] closer's register cells,
+   the SIE ghost).  Written as a plain [uptd -> mword 64 -> iProp Σ] the
+   post's [R] is pinned to the ENTRY hart, and no proof of it exists: the tail
+   rebuilds the bundle out of what prepare_return handed back, which is at the
+   resuming hart ([ProofUsertrapTail.ut_ret2], whose whole reason for being
+   its own section is that hart).  So [R] takes the hart: [R CID] going in,
+   [R CID'] coming out, where [CID'] is the crossing's own binder.  The
+   module type below supplies [fun h => usertrap_res (CID := h)]. *)
+Definition wp_usertrap_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (R : CpuId -> uptd -> mword 64 -> ustate -> list fdstate -> gset gname -> mword 32 -> iProp Σ)
+    (pt : uptd) (j : nat)
+    (m : regfile) (ms_v sc_v stval_v sepc_v ksp : mword 64)
+    (mie_v mdv0 menvcfg0 : mword 64) (U : ustate) (sts : list fdstate)
+    (gn : gname) (cs : gset gname) (pid : mword 32)
+    (* THE DEPOSIT'S FAMILIES, taken ONCE and read by both syscall rows:
+       the process chose them when it built its bundle, and the post it
+       gets back is at the same ones ([UexecSG.v]'s header). *)
+    (f : sfam)
+    (* THE KEY THE KILL PAIR WAS HANDED AT (lane TRAP-ROWS, T3).  OPAQUE:
+       the kernel never reads it, it only gives back the side it did not
+       take, and the party that knows which key its own arm was at is the
+       U-mode loop -- the save walk's trapframe is not that key. *)
+    (Wk : uvis) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.usertrap in
+  let pj := proc_addr j in
+  (* the trap delivered a legal S-mode configuration -- see above *)
+  usertrap_entry_ms ms_v ->
+  (j < NPROC)%nat ->
+  (* calling convention: sp = the process's kernel stack top (uservec loaded
+     it out of the trapframe's kernel_sp), tp = this hart's id (myproc),
+     ra = uva 0x9c, i.e. userret -- usertrap RETURNS INTO userret. *)
+  m !!! Regidx (mword_of_int 2 : mword 5) = ksp ->
+  m !!! Regidx (mword_of_int 4 : mword 5) = cid_word ->
+  (* the three [sconf] pins usertrap needs of the CSRs it borrows -- see the
+     matching conjunct of [mie]/[mideleg]/[menvcfg] below *)
+  mie_v = MIE_S ->
+  and_vec mie_v (not_vec mdv0) = zeros' 64 ->
+  menvcfg0 = MENVCFG_S ->
+  kernel_text -∗ pc_is pcE -∗
+  (* [hw_config]/[minstret_inv] are persistent, so borrowing a copy for the
+     duration of the call costs the caller nothing -- unlike [mie]/
+     [mideleg]/[menvcfg] below, which usertrap needs at FULL ownership
+     (it assembles [IntrDefs.sconf], hence [sie_cap_gpr], out of them for its
+     own internal kernel-tier step lemmas) and must therefore borrow and
+     give back explicitly, exactly like every other loose cell here.
+     [usertrap_post] hands a copy back too, in spite of that -- NOT because
+     the call could otherwise lose them (a persistent proposition is never
+     consumed), but because usertrap may CROSS HARTS before it returns, and
+     the entry copy is a resource AT THE ENTRY HART, silent on any other
+     one.  A caller that needs [hw_config] again after the call (uservec's
+     tail does, to reach userret) needs it AT THE RESUMING HART, which only
+     [usertrap_post] itself is in a position to hand over. *)
+  hw_config -∗ minstret_inv -∗
+  hart_state ↦ᵣ HART_ACTIVE tt -∗
+  cur_privilege ↦ᵣ Supervisor -∗
+  mstatus ↦ᵣ ms_v -∗
+  scause ↦ᵣ sc_v -∗
+  stval ↦ᵣ stval_v -∗
+  sepc ↦ᵣ sepc_v -∗
+  (* NO KERNEL HANDLER IS INSTALLED: the cell is owned raw, at the
+     trampoline, and the [csrw stvec] at +0x1e is what turns it into an
+     [intr_res].  The dangling SIE quarter that pairs with it rides inside
+     [R] -- see the header. *)
+  stvec ↦ᵣ (mword_of_int TRAMPOLINE : mword 64) -∗
+  mie ↦ᵣ mie_v -∗
+  mideleg ↦ᵣ mdv0 -∗
+  menvcfg ↦ᵣ menvcfg0 -∗
+  gpr_file m -∗
+  (* everything kernel-side, abstractly, AT THE ENTRY HART *)
+  R CID pt ksp U sts cs pid -∗
+  (* the process's deposit for the number it trapped at, owed only at an
+     ecall -- [ut_sys_in] *)
+  (∀ n : Z, ut_sys_in n f sc_v (pv_tf (us_V U)) U sts gn cs pid) -∗
+  (* ...and FORK'S, which is not one of them: a slot rather than a bundle,
+     and stated at the frame the PROLOGUE leaves (the entry record's epc
+     word is still the previous round's) -- [ut_fork_in] *)
+  ut_fork_in f sc_v (<[tf_epc_idx := ret_pc sepc_v]> (pv_tf (us_V U))) U sts -∗
+  (* ...AND THE PAYMENT, which is neither and is owed at EVERY cause and
+     every number, at the same frame fork's row is stated at
+     -- [ut_pay_in] *)
+  ut_pay_in f sc_v (<[tf_epc_idx := ret_pc sepc_v]> (pv_tf (us_V U))) U -∗
+  (* ...AND THE KILL ROW, owed at every cause and empty at all but the ones
+     usertrap kills at -- [ut_kill_in] *)
+  (* THE KEY'S GENERATION IS THE BLOCK'S (lane TRAP-ROWS, T2/T3).  Every
+     row usertrap relays that names an incarnation -- the kill pair's, and
+     the console read's one-shot on row 5 -- is at the KEY's generation,
+     and the party that knows it is this process's is the U-mode loop.
+     A RESOURCE ROW and not a Coq premise: the record usertrap runs at is
+     the SAVE WALK's, which the boundary above cannot name, so a Coq
+     premise here would pin it to the wrong one. *)
+  ⌜gn = pv_gen (us_V U)⌝ -∗
+  ut_kill_in f sc_v Wk gn sts -∗
+  (* THE CROSSING: usertrap parks (yield, and every sleeping syscall), so it
+     may return on a different hart -- and the bundle comes back at THAT
+     hart, which is why [R] is a family (see the note above). *)
+  wp_next true pj (fun (CID' : CpuId) =>
+    usertrap_post (CID := CID') (R CID') pt ksp m mie_v menvcfg0 U sts gn cs
+      pid sepc_v sc_v f Wk) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* THE MODULE TYPE'S INSTANCE LIST IS THE UNION OF THE FIVE CONES', NOT THE
+   BOUNDARY'S.  [wp_usertrap_body] above needs almost none of these -- its
+   own statement is register cells, [wp_next] and the abstract [R] -- but
+   [usertrap_res] is a PARAMETER, so its type has to be the one its
+   instantiation has, and [UsertrapRes.ut_res] is the union of syscall's /
+   devintr's / vmfault's / printk-general's / kexit's environments.  It is
+   SpecKexit.v's list verbatim (kexit is the deepest of the five, and the
+   other four add no class of their own).  A consumer that only wants the
+   boundary pays nothing for them: they are Sigma constraints, discharged by
+   whatever Sigma the whole-system composition is built over. *)
+(* SPLIT OUT so the definition can be checked against it WHERE IT IS WRITTEN.
+   [UsertrapRes.v] defines the bundle long before ProofUsertrap can seal
+   USERTRAP (its [wp_usertrap] is the whole proof), and a parameter's instance
+   list that does not admit its instantiation is a thing to discover there
+   rather than at the seal.  [UsertrapRes.UtResFits] is a
+   [<: USERTRAP_RES], which makes that mechanical. *)
+Require Import UserFd.   (* [ufdG] -- the class a minted user slot needs *)
+Module Type USERTRAP_RES.
+  (* the kernel-internal resources usertrap consumes, for the process whose
+     user page table is [pt] and whose kernel stack top is [ksp]: defined
+     concretely by the proof (as [UsertrapRes.ut_res SY.syscall_env], the
+     functor's syscall environment being the one piece that is itself still
+     abstract); threaded opaquely by consumers. *)
+  Parameter usertrap_res :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx},
+      uptd -> mword 64 -> ustate -> list fdstate -> gset gname -> mword 32 -> iProp Σ.
+
+  (* THE TRAPFRAME BORROW.  [usertrap_res] owns the trapframe page at the
+     VA tier internally (via [ProcInv.proc_priv]/[tf_page]) -- it is the
+     ONE OWNER, per [UsertrapRes.ut_own]'s own header comment -- but uservec
+     ALSO owns the same page's bytes, at the physical tier, as [tf_pa]
+     cells (SpecUserret.v's vocabulary), for the whole 44-instruction save/
+     restore walk.  Rather than have [usertrap_res] itself borrow-and-return
+     the page (which would ripple [wp_usertrap_body]'s type and, through it,
+     ONLY every internal usertrap block that already threads [usertrap_res]
+     opaquely -- no external file), this accessor lets a HOLDER of
+     [usertrap_res] pull [tf_page] out for a moment and hand back a
+     (possibly different) one to reseal it -- exactly the shape uservec's
+     tail needs: open, convert its own [tf_pa] cells in, close. Concrete
+     proof: [UsertrapRes.usertrap_res_tf_open], via [proc_priv_split] +
+     [ut_own_priv]. *)
+  (* THE PARKED FORM: [usertrap_res] WITHOUT THE TRANSLATION SLOT.
+     [usertrap_res] owns [satp] (its internal [strans_inv] sits in the KPT
+     arm, i.e. [KptShare.tlb_res_pt]) -- right for the state usertrap RUNS
+     in, and impossible for anything parked across user execution, where
+     [UptTree.utlb_inv_pt] owns [satp] at the USER root instead.  Holding
+     both is contradictory, so a consumer that took [usertrap_res] beside a
+     user-mode table would be vacuous rather than wrong-looking.  uservec
+     therefore takes the PARKED residue, and its exit switch's own
+     [tlb_res_pt] is exactly what completes it; userret's entry switch takes
+     that back out.  Concrete: [UsertrapRes.ut_res_parked]. *)
+  Parameter usertrap_res_parked :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx},
+      uptd -> mword 64 -> ustate -> list fdstate -> gset gname -> mword 32 -> iProp Σ.
+
+  (* uservec's move: the switch just installed the kernel table, so the
+     residue can be completed into the state usertrap consumes. *)
+  Parameter usertrap_res_tlb_close :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (kroot : mword 44) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_parked pt ksp U sts cs pid -∗ tlb_res_pt kroot -∗ usertrap_res pt ksp U sts cs pid.
+
+  (* userret's move: its entry switch is about to install the USER table, so
+     it needs the kernel one back out first.  The root is existential --
+     nothing outside pins which table the slot holds, and userret is
+     parametric in it. *)
+  Parameter usertrap_res_tlb_open :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res pt ksp U sts cs pid -∗
+      ∃ kroot : mword 44, tlb_res_pt kroot ∗ usertrap_res_parked pt ksp U sts cs pid.
+
+  (* THE BARE FORM: the parked residue WITHOUT THE USER ADDRESS SPACE.
+     [usertrap_res_parked] fixed ONE of four overlaps with the user tier
+     (satp).  The other three are all [proc_pt], which rides inside
+     [usertrap_res] via [ProcInv.proc_priv]: the user page-table TREE
+     ([ptree_own 2 (DfracOwn 1)]) and the user DATA PAGES, which
+     [UserPtTree.user_pt_inv] carries too.  So the parked form is still
+     unsatisfiable beside a user-mode frame, and it is the BARE form that
+     parks across user execution.  Concrete: [UsertrapRes.ut_res_bare].
+
+     What the bare form still HAS is everything the kernel genuinely owns
+     while user code runs -- including [p->pagetable]/[p->trapframe] (cells
+     that merely name the table) and the trapframe page itself (physical
+     tier, U = 0 leaf, unreachable from user mode).  That is why
+     [usertrap_res_tf_open] below is stated on THIS form: the trapframe is
+     available in exactly the window the address space is not. *)
+  Parameter usertrap_res_bare :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx},
+      uptd -> mword 64 -> ustate -> list fdstate -> gset gname -> mword 32 -> iProp Σ.
+
+  (* uservec's move, one tier under [_tlb_close]: its exit switch converted
+     the user table back to a [pt_frame], and the pages never moved, so
+     [ProcPtOwn.user_pt_inv_open] rebuilds [proc_pt] and this reseals it
+     into the residue. *)
+  Parameter usertrap_res_pt_close :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗ (∃ M : gmap Z (bv 8), proc_pt pt M) -∗
+      ∃ Mz : gmap Z (bv 8), usertrap_res_parked pt ksp (upd_usM U Mz) sts cs pid.
+
+  (* userret's move: the address space is about to be installed again, so
+     it comes back out, to be split into the tree the entry switch consumes
+     and the pages [ProcPtOwn.user_pt_inv_close] hands the user tier. *)
+  Parameter usertrap_res_pt_open :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_parked pt ksp U sts cs pid -∗ (∃ M : gmap Z (bv 8), proc_pt pt M) ∗ usertrap_res_bare pt ksp U sts cs pid.
+
+  (* ---- THE SAME TWO CROSSINGS AT THE NAMED LAZY IMAGE (milestone J, S3).
+     The pair above is stated at the MAPPED view with the image quantified,
+     which is all the uservec seam needed while [uservec_post] handed back
+     [UserPtTree.user_pt_any pt'].  Once the round's post names its image --
+     and once the loop hands user execution a [UexecRet.uvb] whose image
+     conjunct is [user_ptm_inv pt sz M] -- the crossing has to carry the
+     name in BOTH directions: the entry image is what [UsysMemOk.usys_mem_ok]
+     relates the exit one to.
+
+     THE SIZE IS FORCED, THE IMAGE IS NOT.  The residue's [ut_own] holds
+     [ProcPtOwn.proc_ptm] at the process's own [p->sz]
+     ([uint (pv_sz (us_V U))]) -- that is the view [proc_priv] splits into --
+     so both directions are stated there and neither takes [sz] as a free
+     parameter.  The image is free on the close: the BARE residue owns none
+     of the user bytes, so it re-parks at whatever image comes back, and the
+     index moves by [upd_usM].
+
+     The [_pt_] pair STAYS: other callers speak the mapped view.  Concretes:
+     [UsertrapRes.ut_res_ptm_open] / [ut_res_ptm_close] -- the existing
+     proofs minus the one weakening step ([proc_ptm_pt] / [proc_pt_ptm_any]). *)
+  Parameter usertrap_res_ptm_close :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (M : gmap Z (bv 8)) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      proc_ptm pt (uint (pv_sz (us_V U))) M -∗
+      usertrap_res_parked pt ksp (upd_usM U M) sts cs pid.
+
+  Parameter usertrap_res_ptm_open :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_parked pt ksp U sts cs pid -∗
+      proc_ptm pt (uint (pv_sz (us_V U))) (us_M U) ∗ usertrap_res_bare pt ksp U sts cs pid.
+
+  (* THE FOOTPRINT RENORMALISATION.  The bare residue reads its descriptor
+     only through [ud_root]/[ud_tfp]/[ud_um] -- [proc_pt], the one conjunct
+     whose user-side partner names [ud_data], is what it just gave up -- so
+     it may be re-keyed on [ProcPtOwn.ud_norm].  That is what lets the trap
+     loop hand the user tier a descriptor whose [udata_cov] side condition
+     holds by construction, which is the fact this file's [usertrap_post]
+     explains it cannot ask usertrap for. *)
+  (* THE DESCRIPTOR VIEW, BORROWED OUT OF THE RUNNING RESIDUE -- the fd half
+     of what [usertrap_res_ptm_open] does for the image.  The trap loop puts
+     what comes out into [UexecRet.uvb] as its [Rfd fdv] and hands it back at
+     the trap; the closer is ∀-GENERAL in the states, which is what lets a
+     syscall retype a descriptor.  The AUTHORITY does not move -- it rides in
+     [ProcInv.ofile_slot], hence inside the residue -- so the kernel keeps the
+     array and the process only ever gets the view. *)
+  (* BOTH BORROWS AT ONCE -- see [UsertrapRes.ut_res_bare_fd_tf_open] for why
+     userret's entry cannot get them by two applications. *)
+  Parameter usertrap_res_bare_fd_tf_open :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+    usertrap_res_bare pt ksp U sts cs pid -∗
+    FdSlots.fd_frags (pv_fdg (us_V U)) sts ∗
+    ∃ kroot : mword 44,
+      kpt_inv kroot ∗ ⌜tf_kernel_words_ok kroot ksp (pv_tf (us_V U))⌝ ∗
+      tf_page (ud_tfp pt) (pv_tf (us_V U)) ∗
+      own_context cur_ctx ∗
+      (∀ (ws' : list (mword 64)) (sts' : list fdstate),
+         ⌜tf_kernel_words_ok kroot ksp ws'⌝ -∗ tf_page (ud_tfp pt) ws' -∗
+         FdSlots.fd_frags (pv_fdg (us_V U)) sts' -∗ own_context cur_ctx -∗
+         usertrap_res_bare pt ksp (us_tf U ws') sts' cs pid).
+
+  Parameter usertrap_res_bare_fd_open :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      FdSlots.fd_frags (pv_fdg (us_V U)) sts ∗
+      own_context cur_ctx ∗
+      (∀ sts' : list fdstate,
+         FdSlots.fd_frags (pv_fdg (us_V U)) sts' -∗ own_context cur_ctx -∗
+         usertrap_res_bare pt ksp U sts' cs pid).
+
+  (* THE KEY HISTORY, borrowed out of the bare residue (design/ni-uhist.md
+     D4): the per-process list of rounds at the residue's own name, every
+     round of it lawful ([UhistDefs.uhist_wf]), handed back at any lawful
+     list.  The trap loop appends one round per trip.  Concrete:
+     [UsertrapRes.ut_res_bare_uhist_acc]. *)
+  Parameter usertrap_res_bare_uhist_acc :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      ∃ (γ : gname) (h : list uround), uhist_auth γ h ∗ ⌜uhist_wf h⌝ ∗
+        (∀ h' : list uround, uhist_auth γ h' -∗ ⌜uhist_wf h'⌝ -∗
+           usertrap_res_bare pt ksp U sts cs pid).
+
+  Parameter usertrap_res_bare_norm :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      usertrap_res_bare (ud_norm pt) ksp (us_upt U (ud_norm pt)) sts cs pid.
+
+  (* THE PER-HART CSRs, borrowed out of the parked residue.  [IntrDefs.
+     hart_csrs] -- [sscratch] at an arbitrary value, [medeleg] at
+     [MEDELEG_S], the two state-enable pins at zero -- lives in [cpu_priv],
+     hence inside the [cpu_own] this residue already carries, because that
+     is the bundle a migration re-delivers.  Two consumers, both needing the
+     bare form: uservec borrows [sscratch] across its save walk (its own
+     [csrw sscratch,a0] at +0x00 writes it and the [csrr] at +0x76 reads it
+     back, so a value-agnostic invariant would not serve), and the trap loop
+     hands the three pinned cells to [UserExec.user_cfg] for the user phase,
+     parking the closer wand in their place.  Concrete:
+     [UsertrapRes.ut_res_bare_csrs_open]. *)
+  Parameter usertrap_res_csrs_open :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      hart_csrs ∗ (hart_csrs -∗ usertrap_res_bare pt ksp U sts cs pid).
+
+  (* THE TIMER CAPABILITY'S mcounteren PIN.  The U tier needs
+     [mcounteren ↦ᵣ□] and it cannot come from [hw_config] (timerinit writes
+     mcounteren after that bundle is frozen); the residue carries it inside
+     [devintr_caps_any]'s [timer_cap], at every hart.  Persistent, so it is
+     handed straight back.  Concrete: [UsertrapRes.ut_res_bare_sstc]. *)
+  Parameter usertrap_res_sstc :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗ sstc_enabled ∗ usertrap_res_bare pt ksp U sts cs pid.
+
+  (* ... AND BOTH AT ONCE, which is what uservec needs: its save walk holds
+     the trapframe page open across the same stretch its [csrw sscratch,a0] /
+     [csrr t0,sscratch] pair holds the [sscratch] cell.  Each single accessor
+     consumes the whole sealed residue, so neither composes with the other's
+     remainder -- simultaneous borrows of a sealed bundle come out of ONE
+     opener.  Concrete: [UsertrapRes.ut_res_bare_tf_csrs_open]. *)
+  Parameter usertrap_res_tf_csrs_open :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      ∃ kroot : mword 44,
+        kpt_inv kroot ∗ ⌜tf_kernel_words_ok kroot ksp (pv_tf (us_V U))⌝ ∗
+        tf_page (ud_tfp pt) (pv_tf (us_V U)) ∗ hart_csrs ∗ own_context cur_ctx ∗
+        (∀ ws' : list (mword 64),
+           ⌜tf_kernel_words_ok kroot ksp ws'⌝ -∗ tf_page (ud_tfp pt) ws' -∗ hart_csrs -∗ own_context cur_ctx -∗
+           usertrap_res_bare pt ksp (us_tf U ws') sts cs pid).
+
+  (* THE TRAPFRAME BOUND ON [p->sz], off the residue.  Milestone J's resume
+     obligation ([UexecRet.uvb]'s [⌜UserPerm.usz_ok sz⌝]) is a fact about
+     the process block, and across user execution the loop holds no block
+     -- only this residue.  Pure conclusion, so a caller keeps the bundle.
+     Concrete: [UsertrapRes.ut_res_bare_sz]. *)
+  Parameter usertrap_res_bare_sz :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗ ⌜uint (pv_sz (us_V U)) <= uvm_maxsz⌝.
+
+  (* ...AND WHAT THE PROCESS'S LAZY BIT CLAIMS ABOUT THE TABLE IT RUNS ON
+     (lane KILL-PAY, milestone LAZY-ROW), off the same residue and for the
+     same reason: the U tier's slot guard demands it at every resume
+     ([UexecRet.uslot_F]'s fill row), and across user execution the loop
+     holds no block -- only this residue.  Stated at the residue's OWN
+     table, which it pins itself.  Concrete: [UsertrapRes.ut_res_bare_lazy]. *)
+  Parameter usertrap_res_bare_lazy :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      ⌜pv_lazy (us_V U) = false -> lazy_free (ud_um pt) (uint (pv_sz (us_V U)))⌝.
+
+  (* THE APPLICATION-SIDE FS INVARIANT, off the bare residue: the one
+     persistent fact the trap loop needs of the kernel to mint the
+     process's exec bundle ([UexecExecMint]).  Concrete:
+     [UsertrapRes.ut_res_bare_fsabs] at the syscall environment's own
+     projection ([SpecSyscall.SYSCALL.syscall_env_fsabs]). *)
+  Parameter usertrap_res_bare_fsabs :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      FirstTok.fsabs_env ∗ usertrap_res_bare pt ksp U sts cs pid.
+
+  (* NO SLOT ACCESSOR HERE (milestone J, S6).  The residue used to carry the
+     ∀-state [UexecWp.uexec_wp] as [ut_own]'s last conjunct, and this module
+     type exported [usertrap_res_uwp_acc] / [usertrap_res_run_open] to pull
+     it out and put one back each round.  The trap loop now runs the keyed
+     per-process contract ([UexecRet.uslot] / [uexec_ret]) and FRAMES it
+     across [wp_uservec_pt] -- completed/user-wp-slot.md SS4c, refutation
+     R-a -- so the residue carries no WP and neither accessor has a reader. *)
+  Parameter usertrap_res_tf_open :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (pt : uptd) (ksp : mword 64) (U : ustate) (sts : list fdstate) (cs : gset gname) (pid : mword 32),
+      (* THE CROSS-ROUND HISTORICAL FACT, bare and undischarged -- see
+         [ProcGeom.tf_kernel_words_ok]'s own header. *)
+      usertrap_res_bare pt ksp U sts cs pid -∗
+      ∃ kroot : mword 44,
+        kpt_inv kroot ∗ ⌜tf_kernel_words_ok kroot ksp (pv_tf (us_V U))⌝ ∗
+        tf_page (ud_tfp pt) (pv_tf (us_V U)) ∗
+        own_context cur_ctx ∗
+        (∀ ws' : list (mword 64),
+           ⌜tf_kernel_words_ok kroot ksp ws'⌝ -∗ tf_page (ud_tfp pt) ws' -∗
+         own_context cur_ctx -∗
+           usertrap_res_bare pt ksp (us_tf U ws') sts cs pid).
+
+End USERTRAP_RES.
+
+Module Type USERTRAP.
+  Include USERTRAP_RES.
+  Parameter wp_usertrap :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{!ufdG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (pt : uptd) (j : nat)
+      (m : regfile) (ms_v sc_v stval_v sepc_v ksp : mword 64)
+      (mie_v mdv0 menvcfg0 : mword 64) (U : ustate) (sts : list fdstate)
+      (gn : gname) (cs : gset gname) (pid : mword 32)
+      (f : sfam) (Wk : uvis),
+      wp_usertrap_body (fun h : CpuId => usertrap_res (CID := h))
+        pt j m ms_v sc_v stval_v sepc_v ksp mie_v mdv0 menvcfg0 U sts gn cs
+        pid f Wk.
+End USERTRAP.

@@ -1,0 +1,1594 @@
+(* ===================================================================== *)
+(* UexecApply.v -- THE VOCABULARY THE TRAP LOOP NEEDS TO APPLY A SLOT.     *)
+(*                                                                        *)
+(* Milestone J (claude-notes/completed/user-wp-slot.md SS4c) has the loop  *)
+(* hold [UexecRet.uexec_ret sc W] across a round and re-key it at the      *)
+(* state the round resumed.  Everything here is what that re-keying needs  *)
+(* and nothing in the tree had:                                           *)
+(*                                                                        *)
+(*   SS1  [ret_pc] ON [Z], and the one bv fact the bump wants (K4):        *)
+(*        [ret_pc_add4] -- adding four does not touch bit 0, so clearing   *)
+(*        it before or after the [epc += 4] gives the same resume pc.      *)
+(*   SS2  FOUR REGISTER PEELS out of [tf_resume_gpr0] (K5): x0, a0, a1     *)
+(*        and a7.  [UexecSlot.tf_resume_gpr_sp] is the discipline -- never *)
+(*        [rewrite upd_eq], never a [reflexivity] across the 31-insert     *)
+(*        [userret_gpr] tower; go through [apply]/[exact] at explicit      *)
+(*        arguments and let the kernel do the conversion.                  *)
+(*   SS3  [usys_mem_ok] is blind to everything but the number and the two  *)
+(*        window bases, so two keys agreeing there carry the same row.     *)
+(*   SS4  THE KEY CONGRUENCES: [uslot] depends on its key only through     *)
+(*        [(tf_resume_gpr0 tf, tf_resume_pc tf, uvis_M, uvis_perm)], and   *)
+(*        [uexec_ret] only through those plus the number, the two          *)
+(*        destination pointers and read's count.  [uexec_ret_run] is the instance the loop uses:    *)
+(*        the trapped key and the RUN key it projects to are the same key. *)
+(*   SS5  [UserPerm.usz_ok] from the trapframe bound, so the loop can      *)
+(*        discharge [uvb]'s size guard from [ProcInv]'s own conjunct       *)
+(*        ([proc_priv_nopt_sz_maxsz], added there for this).               *)
+(*                                                                        *)
+(* NOT HERE: a mover between [UexecRet.trapped_machine] and a              *)
+(* [UserExec.user_trap_frame_at] whose image is NAMED.  The two differ in  *)
+(* exactly one conjunct -- [user_ptm_inv pt sz M] against [user_pt_any     *)
+(* pt] -- so the direction that FORGETS the image is a one-liner and is    *)
+(* below ([trapped_machine_frame]); the direction that names it is         *)
+(* S3's [user_trap_frame_atm] (SS4c's "lazy seam", which needs the twin in *)
+(* BOTH directions and a new USERTRAP_RES entry), and stating half of it   *)
+(* here would only have to be restated there.                              *)
+(* ===================================================================== *)
+From Stdlib Require Import ZArith Bool Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import invariants.
+From iris.program_logic Require Import language lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto RiscvFetchExec RiscvExtras.
+Require Import RegFile.
+Require Import MinstretInv WireInv.
+Require Import ProcDefs.     (* [ustate] / [pv_tf] / [pv_sz] / [pv_upt] *)
+Require Import UserFrame.    (* [u_regs] -- the loop's own cell bundle *)
+Require Import UmodeRegs.    (* [uv_regs] / [uv_amb] and the two movers *)
+Require Import UexecWp.      (* [loop_ok] -- [uslot]'s own guard *)
+Require Import ProcGeom.     (* [tf_arg_idx] / [tf_epc_idx] / [TFWORDS] *)
+Require Import UserPtTree.
+Require Import UmodeText.   (* [uptd] / [user_ptm_inv] / [pgroundup] on Z *)
+Require Import ProcPtOwn.    (* [uvm_maxsz] *)
+Require Import UserPerm.     (* [uperm] / [usz_ok] *)
+Require Import UserExec.     (* [user_trap_frame_at] *)
+Require Import UsysMemOk.    (* [usys_num] / [usys_mem_ok] / [bump_tf] *)
+Require Import SpecUserret.  (* [userret_gpr] -- the 31-insert register file *)
+Require Import UexecSlot.    (* [uvis] / [tf_w] / [tf_resume_gpr] / [ret_pc_idem] *)
+Require Import FdSlots.      (* [fdstate] -- the key's descriptor view *)
+Require Import UexecSG.      (* [uexecSG]: [sbundle_at] / [spost_at] / [skey_eq] *)
+Require Import ChildTok.     (* [child_tok] -- fork's answer to the parent *)
+Require Import UexecRet.     (* [tf_resume_gpr0] / [tf_of] / [uslot] / [uexec_ret] *)
+Require Import UexecRound.   (* the round this vocabulary is applied under *)
+Require Import TsoCtx.
+Local Open Scope Z_scope.
+Import Defs.
+
+(* ===================================================================== *)
+(* SS1 [ret_pc] ON [Z], AND THE +4 CONGRUENCE (K4).                        *)
+(*                                                                         *)
+(* [ret_pc] clears bit 0, i.e. rounds DOWN to an even number, and the      *)
+(* [epc += 4] the trap round performs cannot carry into bit 0.  So the     *)
+(* resume pc after a bump is the same whether the trapped key carried the  *)
+(* raw epc word or the already-cleared one -- which is exactly the         *)
+(* difference between the key the kernel holds and the key                 *)
+(* [UexecRet.uvis_of_run] projects to.                                     *)
+(*                                                                         *)
+(* The rewrite chain below is [AlignBits.update_bit0_zero_of_aligned2]'s,  *)
+(* stopped one step earlier: that lemma is this one plus evenness.  Kept   *)
+(* in this file rather than beside it because [AlignBits] is a leaf with a *)
+(* deliberately minimal import set.                                        *)
+(* ===================================================================== *)
+Lemma ret_pc_unsigned (v : mword 64) :
+  bv_unsigned (ret_pc v) = bv_unsigned v / 2 * 2.
+Proof.
+  pose proof (bv_unsigned_in_range _ v) as [Hlo Hhi].
+  unfold ret_pc, update_vec_dec, update_mword_dec, MachineWord.update_slice.
+  rewrite bv_concat_unsigned'.
+  rewrite bv_concat_unsigned'.
+  unfold MachineWord.slice.
+  rewrite !bv_extract_unsigned.
+  change (Z.of_N 0) with 0%Z.
+  rewrite Z.shiftr_0_r.
+  match goal with |- context [bv_wrap (MachineWord.Z_idx 0) ?z] =>
+    replace (bv_wrap (MachineWord.Z_idx 0) z) with 0%Z
+      by (unfold bv_wrap, bv_modulus;
+          change (2 ^ Z.of_N (MachineWord.Z_idx 0))%Z with 1%Z;
+          rewrite Z.mod_1_r; reflexivity) end.
+  match goal with |- context [Z.lor ?hi (bv_wrap ?w ?z)] =>
+    replace (bv_wrap w z) with 0%Z by (vm_compute; reflexivity) end.
+  rewrite Z.lor_0_r.
+  change (Z.of_N (MachineWord.Z_idx 0 + MachineWord.Z_idx 1)) with 1%Z.
+  change (MachineWord.Z_idx 64 - MachineWord.Z_idx 1 - MachineWord.Z_idx 0)%N with 63%N.
+  (* the three conditional rewrites are FULLY APPLIED / asserted: [rewrite]
+     here is ssreflect's (the proofmode pulls it in) and does not take a
+     [by] suffix the way the same script does in AlignBits. *)
+  rewrite (Z.shiftr_div_pow2 _ 1 ltac:(lia)).
+  change (2 ^ 1)%Z with 2%Z.
+  assert (Hm64 : bv_modulus (MachineWord.Z_idx 64) = (2 ^ 64)%Z)
+    by (vm_compute; reflexivity).
+  assert (Hpow : (2 ^ 64)%Z = (2 * 2 ^ 63)%Z) by (vm_compute; reflexivity).
+  rewrite Hm64 in Hhi.
+  assert (Hdiv : (0 <= bv_unsigned v / 2 < 2 ^ 63)%Z).
+  { split; [ apply Z.div_pos; lia | ].
+    apply Z.div_lt_upper_bound; [ lia | ]. lia. }
+  assert (Hw63 : bv_wrap 63 (bv_unsigned v / 2) = bv_unsigned v / 2).
+  { apply bv_wrap_small.
+    replace (bv_modulus 63) with (2 ^ 63)%Z by (vm_compute; reflexivity).
+    lia. }
+  rewrite Hw63.
+  rewrite (Z.shiftl_mul_pow2 _ 1 ltac:(lia)).
+  change (2 ^ 1)%Z with 2%Z.
+  apply bv_wrap_small. rewrite Hm64. lia.
+Qed.
+
+Lemma addv4_unsigned (x : mword 64) :
+  bv_unsigned (add_vec_int x 4) = bv_wrap 64 (bv_unsigned x + 4).
+Proof.
+  unfold add_vec_int. rewrite add_vec64_unsigned.
+  assert (H4 : bv_unsigned (mword_of_int 4 : mword 64) = 4%Z)
+    by (vm_compute; reflexivity).
+  rewrite H4. reflexivity.
+Qed.
+
+(* the pure arithmetic: [2^64] is even, so a carry out of the low bit is
+   impossible and clearing it commutes with adding an even number. *)
+Local Lemma z_wrap_even2 (t : Z) :
+  exists j : Z, (Z.modulo (2 * t) 18446744073709551616 = 2 * j)%Z
+                /\ (0 <= 2 * j < 18446744073709551616)%Z.
+Proof.
+  pose proof (Z.div_mod (2 * t) 18446744073709551616 ltac:(lia)) as H1.
+  pose proof (Z.mod_pos_bound (2 * t) 18446744073709551616 ltac:(lia)) as H2.
+  exists (t - 9223372036854775808 * (Z.div (2 * t) 18446744073709551616))%Z.
+  split; lia.
+Qed.
+
+Local Lemma z_bit0_add4 (u : Z) :
+  (0 <= u)%Z ->
+  (Z.modulo (u / 2 * 2 + 4) 18446744073709551616 / 2 * 2)%Z
+  = (Z.modulo (u + 4) 18446744073709551616 / 2 * 2)%Z.
+Proof.
+  intros Hu.
+  pose proof (Z.div_mod u 2 ltac:(lia)) as Hdm.
+  pose proof (Z.mod_pos_bound u 2 ltac:(lia)) as Hr.
+  assert (Ht : (u / 2 * 2 + 4 = 2 * (u / 2 + 2))%Z) by lia.
+  assert (Hu2 : (u + 4 = 2 * (u / 2 + 2) + Z.modulo u 2)%Z) by lia.
+  rewrite Ht Hu2.
+  destruct (z_wrap_even2 (u / 2 + 2)%Z) as [j [Hj Hjb]].
+  assert (Hadd : (Z.modulo (2 * (u / 2 + 2) + Z.modulo u 2) 18446744073709551616
+                  = 2 * j + Z.modulo u 2)%Z).
+  { rewrite <- (Z.add_mod_idemp_l (2 * (u / 2 + 2)) (Z.modulo u 2)
+                  18446744073709551616 ltac:(lia)).
+    rewrite Hj. apply Z.mod_small. lia. }
+  rewrite Hj Hadd.
+  (* the two divisions, by hand: [lia] alone will not find the witness that
+     [2j] and [2j + r] round down to the same [j]. *)
+  assert (Hd1 : (2 * j / 2 = j)%Z).
+  { replace (2 * j)%Z with (j * 2)%Z by lia.
+    exact (Z.div_mul j 2 ltac:(lia)). }
+  assert (Hr0 : (Z.modulo u 2 / 2 = 0)%Z) by (apply Z.div_small; lia).
+  assert (Hd2 : ((2 * j + Z.modulo u 2) / 2 = j)%Z).
+  { replace (2 * j + Z.modulo u 2)%Z with (j * 2 + Z.modulo u 2)%Z by lia.
+    rewrite (Z.div_add_l j 2 (Z.modulo u 2) ltac:(lia)). rewrite Hr0. lia. }
+  rewrite Hd1 Hd2. reflexivity.
+Qed.
+
+(* K4 -- true UNCONDITIONALLY. *)
+Lemma ret_pc_add4 (v : mword 64) :
+  ret_pc (add_vec_int (ret_pc v) 4) = ret_pc (add_vec_int v 4).
+Proof.
+  apply bv_eq.
+  rewrite (ret_pc_unsigned (add_vec_int (ret_pc v) 4)).
+  rewrite (ret_pc_unsigned (add_vec_int v 4)).
+  rewrite !addv4_unsigned.
+  rewrite (ret_pc_unsigned v).
+  unfold bv_wrap. rewrite bv_modulus64.
+  exact (z_bit0_add4 (bv_unsigned v) (proj1 (bv_unsigned_in_range _ v))).
+Qed.
+
+(* ...and the congruence the round's bump actually applies: two epc words
+   with the same resume pc bump to the same resume pc. *)
+Lemma ret_pc_add4_cong (x y : mword 64) :
+  ret_pc x = ret_pc y ->
+  ret_pc (add_vec_int x 4) = ret_pc (add_vec_int y 4).
+Proof.
+  intros H.
+  rewrite <- (ret_pc_add4 x). rewrite <- (ret_pc_add4 y). rewrite H.
+  reflexivity.
+Qed.
+
+(* ===================================================================== *)
+(* SS2 FOUR REGISTER PEELS OUT OF [tf_resume_gpr0] (K5).                   *)
+(*                                                                         *)
+(* Same discipline as [UexecSlot.tf_resume_gpr_sp]: peel the insert chain  *)
+(* by [apply], discharge each key disequality by [vm_compute;              *)
+(* discriminate] (both keys are closed literals, so there is no symbolic   *)
+(* value for the reduction to meet), and finish at [upd_eq] -- NEVER a     *)
+(* [rewrite]/[reflexivity] that could see the whole [userret_gpr] tower.   *)
+(* ===================================================================== *)
+Local Lemma tf_upd_ne (f : regfile) (k j : regidx) (v w : mword 64) :
+  j <> k -> f !!! j = w -> (<[k := v]> f) !!! j = w.
+Proof. intros Hne <-. exact (upd_ne f k j v Hne). Qed.
+
+Local Ltac gpr_peel :=
+  repeat (apply tf_upd_ne; [ vm_compute; discriminate | ]).
+
+(* x0 is the ONE index the dead base survives at, and [tf_resume_gpr0]
+   pins it to zero -- which is what [UexecRet.tf_of_resume_gpr]'s premise
+   asks for at the projected key. *)
+Lemma tf_resume_gpr0_x0 (tf : list (mword 64)) :
+  tf_resume_gpr0 tf !!! Regidx (mword_of_int 0) = zero_reg.
+Proof.
+  unfold tf_resume_gpr0, tf_resume_gpr, userret_gpr.
+  gpr_peel. unfold zero_rf. reflexivity.
+Qed.
+
+(* a0 = x10, trapframe word [tf_arg_idx 0] = 14 (the return-value slot) *)
+Lemma tf_resume_gpr0_a0 (tf : list (mword 64)) :
+  tf_resume_gpr0 tf !!! Regidx (mword_of_int 10) = tf_w tf (tf_arg_idx 0).
+Proof.
+  unfold tf_resume_gpr0, tf_resume_gpr, userret_gpr.
+  gpr_peel. exact (upd_eq _ (Regidx (mword_of_int 10)) _).
+Qed.
+
+(* a1 = x11, trapframe word [tf_arg_idx 1] = 15 (read/fstat's buffer) *)
+Lemma tf_resume_gpr0_a1 (tf : list (mword 64)) :
+  tf_resume_gpr0 tf !!! Regidx (mword_of_int 11) = tf_w tf (tf_arg_idx 1).
+Proof.
+  unfold tf_resume_gpr0, tf_resume_gpr, userret_gpr.
+  gpr_peel. exact (upd_eq _ (Regidx (mword_of_int 11)) _).
+Qed.
+
+(* a2 = x12, trapframe word [tf_arg_idx 2] = 16 (read's count) *)
+Lemma tf_resume_gpr0_a2 (tf : list (mword 64)) :
+  tf_resume_gpr0 tf !!! Regidx (mword_of_int 12) = tf_w tf (tf_arg_idx 2).
+Proof.
+  unfold tf_resume_gpr0, tf_resume_gpr, userret_gpr.
+  gpr_peel. exact (upd_eq _ (Regidx (mword_of_int 12)) _).
+Qed.
+
+(* a7 = x17, trapframe word [tf_arg_idx 7] = 21 -- THE SYSCALL NUMBER *)
+Lemma tf_resume_gpr0_a7 (tf : list (mword 64)) :
+  tf_resume_gpr0 tf !!! Regidx (mword_of_int 17) = tf_w tf (tf_arg_idx 7).
+Proof.
+  unfold tf_resume_gpr0, tf_resume_gpr, userret_gpr.
+  gpr_peel. exact (upd_eq _ (Regidx (mword_of_int 17)) _).
+Qed.
+
+(* ===================================================================== *)
+(* SS3 THE TABLE READS THREE WORDS.                                        *)
+(*                                                                         *)
+(* [UsysMemOk.usys_mem_ok_ueq] transports a row across [tf_ueq], which     *)
+(* pins the EPC word too -- and the epc is exactly where the trapped key   *)
+(* and its run projection differ ([ret_pc] of it against it).  What is     *)
+(* actually read is the number (word 21) and the two window bases (14 and  *)
+(* 15), so state the congruence at those.                                  *)
+(* ===================================================================== *)
+Lemma usys_mem_ok_args (n : Z) (tf tf' : list (mword 64)) (r : mword 64)
+    (M M' : gmap Z (bv 8)) (pi pi' : gmap (mword 27) uperm) (szv szv' : Z)
+    (lz lz' : bool) :
+  tf !!! tf_arg_idx 0 = tf' !!! tf_arg_idx 0 ->
+  tf !!! tf_arg_idx 1 = tf' !!! tf_arg_idx 1 ->
+  tf !!! tf_arg_idx 2 = tf' !!! tf_arg_idx 2 ->
+  usys_mem_ok n tf r M pi szv lz M' pi' szv' lz'
+  -> usys_mem_ok n tf' r M pi szv lz M' pi' szv' lz'.
+Proof.
+  intros H0 H1 H2 H. unfold usys_mem_ok, usys_read_ret, usys_rdcount in H |- *.
+  destruct (decide (n = USYS_exec)); [ exact H | ].
+  destruct (decide (n = USYS_sbrk));
+    [ unfold usys_sbrk_ret, usys_sbrk_arg, usys_sbrk_lazy, usys_sbrk_eager
+        in H |- *;
+      rewrite <- H0, <- H1; exact H | ].
+  destruct (decide (n = USYS_wait)); [ rewrite <- H0; exact H | ].
+  destruct (decide (n = USYS_pipe)); [ rewrite <- H0; exact H | ].
+  destruct (decide (n = USYS_read)); [ rewrite <- H1; rewrite <- H2; exact H | ].
+  destruct (decide (n = USYS_fstat)); [ rewrite <- H1; exact H | ].
+  exact H.
+Qed.
+
+(* ===================================================================== *)
+(* SS4 THE RUN KEY, AND THE TWO CONGRUENCES.                               *)
+(* ===================================================================== *)
+
+(* THE RUN PROJECTION of a key: the machine the key describes, written
+   back out as a trapframe.  [UexecRet.uvis_of_run] at the key's own
+   resume register file and resume pc.  It is NOT the same list -- the
+   four kernel words are dropped and the epc word is [ret_pc]'d -- but it
+   is the same KEY, which is what SS4 proves. *)
+Definition uvis_run (W : uvis) : uvis :=
+  uvis_of_run (tf_resume_gpr0 (uvis_tf W))
+              (ret_pc (tf_w (uvis_tf W) tf_epc_idx))
+              (uvis_M W) (uvis_perm W) (uvis_sz W) (uvis_fd W) (uvis_cwd W)
+              (uvis_gen W) (uvis_ch W) (uvis_pid W) (uvis_lazy W) (uvis_secc W).
+
+Lemma uvis_run_lazy (W : uvis) : uvis_lazy (uvis_run W) = uvis_lazy W.
+Proof. reflexivity. Qed.
+
+Lemma uvis_run_secc (W : uvis) : uvis_secc (uvis_run W) = uvis_secc W.
+Proof. reflexivity. Qed.
+
+Lemma uvis_run_length (W : uvis) : length (uvis_tf (uvis_run W)) = TFWORDS.
+Proof. exact (tf_of_length _ _). Qed.
+
+Lemma uvis_run_cwd (W : uvis) : uvis_cwd (uvis_run W) = uvis_cwd W.
+Proof. reflexivity. Qed.
+
+Lemma uvis_run_gen (W : uvis) : uvis_gen (uvis_run W) = uvis_gen W.
+Proof. reflexivity. Qed.
+
+Lemma uvis_run_ch (W : uvis) : uvis_ch (uvis_run W) = uvis_ch W.
+Proof. reflexivity. Qed.
+
+Lemma uvis_run_pid (W : uvis) : uvis_pid (uvis_run W) = uvis_pid W.
+Proof. reflexivity. Qed.
+
+Lemma uvis_run_gpr (W : uvis) :
+  tf_resume_gpr0 (uvis_tf (uvis_run W)) = tf_resume_gpr0 (uvis_tf W).
+Proof.
+  unfold uvis_run. cbn [uvis_tf uvis_of_run].
+  exact (tf_of_resume_gpr _ _ (tf_resume_gpr0_x0 (uvis_tf W))).
+Qed.
+
+Lemma uvis_run_pc (W : uvis) :
+  tf_resume_pc (uvis_tf (uvis_run W)) = tf_resume_pc (uvis_tf W).
+Proof.
+  unfold uvis_run, tf_resume_pc. cbn [uvis_tf uvis_of_run].
+  rewrite (tf_of_epc (tf_resume_gpr0 (uvis_tf W))
+             (ret_pc (tf_w (uvis_tf W) tf_epc_idx))).
+  exact (ret_pc_idem (tf_w (uvis_tf W) tf_epc_idx)).
+Qed.
+
+Lemma uvis_run_num (W : uvis) :
+  usys_num (uvis_tf (uvis_run W)) = usys_num (uvis_tf W).
+Proof.
+  unfold uvis_run. cbn [uvis_tf uvis_of_run].
+  rewrite (tf_of_num (tf_resume_gpr0 (uvis_tf W))
+             (ret_pc (tf_w (uvis_tf W) tf_epc_idx))).
+  rewrite (tf_resume_gpr0_a7 (uvis_tf W)).
+  unfold usys_num, tf_w. reflexivity.
+Qed.
+
+(* ...and the EFFECTIVE number, at any spelling of the key's mask: the run
+   projection keeps the raw number, and the mask is read beside it *)
+Lemma uvis_run_eff (W : uvis) (secc : mword 64) :
+  secc = uvis_secc W -> usys_eff secc (uvis_tf (uvis_run W)) = uvis_num W.
+Proof. intros ->. unfold uvis_num, usys_eff. rewrite uvis_run_num. reflexivity. Qed.
+
+Lemma uvis_run_arg0 (W : uvis) :
+  uvis_tf (uvis_run W) !!! tf_arg_idx 0 = uvis_tf W !!! tf_arg_idx 0.
+Proof. exact (tf_resume_gpr0_a0 (uvis_tf W)). Qed.
+
+Lemma uvis_run_arg1 (W : uvis) :
+  uvis_tf (uvis_run W) !!! tf_arg_idx 1 = uvis_tf W !!! tf_arg_idx 1.
+Proof. exact (tf_resume_gpr0_a1 (uvis_tf W)). Qed.
+
+Lemma uvis_run_arg2 (W : uvis) :
+  uvis_tf (uvis_run W) !!! tf_arg_idx 2 = uvis_tf W !!! tf_arg_idx 2.
+Proof. exact (tf_resume_gpr0_a2 (uvis_tf W)). Qed.
+
+Require Import UserFd.   (* [ufd_auth] -- the PROGRAM's own view of
+                            its descriptor table, the authority for
+                            which rides inside [urun] *)
+Section Apply.
+  Context `{!riscvGS Σ}.
+  Context `{!ufdG Σ}.
+  (* [ChildTok.ctokG]: this file names the generation's pieces and binds no
+     whole-system bundle.  A file that binds [Xv6G.xv6G] gets the class
+     through the bundle and must not bind it again. *)
+  Context `{!ctokG Σ}.
+  Context `{GEN : GenId}.
+  Context {SG : uexecSG Σ}.
+
+  (* THE SLOT SEES TEN PROJECTIONS OF ITS KEY AND NOTHING ELSE.
+     [uslot_ukc] is the whole content: the slot IS [ukc] at the permission
+     map, the image, the break, the descriptor view, the working directory,
+     the generation, the children set, the PID, the resume register file and
+     the resume pc. *)
+  Lemma uslot_key_cong (W W' : uvis) :
+    tf_resume_gpr0 (uvis_tf W) = tf_resume_gpr0 (uvis_tf W') ->
+    tf_resume_pc (uvis_tf W) = tf_resume_pc (uvis_tf W') ->
+    uvis_M W = uvis_M W' ->
+    uvis_perm W = uvis_perm W' ->
+    uvis_sz W = uvis_sz W' ->
+    uvis_fd W = uvis_fd W' ->
+    uvis_cwd W = uvis_cwd W' ->
+    uvis_gen W = uvis_gen W' ->
+    uvis_ch W = uvis_ch W' ->
+    (* ...and the PID, the tenth reading: getpid(2)'s answer is a reading of
+       the key ([UexecSlot.uvis_pid]), so a slot sees it. *)
+    uvis_pid W = uvis_pid W' ->
+    (* ...AND THE LAZY BIT, the eleventh: [ukc] carries it, because what a
+       continuation is told about its own table includes whether the fill
+       is empty ([ProcInv.proc_priv_core]'s invariant on
+       [ProcDefs.pv_lazy]). *)
+    uvis_lazy W = uvis_lazy W' ->
+    (* ...AND THE MASK, the twelfth: [ukc] carries it for the lazy bit's
+       reason -- the continuation's key names the mask its calls run under
+       ([UexecSlot.uvis_num]). *)
+    uvis_secc W = uvis_secc W' ->
+    (* the type ascription pins [Σ]: [uvis] is Σ-free, so without it the
+       [⊣⊢] notation cannot elaborate [uslot]'s implicit [Σ] before it
+       has to unify against [bi_car]. *)
+    (uslot W : iProp Σ) ⊣⊢ uslot W'.
+  Proof using .
+    intros Hg Hp HM Hpi Hsz Hfd Hcw Hgn Hch Hpid Hlz Hsc.
+    rewrite (uslot_ukc W) (uslot_ukc W').
+    rewrite Hg Hp HM Hpi Hsz Hfd Hcw Hgn Hch Hpid Hlz Hsc. reflexivity.
+  Qed.
+
+  (* ...AND THE RETURN CHANNEL SEES THOSE FOUR PLUS THE NUMBER AND THE TWO
+     WINDOW BASES.  The length premises are [trapped_machine]'s own K3
+     conjunct: the bump's two readers ([tf_resume_gpr_bump],
+     [tf_resume_pc_bump]) are guarded on the list being long enough.
+     STATED OVER AN ARBITRARY SLOT FAMILY [S] that reads its key at the six
+     projections: the arms read the key through [S] and the number/argument
+     words only. *)
+  Lemma uexec_arm_F_key_cong (S : uvis -d> iPropO Σ)
+      (HS : forall W W' : uvis,
+              tf_resume_gpr0 (uvis_tf W) = tf_resume_gpr0 (uvis_tf W') ->
+              tf_resume_pc (uvis_tf W) = tf_resume_pc (uvis_tf W') ->
+              uvis_M W = uvis_M W' ->
+              uvis_perm W = uvis_perm W' ->
+              uvis_sz W = uvis_sz W' ->
+              uvis_fd W = uvis_fd W' ->
+              uvis_cwd W = uvis_cwd W' ->
+              uvis_gen W = uvis_gen W' ->
+              uvis_ch W = uvis_ch W' ->
+              uvis_pid W = uvis_pid W' ->
+              uvis_lazy W = uvis_lazy W' ->
+              uvis_secc W = uvis_secc W' ->
+              (S W : iProp Σ) ⊣⊢ S W')
+      (sc : mword 64) (W W' : uvis) (f : sfam) :
+    length (uvis_tf W) = TFWORDS ->
+    length (uvis_tf W') = TFWORDS ->
+    usys_num (uvis_tf W) = usys_num (uvis_tf W') ->
+    uvis_tf W !!! tf_arg_idx 0 = uvis_tf W' !!! tf_arg_idx 0 ->
+    uvis_tf W !!! tf_arg_idx 1 = uvis_tf W' !!! tf_arg_idx 1 ->
+    uvis_tf W !!! tf_arg_idx 2 = uvis_tf W' !!! tf_arg_idx 2 ->
+    tf_resume_gpr0 (uvis_tf W) = tf_resume_gpr0 (uvis_tf W') ->
+    tf_resume_pc (uvis_tf W) = tf_resume_pc (uvis_tf W') ->
+    uvis_M W = uvis_M W' ->
+    uvis_perm W = uvis_perm W' ->
+    uvis_sz W = uvis_sz W' ->
+    uvis_fd W = uvis_fd W' ->
+    uvis_cwd W = uvis_cwd W' ->
+    uvis_gen W = uvis_gen W' ->
+    uvis_ch W = uvis_ch W' ->
+    uvis_pid W = uvis_pid W' ->
+    uvis_lazy W = uvis_lazy W' ->
+    uvis_secc W = uvis_secc W' ->
+    (uexec_arm_F S sc W f : iProp Σ) ⊣⊢ uexec_arm_F S sc W' f.
+  Proof using .
+    intros HlW HlW' Hn0 Ha0 Ha1 Ha2 Hg Hp HM Hpi Hsz Hfd Hcw Hgn Hch Hpid Hlz Hsc.
+    assert (Hn : uvis_num W = uvis_num W')
+      by (unfold uvis_num; rewrite Hsc; exact (usys_eff_num_cong _ _ _ Hn0)).
+    assert (Hsk : skey_eq W W')
+      by (rewrite /skey_eq; split_and!;
+          [ exact HM | exact Ha0 | exact Ha1 | exact Ha2 | exact Hfd | exact Hcw
+          | exact Hgn | exact Hch | exact Hpid | exact Hpi | exact Hsz
+          | exact Hlz | exact Hsc ]).
+    (* the BUMPED keys agree too, at every return value and every
+       image/permission pair the row allows *)
+    assert (Hb : forall (r : mword 64) (M' : gmap Z (bv 8))
+                        (pi' : gmap (mword 27) uperm) (szv' : Z)
+                        (fdv' : list fdstate) (cw' : Z) (gn' : gname)
+                        (cs' : gset gname) (lz' : bool) (secc' : mword 64),
+                   (S (bump W r M' pi' szv' fdv' cw' gn' cs' lz' secc') : iProp Σ)
+                     ⊣⊢ S (bump W' r M' pi' szv' fdv' cw' gn' cs' lz' secc')).
+    { intros r M' pi' szv' fdv' cw' gn' cs' lz' secc'.
+      apply HS;
+        cbn [bump bump_at uvis_tf uvis_M uvis_perm uvis_sz uvis_fd uvis_cwd
+             uvis_gen uvis_ch uvis_pid].
+      - unfold tf_resume_gpr0 in Hg |- *.
+        rewrite (tf_resume_gpr_bump zero_rf (uvis_tf W) r
+                   ltac:(rewrite HlW; unfold tf_arg_idx, TFWORDS; lia)).
+        rewrite (tf_resume_gpr_bump zero_rf (uvis_tf W') r
+                   ltac:(rewrite HlW'; unfold tf_arg_idx, TFWORDS; lia)).
+        rewrite Hg. reflexivity.
+      - rewrite (tf_resume_pc_bump (uvis_tf W) r
+                   ltac:(rewrite HlW; unfold tf_epc_idx, TFWORDS; lia)).
+        rewrite (tf_resume_pc_bump (uvis_tf W') r
+                   ltac:(rewrite HlW'; unfold tf_epc_idx, TFWORDS; lia)).
+        exact (ret_pc_add4_cong _ _ Hp).
+      - reflexivity.
+      - reflexivity.
+      - reflexivity.
+      - reflexivity.
+      - reflexivity.
+      - reflexivity.
+      - reflexivity.
+      (* the two keys' pids are the two keys' own, which is the premise:
+         [bump] keeps the key's pid rather than taking one *)
+      - exact Hpid.
+      (* ...and the two bumped keys carry the SAME lazy bit: it is the
+         row's own [lz'], bound outside *)
+      - reflexivity.
+      (* ...and the same mask, the row's own [secc'] *)
+      - reflexivity. }
+    rewrite /uexec_arm_F /uexec_kill_arm_F /uexec_fork_parent_F /ufork_ans
+            /uexec_ret_cont_F /uexec_wait_F /uexec_ret_cont_gen. cbv zeta.
+    destruct (decide (sc = uecall_scause)) as [_ | _];
+      [ | (* the transparent arm is the PAIR now (lane TRAP-ROWS, T3): the
+             right side transports as the slot does and the left is a
+             function of the key's generation alone, which the two keys
+             share ([Hgn]). *)
+        rewrite Hgn;
+        apply bi.and_proper;
+        [ (* ...and the left's own right side reads the exit row, which
+             transports as every bundle row does ([sbundle_at_cong]) *)
+          rewrite /ukill_cred_at;
+          destruct (decide (ukill_sc sc)) as [_ | _]; [ | reflexivity ];
+          apply bi.or_proper; [ reflexivity | ];
+          apply bi.sep_proper; [ reflexivity | ];
+          exact (sbundle_at_cong S USYS_exit f W W' Hsk)
+        | exact (HS W W' Hg Hp HM Hpi Hsz Hfd Hcw Hgn Hch Hpid Hlz Hsc) ] ].
+    (* [Hfd] joins the other four: the returning arm's row reads the ENTRY
+       descriptor view, so both sides have to name the same one before the
+       trapframe transport can be the only difference left.  [Hcw] the
+       same: the cwd row reads the entry inum. *)
+    rewrite Hn HM Hpi Hsz Hfd Hcw Hgn Hch Hpid Hlz Hsc.
+    (* ...AND WAIT'S WINDOW READS THE STATUS POINTER, which is one of the
+       three argument words the two keys share (lane RD-7). *)
+    rewrite Ha0.
+    destruct (decide (uvis_num W' = USYS_exit)) as [_ | _];
+      [ reflexivity | ].
+    destruct (decide (uvis_num W' = USYS_fork)) as [_ | _].
+    - (* fork: the PARENT arm alone, at the [(M, pi)] the key already
+         carries.  The child's continuation went down as the deposit and
+         is not part of the arm ([UexecRet.uexec_dep_F]). *)
+      iSplit.
+      + iIntros "H1" (r fdv' cw' cs' Hr).
+        rewrite -(Hb r (uvis_M W') (uvis_perm W') (uvis_sz W') fdv' cw'
+                    (uvis_gen W') cs' (uvis_lazy W')).
+        iApply ("H1" $! r fdv' cw' cs'). iPureIntro. exact Hr.
+      + iIntros "H1" (r fdv' cw' cs' Hr).
+        rewrite (Hb r (uvis_M W') (uvis_perm W') (uvis_sz W') fdv' cw'
+                   (uvis_gen W') cs' (uvis_lazy W')).
+        iApply ("H1" $! r fdv' cw' cs'). iPureIntro. exact Hr.
+    - (* wait's arm: the returning arm with the kernel's answer in place of
+         the quiet row.  The answer reads the return value and the two
+         sets and no trapframe word, so it transports on the nose. *)
+      destruct (decide (uvis_num W' = USYS_wait)) as [_ | _].
+      { iSplit.
+        + iIntros "H" (r M' pi' szv' fdv' cw' gn' cs' lz' secc') "%Hmo %Hfo %Hpo %Hco %Hgo %Hpio %Hlo %Hso Hcho Hsp".
+          rewrite -(Hb r M' pi' szv' fdv' cw' gn' cs').
+          iApply ("H" $! r M' pi' szv' fdv' cw' gn' cs'
+                    with "[%] [%] [%] [%] [%] [%] [%] [%] [Hcho] [Hsp]").
+          * exact (usys_mem_ok_args _ (uvis_tf W') (uvis_tf W) r _ _ _ _ _ _ _ _
+                     (eq_sym Ha0) (eq_sym Ha1) (eq_sym Ha2) Hmo).
+          * exact (usys_fd_ok_arg_cong _ (uvis_tf W') (uvis_tf W) _ _ _
+                     (eq_sym Ha0) Hfo).
+          * exact (usys_pipe_ok_arg_cong _ (uvis_tf W') (uvis_tf W) _ _ _ _ _
+                     (eq_sym Ha0) Hpo).
+          * exact Hco.
+          * exact Hgo.
+          * exact Hpio.
+          * exact (uexec_live_ok_cong _ _ _ _ _ _ (eq_sym Ha0) (eq_sym Ha2) Hlo).
+          * exact (usys_secc_ok_arg_cong _ _ _ _ _ _ (eq_sym Ha0) Hso).
+          * iExact "Hcho".
+          * iEval (rewrite (spost_at_cong S (uvis_num W') f W' W r
+                              M' fdv' cw' cs' (skey_eq_sym W W' Hsk))) in "Hsp".
+            iExact "Hsp".
+        + iIntros "H" (r M' pi' szv' fdv' cw' gn' cs' lz' secc') "%Hmo %Hfo %Hpo %Hco %Hgo %Hpio %Hlo %Hso Hcho Hsp".
+          rewrite (Hb r M' pi' szv' fdv' cw' gn' cs').
+          iApply ("H" $! r M' pi' szv' fdv' cw' gn' cs'
+                    with "[%] [%] [%] [%] [%] [%] [%] [%] [Hcho] [Hsp]").
+          * exact (usys_mem_ok_args _ (uvis_tf W) (uvis_tf W') r _ _ _ _ _ _ _ _
+                     Ha0 Ha1 Ha2 Hmo).
+          * exact (usys_fd_ok_arg_cong _ (uvis_tf W) (uvis_tf W') _ _ _
+                     Ha0 Hfo).
+          * exact (usys_pipe_ok_arg_cong _ (uvis_tf W) (uvis_tf W') _ _ _ _ _
+                     Ha0 Hpo).
+          * exact Hco.
+          * exact Hgo.
+          * exact Hpio.
+          * exact (uexec_live_ok_cong _ _ _ _ _ _ Ha0 Ha2 Hlo).
+          * exact (usys_secc_ok_arg_cong _ _ _ _ _ _ Ha0 Hso).
+          * iExact "Hcho".
+          * iEval (rewrite (spost_at_cong S (uvis_num W') f W W' r
+                              M' fdv' cw' cs' Hsk)) in "Hsp". iExact "Hsp". } 
+    (* the returning arms: the row transports by SS3 *)
+      iSplit.
+      + iIntros "H" (r M' pi' szv' fdv' cw' gn' cs' lz' secc') "%Hmo %Hfo %Hpo %Hco %Hgo %Hpio %Hlo %Hso %Hcho Hsp".
+        rewrite -(Hb r M' pi' szv' fdv' cw' gn' cs').
+        iApply ("H" $! r M' pi' szv' fdv' cw' gn' cs'
+                  with "[%] [%] [%] [%] [%] [%] [%] [%] [%] [Hsp]").
+        * exact (usys_mem_ok_args _ (uvis_tf W') (uvis_tf W) r _ _ _ _ _ _ _ _
+                   (eq_sym Ha0) (eq_sym Ha1) (eq_sym Ha2) Hmo).
+        * exact (usys_fd_ok_arg_cong _ (uvis_tf W') (uvis_tf W) _ _ _
+                   (eq_sym Ha0) Hfo).
+        (* pipe's join reads a0 too, and by the same congruence *)
+        * exact (usys_pipe_ok_arg_cong _ (uvis_tf W') (uvis_tf W) _ _ _ _ _
+                   (eq_sym Ha0) Hpo).
+        (* the cwd row reads no trapframe word at all *)
+        * exact Hco.
+        (* the generation and children rows read no trapframe word either,
+           and neither does the pid's *)
+        * exact Hgo.
+        * exact Hpio.
+        * exact (uexec_live_ok_cong _ _ _ _ _ _ (eq_sym Ha0) (eq_sym Ha2) Hlo).
+        * exact (usys_secc_ok_arg_cong _ _ _ _ _ _ (eq_sym Ha0) Hso).
+        * exact Hcho.
+        (* ...and the armed post transports by the SAME key rows the
+           deposit does ([UexecSG.skey_eq]) *)
+        * iEval (rewrite (spost_at_cong S (uvis_num W') f W' W r
+                            M' fdv' cw' cs' (skey_eq_sym W W' Hsk))) in "Hsp".
+          iExact "Hsp".
+      + iIntros "H" (r M' pi' szv' fdv' cw' gn' cs' lz' secc') "%Hmo %Hfo %Hpo %Hco %Hgo %Hpio %Hlo %Hso %Hcho Hsp".
+        rewrite (Hb r M' pi' szv' fdv' cw' gn' cs').
+        iApply ("H" $! r M' pi' szv' fdv' cw' gn' cs'
+                  with "[%] [%] [%] [%] [%] [%] [%] [%] [%] [Hsp]").
+        * exact (usys_mem_ok_args _ (uvis_tf W) (uvis_tf W') r _ _ _ _ _ _ _ _
+                   Ha0 Ha1 Ha2 Hmo).
+        * exact (usys_fd_ok_arg_cong _ (uvis_tf W) (uvis_tf W') _ _ _
+                   Ha0 Hfo).
+        * exact (usys_pipe_ok_arg_cong _ (uvis_tf W) (uvis_tf W') _ _ _ _ _
+                   Ha0 Hpo).
+        * exact Hco.
+        * exact Hgo.
+        * exact Hpio.
+        * exact (uexec_live_ok_cong _ _ _ _ _ _ Ha0 Ha2 Hlo).
+        * exact (usys_secc_ok_arg_cong _ _ _ _ _ _ Ha0 Hso).
+        * exact Hcho.
+        * iEval (rewrite (spost_at_cong S (uvis_num W') f W W' r
+                            M' fdv' cw' cs' Hsk)) in "Hsp". iExact "Hsp".
+  Qed.
+
+  Lemma uexec_arm_key_cong (sc : mword 64) (W W' : uvis) (f : sfam) :
+    length (uvis_tf W) = TFWORDS ->
+    length (uvis_tf W') = TFWORDS ->
+    usys_num (uvis_tf W) = usys_num (uvis_tf W') ->
+    uvis_tf W !!! tf_arg_idx 0 = uvis_tf W' !!! tf_arg_idx 0 ->
+    uvis_tf W !!! tf_arg_idx 1 = uvis_tf W' !!! tf_arg_idx 1 ->
+    uvis_tf W !!! tf_arg_idx 2 = uvis_tf W' !!! tf_arg_idx 2 ->
+    tf_resume_gpr0 (uvis_tf W) = tf_resume_gpr0 (uvis_tf W') ->
+    tf_resume_pc (uvis_tf W) = tf_resume_pc (uvis_tf W') ->
+    uvis_M W = uvis_M W' ->
+    uvis_perm W = uvis_perm W' ->
+    uvis_sz W = uvis_sz W' ->
+    uvis_fd W = uvis_fd W' ->
+    uvis_cwd W = uvis_cwd W' ->
+    uvis_gen W = uvis_gen W' ->
+    uvis_ch W = uvis_ch W' ->
+    uvis_pid W = uvis_pid W' ->
+    uvis_lazy W = uvis_lazy W' ->
+    uvis_secc W = uvis_secc W' ->
+    (uexec_arm sc W f : iProp Σ) ⊣⊢ uexec_arm sc W' f.
+  Proof using . exact (uexec_arm_F_key_cong uslot uslot_key_cong sc W W' f). Qed.
+
+  (* THE INSTANCE THE LOOP USES: the key the kernel trapped with and the
+     key its own resume projection describes are the same key, so a
+     [uexec_ret] handed back at one is a [uexec_ret] at the other.  The
+     length premise is [trapped_machine]'s K3 conjunct. *)
+  Lemma uexec_arm_F_run (S : uvis -d> iPropO Σ)
+      (HS : forall W W' : uvis,
+              tf_resume_gpr0 (uvis_tf W) = tf_resume_gpr0 (uvis_tf W') ->
+              tf_resume_pc (uvis_tf W) = tf_resume_pc (uvis_tf W') ->
+              uvis_M W = uvis_M W' ->
+              uvis_perm W = uvis_perm W' ->
+              uvis_sz W = uvis_sz W' ->
+              uvis_fd W = uvis_fd W' ->
+              uvis_cwd W = uvis_cwd W' ->
+              uvis_gen W = uvis_gen W' ->
+              uvis_ch W = uvis_ch W' ->
+              uvis_pid W = uvis_pid W' ->
+              uvis_lazy W = uvis_lazy W' ->
+              uvis_secc W = uvis_secc W' ->
+              (S W : iProp Σ) ⊣⊢ S W')
+      (sc : mword 64) (W : uvis) (f : sfam) :
+    length (uvis_tf W) = TFWORDS ->
+    (uexec_arm_F S sc W f : iProp Σ) ⊣⊢ uexec_arm_F S sc (uvis_run W) f.
+  Proof using .
+    intros Hl.
+    apply (uexec_arm_F_key_cong S HS sc W (uvis_run W) f Hl (uvis_run_length W)
+             (eq_sym (uvis_run_num W)) (eq_sym (uvis_run_arg0 W))
+             (eq_sym (uvis_run_arg1 W)) (eq_sym (uvis_run_arg2 W))
+             (eq_sym (uvis_run_gpr W))
+             (eq_sym (uvis_run_pc W)) eq_refl eq_refl eq_refl eq_refl eq_refl
+             eq_refl eq_refl eq_refl eq_refl eq_refl).
+  Qed.
+
+  Lemma uexec_arm_run (sc : mword 64) (W : uvis) (f : sfam) :
+    length (uvis_tf W) = TFWORDS ->
+    (uexec_arm sc W f : iProp Σ) ⊣⊢ uexec_arm sc (uvis_run W) f.
+  Proof using . exact (uexec_arm_F_run uslot uslot_key_cong sc W f). Qed.
+
+  (* ...AND THE SLOT ALONE ACROSS THE SAME STEP (lane TRAP-ROWS, T3): the
+     additive pair travels to usertrap and the untaken side comes back at
+     the key it was handed at, so the loop moves a bare slot between the
+     trapped key and its run projection exactly as it moves the arm. *)
+  Lemma uslot_run_cong (W : uvis) :
+    length (uvis_tf W) = TFWORDS ->
+    (uslot W : iProp Σ) ⊣⊢ uslot (uvis_run W).
+  Proof using .
+    intro Hl.
+    apply (uslot_key_cong W (uvis_run W)
+             (eq_sym (uvis_run_gpr W)) (eq_sym (uvis_run_pc W))
+             eq_refl eq_refl eq_refl eq_refl eq_refl eq_refl eq_refl eq_refl
+             eq_refl eq_refl).
+  Qed.
+
+End Apply.
+
+(* ===================================================================== *)
+(* SS4b THE ONE FRAME MOVER THAT IS FREE.                                  *)
+(*                                                                         *)
+(* [trapped_machine] and [UserExec.user_trap_frame_at] are the SAME rows   *)
+(* but for the image conjunct: the former names it at the lazy tier        *)
+(* ([user_ptm_inv pt sz M]), the latter existentially                      *)
+(* ([UserPtTree.user_pt_any pt]).  Forgetting the image is                 *)
+(* [user_ptm_inv_any]; naming it is S3's business (see the header).        *)
+(* ===================================================================== *)
+Section Frame.
+  Context `{!riscvGS Σ}.
+  Context `{!ufdG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CtxIdDefs.CurCtx}.
+
+  Lemma trapped_machine_frame (C : ucfg) (pt : uptd) (Rut : uptd -> iProp Σ)
+      (sz : Z) (sc stv : mword 64) (W : uvis) :
+    trapped_machine C pt Rut sz sc stv W -∗
+    ∃ ms_v : mword 64,
+      ⌜trap_mstatus_ok ms_v⌝ ∗
+      user_trap_frame_at C pt Rut ms_v sc stv
+        (tf_w (uvis_tf W) tf_epc_idx) (tf_resume_gpr0 (uvis_tf W)).
+  Proof using .
+    (* post-S3 [trapped_machine] IS [user_trap_frame_atm] plus the K3 length
+       conjunct, so the only row that moves is the image. *)
+    rewrite /trapped_machine /user_trap_frame_atm /user_trap_frame_at.
+    iIntros "H".
+    iDestruct "H" as (ms_v) "(%Hlen & %Hto & Hhs & Hpriv & Hms & Hsc & Hstv &
+                              Hsep & Hpc & Hg & Hpt & Hcfg & Hrut)".
+    iDestruct (user_ptm_inv_any with "Hpt") as "Hany".
+    iExists ms_v.
+    iSplitR; [ iPureIntro; exact Hto | ].
+    iSplitR; [ iPureIntro; exact Hto | ].
+    iSplitL "Hhs"; [ iExact "Hhs" | ].
+    iSplitL "Hpriv"; [ iExact "Hpriv" | ].
+    iSplitL "Hms"; [ iExact "Hms" | ].
+    iSplitL "Hsc"; [ iExact "Hsc" | ].
+    iSplitL "Hstv"; [ iExact "Hstv" | ].
+    iSplitL "Hsep"; [ iExact "Hsep" | ].
+    iSplitL "Hpc"; [ iExact "Hpc" | ].
+    iSplitL "Hg"; [ iExact "Hg" | ].
+    iSplitL "Hany"; [ iExact "Hany" | ].
+    iSplitL "Hcfg"; [ iExact "Hcfg" | ].
+    iExact "Hrut".
+  Qed.
+
+End Frame.
+
+(* ===================================================================== *)
+(* SS5 THE RESUME SIZE GUARD.                                              *)
+(*                                                                         *)
+(* [UexecRet.uvb] carries [⌜usz_ok sz⌝], and the loop's [sz] is the        *)
+(* process's own [p->sz].  [ProcInv.proc_priv_nopt_sz_maxsz] gives         *)
+(* [uint (pv_sz V) <= uvm_maxsz]; [uvm_maxsz = 2^38 - 8192] is             *)
+(* page-aligned and IS [usz_ok]'s bound, so [pgroundup]'s monotonicity     *)
+(* closes the gap.                                                         *)
+(* ===================================================================== *)
+Lemma usz_ok_of_maxsz (sz : Z) : (sz <= uvm_maxsz)%Z -> usz_ok sz.
+Proof.
+  intros H. rewrite uvm_maxsz_val in H. unfold usz_ok.
+  refine (Z.le_trans _ _ _
+            (UserPtTree.pgroundup_mono sz 274877898752 H) _).
+  vm_compute. discriminate.
+Qed.
+
+(* ===================================================================== *)
+(* SS6 THE ROUND'S TAIL, AS NAMED LEMMAS (milestone J, stage S5).          *)
+(*                                                                         *)
+(* [ProofUserretClosed.stvec_handler_loop] is a whole-function continuation *)
+(* -- every proofmode step in it pays for the whole Iris context           *)
+(* (claude-notes/optimization.md, RULE ONE) -- so the round's END, which is *)
+(* pure re-keying and one bundle construction, is discharged HERE, where    *)
+(* the context is the lemma's own premises and nothing else.               *)
+(*                                                                         *)
+(*   [uexec_ret_round_slot] / [_of]  steps A and B: the returned            *)
+(*        [uexec_ret] is re-keyed onto the RUN projection of the trapped    *)
+(*        key ([uexec_ret_run]) -- which is the key the round's relation is *)
+(*        stated at -- and then the round's own arm picks which of          *)
+(*        [uexec_ret]'s arms pays: transparent, ecall/exec (the kernel's    *)
+(*        own answer, off the process's exec deposit), ecall/fork (the      *)
+(*        parent's arm, at the pid) or ecall/other (the bumped slot).       *)
+(*        NOTHING IS MINTED: every arm is the process's own.  The PAYMENT   *)
+(*        goes to whichever continuation the round takes -- the process's   *)
+(*        arm on every exit but one, the exec-success wand on that one --   *)
+(*        and the two are exclusive, so one resource serves both.           *)
+(*   [ukc_apply]                     step D: [uvb] built ROW BY ROW (never  *)
+(*        [iFrame]: the bundle carries [gpr_file]) and the continuation     *)
+(*        applied at the table/size the round landed on -- which is step C, *)
+(*        the guard, met by [reflexivity] because the bundle is asked for   *)
+(*        at [perm_of (ud_um pt) sz] itself.                                *)
+(*   [uslot_apply_loop]              the two composed at a KEY: the slot's  *)
+(*        four projections are supplied as equations, so the caller states  *)
+(*        what its post gave it and never unfolds the seal.                 *)
+(* ===================================================================== *)
+(* [tf_resume_gpr_bump] at the canonical dead base -- the spelling the
+   round's [uround_bump_ok] is stated in. *)
+Lemma tf_resume_gpr0_bump (tf : list (mword 64)) (r : mword 64) :
+  (tf_arg_idx 0 < length tf)%nat ->
+  tf_resume_gpr0 (bump_tf tf r)
+  = <[Regidx (mword_of_int 10) := r]> (tf_resume_gpr0 tf).
+Proof.
+  intros Hl. unfold tf_resume_gpr0. exact (tf_resume_gpr_bump zero_rf tf r Hl).
+Qed.
+
+Section LoopApply.
+  Context `{!riscvGS Σ}.
+  Context `{!ufdG Σ}.
+  (* [ChildTok.ctokG]: this file names the generation's pieces and binds no
+     whole-system bundle.  A file that binds [Xv6G.xv6G] gets the class
+     through the bundle and must not bind it again. *)
+  Context `{!ctokG Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CtxIdDefs.CurCtx}.
+  Context {SG : uexecSG Σ}.
+
+  (* ------------------------------------------------------------------ *)
+  (* STEPS A + B: the returned [uexec_ret], re-keyed at the resume state. *)
+  (* ------------------------------------------------------------------ *)
+  (* THE DESCRIPTOR VIEW CROSSES THE TRAP UNCHANGED, and that is a PREMISE
+     rather than a conclusion of the round: [UexecRound.uround_ok] relates
+     the four record fields the trap moves (trapframe, image, permission
+     map, break) and knows nothing about descriptors, so the resumed key's
+     fd component is the LOOP's to choose.  It chooses the entry view --
+     which is exact for every arm but the four entries that touch
+     [p->ofile[]] (pipe, dup, open, close), whose rows are what will later
+     move it (see the ecall arm of [UexecRet.uexec_ret_F], which ∀-binds
+     [fdv'] precisely so that they can). *)
+  (* THE DESCRIPTOR PIN IS THE TRANSPARENT ARM'S ALONE, and stating it that
+     way is what lets a syscall move the process's fd view.
+
+     Read the proof below for why the other three arms do not want it.  The
+     exec arm is the process's own deposit, answered at the key the kernel
+     built; fork's arm is the PARENT's, instantiated at the pid, and the
+     parent's table is the one fork does not touch.
+     The returning ecall arm instantiates [uexec_ret]'s own ∀-bound [fdv']
+     at [uvis_fd W'], which is arbitrary: "the process is safe at every
+     return value AND every descriptor view the kernel hands back" is
+     exactly what that binder says.  Only the TRANSPARENT arm -- an
+     interrupt or a page fault -- hands back the process's continuation at
+     the SAME key, and there the pin is not a restriction but the truth: no
+     kernel code ran that could retype a descriptor, which is precisely what
+     [SpecUsertrap.ut_fd_kept] certifies on the other side. *)
+  (* THE RETURN VALUE, READ OUT OF THE RESUME PROJECTION.  [uround_ok]'s
+     ecall arm pins the resumed record only up to [tf_resume_gpr0] and
+     [tf_resume_pc] -- the kernel's trapframe is not literally the bump --
+     so "the value the syscall returned" is only visible here through the
+     register file the process comes back on.  [userret_gpr] writes a0
+     OUTERMOST, which is what makes this one [upd_eq]. *)
+  Lemma tf_resume_gpr_a0 (b : regfile) (tf : list (mword 64)) :
+    tf_resume_gpr b tf !!! Regidx (mword_of_int 10) = tf !!! tf_arg_idx 0.
+  Proof using . unfold tf_resume_gpr, userret_gpr. rewrite upd_eq. reflexivity. Qed.
+
+  (* THE RETURNING ARM, FACTORED: the generic returning wand of
+     [UexecRet.uexec_ret_F] at an arbitrary slot family [S], instantiated
+     at the return value the round bound and re-keyed onto the resume key.
+     Both round lemmas -- the plain one below and the enriched one
+     ([uexec_ret_round_slot], whose exec-failure arm is this
+     same shape at [r = -1]) -- are this helper plus the arm selection. *)
+  Lemma uexec_ret_F_returning (S : uvis -d> iPropO Σ)
+      (HS : forall W W' : uvis,
+              tf_resume_gpr0 (uvis_tf W) = tf_resume_gpr0 (uvis_tf W') ->
+              tf_resume_pc (uvis_tf W) = tf_resume_pc (uvis_tf W') ->
+              uvis_M W = uvis_M W' ->
+              uvis_perm W = uvis_perm W' ->
+              uvis_sz W = uvis_sz W' ->
+              uvis_fd W = uvis_fd W' ->
+              uvis_cwd W = uvis_cwd W' ->
+              uvis_gen W = uvis_gen W' ->
+              uvis_ch W = uvis_ch W' ->
+              uvis_pid W = uvis_pid W' ->
+              uvis_lazy W = uvis_lazy W' ->
+              uvis_secc W = uvis_secc W' ->
+              (S W : iProp Σ) ⊣⊢ S W')
+      (W W' : uvis) (f : sfam) (r : mword 64)
+      (* THE CHILDREN ROW IS A PARAMETER, for [UexecRet.uexec_ret_cont_gen]'s
+         reason: twenty entries answer with the pure "it did not move" and
+         wait answers with [uwait_ans].  The two instances below are the
+         only ones. *)
+      (CH : mword 64 -> gmap Z (bv 8) -> gset gname -> iProp Σ) :
+    length (uvis_tf W) = TFWORDS ->
+    (* the generation is the trapped key's: no returning entry
+       re-incarnates its caller ([UsysMemOk.usys_gen_ok] is the identity at
+       every number), so the caller instantiates the resume key at it. *)
+    uvis_gen W' = uvis_gen W ->
+    uround_bump_ok (uvis_tf (uvis_run W)) (uvis_tf W') r ->
+    usys_mem_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W)) r
+      (uvis_M W) (uvis_perm W) (uvis_sz W) (uvis_lazy W)
+      (uvis_M W') (uvis_perm W') (uvis_sz W') (uvis_lazy W') ->
+    usys_fd_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+      (uvis_tf W' !!! tf_arg_idx 0) (uvis_fd W) (uvis_fd W') ->
+    usys_pipe_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+      (uvis_tf W' !!! tf_arg_idx 0) (uvis_M W) (uvis_M W')
+      (uvis_fd W) (uvis_fd W') ->
+    (* ...and the cwd row, at the round's own return value: the round's
+       conjunct, so it arrives at [r] rather than at the a0 word *)
+    usys_cwd_ok (uvis_num (uvis_run W)) r (uvis_cwd W) (uvis_cwd W') ->
+    (* ...AND THE PID ROW, which is getpid's ANSWER and not a move: the
+       caller proves it off the kernel's own post
+       ([SpecUsertrap.ut_ret_pid], carried out of the dispatcher's
+       [SpecSyscall.sysc_ret_pid]), at the OUTGOING a0 word -- where the
+       fd and pipe rows are read, and where the dispatcher stored the
+       answer.  Every other number discharges it from its index
+       ([UsysMemOk.usys_ret_pid_ne]). *)
+    usys_ret_pid (uvis_num (uvis_run W))
+      (uvis_tf W' !!! tf_arg_idx 0) (uvis_pid W) ->
+    (* ...AND WHAT THE RESUME ITSELF PROVES (lane TRAP-ROWS, T2(iii)), read
+       at the same outgoing a0 word -- [UexecRet.uexec_live_ok]. *)
+    uexec_live_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+      (uvis_fd W) (uvis_tf W' !!! tf_arg_idx 0) (uvis_ch W') ->
+    (* ...AND THE MASK ROW, the round's own conjunct (so at [r]), as the cwd
+       row is ([UsysMemOk.usys_secc_ok]) *)
+    usys_secc_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+      (uvis_secc W) (uvis_secc W') r ->
+    (* ...and the resume key's pid is the trapped key's, exactly as its
+       generation is: nothing re-numbers the caller, so the loop builds the
+       resume key at the pid it resumed the process with. *)
+    uvis_pid W' = uvis_pid W ->
+    (* THE ARMED POST, at the value the round bound: what the kernel gives
+       back for the deposit the process made ([UexecSG.spost_at], at the
+       families the arm bound).  The loop
+       reads it off the dispatcher's own answer, exactly as it reads the
+       four pure rows. *)
+    (* ...READ AT THE OUTGOING a0 WORD, which is where the dispatcher stored
+       the return value and where both callers hold it; [Ha0] below is what
+       identifies it with the round's own [r]. *)
+    (* ...AND THE CHILDREN ROW THE KERNEL ANSWERED WITH, at the same a0
+       word and at the set the round resumes on. *)
+    CH (uvis_tf W' !!! tf_arg_idx 0) (uvis_M W') (uvis_ch W') -∗
+    spost_at S (uvis_num (uvis_run W)) f (uvis_run W)
+      (uvis_tf W' !!! tf_arg_idx 0) (uvis_M W') (uvis_fd W') (uvis_cwd W')
+      (uvis_ch W') -∗
+    (∀ (r' : mword 64) (M' : gmap Z (bv 8)) (π' : gmap (mword 27) uperm)
+       (szv' : Z) (fdv' : list fdstate) (cw' : Z) (gn' : gname)
+       (cs' : gset gname) (lz' : bool) (secc' : mword 64),
+       ⌜usys_mem_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+                    r' (uvis_M W) (uvis_perm W) (uvis_sz W) (uvis_lazy W)
+                    M' π' szv' lz'⌝ -∗
+       ⌜usys_fd_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+                   r' (uvis_fd W) fdv'⌝ -∗
+       ⌜usys_pipe_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+                     r' (uvis_M W) M' (uvis_fd W) fdv'⌝ -∗
+       ⌜usys_cwd_ok (uvis_num (uvis_run W)) r' (uvis_cwd W) cw'⌝ -∗
+       ⌜usys_gen_ok (uvis_num (uvis_run W)) (uvis_gen W) gn'⌝ -∗
+       ⌜usys_ret_pid (uvis_num (uvis_run W)) r' (uvis_pid W)⌝ -∗
+       ⌜uexec_live_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+                      (uvis_fd W) r' cs'⌝ -∗
+       ⌜usys_secc_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+                     (uvis_secc W) secc' r'⌝ -∗
+       CH r' M' cs' -∗
+       spost_at S (uvis_num (uvis_run W)) f (uvis_run W) r'
+         M' fdv' cw' cs' -∗
+       S (bump (uvis_run W) r' M' π' szv' fdv' cw' gn' cs' lz' secc')) -∗
+    S W'.
+  Proof using .
+    intros Hl Hgn [Hb1 Hb2] Hm Hfdrow Hpiperow Hcwrow Hpidrow Hliverow Hscrow Hpidk.
+    iIntros "Hch Hsp Hret".
+    (* the two length side conditions the bump's readers take *)
+    assert (Hla : (tf_arg_idx 0 < length (uvis_tf (uvis_run W)))%nat)
+      by (rewrite (uvis_run_length W); unfold tf_arg_idx, TFWORDS; lia).
+    assert (Hle : (tf_epc_idx < length (uvis_tf (uvis_run W)))%nat)
+      by (rewrite (uvis_run_length W); unfold tf_epc_idx, TFWORDS; lia).
+    (* the bump's two readers, hoisted out of argument position
+       (claude-notes/optimization.md, "Inline [ltac:]") *)
+    assert (Hg1 : tf_resume_gpr0 (bump_tf (uvis_tf (uvis_run W)) r)
+                  = tf_resume_gpr0 (uvis_tf W')).
+    { rewrite (tf_resume_gpr0_bump (uvis_tf (uvis_run W)) r Hla).
+      exact (eq_sym Hb1). }
+    (* THE RETURN VALUE IS THE OUTGOING a0 WORD.  The caller's row is
+       stated there (it is where the dispatcher stored it); [r] is the
+       value [uround_ok]'s ecall arm bound.  They are the same word,
+       read off the two sides of [Hg1] at a0. *)
+    (* BUILT AS A TERM, NOT BY [rewrite].  [tf_resume_gpr_a0]'s left
+       side is a [userret_gpr] -- thirty-one nested register inserts --
+       and asking [rewrite] to find it inside [He] sends unification
+       off for good: this proof DIVERGED as
+       [rewrite !tf_resume_gpr_a0 in He].  Chaining the four equations
+       by hand does the same work with no search at all. *)
+    assert (Ha0 : uvis_tf W' !!! tf_arg_idx 0 = r).
+    { pose proof (f_equal (fun M : regfile =>
+                             M !!! Regidx (mword_of_int 10)) Hg1) as He.
+      cbn beta in He.
+      exact (eq_trans
+               (eq_sym (tf_resume_gpr_a0 zero_rf (uvis_tf W')))
+               (eq_trans (eq_sym He)
+                  (eq_trans
+                     (tf_resume_gpr_a0 zero_rf
+                        (bump_tf (uvis_tf (uvis_run W)) r))
+                     (bump_tf_a0 (uvis_tf (uvis_run W)) r Hla)))). }
+    iEval (rewrite Ha0) in "Hsp".
+    iEval (rewrite Ha0) in "Hch".
+    iDestruct ("Hret" $! r (uvis_M W') (uvis_perm W') (uvis_sz W')
+                 (uvis_fd W') (uvis_cwd W') (uvis_gen W') (uvis_ch W')
+                 (uvis_lazy W') (uvis_secc W')
+                 with "[%] [%] [%] [%] [%] [%] [%] [%] Hch Hsp") as "Hs";
+      [ exact Hm | rewrite <- Ha0; exact Hfdrow
+      | rewrite <- Ha0; exact Hpiperow | exact Hcwrow
+      | exact Hgn | rewrite <- Ha0; exact Hpidrow
+      | rewrite <- Ha0; exact Hliverow | exact Hscrow | ].
+    assert (Hp1 : tf_resume_pc (bump_tf (uvis_tf (uvis_run W)) r)
+                  = tf_resume_pc (uvis_tf W')).
+    { rewrite (tf_resume_pc_bump (uvis_tf (uvis_run W)) r Hle).
+      exact (eq_sym Hb2). }
+    iEval (rewrite (HS (bump (uvis_run W) r (uvis_M W') (uvis_perm W')
+                          (uvis_sz W') (uvis_fd W') (uvis_cwd W')
+                          (uvis_gen W') (uvis_ch W') (uvis_lazy W') (uvis_secc W')) W'
+                      Hg1 Hp1 eq_refl eq_refl eq_refl eq_refl eq_refl
+                      eq_refl eq_refl (eq_sym Hpidk) eq_refl eq_refl)) in "Hs".
+    iExact "Hs".
+  Qed.
+
+  Lemma uexec_ret_round_slot (sc : mword 64) (W W' : uvis) (f : sfam) :
+    length (uvis_tf W) = TFWORDS ->
+    (* THE GENERATION AND THE CHILDREN SET ARE THE LOOP'S OWN CHOICE, at
+       every arm.  No entry moves either -- a syscall does not
+       re-incarnate its caller, and this lane's children table is quiet at
+       every number -- so the resume key is built at the trapped key's
+       readings and both premises are [eq_refl] at the call site.  The
+       fork and wait arms that DO move the set restate them; nothing here
+       has to anticipate that. *)
+    uvis_gen W' = uvis_gen W ->
+    (* ...AND SO IS THE PID, on exactly those terms: the kernel holds
+       [p->pid] and no entry re-numbers its caller, so the loop builds the
+       resume key at the number it resumed the process with and this
+       premise is [eq_refl] at the call site. *)
+    uvis_pid W' = uvis_pid W ->
+    (* ...AND THE CHILDREN SET IS QUIET AT EVERY ENTRY BUT THE TWO THAT
+       MOVE IT: fork's own answer below says what the set became, and
+       wait's says what the reap left, so the blanket premise is guarded
+       off both. *)
+    (~ (sc = uecall_scause
+        /\ (uvis_num (uvis_run W) = USYS_fork
+            \/ uvis_num (uvis_run W) = USYS_wait)) ->
+     uvis_ch W' = uvis_ch W) ->
+    (sc <> uecall_scause -> uvis_fd W' = uvis_fd W) ->
+    (* ...AND ON THE ECALL ARM, THE SYSCALL'S OWN ROW.  This is the premise
+       that used to be missing, and its absence is why the process resumed
+       at an ARBITRARY descriptor view: the arm instantiated [uexec_ret]'s
+       [fdv'] at [uvis_fd W'] and owed nothing about it.  It costs the
+       caller nothing -- [SpecUservec]'s post forwards exactly this, off
+       [SpecUsertrap.ut_fd_ecall], off [SpecSyscall.sysc_fd_ok] -- and it is
+       what lets a program carry a fact about its own descriptors across a
+       syscall.  The return value is read at the OUTGOING trapframe's a0
+       word, which is where the dispatcher's [sd a0,112(s2)] put it. *)
+    (sc = uecall_scause ->
+       usys_fd_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+         (uvis_tf W' !!! tf_arg_idx 0) (uvis_fd W) (uvis_fd W')) ->
+    (* ...and PIPE'S JOIN, forwarded on the same arm and read at the same
+       two words.  The images are the key's own, before and after -- which
+       is what makes this statable here at all: [uvis] carries the image,
+       so the u-tier can say the bytes pipe wrote name the slots it
+       opened.  See [UsysMemOk.v]'s SS2c. *)
+    (sc = uecall_scause ->
+       usys_pipe_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+         (uvis_tf W' !!! tf_arg_idx 0) (uvis_M W) (uvis_M W')
+         (uvis_fd W) (uvis_fd W')) ->
+    (* ...AND GETPID'S ANSWER, on the ecall arm and off the same outgoing
+       word.  [SpecUservec]'s post forwards it, off
+       [SpecUsertrap.ut_ret_pid], off [SpecSyscall.sysc_ret_pid], off
+       [SpecSysGetpid]'s own [mf a0 = sign_extend' 64 pid] -- the whole
+       route of a value that is read once and relayed.  Every other number
+       is quiet by its index. *)
+    (sc = uecall_scause ->
+       usys_ret_pid (uvis_num (uvis_run W))
+         (uvis_tf W' !!! tf_arg_idx 0) (uvis_pid W)) ->
+    (* ...AND WHAT THE RESUME ITSELF PROVES (lane TRAP-ROWS, T2(iii)), on
+       the same terms and by the same route: usertrap's second [killed]
+       check refuted the read's one-shot, so at an open readable console
+       descriptor the answer is not -1 -- [SpecUsertrap.ut_live_out], off
+       [SpecUservec]'s post.  Guarded on the ecall like the pid row; the
+       transparent arm answers nothing. *)
+    (sc = uecall_scause ->
+       uexec_live_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+         (uvis_fd W) (uvis_tf W' !!! tf_arg_idx 0) (uvis_ch W')) ->
+    (* THE CWD ROWS RIDE INSIDE THE ROUND: [uround_ok] relates the key's
+       [uvis_cwd] on both sides, so nothing here has to be told about it
+       separately -- the transparent arm pins it, the returning arm reads
+       [UsysMemOk.usys_cwd_ok] off the round's own conjunct. *)
+    uround_ok sc (uvis_tf (uvis_run W)) (uvis_M W) (uvis_perm W) (uvis_sz W)
+      (uvis_cwd W) (uvis_lazy W) (uvis_secc W)
+      (uvis_tf W') (uvis_M W') (uvis_perm W') (uvis_sz W') (uvis_cwd W')
+      (uvis_lazy W') (uvis_secc W') ->
+    (* THE KERNEL'S EXEC ANSWER:
+       exec is the one entry whose round says nothing, because the record it
+       leaves is a DIFFERENT program's.  The dispatcher answers with the
+       failure facts or the new image's slot -- both of kexec's success arms
+       pay the slot out of the process's OWN exec deposit
+       ([SpecKexec.exec_slot_pre]'s two wands), so there is no third arm and
+       the round mints nothing at exec. *)
+    (⌜sc = uecall_scause /\ uvis_num (uvis_run W) = USYS_exec⌝ -∗
+       (⌜exists r : mword 64,
+           uround_bump_ok (uvis_tf (uvis_run W)) (uvis_tf W') r
+           /\ usys_mem_ok USYS_exec (uvis_tf (uvis_run W)) r
+                (uvis_M W) (uvis_perm W) (uvis_sz W) (uvis_lazy W)
+                (uvis_M W') (uvis_perm W') (uvis_sz W') (uvis_lazy W')
+           /\ uvis_fd W' = uvis_fd W⌝
+        (* ...OR THE SUCCESS ARM, WHICH IS THE NEW IMAGE'S SLOT OUTRIGHT.
+           exec keeps the process -- same generation, same payload -- and
+           the run the new image starts carries no payment of its own any
+           more (lane SELF-KILL, P6), so nothing rides this arm but the
+           slot. *)
+        ∨ uslot W')) -∗
+    (* THE KERNEL'S FORK ANSWER, and it is the mint this lane adds.  fork
+       is the second entry whose round says more than a relation on the
+       key: the kernel created a process, and what it hands the PARENT is
+       the parent's quarter of that child's generation
+       ([ChildTok.child_tok], at the payload the process's own families
+       chose) together with the set its children reading grew to.  The
+       return value is read under the round's own bump, which is what ties
+       the pid the token carries to the a0 word the process resumes at.
+       Owed only at a fork ecall; every other arm refutes the guard. *)
+    (⌜sc = uecall_scause
+      /\ uvis_num (uvis_run W) = USYS_fork⌝ -∗
+     ufork_ans (sfork_pay f) (sfork_lend f) (uvis_tf W' !!! tf_arg_idx 0)
+       (uvis_ch W) (uvis_ch W')) -∗
+    (* ...AND THE KERNEL'S WAIT ANSWER, on the same footing: the reap took
+       the reaped generation out of the caller's reading, and the row the
+       loop hands the process is what the set became.  Owed only at a wait
+       ecall; every other arm refutes the guard. *)
+    (⌜sc = uecall_scause
+      /\ uvis_num (uvis_run W) = USYS_wait⌝ -∗
+     uwait_ans_pid_m (uvis_tf W' !!! tf_arg_idx 0) (uvis_M W) (uvis_M W')
+       (uvis_tf (uvis_run W) !!! tf_arg_idx 0)
+       (uvis_ch W) (uvis_ch W') (uvis_pid W)) -∗
+    (* ...AND THE ARMED POST the deposit bought, at the value the round
+       bound.  Owed only on the RETURNING arm -- exit hands nothing back and
+       fork pays no receipt (what its deposit buys is the CHILD's
+       execution), so the guard excludes both, exactly as
+       [SpecUsertrap.ut_sys_out]'s does; every other arm of the round is an
+       instantiation of the process's own arm, a mint or the transparent
+       key. *)
+    (⌜sc = uecall_scause
+      /\ uvis_num (uvis_run W) <> USYS_exit
+      /\ uvis_num (uvis_run W) <> USYS_fork⌝ -∗
+       spost_at uslot (uvis_num (uvis_run W)) f (uvis_run W)
+         (uvis_tf W' !!! tf_arg_idx 0) (uvis_M W') (uvis_fd W')
+         (uvis_cwd W') (uvis_ch W')) -∗
+    (* ...AND THE PROCESS'S OWN ARM -- OR, AT A NON-ECALL CAUSE, THE SLOT
+       ALONE (lane TRAP-ROWS, T3).  The additive pair the process offers at
+       a killing cause goes DOWN to usertrap with the deposit, because only
+       the kernel knows which side it takes; what comes back on the resume
+       path is the untaken side ([SpecUsertrap.ut_kill_out]), and that is
+       what the round transports to the resumed key. *)
+    (if decide (sc = uecall_scause) then uexec_arm sc W f
+     else uslot (uvis_run W)) -∗ uslot W'.
+  Proof using .
+    intros Hl Hgn Hpidk Hch Hfd Hfdrow Hpiperow Hpidrow Hliverow Hr.
+    iIntros "Hxo Hfo Hwo Hsp Hret".
+    destruct (decide (sc = uecall_scause)) as [Hec | Hne].
+    - (* ---- ECALL ---- *)
+      (* STEP A: the trapped key and its run projection are the same key *)
+      iEval (rewrite (uexec_arm_run sc W f Hl)) in "Hret".
+      rewrite (uexec_arm_ecall sc (uvis_run W) f Hec).
+      rewrite Hec in Hr.
+      destruct (uround_ok_ecall (uvis_tf (uvis_run W)) (uvis_M W) (uvis_M W')
+                  (uvis_perm W) (uvis_perm W') (uvis_sz W) (uvis_sz W')
+                  (uvis_cwd W) (uvis_cwd W') (uvis_lazy W) (uvis_lazy W') (uvis_secc W) (uvis_secc W')
+                  (uvis_tf W') Hr)
+        as [[Hexec [Hcwx Hscx]] | [Hnex [r [Hb [Hm [Hc Hsc]]]]]].
+      change (usys_eff (uvis_secc W) (uvis_tf (uvis_run W)))
+        with (uvis_num (uvis_run W)) in *.
+      + (* exec: the round says NOTHING by design -- the kernel answers *)
+        cbv zeta.
+        destruct (decide (uvis_num (uvis_run W) = USYS_exit))
+          as [Hx | _]; [ exfalso; rewrite Hexec in Hx; discriminate Hx | ].
+        destruct (decide (uvis_num (uvis_run W) = USYS_fork))
+          as [Hx | _]; [ exfalso; rewrite Hexec in Hx; discriminate Hx | ].
+        destruct (decide (uvis_num (uvis_run W) = USYS_wait))
+          as [Hx | _]; [ exfalso; rewrite Hexec in Hx; discriminate Hx | ].
+        iDestruct ("Hxo" with "[%]") as "[%Hfail | Hslot]";
+          [ split; [exact Hec | exact Hexec] | | ].
+        * (* failed: the returning arm at [r = -1].  Its cwd row is the
+             round's exec disjunct: exec inherits, so the field did not
+             move, and exec is not chdir. *)
+          destruct Hfail as (r & Hb & Hm & Hfd').
+          iDestruct ("Hsp" with "[%]") as "Hsp";
+            [ split_and!;
+              [ exact Hec | rewrite Hexec; discriminate
+              | rewrite Hexec; discriminate ] |].
+          rewrite <- Hexec in Hm.
+          assert (Hnec : USYS_exec <> USYS_chdir) by discriminate.
+          assert (Hchq : uvis_ch W' = uvis_ch W)
+            by (apply Hch; intros [_ [Hx | Hx]]; rewrite Hexec in Hx;
+                discriminate Hx).
+          assert (Hc : usys_cwd_ok (uvis_num (uvis_run W)) r
+                         (uvis_cwd W) (uvis_cwd W')).
+          { rewrite Hcwx. exact (usys_cwd_ok_refl_at _ USYS_exec r _ Hexec Hnec). }
+          assert (Hsc : usys_secc_ok (uvis_num (uvis_run W)) (uvis_tf (uvis_run W))
+                          (uvis_secc W) (uvis_secc W') r).
+          { rewrite Hscx Hexec. apply usys_secc_ok_refl. discriminate. }
+          iApply (uexec_ret_F_returning uslot uslot_key_cong W W' f r
+                    (fun (r' : mword 64) (_ : gmap Z (bv 8))
+                         (cs2 : gset gname) =>
+                       ⌜usys_ch_ok (uvis_num (uvis_run W)) r'
+                          (uvis_ch W) cs2⌝%I)
+                    Hl Hgn Hb Hm
+                    (Hfdrow Hec) (Hpiperow Hec) Hc (Hpidrow Hec)
+                    (Hliverow Hec) Hsc Hpidk
+                    with "[] [Hsp] [Hret]").
+          (* the children row: this arm is not one of the two that move it *)
+          { iPureIntro. exact Hchq. }
+          (* the post is at the a0 word, which the failure arm pins to [r] *)
+          { iExact "Hsp". }
+          iExact "Hret".
+        * (* succeeded: the new image's slot, out of the deposit.  THE
+             PAYMENT GOES INTO IT (EXEC-PAY): the record the kernel resumes
+             is a different program's but the SAME process, at the same
+             generation and the same payload, and the run that image starts
+             carries [UkRun.ukn_pay] at the kill status like any other --
+             so the arm the process would have resumed on is dropped and
+             this wand takes the payment instead. *)
+          iExact "Hslot".
+      + cbv zeta.
+        destruct (decide (uvis_num (uvis_run W) = USYS_exit))
+          as [Hx | _]; [ contradiction (Hnex Hx) | ].
+        destruct (decide (uvis_num (uvis_run W) = USYS_fork))
+          as [Hfk | Hnfk].
+        * (* THE FORK ROW.  The arm left here is the PARENT's alone
+             ([UexecRet.uexec_fork_parent_F]) -- the child's continuation
+             went DOWN as fork's deposit and is spent at kfork's park -- and
+             it is instantiated, not minted, at the pid the round returned.
+             Fork's three rows are the table's defaults, so the resume key
+             is the trapped one bumped at [r] and nothing else moved. *)
+          (* THE ARM'S GUARD IS PAID BY THE KERNEL.  <allocpid> allocates
+             the child's pid in [1, PIDMAX] under <pid_lock>, and a fork
+             that fails returns -1, so the round's [r] is never 0 --
+             [UsysMemOk.usys_mem_ok]'s fork row says so and this is where
+             it is spent.  The parent therefore always resumes on the
+             program's own arm; nothing is minted here. *)
+          assert (Hrne : r <> (mword_of_int 0 : mword 64))
+            by exact (usys_mem_ok_fork_nz _ _ _ _ _ _ _ _ _ _ _ Hfk Hm).
+          (* fork's three rows, read off the table's defaults *)
+          assert (Hne7 : uvis_num (uvis_run W) <> USYS_exec)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne12 : uvis_num (uvis_run W) <> USYS_sbrk)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne3 : uvis_num (uvis_run W) <> USYS_wait)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne4 : uvis_num (uvis_run W) <> USYS_pipe)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne5 : uvis_num (uvis_run W) <> USYS_read)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne8 : uvis_num (uvis_run W) <> USYS_fstat)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne21 : uvis_num (uvis_run W) <> USYS_close)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne10 : uvis_num (uvis_run W) <> USYS_dup)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne15 : uvis_num (uvis_run W) <> USYS_open)
+            by (rewrite Hfk; vm_compute; discriminate).
+          assert (Hne9 : uvis_num (uvis_run W) <> USYS_chdir)
+            by (rewrite Hfk; vm_compute; discriminate).
+          destruct (usys_mem_ok_quiet (uvis_num (uvis_run W))
+                      (uvis_tf (uvis_run W)) r (uvis_M W) (uvis_M W')
+                      (uvis_perm W) (uvis_perm W') (uvis_sz W) (uvis_sz W')
+                      (uvis_lazy W) (uvis_lazy W')
+                      Hne7 Hne12 Hne3 Hne4 Hne5 Hne8 Hm) as (HM' & Hpi' & Hsz').
+          assert (Hlz' : uvis_lazy W' = uvis_lazy W)
+            by exact (usys_mem_ok_lazy _ _ _ _ _ _ _ _ _ _ _ Hne12 Hm).
+          assert (Hfd' : uvis_fd W' = uvis_fd W)
+            by exact (usys_fd_ok_quiet (uvis_num (uvis_run W))
+                        (uvis_tf (uvis_run W)) (uvis_tf W' !!! tf_arg_idx 0)
+                        (uvis_fd W) (uvis_fd W')
+                        Hne21 Hne10 Hne15 Hne4 (Hfdrow Hec)).
+          assert (Hcw' : uvis_cwd W' = uvis_cwd W)
+            by exact (usys_cwd_ok_quiet (uvis_num (uvis_run W)) r
+                        (uvis_cwd W) (uvis_cwd W') Hne9 Hc).
+          assert (Hsc' : uvis_secc W' = uvis_secc W)
+            by exact (usys_secc_ok_quiet (uvis_num (uvis_run W)) _ _ _ _
+                        ltac:(rewrite Hfk; vm_compute; discriminate) Hsc).
+          (* ...and the bump, read back at the resume key -- the same two
+             transports the returning arms use *)
+          destruct Hb as [Hb1 Hb2].
+          assert (Hla : (tf_arg_idx 0 < length (uvis_tf (uvis_run W)))%nat)
+            by (rewrite (uvis_run_length W); unfold tf_arg_idx, TFWORDS; lia).
+          assert (Hle : (tf_epc_idx < length (uvis_tf (uvis_run W)))%nat)
+            by (rewrite (uvis_run_length W); unfold tf_epc_idx, TFWORDS; lia).
+          assert (Hg1 : tf_resume_gpr0 (bump_tf (uvis_tf (uvis_run W)) r)
+                        = tf_resume_gpr0 (uvis_tf W')).
+          { rewrite (tf_resume_gpr0_bump (uvis_tf (uvis_run W)) r Hla).
+            exact (eq_sym Hb1). }
+          assert (Hp1 : tf_resume_pc (bump_tf (uvis_tf (uvis_run W)) r)
+                        = tf_resume_pc (uvis_tf W')).
+          { rewrite (tf_resume_pc_bump (uvis_tf (uvis_run W)) r Hle).
+            exact (eq_sym Hb2). }
+          (* THE KERNEL'S ANSWER: which generation was created, at which
+             pid, and the parent's quarter of it. *)
+          (* THE STORED a0 WORD IS THE ROUND'S RETURN VALUE: userret
+             restores a0 from word 14 ([UexecSlot.tf_resume_gpr_a0]) and
+             the round's bump pins that register to [r]. *)
+          assert (Ha0r : uvis_tf W' !!! tf_arg_idx 0 = r).
+          { rewrite -(tf_resume_gpr_a0 zero_rf (uvis_tf W')).
+            unfold tf_resume_gpr0 in Hb1. rewrite Hb1. apply upd_eq. }
+          iDestruct ("Hfo" with "[%]") as "Hans";
+            [ split; [ exact Hec | exact Hfk ] | ].
+          iEval (rewrite Ha0r) in "Hans".
+          rewrite /uexec_fork_parent_F.
+    
+          iDestruct ("Hret" $! r (uvis_fd W') (uvis_cwd W') (uvis_ch W')
+                       with "[%] [%] [%] Hans") as "Hs";
+            [ exact Hrne | exact Hfd' | exact Hcw' | ].
+          iEval (rewrite (uslot_key_cong
+                            (bump (uvis_run W) r (uvis_M (uvis_run W))
+                               (uvis_perm (uvis_run W)) (uvis_sz (uvis_run W))
+                               (uvis_fd W') (uvis_cwd W')
+                               (uvis_gen (uvis_run W)) (uvis_ch W')
+                               (uvis_lazy (uvis_run W)) (uvis_secc (uvis_run W)))
+                            W' Hg1 Hp1 (eq_sym HM') (eq_sym Hpi') (eq_sym Hsz')
+                            eq_refl eq_refl (eq_sym Hgn) eq_refl
+                            (eq_sym Hpidk) (eq_sym Hlz') (eq_sym Hsc'))) in "Hs".
+          iExact "Hs".
+        * (* the returning arms: the row is the round's own conjunct *)
+          iDestruct ("Hsp" with "[%]") as "Hsp";
+            [ split_and!; [ exact Hec | exact Hnex | exact Hnfk ] |].
+          destruct (decide (uvis_num (uvis_run W) = USYS_wait))
+            as [Hwt | Hnwt].
+          -- (* WAIT'S ROW.  The reap moved the caller's children reading,
+                so the arm the process left is [UexecRet.uexec_wait_F] and
+                what pays its row is the kernel's answer -- fork's shape,
+                one number over.  Everything else about the arm is the
+                returning arm's: wait writes the exit status into the
+                caller's buffer, and that is what [usys_mem_ok]'s wait row
+                already says. *)
+             iApply (uexec_ret_F_returning uslot uslot_key_cong W W' f r
+                       (fun (r' : mword 64) (M2 : gmap Z (bv 8))
+                            (cs2 : gset gname) =>
+                          uwait_ans_pid_m r' (uvis_M (uvis_run W)) M2
+                            (uvis_tf (uvis_run W) !!! tf_arg_idx 0)
+                            (uvis_ch W) cs2 (uvis_pid W))
+                       Hl Hgn Hb Hm
+                       (Hfdrow Hec) (Hpiperow Hec) Hc (Hpidrow Hec)
+                    (Hliverow Hec) Hsc Hpidk
+                       with "[Hwo] [Hsp] [Hret]").
+             { iApply "Hwo". iPureIntro. split; [exact Hec | exact Hwt]. }
+             { iExact "Hsp". }
+             iExact "Hret".
+          -- assert (Hchq : uvis_ch W' = uvis_ch W)
+               by (apply Hch; intros [_ [Hx | Hx]];
+                   [ exact (Hnfk Hx) | exact (Hnwt Hx) ]).
+             iApply (uexec_ret_F_returning uslot uslot_key_cong W W' f r
+                       (fun (r' : mword 64) (_ : gmap Z (bv 8))
+                            (cs2 : gset gname) =>
+                          ⌜usys_ch_ok (uvis_num (uvis_run W)) r'
+                             (uvis_ch W) cs2⌝%I)
+                       Hl Hgn Hb Hm
+                       (Hfdrow Hec) (Hpiperow Hec) Hc (Hpidrow Hec)
+                    (Hliverow Hec) Hsc Hpidk
+                       with "[] [Hsp] [Hret]").
+             { iPureIntro. exact Hchq. }
+             { iExact "Hsp". }
+             iExact "Hret".
+    - (* ---- TRANSPARENT: interrupt, page fault, anything else ---- *)
+      (* THE SLOT ARRIVES DIRECTLY (lane TRAP-ROWS, T3): the pair went down
+         to usertrap and the kernel handed back the side it did not take,
+         so all that is left here is the key congruence. *)
+      destruct (uround_ok_transparent sc (uvis_tf (uvis_run W))
+                  (uvis_M W) (uvis_M W') (uvis_perm W) (uvis_perm W')
+                  (uvis_sz W) (uvis_sz W') (uvis_cwd W) (uvis_cwd W')
+                  (uvis_lazy W) (uvis_lazy W') (uvis_secc W) (uvis_secc W')
+                  (uvis_tf W') Hne Hr) as [[Hi1 Hi2] [HM [Hpi [Hsz [Hcw [Hlz Hscq]]]]]].
+      assert (Hchq : uvis_ch W' = uvis_ch W)
+        by (apply Hch; intros [Hx _]; exact (Hne Hx)).
+
+      iEval (rewrite (uslot_key_cong (uvis_run W) W'
+                        (eq_sym Hi1) (eq_sym Hi2)
+                        (eq_sym HM) (eq_sym Hpi) (eq_sym Hsz)
+                        (eq_sym (Hfd Hne)) (eq_sym Hcw)
+                        (eq_sym Hgn) (eq_sym Hchq) (eq_sym Hpidk)
+                        (eq_sym Hlz) (eq_sym Hscq))) in "Hret".
+      iExact "Hret".
+  Qed.
+
+  (* ...at the key the loop actually holds: the round's post is stated at
+     the trapped machine's own register file and epc word, and the resume
+     key is [UexecSlot.uvis_of] of the record the round left. *)
+  (* ...at the resumed record, keyed at the fd view that crossed the trap.
+     [UexecSlot.uvis_of] takes the descriptor states as a parameter, and
+     what the loop has to hand at this point is exactly the view the
+     trapped key carried. *)
+  (* ...and the [_of] form takes the view to resume AT, rather than
+     hardwiring the trapped one.  The loop passes the states the round
+     actually left ([SpecUservec.uservec_post]'s [sts']); on a transparent
+     trap those ARE the trapped ones, and [ut_fd_kept] is what says so. *)
+  Lemma uexec_ret_round_slot_of (sc : mword 64) (W : uvis) (f : sfam)
+      (g : regfile)
+      (sepc_v : mword 64) (U' : ustate) (fdv' : list fdstate)
+      (* ...AND THE SET TO RESUME AT, beside the descriptor view and for
+         its reason: fork moves it, so the loop passes what the round left
+         rather than the trapped reading.  Every other entry is quiet, and
+         the premise below says so. *)
+      (cs' : gset gname) :
+    length (uvis_tf W) = TFWORDS ->
+    g = tf_resume_gpr0 (uvis_tf W) ->
+    sepc_v = tf_w (uvis_tf W) tf_epc_idx ->
+    (sc <> uecall_scause -> fdv' = uvis_fd W) ->
+    (~ (sc = uecall_scause
+        /\ (usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)) = USYS_fork
+            \/ usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)) = USYS_wait)) ->
+     cs' = uvis_ch W) ->
+    (* ...and the ecall arm's row, forwarded verbatim -- see
+       [uexec_ret_round_slot]'s own note.  Stated at [tf_of g] because that
+       is the trapframe the round is stated at here, which is exactly the
+       one [SpecUservec]'s post states its row at. *)
+    (sc = uecall_scause ->
+       usys_fd_ok (usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v))) (tf_of g (ret_pc sepc_v))
+         (pv_tf (us_V U') !!! tf_arg_idx 0) (uvis_fd W) fdv') ->
+    (* ...and pipe's join, forwarded verbatim beside it *)
+    (sc = uecall_scause ->
+       usys_pipe_ok (usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v))) (tf_of g (ret_pc sepc_v))
+         (pv_tf (us_V U') !!! tf_arg_idx 0) (uvis_M W) (us_M U')
+         (uvis_fd W) fdv') ->
+    (* ...and GETPID'S ANSWER, forwarded verbatim beside them -- see
+       [uexec_ret_round_slot] *)
+    (sc = uecall_scause ->
+       usys_ret_pid (usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)))
+         (pv_tf (us_V U') !!! tf_arg_idx 0) (uvis_pid W)) ->
+    (* ...and WHAT THE RESUME PROVES, forwarded the same way (lane
+       TRAP-ROWS, T2(iii)) -- see [uexec_ret_round_slot] *)
+    (sc = uecall_scause ->
+       uexec_live_ok (usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)))
+         (tf_of g (ret_pc sepc_v)) (uvis_fd W)
+         (pv_tf (us_V U') !!! tf_arg_idx 0) cs') ->
+    (* ...and the round's cwd ends are the key's and the RECORD's: the
+       inum rides inside the block, so the resumed key's [uvis_cwd] is
+       [pv_cwi (us_V U')] by [uvis_of] itself -- no view to choose *)
+    uround_ok sc (tf_of g (ret_pc sepc_v)) (uvis_M W) (uvis_perm W) (uvis_sz W)
+      (uvis_cwd W) (uvis_lazy W) (uvis_secc W)
+      (pv_tf (us_V U')) (us_M U')
+      (perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))))
+      (uint (pv_sz (us_V U'))) (pv_cwi (us_V U')) (pv_lazy (us_V U')) (pv_secc (us_V U')) ->
+    (⌜sc = uecall_scause /\ usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)) = USYS_exec⌝ -∗
+       (⌜exists r : mword 64,
+           uround_bump_ok (tf_of g (ret_pc sepc_v)) (pv_tf (us_V U')) r
+           /\ usys_mem_ok USYS_exec (tf_of g (ret_pc sepc_v)) r
+                (uvis_M W) (uvis_perm W) (uvis_sz W) (uvis_lazy W)
+                (us_M U')
+                (perm_of (ud_um (pv_upt (us_V U'))) (uint (pv_sz (us_V U'))))
+                (uint (pv_sz (us_V U'))) (pv_lazy (us_V U'))
+           /\ fdv' = uvis_fd W⌝
+        ∨ uslot (uvis_of U' fdv' (uvis_gen W) cs' (uvis_pid W)))) -∗
+    (* ...AND FORK'S, forwarded verbatim -- see [uexec_ret_round_slot] *)
+    (⌜sc = uecall_scause
+      /\ usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)) = USYS_fork⌝ -∗
+     ufork_ans (sfork_pay f) (sfork_lend f) (pv_tf (us_V U') !!! tf_arg_idx 0)
+       (uvis_ch W) cs') -∗
+    (* ...and WAIT'S, forwarded the same way *)
+    (⌜sc = uecall_scause
+      /\ usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)) = USYS_wait⌝ -∗
+     uwait_ans_pid_m (pv_tf (us_V U') !!! tf_arg_idx 0) (uvis_M W) (us_M U')
+       (tf_of g (ret_pc sepc_v) !!! tf_arg_idx 0)
+       (uvis_ch W) cs' (uvis_pid W)) -∗
+    (⌜sc = uecall_scause
+      /\ usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)) <> USYS_exit
+      /\ usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v)) <> USYS_fork⌝ -∗
+       spost_at uslot (usys_eff (uvis_secc W) (tf_of g (ret_pc sepc_v))) f
+         (uvis_run W) (pv_tf (us_V U') !!! tf_arg_idx 0)
+         (us_M U') fdv' (pv_cwi (us_V U')) cs') -∗
+    (* the process's arm at an ecall, the untaken slot at any other cause
+       (lane TRAP-ROWS, T3) *)
+    (if decide (sc = uecall_scause) then uexec_arm sc W f
+     else uslot (uvis_run W)) -∗
+    uslot (uvis_of U' fdv' (uvis_gen W) cs' (uvis_pid W)).
+  Proof using .
+    intros Hl -> -> Hfd Hchrow Hfdrow Hpiperow Hpidrow Hliverow Hr.
+    (* THE RESUME KEY IS BUILT AT THE TRAPPED KEY'S OWN GENERATION -- no
+       entry re-incarnates its caller -- AND AT ITS OWN PID, for the same
+       reason -- and at the set the loop passes. *)
+    exact (uexec_ret_round_slot sc W
+             (uvis_of U' fdv' (uvis_gen W) cs' (uvis_pid W))
+             f Hl eq_refl eq_refl Hchrow Hfd Hfdrow Hpiperow Hpidrow
+             Hliverow Hr).
+  Qed.
+
+  (* ------------------------------------------------------------------ *)
+  (* STEP D (and C): [uvb], row by row, and the continuation applied.     *)
+  (* ------------------------------------------------------------------ *)
+  (* THE DESCRIPTOR RESOURCE IS A PREMISE, beside the image's.  This is
+     where the loop pays for the key's fd view: it hands over [Rfd fdv] --
+     instantiated at [FdSlots.fd_frags γfd] -- exactly as it hands over
+     [user_ptm_inv pt sz M] for [uvis_M]. *)
+  Lemma ukc_apply (C : ucfg) (pt : uptd) (Rfd : list fdstate -> iProp Σ)
+      (Rut : uptd -> iProp Σ)
+      (* A6.140: [ukc]'s ∀ carries the residue-token accessor; the entry
+         supplies it from the concrete residue it was built from *)
+      (HRut : forall pt' : uptd,
+                ⊢ Rut pt' -∗ TsoCtx.own_context XI ∗
+                             (TsoCtx.own_context XI -∗ Rut pt'))
+      (sz : Z) (fdv : list fdstate) (cw : Z) (gn : gname) (cs : gset gname)
+      (pidv : mword 32) (lz : bool) (secc : mword 64)
+      (M : gmap Z (bv 8)) (m : regfile)
+      (ms_v sc_v stv_v sepc_v pc : mword 64) :
+    loop_ok C pt ->
+    usz_ok sz ->
+    user_mstatus_ok ms_v ->
+    (* ...AND THE FILL ROW THE SLOT GUARD NOW CARRIES (lane KILL-PAY,
+       milestone LAZY-ROW): the loop hands the continuation the claim its
+       own key's [lz] bit makes, read off the process's block. *)
+    (lz = false -> lazy_free (ud_um pt) sz) ->
+    ukc (perm_of (ud_um pt) sz) M sz fdv cw gn cs pidv lz secc m pc -∗
+    hw_config -∗ minstret_inv -∗ wire_inv -∗
+    u_regs (HART_ACTIVE tt) ms_v sc_v stv_v sepc_v pc pc m -∗
+    user_ptm_inv_x pt sz M -∗
+    Rfd fdv -∗
+    user_cfg C -∗
+    Rut pt -∗
+    ▷ ukb C pt Rfd Rut sz (perm_of (ud_um pt) sz) fdv cw gn cs pidv lz secc -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hlo Hsz Hms Hlz.
+    iIntros "Hkc Hhw Hmi Hwi Hregs Hupt Hfrag Hcfg Hrut Hk".
+    (* the cell bundle splits into the U-mode residue, the file and the pc *)
+    iDestruct (u_regs_uv_regs ms_v sc_v stv_v sepc_v pc m Hms with "Hregs")
+      as "(Hur & Hg & Hpc)".
+    iApply ("Hkc" $! CID XI C pt Rfd Rut HRut
+              with "[%] [%] [%] [Hhw Hmi Hwi Hur Hg Hpc Hupt Hfrag Hcfg Hrut Hk]").
+    - exact Hlo.
+    - reflexivity.
+    - exact Hlz.
+    - (* THE BUNDLE, ROW BY ROW -- it carries [gpr_file], so never [iFrame]
+         (claude-notes/optimization.md, "Framing"). *)
+      rewrite /uvb /uvb_F.
+      iSplitL "Hhw Hmi Hwi"; [ iApply (uv_amb_intro with "Hhw Hmi Hwi") | ].
+      iSplitL "Hur"; [ iExact "Hur" | ].
+      iSplitR; [ iPureIntro; exact Hsz | ].
+      iSplitL "Hupt"; [ iExact "Hupt" | ].
+      iSplitL "Hfrag"; [ iExact "Hfrag" | ].
+      iSplitL "Hcfg"; [ iExact "Hcfg" | ].
+      iSplitL "Hg"; [ iExact "Hg" | ].
+      iSplitL "Hpc"; [ iExact "Hpc" | ].
+      iSplitL "Hrut"; [ iExact "Hrut" | ].
+      rewrite /ukont_F. iExact "Hk".
+  Qed.
+
+  (* ...and the slot at a KEY, which is what the loop holds: the FIVE
+     projections the slot reads, supplied as equations.  The break joined
+     them when it joined the key. *)
+  Lemma uslot_apply_loop (C : ucfg) (pt : uptd)
+      (Rfd : list fdstate -> iProp Σ) (Rut : uptd -> iProp Σ)
+      (HRut : forall pt' : uptd,
+                ⊢ Rut pt' -∗ TsoCtx.own_context XI ∗
+                             (TsoCtx.own_context XI -∗ Rut pt'))
+      (sz : Z) (fdv : list fdstate) (cw : Z) (gn : gname) (cs : gset gname)
+      (pidv : mword 32) (lz : bool) (secc : mword 64)
+      (W : uvis) (M : gmap Z (bv 8))
+      (m : regfile) (ms_v sc_v stv_v sepc_v pc : mword 64) :
+    loop_ok C pt ->
+    usz_ok sz ->
+    user_mstatus_ok ms_v ->
+    uvis_perm W = perm_of (ud_um pt) sz ->
+    uvis_M W = M ->
+    uvis_sz W = sz ->
+    uvis_fd W = fdv ->
+    uvis_cwd W = cw ->
+    uvis_gen W = gn ->
+    uvis_ch W = cs ->
+    uvis_pid W = pidv ->
+    uvis_lazy W = lz ->
+    uvis_secc W = secc ->
+    (* the fill row, as [ukc_apply] takes it *)
+    (lz = false -> lazy_free (ud_um pt) sz) ->
+    tf_resume_gpr0 (uvis_tf W) = m ->
+    tf_resume_pc (uvis_tf W) = pc ->
+    uslot W -∗
+    hw_config -∗ minstret_inv -∗ wire_inv -∗
+    u_regs (HART_ACTIVE tt) ms_v sc_v stv_v sepc_v pc pc m -∗
+    user_ptm_inv_x pt sz M -∗
+    Rfd fdv -∗
+    user_cfg C -∗
+    Rut pt -∗
+    ▷ ukb C pt Rfd Rut sz (perm_of (ud_um pt) sz) fdv cw gn cs pidv lz secc -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hlo Hsz Hms Hpi HM Hsw Hfd Hcw Hgn Hch Hpid Hlz Hsc Hlf Hg Hpc.
+    iIntros "Hs".
+    (* the seal comes off the HYPOTHESIS only *)
+    iEval (rewrite uslot_ukc) in "Hs".
+    iEval (rewrite Hpi HM Hsw Hfd Hcw Hgn Hch Hpid Hlz Hsc Hg Hpc) in "Hs".
+    iApply (ukc_apply C pt Rfd Rut HRut sz fdv cw gn cs pidv lz secc M m ms_v sc_v
+              stv_v sepc_v pc Hlo Hsz Hms Hlf with "Hs").
+  Qed.
+
+End LoopApply.

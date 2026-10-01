@@ -1,0 +1,38 @@
+/_opam
+*.vo
+*.vos
+*.vok
+CoqMakefile
+CoqMakefile.conf
+.CoqMakefile.d
+.*.aux
+*.glob
+*.v.timing
+*.v.beautified
+*.log
+.*.cache
+/xv6-riscv
+__pycache__
+/sail-riscv
+/aws/
+*.pem
+/mystuff/
+
+# vtest build artifacts
+tools/vtest/build/
+vtest-rocq/CoqMakefile*
+vtest-rocq/*.vo
+vtest-rocq/*.vok
+vtest-rocq/*.vos
+vtest-rocq/*.glob
+vtest-rocq/.*.aux
+
+# tools/tcb/tcb-report.sh generates this seed file on every run (see its header).
+tools/tcb/TcbSeed.v
+
+# rocq-warm daemon sockets and logs (claude-notes/rocq-warm.md)
+.rocq-warm/
+
+# coordinator state lives outside the repo (machine-local)
+/claude-notes/projects/wx-briefs/
+/claude-notes/projects/CHECKPOINT.md

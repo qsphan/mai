@@ -1,0 +1,158 @@
+(*  Xv6G.v -- ONE CLASS FOR THE GHOST STATE THAT IS PURE CAPACITY.
+
+    Every field below is an [inG]/[ghost_varG]/[ghost_mapG] -- a claim about
+    what cameras live in [Σ], and nothing else.  None of them carries a
+    [gname].  That is the whole criterion for membership, and it is what
+    makes this class safe to hand out from adequacy before a single
+    instruction of the kernel has run: there is nothing in it to allocate.
+
+    ---- WHY ONE CLASS RATHER THAN TEN BINDERS --------------------------
+
+    Not brevity.  A spec that spells its own [!bioG Σ, !logG Σ, …] can be
+    instantiated at a DIFFERENT instance of the same class than its caller,
+    and two instances of one [inG] are not equal -- so the resources they
+    build are not the same resources, and the mismatch surfaces as an
+    [iFrame]/[iApply] failure between two propositions that PRINT
+    IDENTICALLY.  durable-notes.md's typeclass-sweep section is about that
+    failure mode; it is expensive to debug precisely because nothing in the
+    error names the cause.  One class means one instance path.
+
+    So the rule that comes with this file: **a file at or above this one
+    binds [xv6G] and does NOT bind any of its members.**  Binding both is
+    the bug this class exists to prevent, and it compiles.
+
+    ---- WHY THIS FILE HOLDS ONLY THE BUNDLE ----------------------------
+
+    The members are DEFINED in [Xv6Cameras.v], which sits on ten
+    base-layer files; read its header for what is in it, what is
+    deliberately not, and why.  The split is not cosmetic:
+
+    - The bundle can only sit above every member, so with the classes
+      spread across their subsystems' files [xv6G]'s cone was eighty-two
+      files -- the whole M-mode execution engine, the inode cache, the
+      inode region, the UART driver.  All 767 files that bind the bundle
+      waited on all of it, and editing ONE subsystem's algebra rebuilt all
+      767.  With the definitions hoisted the cone is eleven, and an edit to
+      (say) [InodeRegion.v] rebuilds 203 files instead of 768.
+
+    - Keeping the BUNDLE out of [Xv6Cameras.v] is what enforces the rule
+      above.  Every member's home file [Require Export]s [Xv6Cameras], so
+      if [xv6G] lived there too it would become visible inside its own
+      cone -- and a low file binding [xv6G] beside a member is exactly the
+      double instance path this class exists to prevent.  It compiles, and
+      nothing in the resulting error names the cause.
+
+    THE [Require Export] BELOW IS LOAD-BEARING, not tidiness.  A member's
+    FIELD instances ([uio_stdinG], [lock_inG], ...) are only active where
+    [Xv6Cameras] is IMPORTED, and [Import] is not transitive -- so with a
+    plain [Require Import] here, a file that reaches the bundle ONLY through
+    [Xv6G] (there is one, [UmodeIo.v]) gets [xv6_uio : xv6G Σ -> uioG Σ] and
+    then no way to step from [uioG Σ] to the [ghost_varG] it wraps.  The
+    error names the innermost class and no cause: "Cannot infer the implicit
+    parameter ghost_varG0 ... (no type class instance found)", with [xv6G]
+    sitting right there in the printed environment.
+
+    ADDING A MEMBER TAKES THREE THINGS, not one: the class (in
+    [Xv6Cameras.v], with its own [subG] instance -- [solve_inG] has to be
+    able to CONSTRUCT it, so a class with no [subG] breaks [subG_xv6GΣ]
+    with "Cannot infer this placeholder"), the field below, and a row in
+    [xv6GΣ].  *)
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import own cancelable_invariants ghost_map.
+Require Export Xv6Cameras.
+
+Class xv6G (Σ : gFunctors) := Xv6G {
+  xv6_sie        :: sieG Σ;
+  xv6_lock       :: lockG Σ;
+  xv6_kalloc     :: kallocG Σ;
+  xv6_bio        :: bioG Σ;
+  xv6_disk       :: diskGhostG Σ;
+  xv6_uart       :: uartGhostG Σ;
+  xv6_fslog      :: fsLogG Σ;
+  xv6_log        :: logG Σ;
+  xv6_fscrash    :: fsCrashG Σ;
+  xv6_ireg       :: iregG Σ;
+  (* ---- the ERA'S TOP MAP, a member since durable-disk 2b-inode-3 -----
+     A checked-out payload carries its fragment ([IcacheEscrow.ic_loaded]
+     holds [FsState.top_frag]), so the class reaches [ProcInv.proc_priv]
+     through [FirstTok.first_boot_persist] and from there essentially every
+     proof file; membership is what keeps that from being an explicit
+     binder in ~400 of them.  See the note at [Xv6Cameras.fsTopG]. *)
+  xv6_fstop      :: fsTopG Σ;
+  (* ---- the LINK-COUNTING FAMILY, a member since durable-disk 2b-inode-4
+     A checked-out payload carries its directory's link TOKENS
+     ([IcacheEscrow.ic_loaded] holds [FsStateInode.ent_toks]) and the inode
+     region parks the per-inum authority ([InodeRegion.ireg_slot]), so
+     without membership the class would be an explicit binder on
+     [ireg_inv] -- hence on the thirty-odd fs contracts that thread it --
+     and on every payload site.  See the note at [Xv6Cameras.fsLinkG]. *)
+  xv6_fslink     :: fsLinkG Σ;
+  (* ---- the three that came OUT of [FileInvDefs.fileG] ---------------
+     [fileG] carried these as superclasses so that the ~100 files merely
+     mentioning [proc_priv] need not name the pipe and cache layers.  The
+     motive was right and is this file's; the remedy was not, because a
+     bundle per subsystem gives you one instance path per bundle.  The rule
+     it forced ("a file that needs both takes [fileG] alone") was
+     unenforceable and, in fact, unenforced: twenty-seven files bound
+     [fileG] and [!icacheG] side by side.  One bundle, one path. *)
+  xv6_icache     :: icacheG Σ;
+  xv6_pipe       :: pipeG Σ;
+  xv6_cinv       :: cinvG Σ;
+  xv6_uio        :: uioG Σ;
+  (* the U-tier's children ghost ([UserChildren.uch_auth] / [uch]); its
+     [gname] is [UkRun.ukn_ch].  See [Xv6Cameras.uchG]. *)
+  xv6_uch        :: uchG Σ;
+  (* the ENCODED per-process ledger ([UsertrapRes.uhist_auth]); its [gname]
+     is [UsertrapRes.un_uh].  See [Xv6Cameras.uledG]. *)
+  xv6_uled       :: uledG Σ;
+  (* the process slot's generation, as a saved predicate carrying its slot,
+     its pid and its exit payload ([ChildTok.gen_own] and the four pieces
+     above it); its [gname] is minted per incarnation by allocproc and
+     named by the private block ([ProcDefs.pv_gen]).  See
+     [ChildTok.ctokG], re-exported by [Xv6Cameras]. *)
+  xv6_ctok       :: ctokG Σ;
+  (* THE [wait_lock] CHILDREN MAP IS NOT A MEMBER, and cannot be: its
+     class CARRIES THE NAME ([Xv6Cameras.wchG]'s [wch_name]), which is the
+     one thing this bundle may not hold.  A row of that map rides every
+     slot's dormant block ([ProcDefs.proc_dormant]), so the name has to be
+     canonical rather than threaded, and it is minted inside the boot fupd
+     and handed out existentially exactly as [ProcAvail.pavG]'s and
+     [FdSlots.fdslotG]'s are.  Files bind [!wchG Σ] beside [!pavG Σ, !wchG Σ]. *)
+  (* the off-borrow liveness counter's camera (off-ledger ruling); its
+     gname is [FsCfg.fsc_fol].  See [Xv6Cameras.flivG]. *)
+  xv6_fliv       :: flivG Σ;
+  (* ---- the BUFFER-CACHE TRANSIT BOX (endgame §3.2), a member since the
+     TSO port's R1: [bio_ctx]/[bio_init] are stated by ~100 files; see the
+     note at [Xv6Cameras.bioboxG]. *)
+  xv6_biobox     :: bioboxG Σ;
+  (* the off box's cameras (R4b, r25 shapes): the set and the slot->box map *)
+  xv6_offbox     :: offboxG Σ;
+  xv6_icbox      :: icboxG Σ;    (* the icache instance of the box (R3) *)
+}.
+
+(* THE OFF LEDGER ([FileInvDefs.ioff_body]) DELIBERATELY HAS NO FIELD HERE.
+   Its capacity is [ghost_mapG Σ nat unit], and that class ALREADY has a
+   member on this bundle -- [logG]'s [logtx_inG] ([Xv6Cameras]).  A second
+   field is the duplicate-class trap this file's members exist to prevent,
+   and it was MEASURED, twice in one day (2026-08-31): as a [fileG] field it
+   is a search cycle ([subG_fileΣ] -> [fscfg] -> [file_fscfg] -> [fileG],
+   [BootShared]'s 400 GB bomb, re-measured at 703 GB); as a field HERE it is
+   two instance paths to one class, and [IcacheEscrow.ic_pin_enter]'s
+   [iFrame] fails on a [t ↪[ln_tx icfg_log] tt] that prints identically on
+   both sides.  [TxPin] already reads the capacity off [logG]; the ledger
+   does the same, through this bundle. *)
+
+(* THE FUNCTOR LIST, and the [subG] instance adequacy resolves the bundle
+   through.  Every member is pure capacity, so this is exactly the union of
+   their own [Σ]s -- and because the fields above are [::] (instance)
+   fields, Rocq cannot assemble the record on its own: without this
+   instance a concrete [Σ] yields "Could not find an instance for
+   [xv6G xv6Σ]" even when every constituent is present. *)
+Definition xv6GΣ : gFunctors :=
+  #[ sieΣ; lockΣ; kallocΣ; bioΣ; diskGhostΣ; uartGhostΣ; fsLogΣ; logΣ;
+     fsCrashΣ; iregΣ; fsTopΣ; fsLinkΣ; icacheΣ; pipeΣ; cinvΣ; uioΣ; uchΣ; uledΣ; ctokΣ;
+     flivΣ; bioboxΣ; icboxΣ;
+     offboxΣ ].
+
+Global Instance subG_xv6GΣ {Σ} : subG xv6GΣ Σ -> xv6G Σ.
+Proof. solve_inG. Qed.

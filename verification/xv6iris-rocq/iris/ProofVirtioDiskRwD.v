@@ -1,0 +1,2186 @@
+(* ProofVirtioDiskRwD.v -- virtio_disk_rw, phase P4: the ring write and THE
+   PUBLISH (+0x176 .. +0x19a).
+
+   The continuation of ProofVirtioDiskRwC.v, which proves P3 and leaves the
+   seam [VirtioDiskRwRestC.vdrw_p3_exit] at +0x176.
+
+     0x176 c.ld a3,8(a5)     a3 = disk.avail = pav
+     0x178 lhu  a4,2(a3)     AU: read avail->idx      (= wrap16 np)
+     0x17c c.andi a4,a4,7 ; 0x17e c.slli a4,a4,1 ; 0x180 c.add a3,a3,a4
+     0x182 sh   a0,4(a3)     PLAIN store of the head into ring slot np mod 8
+     0x186 fence rw,rw
+     0x18a c.ld a4,8(a5) ; 0x18c lhu a5,2(a4)   the SAME np again
+     0x190 c.addiw a5,a5,1
+     0x192 sh   a5,2(a4)     THE PUBLISH (AU: avail->idx := wrap16 (S np))
+     0x196 fence rw,rw
+
+   A FOURTH file, purely for build latency (see the worklist).  Nothing in
+   P4 calls a callee, so the phase itself lives in plain Sections; only the
+   P3 -> P4 glue re-opens the functor.
+
+   NOTE (the ProofVirtioDiskIntr helpers): a sibling owns that file, so the
+   four small things P4 needs from it -- the [fence rw,rw] execution fact and
+   its leaf, the page-offset alignment lemma, and the bitvector arithmetic of
+   the 16-bit counter -- are CLONED here under [vdrwd_] names rather than
+   imported.
+
+   P5 follows in ProofVirtioDiskRwE.v and P6 in ProofVirtioDiskRwF.v.
+   The whole function is composed and sealed in ProofVirtioDiskRwF.v
+   ([Module VirtioDiskRwProof … : VIRTIODISKRW]) and instantiated in
+   LinkVirtioDiskRw.v.  Everything here is Qed-closed.
+ *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language weakestpre lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map mono_nat.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes.
+Require Import RiscvLang RiscvPtsto RiscvFetchExec.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import KMap.
+Require Import KptPt.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import HartTp WpNext.
+Require Import VcGen WpSconfAlu WpSconfMem WpSconfCtl.
+Require Import MinstretInv.
+Require Import MemAccessGen.
+Require Import WpSmodeHalf.
+Require Import VirtioQueue DiskPtsto VirtioProto DiskInv DiskAvail.
+Require Import RiscvExec TsoMemPa WpLock.
+Require Import VirtioModel.
+Require Import WpUart.
+Require Import PermInv.
+Require Import CodeVirtioDiskRw.
+Require Import VirtioDiskRwDefs.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+(* The [set_solver] override.  EXPORT, not Import: this import is         *)
+(* deliberately "dead" -- the file compiles without it, just far slower --  *)
+(* and the nightly dead-import sweep skips [Require Export] lines.         *)
+(* It has to be HERE rather than inherited: [Require Export] only          *)
+(* propagates through an unbroken chain of Exports, and this tree's        *)
+(* intermediate files use [Require Import], so nothing downstream inherits *)
+(* it.  See FastSetSolver.v.                                              *)
+Require Export FastSetSolver.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Require Import TsoCtxStore.
+Import Defs.
+
+Local Open Scope Z_scope.
+
+(* [rget m k] back to [m !!! Regidx k] across the whole proofmode goal. *)
+Ltac rgall := repeat (rewrite rget_ne; [| vm_compute; discriminate]).
+
+
+(* ===================================================================== *)
+(* §1  Pure arithmetic.  Everything [lia] touches is mword-free; every    *)
+(*     bitvector identity is a closed [vm_compute] or an 8-way destruct.  *)
+(* ===================================================================== *)
+
+(* ---- the modular arithmetic of the 16-bit counters ---- *)
+
+Lemma vdrwd_wrap16_z (a : Z) : bv_wrap 16 a = (a `mod` 65536)%Z.
+Proof. unfold bv_wrap, bv_modulus. change (Z.of_N 16) with 16%Z. reflexivity. Qed.
+
+Lemma vdrwd_wrap32_z (a : Z) : bv_wrap 32 a = (a `mod` 4294967296)%Z.
+Proof. unfold bv_wrap, bv_modulus. change (Z.of_N 32) with 32%Z. reflexivity. Qed.
+
+Lemma vdrwd_wrap64_z (a : Z) : bv_wrap 64 a = (a `mod` 18446744073709551616)%Z.
+Proof. unfold bv_wrap, bv_modulus. change (Z.of_N 64) with 64%Z. reflexivity. Qed.
+
+Lemma vdrwd_mod_32_16 (a : Z) : ((a `mod` 4294967296) `mod` 65536)%Z = (a `mod` 65536)%Z.
+Proof.
+  rewrite (Z.mod_mod_divide a 4294967296 65536); [reflexivity|].
+  exists 65536%Z. reflexivity.
+Qed.
+
+Lemma vdrwd_mod_64_16 (a : Z) : ((a `mod` 18446744073709551616) `mod` 65536)%Z = (a `mod` 65536)%Z.
+Proof.
+  rewrite (Z.mod_mod_divide a 18446744073709551616 65536); [reflexivity|].
+  exists 281474976710656%Z. reflexivity.
+Qed.
+
+Lemma vdrwd_mod_64_32 (a : Z) :
+  ((a `mod` 18446744073709551616) `mod` 4294967296)%Z = (a `mod` 4294967296)%Z.
+Proof.
+  rewrite (Z.mod_mod_divide a 18446744073709551616 4294967296); [reflexivity|].
+  exists 4294967296%Z. reflexivity.
+Qed.
+
+Lemma vdrwd_land7_z (x : Z) : Z.land x 7 = (x `mod` 8)%Z.
+Proof. change 7%Z with (Z.ones 3). rewrite (Z.land_ones x 3 ltac:(lia)). reflexivity. Qed.
+
+Lemma vdrwd_mod8_bound_z (k : nat) : (0 <= Z.of_nat (k `mod` 8) < 8)%Z.
+Proof. pose proof (Nat.mod_upper_bound k 8 ltac:(lia)). lia. Qed.
+
+Lemma vdrwd_mod8_z (k : nat) : (Z.of_nat k `mod` 8)%Z = Z.of_nat (k `mod` 8)%nat.
+Proof. rewrite Nat2Z.inj_mod. reflexivity. Qed.
+
+Lemma vdrwd_small_wrap64 (k : Z) : (0 <= k)%Z -> (k < 4096)%Z -> bv_wrap 64 k = k.
+Proof.
+  intros H0 H1. rewrite vdrwd_wrap64_z. apply Z.mod_small. lia.
+Qed.
+
+(* ---- the CLAIM MAP at publish ---------------------------------------- *)
+(* [disk_res]'s clause on the claim map: every row is below the published
+   count, sits at its own position and links its slot to its buffer.  The
+   publisher's position is therefore not yet a row... *)
+Lemma vdrwd_cm_fresh (np : nat) (cm : gmap nat dclaim) :
+  (forall p dc, cm !! p = Some dc ->
+     (p < np)%nat /\ dc_pos dc = p /\ slot_buf_link (dc_slot dc) (dc_buf dc)) ->
+  cm !! np = None.
+Proof.
+  intro Hcm. destruct (cm !! np) as [dc|] eqn:Hlk; [| reflexivity].
+  exfalso. destruct (Hcm np dc Hlk) as (Hlt & _ & _). lia.
+Qed.
+
+(* ...and the clause survives recording it, at the bumped count. *)
+Lemma vdrwd_cm_ins (np : nat) (cm : gmap nat dclaim) (dc : dclaim) :
+  (forall p dc', cm !! p = Some dc' ->
+     (p < np)%nat /\ dc_pos dc' = p /\ slot_buf_link (dc_slot dc') (dc_buf dc')) ->
+  dc_pos dc = np -> slot_buf_link (dc_slot dc) (dc_buf dc) ->
+  forall p dc', <[ np := dc ]> cm !! p = Some dc' ->
+    (p < S np)%nat /\ dc_pos dc' = p /\ slot_buf_link (dc_slot dc') (dc_buf dc').
+Proof.
+  intros Hcm Hpos Hlink p dc' Hp.
+  destruct (decide (p = np)) as [->|Hne].
+  - rewrite lookup_insert_eq in Hp. injection Hp as <-.
+    split_and!; [lia | exact Hpos | exact Hlink].
+  - rewrite (lookup_insert_ne cm np p dc (not_eq_sym Hne)) in Hp.
+    destruct (Hcm p dc' Hp) as (Hlt & Hpp & Hl).
+    split_and!; [lia | exact Hpp | exact Hl].
+Qed.
+
+(* the head, as the ring store spells it and as the receipt is keyed *)
+Lemma vdrwd_hd16 (h : nat) : (h < 8)%nat ->
+  Z.to_nat (bv_unsigned (Z_to_bv 16 (Z.of_nat h))) = h.
+Proof. intro Hh. rewrite (bv16_small h Hh). apply Nat2Z.id. Qed.
+
+(* ---- bitvector-level structural helpers ------------------------------ *)
+
+Lemma vdrwd_zext16_unsigned (x : SailStdpp.Values.mword 16) :
+  bv_unsigned (zero_extend' 64 x : SailStdpp.Values.mword 64) = bv_unsigned x.
+Proof.
+  cbv [zero_extend' Operators_mwords.zero_extend Operators_mwords.extz_vec
+       MachineWord.MachineWord.zero_extend].
+  rewrite bv_zero_extend_unsigned. reflexivity.
+  first [ lia | vm_compute; discriminate | done ].
+Qed.
+
+Lemma vdrwd_and_vec_unsigned (a b : mword 64) :
+  bv_unsigned (and_vec a b) = Z.land (bv_unsigned a) (bv_unsigned b).
+Proof.
+  cbv [and_vec Operators_mwords.word_binop 
+       ].
+  unfold MachineWord.MachineWord.and. apply bv_and_unsigned.
+Qed.
+
+Lemma vdrwd_trunc16_subrange (w : mword 64) : trunc16 w = subrange_vec_dec w 15 0.
+Proof.
+  unfold trunc16. change (Z.sub (Z.mul 2 8) 1) with 15%Z.
+  change (15 - 0 + 1)%Z with 16%Z. apply autocast_id.
+Qed.
+
+Lemma vdrwd_trunc16_unsigned (w : mword 64) :
+  bv_unsigned (trunc16 w) = bv_wrap 16 (bv_unsigned w).
+Proof.
+  rewrite vdrwd_trunc16_subrange.
+  unfold subrange_vec_dec. rewrite autocast_id.
+  unfold to_word_idx.
+  rewrite MachineWord.MachineWord.cast_idx_refl.
+  unfold MachineWord.MachineWord.slice.
+  change (MachineWord.MachineWord.Z_idx 0) with 0%N.
+  rewrite bv_extract_0_unsigned.
+  change (MachineWord.MachineWord.Z_idx (15 - 0 + 1)) with 16%N.
+  reflexivity.
+Qed.
+
+Lemma vdrwd_sub32_unsigned (x : mword 64) :
+  bv_unsigned (subrange_vec_dec x 31 0 : SailStdpp.Values.mword 32)
+  = (bv_unsigned x `mod` 4294967296)%Z.
+Proof. rewrite <- trunc32_subrange. rewrite trunc32_unsigned. apply vdrwd_wrap32_z. Qed.
+
+Lemma vdrwd_sext32_mod32 (w : SailStdpp.Values.mword 32) :
+  ((bv_unsigned (sign_extend' 64 w : mword 64)) `mod` 4294967296)%Z = bv_unsigned w.
+Proof.
+  pose proof (f_equal bv_unsigned (trunc32_sext w)) as He.
+  rewrite trunc32_unsigned vdrwd_wrap32_z in He. exact He.
+Qed.
+
+Lemma vdrwd_sext32_mod16 (w : SailStdpp.Values.mword 32) :
+  ((bv_unsigned (sign_extend' 64 w : mword 64)) `mod` 65536)%Z
+  = (bv_unsigned w `mod` 65536)%Z.
+Proof.
+  rewrite <- (vdrwd_mod_32_16 (bv_unsigned (sign_extend' 64 w : mword 64))).
+  rewrite vdrwd_sext32_mod32. reflexivity.
+Qed.
+
+(* ---- the ring index [avail->idx & 7] and its doubling ---------------- *)
+
+Lemma vdrwd_ring_idx (np : nat) :
+  and_vec (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16))
+          (sign_extend' 64 (sign_extend' 12 (mword_of_int 7 : mword 6)))
+  = (mword_of_int (Z.of_nat (np `mod` 8)) : mword 64).
+Proof.
+  apply bv_eq. rewrite vdrwd_and_vec_unsigned vq_moi_unsigned.
+  replace (bv_unsigned (sign_extend' 64 (sign_extend' 12 (mword_of_int 7 : mword 6)) : mword 64))
+    with 7%Z by (vm_compute; reflexivity).
+  rewrite vdrwd_zext16_unsigned vdrwd_land7_z wrap16_mod8 vdrwd_mod8_z.
+  pose proof (vdrwd_mod8_bound_z np) as Hb.
+  rewrite (vdrwd_small_wrap64 _ (proj1 Hb) ltac:(lia)). reflexivity.
+Qed.
+
+Lemma vdrwd_shl1 (k : nat) : (k < 8)%nat ->
+  shift_bits_left (mword_of_int (Z.of_nat k) : mword 64)
+    (subrange_vec_dec (mword_of_int 1 : mword 6) (Z.sub log2_xlen 1) 0)
+  = (mword_of_int (Z.of_nat (2 * k)) : mword 64).
+Proof. intro H. do 8 (destruct k as [|k]; [apply bv_eq; vm_compute; reflexivity|]). lia. Qed.
+
+Lemma vdrwd_zring (k : nat) : (Z.of_nat (2 * k) + 4 = Z.of_nat (4 + 2 * k))%Z.
+Proof. lia. Qed.
+
+Lemma vdrwd_ring_addr (pav : mword 64) (k : nat) :
+  add_vec (add_vec (pav : mword 64) (mword_of_int (Z.of_nat (2 * k))))
+          (sign_extend' 64 (mword_of_int 4 : mword 12))
+  = (d_ring pav k : SailStdpp.Values.mword 64).
+Proof.
+  rewrite vdrwc_sx4.
+  rewrite (vdrw_av2 pav (Z.of_nat (2 * k)) 4).
+  rewrite vdrwd_zring. unfold d_ring. rewrite vdrw_pa_add_moi. reflexivity.
+Qed.
+
+Lemma vdrwd_idx_addr (pav : mword 64) :
+  add_vec (pav : mword 64) (sign_extend' 64 (mword_of_int 2 : mword 12))
+  = (pa_add pav 2%nat : SailStdpp.Values.mword 64).
+Proof.
+  assert (H2 : sign_extend' 64 (mword_of_int 2 : mword 12) = (mword_of_int 2 : mword 64))
+    by (apply bv_eq; vm_compute; reflexivity).
+  rewrite H2. rewrite vdrw_pa_add_moi. reflexivity.
+Qed.
+
+Lemma vdrwd_avail_ptr_addr :
+  add_vec (disk_base : SailStdpp.Values.mword 64)
+          (sign_extend' 64 (mword_of_int 8 : mword 12))
+  = (d_avail_ptr : SailStdpp.Values.mword 64).
+Proof.
+  rewrite vdrwc_sx8. unfold d_avail_ptr. rewrite vdrw_pa_add_moi. reflexivity.
+Qed.
+
+(* ---- the PUBLISH store value: [c.addiw a5,a5,1] then [sh] ------------ *)
+
+Lemma vdrwd_publish_val (np : nat) :
+  trunc16 (sign_extend' 64 (subrange_vec_dec
+     (add_vec (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16))
+              (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)))) 31 0))
+  = (wrap16 (S np) : SailStdpp.Values.mword 16).
+Proof.
+  apply bv_eq.
+  rewrite vdrwd_trunc16_unsigned vdrwd_wrap16_z.
+  rewrite vdrwd_sext32_mod16 vdrwd_sub32_unsigned vdrwd_mod_32_16.
+  rewrite vq_add_vec_unsigned vdrwd_wrap64_z vdrwd_mod_64_16.
+  rewrite vdrwd_zext16_unsigned.
+  replace (bv_unsigned (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)) : mword 64))
+    with 1%Z by (vm_compute; reflexivity).
+  unfold wrap16. rewrite !Z_to_bv_unsigned !vdrwd_wrap16_z.
+  rewrite Zplus_mod_idemp_l. f_equal. lia.
+Qed.
+
+(* ---- the static [struct disk] is kernel DATA ------------------------- *)
+
+Lemma vdrwd_disk_kdata_z (k : Z) :
+  (0 <= k)%Z -> (k < 4096)%Z ->
+  (2147512320 <= (KernelSyms.disk + k) `mod` 18446744073709551616 < 2281701376)%Z.
+Proof. intros H0 H1. unfold KernelSyms.disk. rewrite Z.mod_small; lia. Qed.
+
+Lemma vdrwd_disk_kdata (k : nat) : (k < 4096)%nat -> addr_is_kdata (pa_add disk_base k).
+Proof.
+  intro Hk. unfold addr_is_kdata, text_end, ram_base, ram_size.
+  rewrite uint_unsigned pa_add_unsigned vdrwd_wrap64_z.
+  replace (bv_unsigned (disk_base : SailStdpp.Values.mword 64)) with KernelSyms.disk
+    by (vm_compute; reflexivity).
+  change (0x80007000)%Z with 2147512320%Z.
+  change (0x80000000 + 0x8000000)%Z with 2281701376%Z.
+  apply vdrwd_disk_kdata_z; [ exact (Nat2Z.is_nonneg k) | lia ].
+Qed.
+
+Lemma vdrwd_disk_static (k : nat) : (k < 4096)%nat ->
+  kmap_static (svpn_of (pa_add disk_base k)) KP_rw.
+Proof. intro Hk. apply kdata_svpn_class, vdrwd_disk_kdata. exact Hk. Qed.
+
+(* ---- THE SECTOR: [vdrw_sector_raw bno = 2 * uint bno] ----------------- *)
+(* The one pure obligation P1 deferred.  The C source computes
+   [b->blockno * (BSIZE/512)] in 32-bit arithmetic and then zero-extends with
+   the [slli 32 / srli 32] pair, so under the spec's no-overflow premise the
+   sector is exactly [2 * bno]. *)
+
+Lemma vdrwd_shl32_unsigned (x : mword 64) :
+  bv_unsigned (shift_bits_left x (subrange_vec_dec (mword_of_int 32 : mword 6)
+                                    (Z.sub log2_xlen 1) 0))
+  = ((bv_unsigned x * 4294967296) `mod` 18446744073709551616)%Z.
+Proof.
+  assert (Hn : shift_bits_left x (subrange_vec_dec (mword_of_int 32 : mword 6)
+                                    (Z.sub log2_xlen 1) 0)
+             = shiftl x 32).
+  { unfold shift_bits_left. f_equal; vm_compute; reflexivity. }
+  rewrite Hn.
+  unfold shiftl,
+    MachineWord.MachineWord.logical_shift_left.
+  rewrite bv_shiftl_unsigned.
+  assert (Hsh : bv_unsigned (MachineWord.MachineWord.N_to_word
+                  (MachineWord.MachineWord.Z_idx 64) (MachineWord.MachineWord.Z_idx 32)) = 32%Z)
+    by (vm_compute; reflexivity).
+  rewrite Hsh vdrwd_wrap64_z Z.shiftl_mul_pow2; [| lia].
+  change (2 ^ 32)%Z with 4294967296%Z. reflexivity.
+Qed.
+
+Lemma vdrwd_shr32_unsigned (x : mword 64) :
+  bv_unsigned (shift_bits_right x (subrange_vec_dec (mword_of_int 32 : mword 6)
+                                     (Z.sub log2_xlen 1) 0))
+  = (bv_unsigned x / 4294967296)%Z.
+Proof.
+  assert (Hn : shift_bits_right x (subrange_vec_dec (mword_of_int 32 : mword 6)
+                                     (Z.sub log2_xlen 1) 0)
+             = shiftr x 32).
+  { unfold shift_bits_right. f_equal; vm_compute; reflexivity. }
+  rewrite Hn.
+  unfold shiftr,
+    MachineWord.MachineWord.logical_shift_right.
+  rewrite bv_shiftr_unsigned.
+  assert (Hsh : bv_unsigned (MachineWord.MachineWord.N_to_word
+                  (MachineWord.MachineWord.Z_idx 64) (MachineWord.MachineWord.Z_idx 32)) = 32%Z)
+    by (vm_compute; reflexivity).
+  rewrite Hsh Z.shiftr_div_pow2; [| lia].
+  change (2 ^ 32)%Z with 4294967296%Z. reflexivity.
+Qed.
+
+Lemma vdrwd_shift32_z (u : Z) :
+  ((u * 4294967296) `mod` 18446744073709551616 / 4294967296)%Z = (u `mod` 4294967296)%Z.
+Proof.
+  replace 18446744073709551616%Z with (4294967296 * 4294967296)%Z by reflexivity.
+  rewrite (Z.mul_comm u 4294967296).
+  rewrite (Z.mul_mod_distr_l u 4294967296 4294967296 ltac:(lia) ltac:(lia)).
+  rewrite Z.mul_comm. apply Z.div_mul. lia.
+Qed.
+
+Lemma vdrwd_shl1_32 (x : mword 32) :
+  bv_unsigned (shift_bits_left x (mword_of_int 1 : mword 5))
+  = ((bv_unsigned x * 2) `mod` 4294967296)%Z.
+Proof.
+  assert (Hn : shift_bits_left x (mword_of_int 1 : mword 5) = shiftl x 1).
+  { unfold shift_bits_left. f_equal; vm_compute; reflexivity. }
+  rewrite Hn.
+  unfold shiftl,
+    MachineWord.MachineWord.logical_shift_left.
+  rewrite bv_shiftl_unsigned.
+  assert (Hsh : bv_unsigned (MachineWord.MachineWord.N_to_word
+                  (MachineWord.MachineWord.Z_idx 32) (MachineWord.MachineWord.Z_idx 1)) = 1%Z)
+    by (vm_compute; reflexivity).
+  rewrite Hsh vdrwd_wrap32_z Z.shiftl_mul_pow2; [| lia].
+  change (2 ^ 1)%Z with 2%Z. reflexivity.
+Qed.
+
+Lemma vdrwd_dbl_small (x : Z) :
+  (0 <= x)%Z -> (x < 2147483648)%Z -> ((x * 2) `mod` 4294967296)%Z = (2 * x)%Z.
+Proof. intros H0 H1. rewrite Z.mod_small; lia. Qed.
+
+Lemma vdrwd_uint32 (a : SailStdpp.Values.mword 32) : uint a = bv_unsigned a.
+Proof.
+  pose proof (bv_unsigned_in_range _ a) as Hr.
+  unfold uint, MachineWord.MachineWord.word_to_N.
+  rewrite Z2N.id; [ reflexivity | lia ].
+Qed.
+
+Lemma vdrwd_sector_raw_val (bno : SailStdpp.Values.mword 32) :
+  (uint bno < 2147483648)%Z ->
+  bv_unsigned (vdrw_sector_raw bno) = (2 * uint bno)%Z.
+Proof.
+  intro Hb.
+  rewrite vdrwd_uint32 in Hb.
+  pose proof (bv_unsigned_in_range 32 bno) as [Hnn _].
+  unfold vdrw_sector_raw, vdrw_sh32.
+  assert (Hsub : (subrange_vec_dec (sign_extend' 64 bno : mword 64) 31 0
+                    : SailStdpp.Values.mword 32) = bno)
+    by (rewrite <- trunc32_subrange; apply trunc32_sext).
+  rewrite Hsub.
+  rewrite vdrwd_shr32_unsigned vdrwd_shl32_unsigned vdrwd_shift32_z.
+  rewrite vdrwd_sext32_mod32 vdrwd_shl1_32.
+  rewrite vdrwd_uint32.
+  exact (vdrwd_dbl_small (bv_unsigned bno) Hnn Hb).
+Qed.
+
+(* ---- page-offset alignment: RESTATEMENTS of [DiskInv]'s ---------------
+   The family lives in DiskInv.v now (it is the queue pages' geometry, and
+   three files had cloned it); these keep the local names so no call site
+   below had to change. *)
+
+Lemma vdrwd_wrap_off (x k : Z) :
+  0 <= x -> x < 18446744073709551616 -> x mod 4096 = 0 ->
+  0 <= k -> k < 4096 ->
+  (x + k) mod 18446744073709551616 = x + k.
+Proof. exact (pa_wrap_in_page x k). Qed.
+
+Lemma vdrwd_rem_off (x k d : Z) :
+  0 <= x -> x < 18446744073709551616 -> x mod 4096 = 0 ->
+  0 <= k -> k < 4096 -> 0 < d -> 4096 mod d = 0 -> k mod d = 0 ->
+  Z.rem ((x + k) mod 18446744073709551616) d = 0.
+Proof. exact (pa_rem_in_page x k d). Qed.
+
+Lemma vdrwd_aligned_off (p : Arch.pa) (k : nat) (d : Z) :
+  bv_unsigned (p : SailStdpp.Values.mword 64) `mod` 4096 = 0 ->
+  (Z.of_nat k < 4096)%Z -> (0 < d)%Z -> (4096 mod d = 0)%Z ->
+  (Z.of_nat k mod d = 0)%Z ->
+  is_aligned_paddr (Physaddr (pa_add p k)) d = true.
+Proof. exact (pa_add_aligned_in_page p k d). Qed.
+
+Lemma vdrwd_two_add_lt (j : nat) : (j < 2)%nat -> (2 + j < 4096)%nat.
+Proof. intro Hj. lia. Qed.
+
+Lemma vdrwd_ring_off_lt (k j : nat) : (k < 8)%nat -> (j < 2)%nat -> (4 + 2 * k + j < 4096)%nat.
+Proof. intros Hk Hj. lia. Qed.
+
+Lemma vdrwd_ring_off_lt_z (k : nat) : (k < 8)%nat -> (Z.of_nat (4 + 2 * k) < 4096)%Z.
+Proof. intro Hk. lia. Qed.
+
+Lemma vdrwd_ring_off_mod2 (k : nat) : (Z.of_nat (4 + 2 * k) mod 2 = 0)%Z.
+Proof.
+  replace (Z.of_nat (4 + 2 * k))%Z with ((2 + Z.of_nat k) * 2)%Z by lia.
+  apply Z.mod_mul. lia.
+Qed.
+
+(* ===================================================================== *)
+(* §2  Assembling the PIN.                                               *)
+(*                                                                       *)
+(* [virtio_proto_publish_acc] wants ONE byte map [pin] with [phys_map]    *)
+(* ownership and a [slot_pin_ok] whose clauses are [read_bytes] at six    *)
+(* windows.  What the publisher HOLDS is seventeen separately owned word  *)
+(* cells (plus, for a write request, the caller's buffer).  So the pin is *)
+(* the disjoint union of that many [range_map]s, and the ONE induction    *)
+(* below turns a list of separately-owned maps into the union together    *)
+(* with the sub-map facts every [read_bytes] obligation needs.           *)
+(* ===================================================================== *)
+
+(* [l]'s elements are pairwise disjoint, in the prefix form the [foldr]
+   induction produces.  Deliberately POLYMORPHIC in the key type: a
+   [gmap Arch.pa _] spelled out here would pick up the wrong Countable
+   instance (durable-notes' binder trap), so the instance is left to come
+   from the caller. *)
+Fixpoint pm_ok {K A} `{Countable K} (l : list (gmap K A)) : Prop :=
+  match l with
+  | [] => True
+  | m :: l' => m ##ₘ foldr union ∅ l' /\ pm_ok l'
+  end.
+
+Lemma map_union_diff_l {K A} `{Countable K} (m1 m2 : gmap K A) :
+  m1 ##ₘ m2 -> (m1 ∪ m2) ∖ m1 = m2.
+Proof.
+  intro Hd. apply map_eq. intro i.
+  destruct (m1 !! i) as [x|] eqn:H1.
+  - assert (H2 : m2 !! i = None).
+    { destruct (m2 !! i) as [y|] eqn:Hy; [| reflexivity].
+      exfalso. exact (proj1 (map_disjoint_spec m1 m2) Hd i x y H1 Hy). }
+    rewrite H2. apply lookup_difference_None. right. exists x. exact H1.
+  - destruct (m2 !! i) as [y|] eqn:H2.
+    + apply lookup_difference_Some. split; [| exact H1].
+      rewrite lookup_union_r; [exact H2 | exact H1].
+    + apply lookup_difference_None. left.
+      rewrite lookup_union_r; [exact H2 | exact H1].
+Qed.
+
+Section VdrwdMaps.
+  Context `{!riscvGS Σ, !xv6G Σ}.
+
+  (* NB the binder types are left to inference: a [gmap Arch.pa _] written
+     out in a file that imports SailStdpp.Values picks up a DIFFERENT
+     Countable instance from the one VirtioProto's [phys_map] uses
+     (durable-notes' instance-leak trap), so every map binder here is [_]. *)
+  Definition pm_list (l : list _) : iProp Σ :=
+    ([∗ list] m ∈ l, phys_map m)%I.
+
+  Lemma pm_union (l : list _) :
+    pm_list l -∗
+    phys_map (foldr union ∅ l) ∗ ⌜pm_ok l⌝ ∗
+    ⌜forall m, m ∈ l -> m ⊆ foldr union ∅ l⌝.
+  Proof using .
+    induction l as [|m l IH].
+    - iIntros "_". rewrite /phys_map big_sepM_empty. iSplitR; [done|].
+      iSplitR; [iPureIntro; exact I|].
+      iPureIntro. intros m Hm. exfalso. exact (not_elem_of_nil m Hm).
+    - rewrite /pm_list. iIntros "[Hm Hl]".
+      iDestruct (IH with "Hl") as "(Hu & %Hokl & %Hsub)".
+      iDestruct (phys_map_disj with "Hm Hu") as %Hd.
+      iSplitL "Hm Hu".
+      { cbn [foldr]. rewrite (phys_map_union m (foldr union ∅ l) Hd). iFrame. }
+      iSplitR; [iPureIntro; exact (conj Hd Hokl)|].
+      iPureIntro. intros m' Hm'. cbn [foldr].
+      apply elem_of_cons in Hm' as [->|Hm'].
+      + apply map_union_subseteq_l.
+      + apply (transitivity (Hsub m' Hm')). apply map_union_subseteq_r. exact Hd.
+  Qed.
+
+  (* the converse: a pairwise-disjoint list's union splits back into the
+     separately-owned windows.  This is what lets P6 take the parked payoff's
+     one opaque [phys_map] apart into the cells [free_chain] hands back. *)
+  Lemma pm_split (l : list _) :
+    pm_ok l -> phys_map (foldr union ∅ l) -∗ pm_list l.
+  Proof using .
+    induction l as [|m l IH]; intro Hok.
+    - iIntros "_". rewrite /pm_list. done.
+    - destruct Hok as [Hd Hokl].
+      iIntros "H". cbn [foldr].
+      rewrite (phys_map_union m (foldr union ∅ l) Hd).
+      iDestruct "H" as "[Hm Hl]".
+      rewrite /pm_list. iSplitL "Hm"; [iExact "Hm"|].
+      iApply (IH Hokl with "Hl").
+  Qed.
+
+  (* A6.125 step 4: the same over PIN OFFERS (VirtioProto.pin_offer) -- the
+     publisher's cells go into the lease with their memory at 1 and half
+     their stamp, so ownership still proves the regions pairwise disjoint *)
+  Definition po_list (l : list _) : iProp Σ :=
+    ([∗ list] m ∈ l, pin_offer m)%I.
+
+  Lemma po_union (l : list _) :
+    po_list l -∗
+    pin_offer (foldr union ∅ l) ∗ ⌜pm_ok l⌝ ∗
+    ⌜forall m, m ∈ l -> m ⊆ foldr union ∅ l⌝.
+  Proof using .
+    induction l as [|m l IH].
+    - iIntros "_". rewrite /pin_offer big_sepM_empty. iSplitR; [done|].
+      iSplitR; [iPureIntro; exact I|].
+      iPureIntro. intros m Hm. exfalso. exact (not_elem_of_nil m Hm).
+    - rewrite /po_list. iIntros "[Hm Hl]".
+      iDestruct (IH with "Hl") as "(Hu & %Hokl & %Hsub)".
+      iDestruct (pin_offer_disj with "Hm Hu") as %Hd.
+      iSplitL "Hm Hu".
+      { cbn [foldr]. rewrite (pin_offer_union m (foldr union ∅ l) Hd). iFrame. }
+      iSplitR; [iPureIntro; exact (conj Hd Hokl)|].
+      iPureIntro. intros m' Hm'. cbn [foldr].
+      apply elem_of_cons in Hm' as [->|Hm'].
+      + apply map_union_subseteq_l.
+      + apply (transitivity (Hsub m' Hm')). apply map_union_subseteq_r. exact Hd.
+  Qed.
+
+  (* the kept halves follow the same list, joined by the pure disjointness *)
+  Definition kp_list (ξ : CtxId) (l : list _) : iProp Σ :=
+    ([∗ list] m ∈ l, keep_map ξ m)%I.
+
+  Lemma kp_union (ξ : CtxId) (l : list _) :
+    pm_ok l -> kp_list ξ l -∗ keep_map ξ (foldr union ∅ l).
+  Proof using .
+    induction l as [|m l IH]; intro Hok.
+    - iIntros "_". rewrite keep_map_empty. done.
+    - destruct Hok as [Hd Hokl]. rewrite /kp_list. iIntros "[Hm Hl]".
+      cbn [foldr]. rewrite (keep_map_union ξ m (foldr union ∅ l) Hd).
+      iFrame "Hm". iApply (IH Hokl with "Hl").
+  Qed.
+
+  (* the byte-window resources, all in the ONE [phys_map (range_map ...)]
+     shape [pm_union] consumes *)
+  Lemma vdrwd_pw8_map (a : Arch.pa) (w : bv 64) :
+    phys_word8 a w ⊣⊢ phys_map (range_map a 8 (nth_byte w)).
+  Proof using . rewrite /phys_word8. symmetry. apply (phys_map_range a 8 (nth_byte w)). lia. Qed.
+
+  (* A6.69: [VirtioProto.phys_map] is a big-op of [TsoCtx.phys_ledger], so
+     the singleton bridge is stated at the LEDGER byte.  The raw
+     [phys_pointsto] would drop the timestamp element and could not be
+     re-entered (A6.9). *)
+  Lemma vdrwd_pb_map (a : Arch.pa) (v : bv 8) :
+    phys_ledger a (DfracOwn 1) v ⊣⊢ phys_map {[ a := v ]}.
+  Proof using . rewrite /phys_map big_sepM_singleton. reflexivity. Qed.
+
+End VdrwdMaps.
+
+(* the two read facts a region of the union supports *)
+Lemma vdrwd_read_reg (a : Arch.pa) (n : N) (w : bv (8 * n)) (mm : _) :
+  (Z.of_N n < 18446744073709551616)%Z ->
+  range_map a (N.to_nat n) (nth_byte w) ⊆ mm ->
+  read_bytes mm a n = Some w.
+Proof.
+  intros Hn Hsub. apply (read_bytes_mono _ _ _ _ _ Hsub).
+  rewrite <- write_bytes_range_map. apply read_write_bytes. exact Hn.
+Qed.
+
+Lemma vdrwd_read_list (a : Arch.pa) (bs : list (bv 8)) (mm : _) :
+  (Z.of_nat (length bs) < 18446744073709551616)%Z ->
+  range_map a (length bs) (fun j => bs !!! j) ⊆ mm ->
+  read_byte_list mm a (length bs) = Some bs.
+Proof.
+  intros Hn Hsub. apply (read_byte_list_mono _ _ _ _ _ Hsub).
+  apply read_byte_list_intro; [reflexivity|].
+  intros j b Hj.
+  assert (Hjlt : (j < length bs)%nat) by (apply lookup_lt_Some in Hj; exact Hj).
+  rewrite (range_map_lookup a (length bs) (fun k => bs !!! k) j Hn Hjlt).
+  f_equal. apply list_lookup_total_correct. exact Hj.
+Qed.
+
+(* ===================================================================== *)
+(* §3  The two leaves P4 needs beyond the plain ones: the dev_inv-        *)
+(*     OPENING accesses to [avail->idx].  (The `fence rw,rw` is the       *)
+(*     shared [WpSconfCtl.wp_fence_gen_s_sconf].)                         *)
+(* ===================================================================== *)
+
+Section VdrwdLeaves.
+  Context `{!riscvGS Σ, !xv6G Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+  (* ---- the avail-ring INDEX read: [lhu rd,2(rs1)] with rs1 = disk.avail.
+     Drives [virtio_proto_avail_idx_acc]: the value is the driver's OWN
+     published count, so nothing new is learned about it -- what the read is
+     for is that the code re-derives the ring slot from it. ---- *)
+  (* ===================================================================== *)
+  (* A6.124: THE AVAIL-INDEX WORD, READ AND PUBLISHED ON THE LEDGER.        *)
+  (*                                                                       *)
+  (* The word's two ledger cells are split in halves (DiskAvail.v): the    *)
+  (* DMA lease keeps a sealed half, the vdisk_lock payload the other with   *)
+  (* the stamp exposed and a floor beside it.  The holder READS with its    *)
+  (* own half -- exact, from the floor cashed against its running token    *)
+  (* ([DiskAvail.avail_half_read_ok]); no invariant is opened for the value *)
+  (* (only peeked for [nr <= np]).  The PUBLISH joins the halves inside the *)
+  (* device invariant, stores through the full cell, appends its message,  *)
+  (* REGISTERS the write in its own context ([TsoCtx.ctx_wrote_register])  *)
+  (* and re-splits: the lease's half goes back through the publish         *)
+  (* accessor, the payload's half leaves with the dirty-arm floor.  Both    *)
+  (* obligations are stated at the leaf's ∀-bound [CIDw]; the same-CPU      *)
+  (* promise is unused.                                                    *)
+  (* ===================================================================== *)
+
+  (* the leaf's VA-keyed claim, from the static map; the RAM fact is read
+     off the holder's own cell *)
+  Local Lemma vdrwd_avail_claim (pav : mword 64) (np : nat) :
+    is_aligned_paddr (Physaddr (pa_add pav 2%nat)) 2 = true ->
+    (forall j, (j < 2)%nat -> kmap_static (svpn_of (pa_add (pa_add pav 2%nat) j)) KP_rw) ->
+    (forall j, (j < 2)%nat ->
+       (uint (pa_add (pa_add pav 2%nat) j : SailStdpp.Values.mword 64) < 274877906944)%Z) ->
+    kmap_static_claims -∗ avail_half pav np -∗
+    wordw_claim (KTR := KT0) 2 (pa_add pav 2%nat).
+  Proof using .
+    iIntros (Halign Hst2 Hcan2) "#Hkm Havh".
+    iDestruct (avail_half_ram with "Havh") as %Hram.
+    assert (H02 : (0 < 2)%nat) by lia.
+    pose proof (Hst2 0%nat H02) as Hs0. pose proof (Hcan2 0%nat H02) as Hc0.
+    rewrite pa_add_0 in Hs0 Hc0.
+    iDestruct (kmap_static_claims_at _ KP_rw Hs0 with "Hkm") as "#Hk0".
+    pose proof (pa_of_id (pa_add pav 2%nat) Hc0) as Hid.
+    rewrite /wordw_claim /mem_claim. iSplitR; [iPureIntro; exact Halign|].
+    iExists (kpt_leaf_ppn (svpn_of (pa_add pav 2%nat))). iFrame "Hk0". iPureIntro.
+    split; [exact Hc0|]. split; [rewrite Hid; exact Hram|].
+    exact (ktier_pin_of_id _ _ _ Hid).
+  Qed.
+
+  Local Lemma vdrwd_avail_read_ok (ea pav : mword 64) (np : nat) {P : CpuId -> Prop} :
+    ea = (pa_add pav 2%nat : mword 64) ->
+    forall (CIDw : CpuId) (img : bytemap) (sigma : mstate) (log : list pwmsg)
+           (V : agent -> nat) (ppn : mword 44) (v : mword 16),
+      (uint ea < 274877906944)%Z ->
+      (bv_unsigned (subrange_vec_dec ea 11 0) + 2 <= 4096)%Z ->
+      ktier_pin KT0 ppn ea ->
+      P CIDw ->
+      kmap_at (svpn_of ea) ppn KP_rw -∗
+      gen_heap_interp (hG := riscv_memGS) sigma.(mem) -∗
+      tso_interp_of riscv_eraGS img sigma.(mem) log V -∗
+      TsoCtx.own_context (CID := CIDw) CtxIdDefs.cur_ctx -∗
+      (⌜v = wrap16 np⌝ ∗ avail_half pav np) -∗
+      ⌜forall tvr : nat, (V (hart_agent (@cpu_id CIDw)) <= tvr)%nat ->
+         tso_read_bytes img log (hart_agent (@cpu_id CIDw)) tvr
+           (pa_of ppn ea) (Z.to_N 2) v⌝.
+  Proof using .
+    intros -> CIDw img sigma log V ppn v Hcan Hoff Hid _.
+    rewrite (ktier_pin_id ppn _ Hid).
+    iIntros "#Hk Hgh Htso Hctx [%Hv Havh]". subst v.
+    iDestruct (tso_interp_of_pin with "Htso") as %Hpin.
+    rewrite (tso_interp_of_at_gs riscv_eraGS img sigma.(mem) log V
+               sigma.(sregs) sigma.(mdev) Hpin).
+    iApply (avail_half_read_ok (CID := CIDw)
+              (gs_of img sigma.(mem) log V sigma.(sregs) sigma.(mdev)) pav np
+              with "Hgh Htso Hctx Havh").
+  Qed.
+
+  Local Lemma vdrwd_avail_store_ok (ea pav : mword 64) (np : nat) {P : CpuId -> Prop} :
+    ea = (pa_add pav 2%nat : mword 64) ->
+    forall (CIDw : CpuId) (img : bytemap) (sigma : mstate) (log : list pwmsg)
+           (V : agent -> nat) (ppn : mword 44),
+      (uint ea < 274877906944)%Z ->
+      (bv_unsigned (subrange_vec_dec ea 11 0) + 2 <= 4096)%Z ->
+      ktier_pin KT0 ppn ea ->
+      P CIDw ->
+      kmap_at (svpn_of ea) ppn KP_rw -∗
+      gen_heap_interp (hG := riscv_memGS) sigma.(mem) -∗
+      tso_interp_of riscv_eraGS img sigma.(mem) log V -∗
+      TsoCtx.own_context (CID := CIDw) CtxIdDefs.cur_ctx -∗
+      ([∗ list] j ∈ seq 0 2, phys_ledger (pa_add (pa_add pav 2%nat) j) (DfracOwn 1)
+                               (nth_byte (wrap16 np) j)) ==∗
+      gen_heap_interp (hG := riscv_memGS)
+        (write_bytes sigma.(mem) (pa_of ppn ea) (Z.to_N 2)
+           (wrap16 (S np) : SailStdpp.Values.mword 16)) ∗
+      tso_interp_of riscv_eraGS img
+        (write_bytes sigma.(mem) (pa_of ppn ea) (Z.to_N 2)
+           (wrap16 (S np) : SailStdpp.Values.mword 16))
+        (log ++ [PWMsg (snap_of (pa_of ppn ea) (Z.to_N 2)
+                          (wrap16 (S np) : SailStdpp.Values.mword 16))
+                   (hart_agent (@cpu_id CIDw))])%list
+        (vstep (hart_agent (@cpu_id CIDw)) (V (hart_agent (@cpu_id CIDw)))
+           (log ++ [PWMsg (snap_of (pa_of ppn ea) (Z.to_N 2)
+                             (wrap16 (S np) : SailStdpp.Values.mword 16))
+                      (hart_agent (@cpu_id CIDw))])%list V) ∗
+      TsoCtx.own_context (CID := CIDw) CtxIdDefs.cur_ctx ∗
+      (∃ t : nat,
+         ([∗ list] j ∈ seq 0 2, phys_ledger_at (pa_add (pa_add pav 2%nat) j) (DfracOwn 1)
+                                  (nth_byte (wrap16 (S np)) j) t) ∗
+         TsoCtx.ctx_wrote CtxIdDefs.cur_ctx t (pa_add pav 2%nat)).
+  Proof using .
+    intros -> CIDw img sigma log V ppn Hcan Hoff Hid _.
+    rewrite (ktier_pin_id ppn _ Hid).
+    iIntros "#Hk Hm Htso Hctx Hres".
+    iDestruct (tso_interp_of_pin with "Htso") as %Hpin.
+    iDestruct (tso_interp_of_bound with "Htso") as %Hbd.
+    set (vnew := (wrap16 (S np) : SailStdpp.Values.mword 16)).
+    set (log' := (log ++ [PWMsg (snap_of (pa_add pav 2%nat) (Z.to_N 2) vnew)
+                            (hart_agent (@cpu_id CIDw))])%list).
+    set (V' := vstep (hart_agent (@cpu_id CIDw))
+                 (V (hart_agent (@cpu_id CIDw))) log' V).
+    assert (Hpin' : forall h, (NCPU <= h)%nat -> V' h = length log').
+    { intros h Hh. rewrite /V' /vstep. case_decide as Hd.
+      - exfalso. subst h. pose proof (fin_to_nat_lt (@cpu_id CIDw)).
+        rewrite /hart_agent in Hh. lia.
+      - destruct (lt_dec h NCPU); [lia | reflexivity]. }
+    assert (Htvc : forall c : CPU, V' (hart_agent c) = V (hart_agent c)).
+    { intros c. rewrite /V' /vstep. case_decide as Hd.
+      - by rewrite Hd.
+      - destruct (lt_dec (hart_agent c) NCPU) as [|Hge]; first reflexivity.
+        exfalso. pose proof (fin_to_nat_lt c). rewrite /hart_agent in Hge. lia. }
+    assert (Htvmono : forall c : CPU, (V (hart_agent c) <= V' (hart_agent c))%nat)
+      by (intros c; rewrite Htvc; lia).
+    assert (Htvtop : forall c : CPU, (V' (hart_agent c) <= length log')%nat).
+    { intros c. rewrite Htvc /log' length_app /=.
+      pose proof (Hbd (hart_agent c)). lia. }
+    rewrite (tso_interp_of_at_gs riscv_eraGS img sigma.(mem) log V
+               sigma.(sregs) sigma.(mdev) Hpin).
+    (* the running context's write-set bound, BEFORE the append *)
+    iDestruct (TsoCtx.own_context_expose_w with "Hctx") as (W) "[#HWl Hctxw]".
+    iDestruct (TsoCtx.tso_interp_llb_valid with "Htso HWl") as "[Htso %HWle]".
+    cbn [glog gs_of] in HWle.
+    iMod (TsoCtxStore.ledger_store_win_at_ok (CID := CIDw)
+            (gs_of img sigma.(mem) log V sigma.(sregs) sigma.(mdev))
+            (gs_of img (write_bytes sigma.(mem) (pa_add pav 2%nat) (Z.to_N 2) vnew)
+               log' V' sigma.(sregs) sigma.(mdev))
+            (pa_add pav 2%nat) (Z.to_N 2) (wrap16 np) vnew
+            ltac:(vm_compute; discriminate) eq_refl eq_refl eq_refl
+            Htvmono Htvtop with "Hm Htso Hres") as "(Hm & Htso & #Hmsg & Hnew)".
+    iDestruct (TsoCtx.tso_interp_loglen_llb with "Htso") as "[Htso #Hllb]".
+    iEval (cbn [glog gs_of]; rewrite /log' length_app Nat.add_1_r) in "Hllb".
+    iMod (TsoCtx.ctx_wrote_register (CID := CIDw) CtxIdDefs.cur_ctx W (length log)
+            (pa_add pav 2%nat)
+            (PWMsg (snap_of (pa_add pav 2%nat) (Z.to_N 2) vnew)
+               (hart_agent (@cpu_id CIDw)))
+            HWle eq_refl with "Hctxw Hllb Hmsg") as "[Hctx #Hw]".
+    iModIntro. iFrame "Hm Hctx".
+    iSplitL "Htso".
+    { rewrite -(tso_interp_of_at_gs riscv_eraGS img
+                  (write_bytes sigma.(mem) (pa_add pav 2%nat) (Z.to_N 2) vnew) log' V'
+                  sigma.(sregs) sigma.(mdev) Hpin').
+      iExact "Htso". }
+    iExists (S (length log)). iFrame "Hw". iExact "Hnew".
+  Qed.
+
+
+  (* the 2-byte twin of [MemClaim.wordw8_ctx]: the AU leaves' window IS
+     the ↦₂ cell, up to [Z.to_nat] *)
+  Local Lemma vdrwd_wordw2_ctx `{KTR2 : !CurKtier} (a : Arch.pa)
+      (dq : dfrac) (v : SailStdpp.Values.mword 16) :
+    wordw_pointsto (KTR := KTR2) 2 a dq v
+    ⊣⊢ TsoCtx.ctx_word2_pointsto (KTR := KTR2) cur_ctx a dq v.
+  Proof using .
+    rewrite /wordw_pointsto /TsoCtx.ctx_word2_pointsto.
+    by change (Z.to_nat 2) with 2%nat.
+  Qed.
+
+  (* the same VA-keyed claim for a ring cell, off the holder's half cells
+     (the row design: the payload keeps the ring cell's ctx halves) *)
+  Local Lemma vdrwd_ring_claim (A : Arch.pa) (w : bv 16) :
+    is_aligned_paddr (Physaddr A) 2 = true ->
+    (forall j, (j < 2)%nat -> kmap_static (svpn_of (pa_add A j)) KP_rw) ->
+    (forall j, (j < 2)%nat ->
+       (uint (pa_add A j : SailStdpp.Values.mword 64) < 274877906944)%Z) ->
+    kmap_static_claims -∗ hcell_map cur_ctx (range_map A 2 (nth_byte w)) -∗
+    wordw_claim (KTR := KT0) 2 A.
+  Proof using .
+    iIntros (Halign Hst2 Hcan2) "#Hkm Hhc".
+    iDestruct (hcell_map_ram with "Hhc") as %Hram.
+    assert (H02 : (0 < 2)%nat) by lia.
+    pose proof (Hst2 0%nat H02) as Hs0. pose proof (Hcan2 0%nat H02) as Hc0.
+    rewrite pa_add_0 in Hs0 Hc0.
+    iDestruct (kmap_static_claims_at _ KP_rw Hs0 with "Hkm") as "#Hk0".
+    pose proof (pa_of_id A Hc0) as Hid.
+    rewrite /wordw_claim /mem_claim. iSplitR; [iPureIntro; exact Halign|].
+    iExists (kpt_leaf_ppn (svpn_of A)). iFrame "Hk0". iPureIntro.
+    split; [exact Hc0|]. split; [rewrite Hid; exact Hram|].
+    exact (ktier_pin_of_id _ _ _ Hid).
+  Qed.
+
+  Lemma wp_vdrwd_lhu_avail (γu : uart_names) (γd : disk_names) (pme : Arch.pa) (pd pav pu : mword 64)
+      (pc : mword 64) (rd rs1 : mword 5) `{!SrcOk rs1} (imm : mword 12)
+      (m : regfile) (n : nat) (np : nat) :
+    add_vec (rget m rs1) (sign_extend' 64 imm) = (pa_add pav 2%nat : mword 64) ->
+    uint rd <> 0 -> rd_ok rd ->
+    sie_cap_gpr KT1 m n false pme -∗ pc_is pc -∗
+    instr pc false (LOAD (imm, Regidx rs1, Regidx rd, true, 2)) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    disk_pub γd np -∗
+    (* A6.124: the holder READS with its own half of the word -- exact, from
+       the floor cashed against its running token
+       ([DiskAvail.avail_half_read_ok]); no invariant is opened *)
+    avail_half pav np -∗
+    ( disk_pub γd np -∗ avail_half pav np -∗
+      sie_cap_gpr KT1 (<[Regidx rd := regval_into_reg
+          (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16))]> m) n false pme -∗
+      pc_is (add_vec_int pc 4) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hea Hrd Hrdsp.
+    (* the class, consumed at [rs1] -- see [IntrDefs.SrcOk] *)
+    assert (Hea_all : forall hh : CpuId,
+              add_vec (rget (CID := hh) m rs1) (sign_extend' 64 imm)
+              = add_vec (rget (CID := CID) m rs1) (sign_extend' 64 imm))
+      by (intros hh; by rewrite (src_ok_rget_indep m rs1 hh CID)).
+    iIntros "Hcg Hpc Hinstr #Hdinv #Hgeom Hpub Havh Hcont".
+    iDestruct (sie_cap_gpr_kmap_claims with "Hcg") as "[#Hkm Hcg]".
+    iDestruct (disk_geom_static with "Hgeom") as %(_ & Hsta & _).
+    iDestruct (disk_geom_canonical with "Hgeom") as %(_ & Hcana & _).
+    iDestruct (disk_geom_aligned with "Hgeom") as %Hal0.
+    destruct Hal0 as (_ & Hala & _).
+    assert (Halign : is_aligned_paddr (Physaddr (pa_add pav 2%nat)) 2 = true).
+    { apply (vdrwd_aligned_off pav 2%nat 2 Hala);
+        [ reflexivity | reflexivity | reflexivity | reflexivity ]. }
+    assert (Hst2 : forall j, (j < 2)%nat ->
+              kmap_static (svpn_of (pa_add (pa_add pav 2%nat) j)) KP_rw).
+    { intros j Hj. rewrite pa_add_add. exact (Hsta (2 + j)%nat (vdrwd_two_add_lt j Hj)). }
+    assert (Hcan2 : forall j, (j < 2)%nat ->
+              (uint (pa_add (pa_add pav 2%nat) j : SailStdpp.Values.mword 64) < 274877906944)%Z).
+    { intros j Hj. rewrite pa_add_add. exact (Hcana (2 + j)%nat (vdrwd_two_add_lt j Hj)). }
+    iDestruct (vdrwd_avail_claim pav np Halign Hst2 Hcan2 with "Hkm Havh") as "#Hcl".
+    iApply (wp_load_s_sconf_au_dat (kt := KT1) (ktd := KT0) 2 false true pc rd rs1 imm m n
+              (fun w => zero_extend' 64 w)
+              (fun w => (⌜w = wrap16 np⌝ ∗ disk_pub γd np ∗ avail_half pav np)%I)
+              (⊤ ∖ ↑minstretN) false
+              (fun w => (⌜w = wrap16 np⌝ ∗ avail_half pav np)%I)
+              ltac:(lia) ltac:(lia) ltac:(unfold vmem_width; lia) ltac:(exists 2048; reflexivity)
+              ltac:(vm_compute; reflexivity)
+              exec_read_ram_plain_2 data2_ext_2_unsigned Hrd Hrdsp
+              ltac:(solve_ndisj)
+              (vdrwd_avail_read_ok (add_vec (rget m rs1) (sign_extend' 64 imm)) pav np Hea)
+              with "Hcg Hpc Hinstr [] [Hpub Havh] [Hcont]").
+    { rewrite Hea. iExact "Hcl". }
+    { iModIntro. iExists (wrap16 np : SailStdpp.Values.mword 16).
+      iSplitL "Havh"; [by iFrame "Havh"|].
+      iIntros "[_ Havh]". iModIntro. iFrame "Hpub Havh". done. }
+    iIntros (w). iApply wp_next_off_intro. iIntros "Hcg Hpc Hpost". rgall.
+    iDestruct "Hpost" as "(-> & Hpub & Havh)".
+    iApply ("Hcont" with "Hpub Havh Hcg Hpc").
+  Qed.
+
+  (* ---- THE RING STORE: [sh rs2,4(rs1)] with rs1 = disk.avail + 2*(np%8)
+     and rs2 the descriptor head.  This is the instruction BEFORE the fence
+     and the index bump, and the cell it writes belongs to the device
+     invariant's lease -- so it drives [virtio_proto_ring_acc], keyed by the
+     head's still-INACTIVE receipt (which is what says the cell is nobody
+     else's).  What comes back is the STAGED HEAD, which the publish two
+     instructions later spends, and the receipt untouched. ---- *)
+  Lemma wp_vdrwd_sh_ring (γu : uart_names) (γd : disk_names) (pme : Arch.pa)
+      (pd pav pu : mword 64)
+      (pc : mword 64) (rs2 rs1 : mword 5) `{!SrcOk rs1} `{!SrcOk rs2}
+      (imm : mword 12) (m : regfile) (n : nat) (np : nat) (h w0 : bv 16) :
+    add_vec (rget m rs1) (sign_extend' 64 imm)
+      = (d_ring pav (np `mod` 8) : mword 64) ->
+    trunc16 (rget m rs2) = h ->
+    sie_cap_gpr KT1 m n false pme -∗ pc_is pc -∗
+    instr pc false (STORE (imm, Regidx rs2, Regidx rs1, 2)) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    disk_pub γd np -∗ disk_stage γd None -∗
+    (Z.to_nat (bv_unsigned h)) ↪[dn_head γd] HInactive -∗
+    (* THE ROW DESIGN (decision 4): the holder's half of the ring cell, out
+       of the payload's [DiskAvail.ring_hcells]; the lease holds the sealed
+       half, and the store goes through the two joined *)
+    hcell_map cur_ctx (range_map (d_ring pav (np `mod` 8)) 2 (nth_byte w0)) -∗
+    ( sie_cap_gpr KT1 m n false pme -∗
+      pc_is (add_vec_int pc 4) -∗
+      disk_pub γd np -∗ disk_stage γd (Some h) -∗
+      (Z.to_nat (bv_unsigned h)) ↪[dn_head γd] HInactive -∗
+      hcell_map cur_ctx (range_map (d_ring pav (np `mod` 8)) 2 (nth_byte h)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hea Hsv.
+    assert (Hea_all : forall hh : CpuId,
+              add_vec (rget (CID := hh) m rs1) (sign_extend' 64 imm)
+              = add_vec (rget (CID := CID) m rs1) (sign_extend' 64 imm))
+      by (intros hh; by rewrite (src_ok_rget_indep m rs1 hh CID)).
+    assert (Hsv2_all : forall hh : CpuId, rget (CID := hh) m rs2 = rget (CID := CID) m rs2)
+      by (intros hh; exact (src_ok_rget_indep m rs2 hh CID)).
+    iIntros "Hcg Hpc Hinstr #Hdinv #Hgeom Hpub Hstg Hfrag Hhc Hcont".
+    iDestruct (sie_cap_gpr_kmap_claims with "Hcg") as "[#Hkm Hcg]".
+    iDestruct (disk_geom_static with "Hgeom") as %(_ & Hsta & _).
+    iDestruct (disk_geom_canonical with "Hgeom") as %(_ & Hcana & _).
+    iDestruct (disk_geom_aligned with "Hgeom") as %Hal0.
+    iDestruct (disk_geom_cfg with "Hgeom") as "#Hcfg0".
+    destruct Hal0 as (_ & Hala & _).
+    assert (Hq8 : ((np `mod` 8) < 8)%nat) by (apply Nat.mod_upper_bound; lia).
+    assert (Halign : is_aligned_paddr (Physaddr (d_ring pav (np `mod` 8))) 2 = true).
+    { unfold d_ring.
+      apply (vdrwd_aligned_off pav (4 + 2 * (np `mod` 8))%nat 2 Hala);
+        [ apply vdrwd_ring_off_lt_z; exact Hq8 | reflexivity | reflexivity
+        | apply vdrwd_ring_off_mod2 ]. }
+    assert (Hst2 : forall j, (j < 2)%nat ->
+              kmap_static (svpn_of (pa_add (d_ring pav (np `mod` 8)) j)) KP_rw).
+    { intros j Hj. unfold d_ring. rewrite pa_add_add.
+      apply Hsta. apply vdrwd_ring_off_lt; [exact Hq8 | exact Hj]. }
+    assert (Hcan2 : forall j, (j < 2)%nat ->
+              (uint (pa_add (d_ring pav (np `mod` 8)) j : SailStdpp.Values.mword 64)
+               < 274877906944)%Z).
+    { intros j Hj. unfold d_ring. rewrite pa_add_add.
+      apply Hcana. apply vdrwd_ring_off_lt; [exact Hq8 | exact Hj]. }
+    (* the address claim, off the holder's own half cells *)
+    iDestruct (vdrwd_ring_claim (d_ring pav (np `mod` 8)) w0 Halign Hst2 Hcan2
+                 with "Hkm Hhc") as "#Hcl".
+    iApply (wp_store_s_sconf_au (kt := KT1) (ktd := KT0) 2 false pc rs2 rs1 imm m n
+              (h : SailStdpp.Values.mword 16)
+              (disk_pub γd np ∗ disk_stage γd (Some h) ∗
+               (Z.to_nat (bv_unsigned h)) ↪[dn_head γd] HInactive ∗
+               hcell_map cur_ctx (range_map (d_ring pav (np `mod` 8)) 2 (nth_byte h)))%I
+              (⊤ ∖ ↑minstretN ∖ ↑diskN) false
+              ltac:(lia) ltac:(lia) ltac:(unfold vmem_width; lia) ltac:(exists 2048; reflexivity)
+              ltac:(vm_compute; reflexivity)
+              exec_write_ram_plain_2
+              ltac:(rewrite (store_ext_2 (rget m rs2)); exact Hsv)
+              ltac:(solve_ndisj) with "Hcg Hpc Hinstr [] [Hpub Hstg Hfrag Hhc] [Hcont]").
+    { rewrite Hea. iExact "Hcl". }
+    { iDestruct (dev_inv_disk with "Hdinv") as "#Hvinv".
+      iInv "Hvinv" as ">Hdbody" "Hdclose".
+      iDestruct "Hdbody" as (vst) "(Hvf & Hproto & %Hvok)".
+      iDestruct (virtio_proto_ring_acc γd vst np h
+                   with "Hproto Hpub Hstg Hfrag") as "(_ & #Hcfgv & _ & Hexc & Hclose)".
+      iDestruct (disk_cfg_agree with "Hcfgv Hcfg0") as %Hceq.
+      assert (Haddr : ring_slot_pa (v_cfg vst) (np `mod` 8)%nat
+                      = d_ring pav (np `mod` 8)).
+      { rewrite Hceq. unfold ring_slot_pa, d_ring, pa_off, vq_avail_ring_off.
+        cbn [vc_avail]. f_equal. lia. }
+      iDestruct "Hexc" as (w1) "Hw2".
+      iEval (rewrite Haddr) in "Hw2".
+      (* the lease's sealed half and the holder's half agree; joined they
+         are the full ctx cell the store goes through *)
+      iDestruct (hcell_half_agree with "Hhc Hw2") as %<-.
+      iDestruct (hcell_map_join with "Hhc Hw2") as "Hcc".
+      iDestruct (ctx_word2_of_ccell (d_ring pav (np `mod` 8)) w0 Halign Hst2 Hcan2
+                   with "Hkm Hcc") as "Hcell".
+      iModIntro. iExists (w0 : SailStdpp.Values.mword 16).
+      iSplitL "Hcell".
+      { rewrite Hea. iEval (rewrite -(vdrwd_wordw2_ctx (KTR2 := KT0))) in "Hcell". iExact "Hcell". }
+      iIntros "Hcell". iEval (rewrite Hea (vdrwd_wordw2_ctx (KTR2 := KT0))) in "Hcell".
+      (* split the stored cell back: the sealed half to the lease, the kept
+         arms with the memory half to the row *)
+      iEval (rewrite /TsoCtx.ctx_word2_pointsto) in "Hcell".
+      iDestruct "Hcell" as "[_ Hbytes]".
+      iDestruct (ctx_win_offer (d_ring pav (np `mod` 8)) 2 (nth_byte h) ltac:(lia) Hst2
+                   with "Hkm Hbytes") as "[Hoff Hkeep]".
+      iDestruct (pin_offer_split with "Hoff") as "[Hhalf Hback]".
+      iDestruct (keep_map_back with "Hkeep Hback") as "Hhc".
+      iEval (rewrite -Haddr) in "Hhalf".
+      iMod ("Hclose" with "Hhalf") as "(Hproto & Hpub & Hstg & Hfrag)".
+      iMod ("Hdclose" with "[Hvf Hproto]") as "_".
+      { iApply bi.later_intro. iExists vst. iFrame. iPureIntro. exact Hvok. }
+      iModIntro. iFrame "Hpub Hstg Hfrag Hhc". }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc (Hpub & Hstg & Hfrag & Hhc)". rgall.
+    iApply ("Hcont" with "Hcg Hpc Hpub Hstg Hfrag Hhc").
+  Qed.
+
+  (* ---- THE PUBLISH: [sh rs2,2(rs1)] with rs1 = disk.avail and rs2 the
+     incremented index.  Drives [virtio_proto_publish_acc]: the pin and the
+     writable footprint go into the DMA lease, the disk fragments become the
+     slot's pending resource, the claim's row and the two driver cells
+     ([disk.info[h].b], [b->disk]) go into the head's receipt, and what
+     comes back is the bumped publisher credential plus the ACTIVE receipt
+     fragment the caller holds across [sleep()]. ---- *)
+  Lemma wp_vdrwd_sh_publish (γu : uart_names) (γd : disk_names) (pme : Arch.pa) (pd pav pu : mword 64)
+      (pc : mword 64) (rs2 rs1 : mword 5) `{!SrcOk rs1} `{!SrcOk rs2} (imm : mword 12)
+      (m : regfile) (n : nat) (np : nat) (sl : vslot) (dc : dclaim) (pin wrb : _) :
+    add_vec (rget m rs1) (sign_extend' 64 imm) = (pa_add pav 2%nat : mword 64) ->
+    trunc16 (rget m rs2) = (wrap16 (S np) : SailStdpp.Values.mword 16) ->
+    slot_pin_ok (virtio_init_cfg pd pav pu) np sl pin ->
+    dc_slot dc = sl -> dc_pos dc = np -> dc_pin dc = pin ->
+    dom wrb = slot_wr sl ->
+    slot_wr sl ## dom pin ->
+    sie_cap_gpr KT1 m n false pme -∗ pc_is pc -∗
+    instr pc false (STORE (imm, Regidx rs2, Regidx rs1, 2)) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    disk_pub γd np -∗
+    (* A6.124: the holder's half of the index word *)
+    avail_half pav np -∗
+    (* the RING STORE two instructions back already put this chain's head in
+       the cell; the bump spends that fact *)
+    disk_stage γd (Some (vs_hd sl)) -∗
+    (Z.to_nat (bv_unsigned (vr_head (vs_req sl)))) ↪[dn_head γd] HInactive -∗
+    np ↪[dn_claim γd] dc -∗
+    (* A6.125: the pin is OFFERED (memory at 1, stamp at ½) *)
+    pin_offer pin -∗ phys_map wrb -∗
+    slot_pend_res γd (vs_all sl) sl -∗
+    ( sie_cap_gpr KT1 m n false pme -∗
+      pc_is (add_vec_int pc 4) -∗
+      disk_pub γd (S np) -∗ disk_stage γd None -∗
+      (Z.to_nat (bv_unsigned (vr_head (vs_req sl)))) ↪[dn_head γd] HActive dc -∗
+      avail_half pav (S np) -∗ pin_back pin -∗
+      mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Hea Hsv Hpinok Hdcsl Hdcpos Hdcpin Hwrbdom Hwrpin.
+    assert (Hea_all : forall hh : CpuId,
+              add_vec (rget (CID := hh) m rs1) (sign_extend' 64 imm)
+              = add_vec (rget (CID := CID) m rs1) (sign_extend' 64 imm))
+      by (intros hh; by rewrite (src_ok_rget_indep m rs1 hh CID)).
+    assert (Hsv2_all : forall hh : CpuId, rget (CID := hh) m rs2 = rget (CID := CID) m rs2)
+      by (intros hh; exact (src_ok_rget_indep m rs2 hh CID)).
+    iIntros "Hcg Hpc Hinstr #Hdinv #Hgeom Hpub Havh Hstg Hfrag Hclaim Hpin Hwrb Hpend Hcont".
+    iDestruct (sie_cap_gpr_kmap_claims with "Hcg") as "[#Hkm Hcg]".
+    iDestruct (disk_geom_static with "Hgeom") as %(_ & Hsta & _).
+    iDestruct (disk_geom_canonical with "Hgeom") as %(_ & Hcana & _).
+    iDestruct (disk_geom_aligned with "Hgeom") as %Hal0.
+    iDestruct (disk_geom_cfg with "Hgeom") as "#Hcfg0".
+    destruct Hal0 as (_ & Hala & _).
+    assert (Halign : is_aligned_paddr (Physaddr (pa_add pav 2%nat)) 2 = true).
+    { apply (vdrwd_aligned_off pav 2%nat 2 Hala);
+        [ reflexivity | reflexivity | reflexivity | reflexivity ]. }
+    assert (Hst2 : forall j, (j < 2)%nat ->
+              kmap_static (svpn_of (pa_add (pa_add pav 2%nat) j)) KP_rw).
+    { intros j Hj. rewrite pa_add_add. exact (Hsta (2 + j)%nat (vdrwd_two_add_lt j Hj)). }
+    assert (Hcan2 : forall j, (j < 2)%nat ->
+              (uint (pa_add (pa_add pav 2%nat) j : SailStdpp.Values.mword 64) < 274877906944)%Z).
+    { intros j Hj. rewrite pa_add_add. exact (Hcana (2 + j)%nat (vdrwd_two_add_lt j Hj)). }
+    iDestruct (vdrwd_avail_claim pav np Halign Hst2 Hcan2 with "Hkm Havh") as "#Hcl".
+    iApply (wp_store_s_sconf_au_dat (kt := KT1) (ktd := KT0) 2 false pc rs2 rs1 imm m n
+              (wrap16 (S np) : SailStdpp.Values.mword 16)
+              (disk_pub γd (S np) ∗ disk_stage γd None ∗
+               (Z.to_nat (bv_unsigned (vr_head (vs_req sl)))) ↪[dn_head γd] HActive dc ∗
+               avail_half pav (S np) ∗ pin_back pin)%I
+              (⊤ ∖ ↑minstretN ∖ ↑diskN) false
+              ([∗ list] j ∈ seq 0 2, phys_ledger (pa_add (pa_add pav 2%nat) j) (DfracOwn 1)
+                                       (nth_byte (wrap16 np) j))%I
+              (∃ t : nat,
+                 ([∗ list] j ∈ seq 0 2, phys_ledger_at (pa_add (pa_add pav 2%nat) j) (DfracOwn 1)
+                                          (nth_byte (wrap16 (S np)) j) t) ∗
+                 TsoCtx.ctx_wrote CtxIdDefs.cur_ctx t (pa_add pav 2%nat))%I
+              ltac:(lia) ltac:(lia) ltac:(unfold vmem_width; lia) ltac:(exists 2048; reflexivity)
+              ltac:(vm_compute; reflexivity)
+              exec_write_ram_plain_2
+              ltac:(rewrite (store_ext_2 (rget m rs2)); exact Hsv)
+              ltac:(solve_ndisj)
+              (vdrwd_avail_store_ok (add_vec (rget m rs1) (sign_extend' 64 imm)) pav np Hea)
+              with "Hcg Hpc Hinstr [] [Hpub Havh Hstg Hfrag Hclaim Hpin Hwrb Hpend] [Hcont]").
+    { rewrite Hea. iExact "Hcl". }
+    { iDestruct (dev_inv_disk with "Hdinv") as "#Hvinv".
+      iInv "Hvinv" as ">Hdbody" "Hdclose".
+      iDestruct "Hdbody" as (vst) "(Hvf & Hproto & %Hvok)".
+      (* pin the live configuration first: the publish accessor's pure premise
+         is stated at [v_cfg vst], and the caller supplies it at the frozen
+         [virtio_init_cfg]. *)
+      iDestruct (virtio_proto_avail_idx_acc γd vst np with "Hproto Hpub")
+        as "(_ & #Hcfgv & _ & Hah & Hback)".
+      iDestruct (disk_cfg_agree with "Hcfgv Hcfg0") as %Hceq.
+      iDestruct ("Hback" with "Hah") as "[Hproto Hpub]".
+      assert (Haddr : avail_idx_pa (v_cfg vst) = pa_add pav 2%nat)
+        by (rewrite Hceq; reflexivity).
+      iDestruct (virtio_proto_publish_acc γd vst np sl dc pin wrb
+                   ltac:(rgall; rewrite Hceq; exact Hpinok)
+                   Hdcsl Hdcpos Hdcpin Hwrbdom Hwrpin
+                   with "Hproto Hpub Hstg Hfrag Hclaim Hpin Hwrb Hpend")
+        as "(_ & _ & Hah & Hclose)".
+      (* JOIN THE HALVES: the lease's sealed half and the holder's exposed one
+         make the full cells the store goes through *)
+      iEval (rewrite /avail_lease_half Haddr) in "Hah".
+      iEval (rewrite /avail_half) in "Havh".
+      iDestruct (big_sepL_sep_2 with "Hah Havh") as "Hres".
+      iAssert ([∗ list] j ∈ seq 0 2, phys_ledger (pa_add (pa_add pav 2%nat) j) (DfracOwn 1)
+                                       (nth_byte (wrap16 np) j))%I
+        with "[Hres]" as "Hres".
+      { iApply (big_sepL_impl with "Hres"). iIntros "!>" (k j _) "[H1 (%t & H2 & _)]".
+        iDestruct (phys_ledger_at_join_sealed with "H2 H1") as "[_ Hc]".
+        by iApply phys_ledger_at_ledger. }
+      iModIntro. iFrame "Hres".
+      iIntros "(%t & Hnew & #Hw)".
+      (* RE-SPLIT at the new count: sealed half to the lease, exposed half with
+         the dirty-arm floor to the payload *)
+      iAssert (avail_lease_half (v_cfg vst) (S np) ∗ avail_half pav (S np))%I
+        with "[Hnew]" as "[Hah Havh]".
+      { rewrite /avail_lease_half /avail_half Haddr -big_sepL_sep.
+        iApply (big_sepL_impl with "Hnew"). iIntros "!>" (k j _) "Hc".
+        iEval (rewrite phys_ledger_at_halves) in "Hc". iDestruct "Hc" as "[H1 H2]".
+        iSplitL "H1"; [by iApply phys_ledger_at_ledger|].
+        iExists t. iFrame "H2". by iApply (lk_floor_of_wrote with "Hw"). }
+      iMod ("Hclose" with "Hah") as "(Hproto & Hpub & Hstg & Hpb & Hact)".
+      iMod ("Hdclose" with "[Hvf Hproto]") as "_".
+      { iApply bi.later_intro. iExists vst. iFrame. iPureIntro. exact Hvok. }
+      iModIntro. iFrame "Hpub Hstg Hact Havh Hpb". }
+    iApply wp_next_off_intro.
+    iIntros "Hcg Hpc (Hpub & Hstg & Hact & Havh & Hpb)". rgall.
+    iApply ("Hcont" with "Hcg Hpc Hpub Hstg Hact Havh Hpb").
+  Qed.
+
+End VdrwdLeaves.
+
+(* ===================================================================== *)
+(* §4  THE PIN, as a pure fact and as ownership.                          *)
+(* ===================================================================== *)
+
+(* the slot [virtio_disk_rw] publishes *)
+(* [kq] is the crash-permit key ([VirtioQueue.vs_perm]); it comes FIRST so
+   that every downstream statement about the published slot threads it as a
+   leading parameter, exactly like a section variable would. *)
+Definition vdrwd_slot (kq : nat * positive)
+    (b : Arch.pa) (h : nat)
+    (wr sector : SailStdpp.Values.mword 64)
+    (bs : list (bv 8)) : vslot :=
+  rw_slot h (vdrw_ty wr) sector (b_data b) (d_info_status h) bs kq.
+
+(* whether the request is a WRITE, as the pin sees it *)
+Definition vdrwd_out (wr : SailStdpp.Values.mword 64) : bool :=
+  bv_unsigned (vdrw_ty wr) =? virtio_blk_t_out.
+
+(* the slot's DATA field: the block's content in both directions -- a write's
+   payload (which the pin covers) or a read's current disk content (which the
+   published pending resource pins).  See [VirtioQueue.vs_data]. *)
+Definition vdrwd_sldata (wr : SailStdpp.Values.mword 64)
+    (bs_buf bs_disk : list (bv 8)) : list (bv 8) :=
+  if vdrwd_out wr then bs_buf else bs_disk.
+
+(* the buffer window, which is inside the PIN for a write and inside the
+   device-WRITABLE footprint for a read *)
+Definition vdrwd_bufwin (b : Arch.pa) (wr : SailStdpp.Values.mword 64)
+    (bs : list (bv 8)) :=
+  if bv_unsigned (vdrw_ty wr) =? virtio_blk_t_out
+  then range_map (b_data b) 1024 (fun j => bs !!! j)
+  else ∅.
+
+(* THE PIN, minus its avail-ring entry: the fifteen word windows the chain
+   formatting wrote plus (for a write) the payload.  This is exactly what
+   comes back with the chain ([VirtioProto.chain_back]'s [phys_map]), i.e.
+   what P6 gets back and has to split into cells again.  (No return-type annotation: a
+   [gmap Arch.pa _] spelled out here would pick the wrong Countable
+   instance.) *)
+Definition vdrwd_pinr_regions (pd : SailStdpp.Values.mword 64) (b : Arch.pa)
+    (h m2 t : nat) (wr sector : SailStdpp.Values.mword 64) (mbuf : _) :=
+  [ range_map (d_desc pd h) 8 (nth_byte (d_ops h : SailStdpp.Values.mword 64))
+  ; range_map (pa_add pd (16 * h + 8)) 4 (nth_byte (Z_to_bv 32 16))
+  ; range_map (pa_add pd (16 * h + 12)) 2 (nth_byte (Z_to_bv 16 1))
+  ; range_map (pa_add pd (16 * h + 14)) 2 (nth_byte (Z_to_bv 16 (Z.of_nat m2)))
+  ; range_map (d_desc pd m2) 8 (nth_byte (b_data b : SailStdpp.Values.mword 64))
+  ; range_map (pa_add pd (16 * m2 + 8)) 4 (nth_byte (Z_to_bv 32 1024))
+  ; range_map (pa_add pd (16 * m2 + 12)) 2 (nth_byte (vdrw_flags wr))
+  ; range_map (pa_add pd (16 * m2 + 14)) 2 (nth_byte (Z_to_bv 16 (Z.of_nat t)))
+  ; range_map (d_desc pd t) 8 (nth_byte (d_info_status h : SailStdpp.Values.mword 64))
+  ; range_map (pa_add pd (16 * t + 8)) 4 (nth_byte (Z_to_bv 32 1))
+  ; range_map (pa_add pd (16 * t + 12)) 2 (nth_byte (Z_to_bv 16 2))
+  ; range_map (pa_add pd (16 * t + 14)) 2 (nth_byte (Z_to_bv 16 0))
+  ; range_map (d_ops h) 4 (nth_byte (vdrw_ty wr))
+  ; range_map (pa_add disk_base (168 + 16 * h + 4)) 4
+      (nth_byte (mword_of_int 0 : SailStdpp.Values.mword 32))
+  ; range_map (pa_add disk_base (168 + 16 * h + 8)) 8 (nth_byte sector)
+  ; mbuf ].
+
+(* ...and the pin itself.  THE AVAIL-RING ENTRY IS NOT IN IT ANY MORE
+   (finding 5): that cell belongs to the device invariant's lease, and a pin
+   that also claimed it would make [slot_fp sl pin ## dom dma] -- the
+   publish accessor's premise, and what [vproto_hd_fresh] rests on -- false.
+   So the pin is exactly the fifteen chain regions plus the payload window,
+   and [pin ∖ ring] has nothing left to do. *)
+Definition vdrwd_regions (pd pav : SailStdpp.Values.mword 64) (b : Arch.pa)
+    (np h m2 t : nat) (wr sector : SailStdpp.Values.mword 64) (mbuf : _) :=
+  vdrwd_pinr_regions pd b h m2 t wr sector mbuf.
+
+Lemma vdrwd_ring_off_nat (k : nat) :
+  Z.to_nat (4 + 2 * Z.of_nat (k `mod` 8))%Z = (4 + 2 * (k `mod` 8))%nat.
+Proof. lia. Qed.
+
+Lemma vdrwd_ring_pa (pd pav pu : SailStdpp.Values.mword 64) (k : nat) :
+  ring_entry_pa (virtio_init_cfg pd pav pu) k = d_ring pav (k `mod` 8).
+Proof.
+  unfold ring_entry_pa, d_ring, pa_off, vq_avail_ring_off, virtio_init_cfg.
+  cbn [vc_avail]. rewrite vdrwd_mod8_z vdrwd_ring_off_nat. reflexivity.
+Qed.
+
+Lemma vdrwd_ops_sec_pa (h : nat) :
+  pa_add (d_ops h : Arch.pa) 8 = pa_add disk_base (168 + 16 * h + 8).
+Proof. unfold d_ops. rewrite pa_add_add. reflexivity. Qed.
+
+Lemma vdrwd_len1024 : Z.to_nat (bv_unsigned (Z_to_bv 32 1024)) = 1024%nat.
+Proof. vm_compute. reflexivity. Qed.
+
+(* THE pure half: a pin that CONTAINS the sixteen windows (and, for a write
+   request, the payload) parses to exactly the request the driver meant. *)
+Lemma vdrwd_mk_pin (kq : nat * positive)
+    (pd pav pu : SailStdpp.Values.mword 64) (b : Arch.pa)
+    (np h m2 t : nat) (wr sector : SailStdpp.Values.mword 64)
+    (bs : list (bv 8)) (pin mbuf : _) :
+  (h < 8)%nat -> (m2 < 8)%nat -> (t < 8)%nat ->
+  length bs = 1024%nat ->
+  (forall m, m ∈ vdrwd_regions pd pav b np h m2 t wr sector mbuf -> m ⊆ pin) ->
+  (bv_unsigned (vdrw_ty wr) = virtio_blk_t_out ->
+     range_map (b_data b) 1024 (fun j => bs !!! j) ⊆ pin) ->
+  d_info_status h ∉ pa_range (b_data b) 1024 ->
+  slot_pin_ok (virtio_init_cfg pd pav pu) np (vdrwd_slot kq b h wr sector bs) pin.
+Proof.
+  intros Hh Hm Ht Hlen Hsub Hbuf Hstat.
+  destruct (vdrwc_ty_flags wr) as [Htyv Hflags].
+  unfold vdrwd_slot.
+  apply (mk_pin_slot_ok (virtio_init_cfg pd pav pu) np pd pin h m2 t
+           (d_ops h) (b_data b) (d_info_status h) (vdrw_ty wr) sector bs kq).
+  - reflexivity.
+  - reflexivity.
+  - exact Hh.
+  - exact Hm.
+  - exact Ht.
+  - split_and!.
+    + apply (vdrwd_read_reg _ 8 (d_ops h : SailStdpp.Values.mword 64) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 0). reflexivity.
+    + apply (vdrwd_read_reg _ 4 (Z_to_bv 32 16) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 1). reflexivity.
+    + apply (vdrwd_read_reg _ 2 (Z_to_bv 16 1) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 2). reflexivity.
+    + apply (vdrwd_read_reg _ 2 (Z_to_bv 16 (Z.of_nat m2)) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 3). reflexivity.
+  - split_and!.
+    + apply (vdrwd_read_reg _ 8 (b_data b : SailStdpp.Values.mword 64) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 4). reflexivity.
+    + apply (vdrwd_read_reg _ 4 (Z_to_bv 32 1024) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 5). reflexivity.
+    + assert (Hr : read_bytes pin (pa_add pd (16 * m2 + 12)) 2 = Some (vdrw_flags wr)).
+      { apply (vdrwd_read_reg _ 2 (vdrw_flags wr) pin ltac:(lia)).
+        apply Hsub. apply (list_elem_of_lookup_2 _ 6). reflexivity. }
+      rewrite Hr Hflags. reflexivity.
+    + apply (vdrwd_read_reg _ 2 (Z_to_bv 16 (Z.of_nat t)) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 7). reflexivity.
+  - split_and!.
+    + apply (vdrwd_read_reg _ 8 (d_info_status h : SailStdpp.Values.mword 64) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 8). reflexivity.
+    + apply (vdrwd_read_reg _ 4 (Z_to_bv 32 1) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 9). reflexivity.
+    + apply (vdrwd_read_reg _ 2 (Z_to_bv 16 2) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 10). reflexivity.
+    + apply (vdrwd_read_reg _ 2 (Z_to_bv 16 0) pin ltac:(lia)).
+      apply Hsub. apply (list_elem_of_lookup_2 _ 11). reflexivity.
+  - apply (vdrwd_read_reg _ 4 (vdrw_ty wr) pin ltac:(lia)).
+    apply Hsub. apply (list_elem_of_lookup_2 _ 12). reflexivity.
+  - rewrite vdrwd_ops_sec_pa.
+    apply (vdrwd_read_reg _ 8 sector pin ltac:(lia)).
+    apply Hsub. apply (list_elem_of_lookup_2 _ 14). reflexivity.
+  - exact Htyv.
+  - intro Hout.
+    replace 1024%nat with (length bs) by exact Hlen.
+    apply (vdrwd_read_list (b_data b) bs pin ltac:(lia)).
+    rewrite Hlen. exact (Hbuf Hout).
+  - exact Hstat.
+Qed.
+
+(* the per-window identity-mapping premise, from a page-wide (or struct-wide)
+   one: every address the chain formatting touches is [base + k]. *)
+Lemma vdrwd_off_static (base a : Arch.pa) (k n : nat) :
+  a = pa_add base k -> (k + n <= 4096)%nat ->
+  (forall j, (j < 4096)%nat -> kmap_static (svpn_of (pa_add base j)) KP_rw) ->
+  forall j, (j < n)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw.
+Proof. intros -> Hkn Hs j Hj. rewrite pa_add_add. apply Hs. lia. Qed.
+
+Section VdrwdPinRes.
+  Context `{!riscvGS Σ, !xv6G Σ}.
+  Context `{XI : CurCtx}.
+
+  (* the three word widths and the byte, straight into the [range_map] shape *)
+  Lemma vdrwd_w2 (a : Arch.pa) (w : bv 16) :
+    (forall j, (j < 2)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗ a ↦₂ w -∗ phys_map (range_map a 2 (nth_byte w)).
+  Proof using .
+    iIntros (Hs) "#Hb H". rewrite <- phys_word2_map.
+    iApply (word2_to_phys a w Hs with "Hb H").
+  Qed.
+
+  Lemma vdrwd_w4 (a : Arch.pa) (w : bv 32) :
+    (forall j, (j < 4)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗ a ↦₄ w -∗ phys_map (range_map a 4 (nth_byte w)).
+  Proof using .
+    iIntros (Hs) "#Hb H". rewrite <- phys_word4_map.
+    iApply (word4_to_phys a w Hs with "Hb H").
+  Qed.
+
+  Lemma vdrwd_w8 (a : Arch.pa) (w : bv 64) :
+    (forall j, (j < 8)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗ a ↦₈ w -∗ phys_map (range_map a 8 (nth_byte w)).
+  Proof using .
+    iIntros (Hs) "#Hb H". rewrite <- vdrwd_pw8_map.
+    iApply (word8_to_phys a w Hs with "Hb H").
+  Qed.
+
+  (* A6.125 step 4: the OFFER forms -- the word leaves as (memory at 1,
+     stamp at ½) and its kept halves stay with the publisher *)
+  Lemma vdrwd_o2 (a : Arch.pa) (w : bv 16) :
+    (forall j, (j < 2)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗ a ↦₂ w -∗
+    pin_offer (range_map a 2 (nth_byte w)) ∗ keep_map cur_ctx (range_map a 2 (nth_byte w)).
+  Proof using .
+    iIntros (Hs) "#Hb [_ H]".
+    iApply (ctx_win_offer a 2 (nth_byte w) ltac:(lia) Hs with "Hb H").
+  Qed.
+
+  Lemma vdrwd_o4 (a : Arch.pa) (w : bv 32) :
+    (forall j, (j < 4)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗ a ↦₄ w -∗
+    pin_offer (range_map a 4 (nth_byte w)) ∗ keep_map cur_ctx (range_map a 4 (nth_byte w)).
+  Proof using .
+    iIntros (Hs) "#Hb [_ H]".
+    iApply (ctx_win_offer a 4 (nth_byte w) ltac:(lia) Hs with "Hb H").
+  Qed.
+
+  Lemma vdrwd_o8 (a : Arch.pa) (w : bv 64) :
+    (forall j, (j < 8)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗ a ↦₈ w -∗
+    pin_offer (range_map a 8 (nth_byte w)) ∗ keep_map cur_ctx (range_map a 8 (nth_byte w)).
+  Proof using .
+    iIntros (Hs) "#Hb [_ H]".
+    iApply (ctx_win_offer a 8 (nth_byte w) ltac:(lia) Hs with "Hb H").
+  Qed.
+
+  Lemma vdrwd_ctx_bytes_of_fun (a : Arch.pa) (n : nat) (g : nat -> bv 8)
+      (bs : list (bv 8)) :
+    bs = g <$> seq 0 n ->
+    ([∗ list] j ↦ x ∈ bs, pa_add a j ↦ₘ x)
+    ⊣⊢ ([∗ list] j ∈ seq 0 n, pa_add a j ↦ₘ g j).
+  Proof using .
+    intros ->. rewrite big_sepL_fmap.
+    apply big_sepL_proper. intros k y Hk.
+    apply lookup_seq in Hk as [Hy _].
+    assert (Hyk : y = k) by lia. rewrite Hyk. reflexivity.
+  Qed.
+
+  Lemma vdrwd_buf_offer (a : Arch.pa) (bs : list (bv 8)) :
+    (Z.of_nat (length bs) < 18446744073709551616)%Z ->
+    (forall j, (j < length bs)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗ ([∗ list] j ↦ x ∈ bs, pa_add a j ↦ₘ x) -∗
+    pin_offer (range_map a (length bs) (fun j => bs !!! j)) ∗
+    keep_map cur_ctx (range_map a (length bs) (fun j => bs !!! j)).
+  Proof using .
+    iIntros (Hn Hs) "#Hb H".
+    iEval (rewrite (vdrwd_ctx_bytes_of_fun a (length bs) (fun j => bs !!! j) bs
+                      (list_eq_total bs))) in "H".
+    iApply (ctx_win_offer a (length bs) (fun j => bs !!! j) Hn Hs with "Hb H").
+  Qed.
+
+  Lemma vdrwd_buf_to_phys (a : Arch.pa) (bs : list (bv 8)) :
+    (forall j, (j < length bs)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗ ([∗ list] j ↦ x ∈ bs, pa_add a j ↦ₘ x) -∗ phys_list a bs.
+  Proof using .
+    iIntros (Hs) "#Hb H". rewrite /phys_list.
+    iApply (big_sepL_impl with "H").
+    iIntros "!>" (k x Hk) "Hx".
+    (* A6.124: the tier is the ledger now (A6.48 ruling 4) -- the ctx byte
+       keeps its stamp element across the identity map ([ctx_ident_ledger]);
+       this text was never compiled before this unit (the file's earlier red
+       root sat above it). *)
+    assert (Hk' : (k < length bs)%nat) by (apply lookup_lt_Some in Hk; exact Hk).
+    iApply (ctx_ident_ledger (pa_add a k) (DfracOwn 1) x (Hs k Hk') with "Hb Hx").
+  Qed.
+
+  Lemma vdrwd_plist_map (a : Arch.pa) (bs : list (bv 8)) :
+    (Z.of_nat (length bs) < 18446744073709551616)%Z ->
+    phys_list a bs -∗ phys_map (range_map a (length bs) (fun j => bs !!! j)).
+  Proof using . intro Hn. rewrite (phys_list_map a bs Hn). iIntros "$". Qed.
+
+  (* the status byte is in [struct disk], the buffer in a [struct buf]: an
+     address disequality, and hence provable from OWNERSHIP alone. *)
+  Lemma vdrwd_stat_out (sts a : Arch.pa) (v : bv 8) (bs : list (bv 8)) :
+    length bs = 1024%nat ->
+    phys_ledger sts (DfracOwn 1) v -∗ phys_list a bs -∗
+    ⌜sts ∉ pa_range a 1024⌝.
+  Proof using .
+    iIntros (Hlen) "Hs Hl".
+    iDestruct (TsoCtx.phys_ledger_forget with "Hs") as "Hs".
+    destruct (decide (sts ∈ pa_range a 1024)) as [Hin|Hout]; [| iPureIntro; exact Hout ].
+    apply pa_range_elim in Hin as (j & Hj & ->).
+    assert (Hb : is_Some (bs !! j)) by (apply lookup_lt_is_Some; lia).
+    destruct Hb as [x Hx].
+    iDestruct (big_sepL_lookup _ bs j x Hx with "Hl") as "Hb".
+    (* A6.124: the list's cells are ledger cells now; the address fact is
+       read off the forgotten points-to (never compiled before this unit) *)
+    iDestruct (TsoCtx.phys_ledger_forget with "Hb") as "Hb".
+    rewrite /phys_pointsto.
+    iDestruct "Hs" as "[Hs _]". iDestruct "Hb" as "[Hb _]".
+    iDestruct (pointsto_ne with "Hs Hb") as %Hne.
+    destruct (Hne eq_refl).
+  Qed.
+
+  (* the same, read off the buffer's ctx bytes before they split *)
+  Lemma vdrwd_stat_out_ctx (sts a : Arch.pa) (v : bv 8) (bs : list (bv 8)) :
+    length bs = 1024%nat ->
+    (forall j, (j < length bs)%nat -> kmap_static (svpn_of (pa_add a j)) KP_rw) ->
+    kmap_static_claims -∗
+    phys_ledger sts (DfracOwn 1) v -∗ ([∗ list] j ↦ x ∈ bs, pa_add a j ↦ₘ x) -∗
+    ⌜sts ∉ pa_range a 1024⌝.
+  Proof using .
+    iIntros (Hlen Hs) "#Hkm Hs Hl".
+    iDestruct (TsoCtx.phys_ledger_forget with "Hs") as "Hs".
+    destruct (decide (sts ∈ pa_range a 1024)) as [Hin|Hout]; [| iPureIntro; exact Hout ].
+    apply pa_range_elim in Hin as (j & Hj & ->).
+    assert (Hb : is_Some (bs !! j)) by (apply lookup_lt_is_Some; lia).
+    destruct Hb as [x Hx].
+    iDestruct (big_sepL_lookup _ bs j x Hx with "Hl") as "Hb".
+    assert (Hj' : (j < length bs)%nat) by lia.
+    iDestruct (ctx_ident_ledger (pa_add a j) (DfracOwn 1) x (Hs j Hj') with "Hkm Hb") as "Hb".
+    iDestruct (TsoCtx.phys_ledger_forget with "Hb") as "Hb".
+    rewrite /phys_pointsto.
+    iDestruct "Hs" as "[Hs _]". iDestruct "Hb" as "[Hb _]".
+    iDestruct (pointsto_ne with "Hs Hb") as %Hne.
+    destruct (Hne eq_refl).
+  Qed.
+
+End VdrwdPinRes.
+
+Section VdrwdPinBuild.
+  Context `{!riscvGS Σ, !xv6G Σ}.
+  Context `{XI : CurCtx}.
+
+  (* THE ownership half: the seventeen formatted cells, the ring cell and the
+     caller's buffer become the pin and the writable footprint the publish
+     accessor consumes -- plus, for a WRITE, the payload moves from the
+     writable side into the pin. *)
+  Lemma vdrwd_pin_res (kq : nat * positive)
+      (pd pav pu : SailStdpp.Values.mword 64) (b : Arch.pa)
+      (np h m2 t : nat) (wr sector : SailStdpp.Values.mword 64)
+      (bs bsl : list (bv 8)) :
+    (h < 8)%nat -> (m2 < 8)%nat -> (t < 8)%nat ->
+    length bs = 1024%nat -> length bsl = 1024%nat ->
+    (vdrwd_out wr = true -> bsl = bs) ->
+    (forall j, (j < 4096)%nat -> kmap_static (svpn_of (pa_add pd j)) KP_rw) ->
+    (forall j, (j < 4096)%nat -> kmap_static (svpn_of (pa_add pav j)) KP_rw) ->
+    (forall j, (j < 1024)%nat -> kmap_static (svpn_of (pa_add (b_data b) j)) KP_rw) ->
+    kmap_static_claims -∗
+    (* NO RING CELL: it is the lease's, and the store that put the head there
+       went through the device invariant (finding 5) *)
+    vdrw_chain pd b h m2 t wr sector -∗
+    ([∗ list] j ↦ x ∈ bs, pa_add (b_data b) j ↦ₘ x) -∗
+    ∃ pin wrb,
+      ⌜slot_pin_ok (virtio_init_cfg pd pav pu) np (vdrwd_slot kq b h wr sector bsl) pin⌝ ∗
+      ⌜dom wrb = slot_wr (vdrwd_slot kq b h wr sector bsl)⌝ ∗
+      ⌜slot_wr (vdrwd_slot kq b h wr sector bsl) ## dom pin⌝ ∗
+      (* THE STRUCTURE OF THE PIN, for P6: exactly the fifteen formatted
+         windows (plus a write's payload), pairwise disjoint.  No ring
+         residue to take off any more -- the pin never held that cell. *)
+      ⌜pin = foldr union ∅ (vdrwd_pinr_regions pd b h m2 t wr sector
+                           (vdrwd_bufwin b wr bs))
+       /\ pm_ok (vdrwd_pinr_regions pd b h m2 t wr sector
+                   (vdrwd_bufwin b wr bs))⌝ ∗
+      pin_offer pin ∗ keep_map cur_ctx pin ∗ phys_map wrb ∗
+      d_info_b h ↦₈ (b : SailStdpp.Values.mword 64) ∗
+      b_disk b ↦₄ (SailStdpp.Values.mword_of_int (len := 32) 1) ∗
+      vdrw_slot_rest m2 ∗ vdrw_slot_rest t.
+  Proof using .
+    intros Hh Hm Ht Hlen Hlensl Hbsl Hspd Hspav Hsbuf.
+    iIntros "#Hkm Hchain Hbuf".
+    rewrite /vdrw_chain.
+    iDestruct "Hchain" as "(Hops0 & Hops1 & Hops2 & Hda0 & Hdl0 & Hdf0 & Hdn0 &
+                            Hda1 & Hdl1 & Hdf1 & Hdn1 & Hda2 & Hdl2 & Hdf2 & Hdn2 &
+                            Hst & Hib & Hbd & Hrm & Hrt)".
+    (* ---- every window into the [phys_map (range_map ...)] shape ---- *)
+    iDestruct (vdrwd_o8 (d_desc pd h) (d_ops h : SailStdpp.Values.mword 64)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * h)%nat 8 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hda0") as "[Hda0 Kda0]".
+    iDestruct (vdrwd_o4 (pa_add pd (16 * h + 8)) (Z_to_bv 32 16)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * h + 8)%nat 4 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdl0") as "[Hdl0 Kdl0]".
+    iDestruct (vdrwd_o2 (pa_add pd (16 * h + 12)) (Z_to_bv 16 1)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * h + 12)%nat 2 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdf0") as "[Hdf0 Kdf0]".
+    iDestruct (vdrwd_o2 (pa_add pd (16 * h + 14)) (Z_to_bv 16 (Z.of_nat m2))
+                 ltac:(apply (vdrwd_off_static pd _ (16 * h + 14)%nat 2 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdn0") as "[Hdn0 Kdn0]".
+    iDestruct (vdrwd_o8 (d_desc pd m2) (b_data b : SailStdpp.Values.mword 64)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * m2)%nat 8 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hda1") as "[Hda1 Kda1]".
+    iDestruct (vdrwd_o4 (pa_add pd (16 * m2 + 8)) (Z_to_bv 32 1024)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * m2 + 8)%nat 4 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdl1") as "[Hdl1 Kdl1]".
+    iDestruct (vdrwd_o2 (pa_add pd (16 * m2 + 12)) (vdrw_flags wr)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * m2 + 12)%nat 2 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdf1") as "[Hdf1 Kdf1]".
+    iDestruct (vdrwd_o2 (pa_add pd (16 * m2 + 14)) (Z_to_bv 16 (Z.of_nat t))
+                 ltac:(apply (vdrwd_off_static pd _ (16 * m2 + 14)%nat 2 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdn1") as "[Hdn1 Kdn1]".
+    iDestruct (vdrwd_o8 (d_desc pd t) (d_info_status h : SailStdpp.Values.mword 64)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * t)%nat 8 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hda2") as "[Hda2 Kda2]".
+    iDestruct (vdrwd_o4 (pa_add pd (16 * t + 8)) (Z_to_bv 32 1)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * t + 8)%nat 4 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdl2") as "[Hdl2 Kdl2]".
+    iDestruct (vdrwd_o2 (pa_add pd (16 * t + 12)) (Z_to_bv 16 2)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * t + 12)%nat 2 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdf2") as "[Hdf2 Kdf2]".
+    iDestruct (vdrwd_o2 (pa_add pd (16 * t + 14)) (Z_to_bv 16 0)
+                 ltac:(apply (vdrwd_off_static pd _ (16 * t + 14)%nat 2 eq_refl ltac:(lia) Hspd))
+                 with "Hkm Hdn2") as "[Hdn2 Kdn2]".
+    iDestruct (vdrwd_o4 (d_ops h) (vdrw_ty wr)
+                 ltac:(apply (vdrwd_off_static disk_base _ (168 + 16 * h)%nat 4 eq_refl
+                                ltac:(lia) vdrwd_disk_static))
+                 with "Hkm Hops0") as "[Hops0 Kops0]".
+    iDestruct (vdrwd_o4 (pa_add disk_base (168 + 16 * h + 4))
+                 (SailStdpp.Values.mword_of_int (len := 32) 0)
+                 ltac:(apply (vdrwd_off_static disk_base _ (168 + 16 * h + 4)%nat 4 eq_refl
+                                ltac:(lia) vdrwd_disk_static))
+                 with "Hkm Hops1") as "[Hops1 Kops1]".
+    iDestruct (vdrwd_o8 (pa_add disk_base (168 + 16 * h + 8)) sector
+                 ltac:(apply (vdrwd_off_static disk_base _ (168 + 16 * h + 8)%nat 8 eq_refl
+                                ltac:(lia) vdrwd_disk_static))
+                 with "Hkm Hops2") as "[Hops2 Kops2]".
+    (* ---- the status byte and the buffer, still in their own tiers ---- *)
+    iDestruct (byte_to_phys (d_info_status h) (Z_to_bv 8 255)
+                 ltac:(unfold d_info_status; apply vdrwd_disk_static; lia)
+                 with "Hkm Hst") as "Hst".
+    iDestruct (vdrwd_stat_out_ctx (d_info_status h) (b_data b) (Z_to_bv 8 255) bs Hlen
+                 ltac:(rgall; rewrite Hlen; exact Hsbuf) with "Hkm Hst Hbuf") as %Hstat.
+    iEval (rewrite vdrwd_pb_map) in "Hst".
+    (* ---- the fifteen fixed windows, as a function of the last one: the
+       OFFERS and, beside them, the KEPT halves ---- *)
+    iAssert (∀ mm, keep_map cur_ctx mm -∗
+               kp_list cur_ctx (vdrwd_regions pd pav b np h m2 t wr sector mm))%I
+      with "[Kda0 Kdl0 Kdf0 Kdn0 Kda1 Kdl1 Kdf1 Kdn1 Kda2 Kdl2 Kdf2 Kdn2
+             Kops0 Kops1 Kops2]" as "Hkl".
+    { iIntros (mm) "Hmm".
+      rewrite /kp_list /vdrwd_regions /vdrwd_pinr_regions.
+      iFrame "Kda0 Kdl0 Kdf0 Kdn0 Kda1 Kdl1 Kdf1 Kdn1 Kda2 Kdl2 Kdf2 Kdn2
+              Kops0 Kops1 Kops2 Hmm". done. }
+    iAssert (∀ mm, pin_offer mm -∗
+               po_list (vdrwd_regions pd pav b np h m2 t wr sector mm))%I
+      with "[Hda0 Hdl0 Hdf0 Hdn0 Hda1 Hdl1 Hdf1 Hdn1 Hda2 Hdl2 Hdf2 Hdn2
+             Hops0 Hops1 Hops2]" as "Hpl".
+    { iIntros (mm) "Hmm".
+      rewrite /po_list /vdrwd_regions /vdrwd_pinr_regions.
+      iSplitL "Hda0"; [iExact "Hda0"|].
+      iSplitL "Hdl0"; [iExact "Hdl0"|].
+      iSplitL "Hdf0"; [iExact "Hdf0"|].
+      iSplitL "Hdn0"; [iExact "Hdn0"|].
+      iSplitL "Hda1"; [iExact "Hda1"|].
+      iSplitL "Hdl1"; [iExact "Hdl1"|].
+      iSplitL "Hdf1"; [iExact "Hdf1"|].
+      iSplitL "Hdn1"; [iExact "Hdn1"|].
+      iSplitL "Hda2"; [iExact "Hda2"|].
+      iSplitL "Hdl2"; [iExact "Hdl2"|].
+      iSplitL "Hdf2"; [iExact "Hdf2"|].
+      iSplitL "Hdn2"; [iExact "Hdn2"|].
+      iSplitL "Hops0"; [iExact "Hops0"|].
+      iSplitL "Hops1"; [iExact "Hops1"|].
+      iSplitL "Hops2"; [iExact "Hops2"|].
+      iSplitL "Hmm"; [iExact "Hmm"|].
+      done. }
+    (* ---- the two branches: a WRITE pins its payload, a READ leases it ---- *)
+    destruct (bv_unsigned (vdrw_ty wr) =? virtio_blk_t_out) eqn:Hout.
+    - (* OUT *)
+      assert (Hbe : bsl = bs) by (apply Hbsl; unfold vdrwd_out; exact Hout).
+      iDestruct (vdrwd_buf_offer (b_data b) bs ltac:(rewrite Hlen; lia)
+                   ltac:(rgall; rewrite Hlen; exact Hsbuf) with "Hkm Hbuf") as "[Hbuf Kbuf]".
+      iEval (rewrite Hlen) in "Hbuf". iEval (rewrite Hlen) in "Kbuf".
+      iDestruct ("Hpl" with "Hbuf") as "Hpl".
+      iDestruct (po_union with "Hpl") as "(Hpin & %Hpmok & %Hsub)".
+      iDestruct ("Hkl" with "Kbuf") as "Hkl".
+      iDestruct (kp_union _ _ Hpmok with "Hkl") as "Kpin".
+      iExists (foldr union ∅ (vdrwd_regions pd pav b np h m2 t wr sector
+                 (range_map (b_data b) 1024 (fun j => bs !!! j)))),
+              {[ d_info_status h := Z_to_bv 8 255 ]}.
+      iDestruct (pin_offer_full_disj with "Hst Hpin") as %Hpw.
+      iFrame "Hpin Kpin Hst Hib Hbd Hrm Hrt".
+      (* [pm_ok] of the pin IS [pm_ok] of the residue: same list now *)
+      iPureIntro. split_and!.
+      + apply (vdrwd_mk_pin kq pd pav pu b np h m2 t wr sector bsl _
+                 (range_map (b_data b) 1024 (fun j => bs !!! j))
+                 Hh Hm Ht Hlensl).
+        * exact Hsub.
+        * intros _. rewrite Hbe.
+          apply Hsub. apply (list_elem_of_lookup_2 _ 15). reflexivity.
+        * exact Hstat.
+      + rewrite dom_singleton_L.
+        unfold slot_wr, vdrwd_slot, vs_is_out.
+        cbn [rw_slot vs_req vr_type vr_status].
+        rewrite Hout union_empty_r_L. reflexivity.
+      + unfold slot_wr, vdrwd_slot, vs_is_out.
+        cbn [rw_slot vs_req vr_type vr_status].
+        rewrite Hout.
+        assert (Hd : dom ({[ d_info_status h := Z_to_bv 8 255 ]} : gmap _ _)
+                     ## dom (foldr union ∅ (vdrwd_regions pd pav b np h m2 t wr sector
+                               (range_map (b_data b) 1024 (fun j => bs !!! j)))))
+          by (apply gset_disj_sym; exact Hpw).
+        rewrite dom_singleton_L in Hd. rewrite union_empty_r_L. exact Hd.
+      + rewrite /vdrwd_bufwin Hout.
+        (* [vdrwd_regions] IS [vdrwd_pinr_regions] now: no ring cell to take
+           off the front (finding 5) *)
+        reflexivity.
+      + rewrite /vdrwd_bufwin Hout. exact Hpmok.
+    - (* IN *)
+      iDestruct (vdrwd_buf_to_phys (b_data b) bs
+                   ltac:(rgall; rewrite Hlen; exact Hsbuf) with "Hkm Hbuf") as "Hbuf".
+      iDestruct (vdrwd_plist_map (b_data b) bs ltac:(lia) with "Hbuf") as "Hbuf".
+      iEval (rewrite Hlen) in "Hbuf".
+      iDestruct (phys_map_disj with "Hst Hbuf") as %Hsb.
+      iAssert (pin_offer ∅)%I as "Hemp".
+      { rewrite pin_offer_empty. done. }
+      iAssert (keep_map cur_ctx ∅)%I as "Kemp".
+      { rewrite keep_map_empty. done. }
+      iDestruct ("Hpl" $! ∅ with "Hemp") as "Hpl".
+      iDestruct (po_union with "Hpl") as "(Hpin & %Hpmok & %Hsub)".
+      iDestruct ("Hkl" $! ∅ with "Kemp") as "Hkl".
+      iDestruct (kp_union _ _ Hpmok with "Hkl") as "Kpin".
+      iExists (foldr union ∅ (vdrwd_regions pd pav b np h m2 t wr sector ∅)),
+              ({[ d_info_status h := Z_to_bv 8 255 ]}
+                 ∪ range_map (b_data b) 1024 (fun j => bs !!! j)).
+      iAssert (phys_map ({[ d_info_status h := Z_to_bv 8 255 ]}
+                 ∪ range_map (b_data b) 1024 (fun j => bs !!! j)))
+        with "[Hst Hbuf]" as "Hwrb".
+      { rewrite (phys_map_union _ _ Hsb). iFrame. }
+      iDestruct (pin_offer_full_disj with "Hwrb Hpin") as %Hpw.
+      iFrame "Hpin Kpin Hwrb Hib Hbd Hrm Hrt".
+      (* [pm_ok] of the pin IS [pm_ok] of the residue: same list now *)
+      iPureIntro. split_and!.
+      + apply (vdrwd_mk_pin kq pd pav pu b np h m2 t wr sector bsl _ ∅
+                 Hh Hm Ht Hlensl).
+        * exact Hsub.
+        * intro Hc. exfalso. rewrite Hc Z.eqb_refl in Hout. discriminate.
+        * exact Hstat.
+      + rewrite dom_union_L dom_singleton_L range_map_dom.
+        unfold slot_wr, vdrwd_slot, vs_is_out, vs_len.
+        cbn [rw_slot vs_req vr_type vr_status vr_buf vr_len].
+        rewrite Hout vdrwd_len1024. reflexivity.
+      + assert (Hd : dom ({[ d_info_status h := Z_to_bv 8 255 ]}
+                            ∪ range_map (b_data b) 1024 (fun j => bs !!! j))
+                     ## dom (foldr union ∅
+                               (vdrwd_regions pd pav b np h m2 t wr sector ∅)))
+          by (apply gset_disj_sym; exact Hpw).
+        rewrite dom_union_L dom_singleton_L range_map_dom in Hd.
+        unfold slot_wr, vdrwd_slot, vs_is_out, vs_len.
+        cbn [rw_slot vs_req vr_type vr_status vr_buf vr_len].
+        rewrite Hout vdrwd_len1024. exact Hd.
+      + rewrite /vdrwd_bufwin Hout.
+        (* [vdrwd_regions] IS [vdrwd_pinr_regions] now: no ring cell to take
+           off the front (finding 5) *)
+        reflexivity.
+      + rewrite /vdrwd_bufwin Hout. exact Hpmok.
+  Qed.
+
+End VdrwdPinBuild.
+
+(* ===================================================================== *)
+(* §5  The published slot, as the claim records it.                       *)
+(* ===================================================================== *)
+
+(* the slot the publisher records really does describe the caller's buffer *)
+Lemma vdrwd_slot_link (kq : nat * positive) (b : Arch.pa) (h : nat)
+    (wr sector : SailStdpp.Values.mword 64)
+    (bs : list (bv 8)) :
+  (h < 8)%nat -> slot_buf_link (vdrwd_slot kq b h wr sector bs) b.
+Proof.
+  intro Hh. unfold slot_buf_link, vdrwd_slot.
+  exists h. cbn [rw_slot vs_req vr_head vr_status vr_buf].
+  split_and!.
+  - exact Hh.
+  - apply bv16_small. exact Hh.
+  - reflexivity.
+  - reflexivity.
+  - unfold vs_len. cbn [rw_slot vs_req vr_len]. exact vdrwd_len1024.
+Qed.
+
+Lemma vdrwd_slot_head (kq : nat * positive) (b : Arch.pa) (h : nat)
+    (wr sector : SailStdpp.Values.mword 64)
+    (bs : list (bv 8)) :
+  (h < 8)%nat -> sl_head (vdrwd_slot kq b h wr sector bs) = h.
+Proof.
+  intro Hh. unfold sl_head, vdrwd_slot. cbn [rw_slot vs_req vr_head].
+  rewrite (bv16_small h Hh). lia.
+Qed.
+
+(* the same, as the receipt is keyed *)
+Lemma vdrwd_slot_hd (kq : nat * positive) (b : Arch.pa) (h : nat)
+    (wr sector : SailStdpp.Values.mword 64)
+    (bs : list (bv 8)) :
+  (h < 8)%nat ->
+  Z.to_nat (bv_unsigned (vr_head (vs_req (vdrwd_slot kq b h wr sector bs)))) = h.
+Proof. intro Hh. exact (vdrwd_slot_head kq b h wr sector bs Hh). Qed.
+
+Lemma vdrwd_slot_off (kq : nat * positive) (b : Arch.pa) (h : nat)
+    (wr sector : SailStdpp.Values.mword 64)
+    (bs : list (bv 8)) (o : Z) :
+  bv_unsigned sector = o ->
+  vs_sector_off (vdrwd_slot kq b h wr sector bs) = (o * 512)%Z.
+Proof.
+  intro Ho. unfold vs_sector_off, vdrwd_slot, virtio_sector_size.
+  cbn [rw_slot vs_req vr_sector]. rewrite Ho. reflexivity.
+Qed.
+
+(* THE PUBLISHED SLOT'S CRASH-PERMIT INDEX (phase C2a): what this request
+   does to the disk image, in the vocabulary of the CALLER's arguments.
+   Independent of the head index and of the buffer address, which is exactly
+   what lets the permit be deposited BEFORE the descriptor chain is chosen. *)
+Definition vdrwd_wr (wr : SailStdpp.Values.mword 64) (sec_off : Z)
+    (bs_buf : list (bv 8)) : disk_wr :=
+  if vdrwd_out wr then Some (sec_off, bs_buf) else None.
+
+Lemma vdrwd_slot_is_out (kq : nat * positive) (b : Arch.pa) (h : nat)
+    (wr sector : SailStdpp.Values.mword 64) (bs : list (bv 8)) :
+  vs_is_out (vdrwd_slot kq b h wr sector bs) = vdrwd_out wr.
+Proof.
+  unfold vs_is_out, vdrwd_out, vdrwd_slot. cbn [rw_slot vs_req vr_type].
+  reflexivity.
+Qed.
+
+Lemma vdrwd_slot_wr (kq : nat * positive) (b : Arch.pa) (h : nat)
+    (wr sector : SailStdpp.Values.mword 64)
+    (bs_buf bs_disk : list (bv 8)) (sec_off : Z) :
+  (bv_unsigned sector * 512)%Z = sec_off ->
+  vs_wr (vdrwd_slot kq b h wr sector (vdrwd_sldata wr bs_buf bs_disk))
+  = vdrwd_wr wr sec_off bs_buf.
+Proof.
+  intro Hoff. unfold vs_wr, vdrwd_wr.
+  rewrite vdrwd_slot_is_out.
+  destruct (vdrwd_out wr) eqn:Ho; [|reflexivity].
+  rewrite (vdrwd_slot_off kq b h wr sector _ (bv_unsigned sector) eq_refl) Hoff.
+  unfold vs_data, vdrwd_slot. cbn [rw_slot].
+  unfold vdrwd_sldata. rewrite Ho. reflexivity.
+Qed.
+
+(* ===================================================================== *)
+(* §6  P4 -- +0x176 .. +0x19a, the ring write and THE PUBLISH.            *)
+(* ===================================================================== *)
+
+Section VdrwdP4.
+  Context `{!riscvGS Σ, !xv6G Σ}.
+  Context `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}.
+
+
+  Notation Ra0 := (mword_of_int 10 : mword 5).
+  Notation Ra1 := (mword_of_int 11 : mword 5).
+  Notation Ra3 := (mword_of_int 13 : mword 5).
+  Notation Ra4 := (mword_of_int 14 : mword 5).
+  Notation Ra5 := (mword_of_int 15 : mword 5).
+
+  Local Ltac reg_neq :=
+    lazymatch goal with
+    | |- ?a <> ?b => tryif unify a b then fail else (vm_compute; discriminate)
+    end.
+
+  Local Ltac csne :=
+    apply not_eq_sym, is_cs_idx_true_neq; [ vm_compute; reflexivity | assumption ].
+
+  Local Ltac pcstep := apply bv_eq; vm_compute; reflexivity.
+
+  Lemma wp_vdrw_p4 (kq : nat * positive)
+      (γu : uart_names) (γd : disk_names) (pme : Arch.pa)
+      (M : regfile) (av : nat)
+      (pd pav pu : SailStdpp.Values.mword 64) (b : Arch.pa)
+      (wr sector : SailStdpp.Values.mword 64)
+      (np nr h m2 t : nat) (cm : gmap nat dclaim) (fr : nat -> bool)
+      (bs_buf bs_disk : list (bv 8)) (sec_off : Z) :
+    tri_ok (h, m2, t) ->
+    length bs_buf = 1024%nat -> length bs_disk = 1024%nat ->
+    (forall j, (j < 1024)%nat -> addr_is_kdata (pa_add (b_data b) j)) ->
+    (bv_unsigned sector * 512)%Z = sec_off ->
+    M !!! Regidx Ra0 = (mword_of_int (Z.of_nat h) : SailStdpp.Values.mword 64) ->
+    M !!! Regidx Ra5 = (disk_base : SailStdpp.Values.mword 64) ->
+    sie_cap_gpr KT1 M av false pme -∗
+    kernel_text -∗ pc_is (mword_of_int (KernelSyms.virtio_disk_rw + 0x176) : mword 64) -∗
+    dev_inv γu γd -∗ disk_geom γd pd pav pu -∗
+    vdrw_body γd pd pav np nr cm fr -∗
+    vdrw_chain pd b h m2 t wr sector -∗
+    (* the head's receipt, still INACTIVE: the ring store is keyed by it and
+       the publish flips it *)
+    h ↪[dn_head γd] HInactive -∗
+    ([∗ list] j ↦ x ∈ bs_buf, pa_add (b_data b) j ↦ₘ x) -∗
+    disk_bytes γd sec_off bs_disk -∗
+    (* THE CRASH PERMIT's token, deposited before the chain was formatted and
+       spent into the published slot here (PermInv.v).  It is the TIMELESS
+       skeleton of the client's SEQUENTIAL view shift: the shift itself is in
+       [perm_inv] at the single key [kq], indexed at the sectors still to
+       land -- all of them, since nothing has landed yet
+       (sector-atomic-disk.md §6e). *)
+    perm_pend (dn_perm γd) kq (vdrwd_wr wr sec_off bs_buf)
+      (set_seq 0 (wr_nsectors (vdrwd_wr wr sec_off bs_buf))) -∗
+    ( ∀ (M1 : regfile) pin,
+        ⌜(forall r : mword 5, is_cs_idx r = true -> M1 !!! Regidx r = M !!! Regidx r)
+         /\ M1 !!! Regidx Ra1 = M !!! Regidx Ra1⌝ -∗
+        ⌜pin = foldr union ∅ (vdrwd_pinr_regions pd b h m2 t wr sector
+                             (vdrwd_bufwin b wr bs_buf))
+         /\ pm_ok (vdrwd_pinr_regions pd b h m2 t wr sector
+                     (vdrwd_bufwin b wr bs_buf))⌝ -∗
+        sie_cap_gpr KT1 M1 av false pme -∗
+        pc_is (mword_of_int (KernelSyms.virtio_disk_rw + 0x19a) : mword 64) -∗
+        (* the lock resource, with the claim's row recorded at the old count *)
+        vdrw_body γd pd pav (S np) nr
+                  (<[ np := DClaim b (vdrwd_slot kq b h wr sector
+                                        (vdrwd_sldata wr bs_buf bs_disk))
+                                   pin np ]> cm) fr -∗
+        (* THE RECEIPT FRAGMENT the sleeper holds *)
+        h ↪[dn_head γd] HActive (DClaim b (vdrwd_slot kq b h wr sector
+                                            (vdrwd_sldata wr bs_buf bs_disk))
+                                       pin np) -∗
+        vdrw_slot_rest m2 -∗ vdrw_slot_rest t -∗
+        mWP (Loop : expr riscv_lang)) -∗
+    mWP (Loop : expr riscv_lang).
+  Proof using .
+    intros Htok Hlenbuf Hlendisk Hbufkd Hoff Ha0 Ha5.
+    destruct Htok as (Hhm & Hht & Hmt & Hh8 & Hm8 & Ht8). cbn in Hh8, Hm8, Ht8.
+    iIntros "Hcg #Htext Hpc #Hdinv #Hgeom Hbody Hchain Hfrag Hbuf Hdisk Hpend Hcont".
+    iDestruct (sie_cap_gpr_kmap_claims with "Hcg") as "[#Hkm Hcg]".
+    iDestruct (disk_geom_static with "Hgeom") as %(Hspd & Hspav & _).
+    iDestruct (disk_geom_avail_ptr with "Hgeom") as "#Hap".
+    (* the buffer's identity mapping *)
+    assert (Hsbuf : forall j, (j < 1024)%nat ->
+              kmap_static (svpn_of (pa_add (b_data b) j)) KP_rw)
+      by (intros j Hj; apply kdata_svpn_class, Hbufkd, Hj).
+    (* ---- open the lock resource ---- *)
+    rewrite /vdrw_body.
+    iDestruct "Hbody" as "(%Hcm & Hpub & #Hlb & Hrd & Hdfl & Hstg & Hclaim & Hrows & Huidx & Hfb & Hring & Havh)".
+    (* ---- +0x176  c.ld a3,8(a5) ---- *)
+    assert (Hava : add_vec (M !!! Regidx Ra5) (sign_extend' 64 (mword_of_int 8 : mword 12))
+                   = (d_avail_ptr : SailStdpp.Values.mword 64))
+      by (rewrite Ha5; apply vdrwd_avail_ptr_addr).
+    iApply (wp_cld_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_rw + 0x176) : mword 64) Ra3 Ra5
+              (mword_of_int 8 : mword 12) M av pav false (dqm := DfracDiscarded)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] []").
+    { iApply (rwi_176 with "Htext"). }
+    { rgall. iEval (rewrite Hava). iExact "Hap". }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc _". rgall.
+    set (N1 := <[Regidx Ra3 := regval_into_reg (pav : SailStdpp.Values.mword 64)]> M).
+    change (<[Regidx Ra3 := regval_into_reg (pav : SailStdpp.Values.mword 64)]> M) with N1.
+    assert (HN1a3 : N1 !!! Regidx Ra3 = (pav : SailStdpp.Values.mword 64))
+      by (rewrite /N1; apply upd_eq).
+    assert (HN1a5 : N1 !!! Regidx Ra5 = (disk_base : SailStdpp.Values.mword 64))
+      by (rewrite /N1 upd_ne; [| reg_neq]; exact Ha5).
+    assert (HN1a0 : N1 !!! Regidx Ra0
+                    = (mword_of_int (Z.of_nat h) : SailStdpp.Values.mword 64))
+      by (rewrite /N1 upd_ne; [| reg_neq]; exact Ha0).
+    assert (Hp164 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x176) : mword 64) 2
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x178)) by pcstep.
+    iEval (rewrite Hp164) in "Hpc".
+    (* ---- +0x178  lhu a4,2(a3)  -- the avail-index read ---- *)
+    assert (Hidxa : add_vec (rget N1 Ra3) (sign_extend' 64 (mword_of_int 2 : mword 12))
+                    = (pa_add pav 2%nat : SailStdpp.Values.mword 64))
+      by (rgall; rewrite HN1a3; apply vdrwd_idx_addr).
+    iApply (wp_vdrwd_lhu_avail γu γd pme pd pav pu
+              (mword_of_int (KernelSyms.virtio_disk_rw + 0x178) : mword 64) Ra4 Ra3
+              (mword_of_int 2 : mword 12) N1 av np Hidxa
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] Hdinv Hgeom Hpub Havh").
+    { iApply (rwi_178 with "Htext"). }
+    iIntros "Hpub Havh Hcg Hpc".
+    set (N2 := <[Regidx Ra4 := regval_into_reg
+                  (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16))]> N1).
+    change (<[Regidx Ra4 := regval_into_reg
+                  (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16))]> N1) with N2.
+    assert (HN2a4 : N2 !!! Regidx Ra4
+                    = (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16)
+                       : SailStdpp.Values.mword 64))
+      by (rewrite /N2; apply upd_eq).
+    assert (HN2a3 : N2 !!! Regidx Ra3 = (pav : SailStdpp.Values.mword 64))
+      by (rewrite /N2 upd_ne; [| reg_neq]; exact HN1a3).
+    assert (HN2a0 : N2 !!! Regidx Ra0
+                    = (mword_of_int (Z.of_nat h) : SailStdpp.Values.mword 64))
+      by (rewrite /N2 upd_ne; [| reg_neq]; exact HN1a0).
+    assert (HN2a5 : N2 !!! Regidx Ra5 = (disk_base : SailStdpp.Values.mword 64))
+      by (rewrite /N2 upd_ne; [| reg_neq]; exact HN1a5).
+    assert (Hp168 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x178) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x17c)) by pcstep.
+    iEval (rewrite Hp168) in "Hpc".
+    assert (Hmod8 : ((np `mod` 8) < 8)%nat) by (apply Nat.mod_upper_bound; lia).
+    (* ---- +0x17c  c.andi a4,a4,7 ---- *)
+    iApply (wp_candi_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x17c) : mword 64) Ra4
+              (mword_of_int 7 : mword 6) N2 av false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (rwi_17c with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    set (N3 := <[Regidx Ra4 := regval_into_reg
+                  (and_vec (N2 !!! Regidx Ra4)
+                     (sign_extend' 64 (sign_extend' 12 (mword_of_int 7 : mword 6))))]> N2).
+    change (<[Regidx Ra4 := regval_into_reg
+                  (and_vec (N2 !!! Regidx Ra4)
+                     (sign_extend' 64 (sign_extend' 12 (mword_of_int 7 : mword 6))))]> N2)
+      with N3.
+    assert (HN3a4 : N3 !!! Regidx Ra4
+                    = (mword_of_int (Z.of_nat (np `mod` 8)) : SailStdpp.Values.mword 64)).
+    { rewrite /N3 upd_eq HN2a4. apply vdrwd_ring_idx. }
+    assert (HN3a3 : N3 !!! Regidx Ra3 = (pav : SailStdpp.Values.mword 64))
+      by (rewrite /N3 upd_ne; [| reg_neq]; exact HN2a3).
+    assert (HN3a0 : N3 !!! Regidx Ra0
+                    = (mword_of_int (Z.of_nat h) : SailStdpp.Values.mword 64))
+      by (rewrite /N3 upd_ne; [| reg_neq]; exact HN2a0).
+    assert (HN3a5 : N3 !!! Regidx Ra5 = (disk_base : SailStdpp.Values.mword 64))
+      by (rewrite /N3 upd_ne; [| reg_neq]; exact HN2a5).
+    assert (Hp16a : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x17c) : mword 64) 2
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x17e)) by pcstep.
+    iEval (rewrite Hp16a) in "Hpc".
+    (* ---- +0x17e  c.slli a4,a4,1 ---- *)
+    iApply (wp_cslli_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x17e) : mword 64)
+              (Regidx Ra4) Ra4 (mword_of_int 1 : mword 6) N3 av false
+              eq_refl ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (rwi_17e with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    set (N4 := <[Regidx Ra4 := regval_into_reg
+                  (shift_bits_left (N3 !!! Regidx Ra4)
+                     (subrange_vec_dec (mword_of_int 1 : mword 6) (Z.sub log2_xlen 1) 0))]> N3).
+    change (<[Regidx Ra4 := regval_into_reg
+                  (shift_bits_left (N3 !!! Regidx Ra4)
+                     (subrange_vec_dec (mword_of_int 1 : mword 6) (Z.sub log2_xlen 1) 0))]> N3)
+      with N4.
+    assert (HN4a4 : N4 !!! Regidx Ra4
+                    = (mword_of_int (Z.of_nat (2 * (np `mod` 8)))
+                       : SailStdpp.Values.mword 64)).
+    { rewrite /N4 upd_eq HN3a4. apply vdrwd_shl1. exact Hmod8. }
+    assert (HN4a3 : N4 !!! Regidx Ra3 = (pav : SailStdpp.Values.mword 64))
+      by (rewrite /N4 upd_ne; [| reg_neq]; exact HN3a3).
+    assert (HN4a0 : N4 !!! Regidx Ra0
+                    = (mword_of_int (Z.of_nat h) : SailStdpp.Values.mword 64))
+      by (rewrite /N4 upd_ne; [| reg_neq]; exact HN3a0).
+    assert (HN4a5 : N4 !!! Regidx Ra5 = (disk_base : SailStdpp.Values.mword 64))
+      by (rewrite /N4 upd_ne; [| reg_neq]; exact HN3a5).
+    assert (Hp16c : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x17e) : mword 64) 2
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x180)) by pcstep.
+    iEval (rewrite Hp16c) in "Hpc".
+    (* ---- +0x180  c.add a3,a3,a4 ---- *)
+    iApply (wp_cadd_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x180) : mword 64) Ra3 Ra4 N4 av false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (rwi_180 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    set (N5 := <[Regidx Ra3 := regval_into_reg
+                  (add_vec (N4 !!! Regidx Ra3) (N4 !!! Regidx Ra4))]> N4).
+    change (<[Regidx Ra3 := regval_into_reg
+                  (add_vec (N4 !!! Regidx Ra3) (N4 !!! Regidx Ra4))]> N4) with N5.
+    assert (HN5a3 : N5 !!! Regidx Ra3
+                    = add_vec (pav : SailStdpp.Values.mword 64)
+                        (mword_of_int (Z.of_nat (2 * (np `mod` 8)))))
+      by (rewrite /N5 upd_eq HN4a3 HN4a4; reflexivity).
+    assert (HN5a0 : N5 !!! Regidx Ra0
+                    = (mword_of_int (Z.of_nat h) : SailStdpp.Values.mword 64))
+      by (rewrite /N5 upd_ne; [| reg_neq]; exact HN4a0).
+    assert (HN5a5 : N5 !!! Regidx Ra5 = (disk_base : SailStdpp.Values.mword 64))
+      by (rewrite /N5 upd_ne; [| reg_neq]; exact HN4a5).
+    assert (Hp16e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x180) : mword 64) 2
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x182)) by pcstep.
+    iEval (rewrite Hp16e) in "Hpc".
+    (* ---- +0x182  sh a0,4(a3)   ring[np mod 8] := h ---- *)
+    assert (Hring : add_vec (N5 !!! Regidx Ra3)
+                      (sign_extend' 64 (mword_of_int 4 : mword 12))
+                    = (d_ring pav (np `mod` 8) : SailStdpp.Values.mword 64))
+      by (rewrite HN5a3; apply vdrwd_ring_addr).
+    assert (HN5sv : trunc16 (N5 !!! Regidx Ra0)
+                    = (Z_to_bv 16 (Z.of_nat h) : SailStdpp.Values.mword 16))
+      by (rewrite HN5a0; exact (vdrwc_trunc16_idx' h Hh8)).
+    (* the row design: the ring cell's holder half, out of the payload *)
+    iEval (rewrite /ring_hcells) in "Hring".
+    iDestruct (big_sepL_lookup_acc _ (seq 0 8) (np `mod` 8)%nat (np `mod` 8)%nat
+                 ltac:(rewrite lookup_seq_lt; [reflexivity | exact Hmod8]) with "Hring")
+      as "[Hrc Hringb]".
+    iDestruct "Hrc" as (w0) "Hhc".
+    iApply (wp_vdrwd_sh_ring γu γd pme pd pav pu
+              (mword_of_int (KernelSyms.virtio_disk_rw + 0x182) : mword 64)
+              Ra0 Ra3 (mword_of_int 4 : mword 12) N5 av np
+              (Z_to_bv 16 (Z.of_nat h)) w0
+              Hring HN5sv
+              with "Hcg Hpc [] Hdinv Hgeom Hpub Hstg [Hfrag] Hhc").
+    { iApply (rwi_182 with "Htext"). }
+    { rewrite (vdrwd_hd16 h Hh8). iExact "Hfrag". }
+    iIntros "Hcg Hpc Hpub Hstg Hfrag Hhc". rgall.
+    iEval (rewrite (vdrwd_hd16 h Hh8)) in "Hfrag".
+    iDestruct ("Hringb" with "[Hhc]") as "Hring".
+    { iExists (Z_to_bv 16 (Z.of_nat h)). iExact "Hhc". }
+    assert (Hp172 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x182) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x186)) by pcstep.
+    iEval (rewrite Hp172) in "Hpc".
+    (* ---- +0x186  fence rw,rw ---- *)
+    iApply (wp_fence_gen_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x186) : mword 64)
+              (mword_of_int 0) (mword_of_int 15) (mword_of_int 15)
+              (Regidx (mword_of_int 0)) (Regidx (mword_of_int 0)) N5 av false
+              with "Hcg Hpc []").
+    { iApply (rwi_186 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    assert (Hp176 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x186) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x18a)) by pcstep.
+    iEval (rewrite Hp176) in "Hpc".
+    (* ---- +0x18a  c.ld a4,8(a5) ---- *)
+    assert (Hava2 : add_vec (N5 !!! Regidx Ra5) (sign_extend' 64 (mword_of_int 8 : mword 12))
+                    = (d_avail_ptr : SailStdpp.Values.mword 64))
+      by (rewrite HN5a5; apply vdrwd_avail_ptr_addr).
+    iApply (wp_cld_s_sconf (kt := KT1) (ktd := KT0) (mword_of_int (KernelSyms.virtio_disk_rw + 0x18a) : mword 64) Ra4 Ra5
+              (mword_of_int 8 : mword 12) N5 av pav false (dqm := DfracDiscarded)
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] []").
+    { iApply (rwi_18a with "Htext"). }
+    { rgall. iEval (rewrite Hava2). iExact "Hap". }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc _". rgall.
+    set (N6 := <[Regidx Ra4 := regval_into_reg (pav : SailStdpp.Values.mword 64)]> N5).
+    change (<[Regidx Ra4 := regval_into_reg (pav : SailStdpp.Values.mword 64)]> N5) with N6.
+    assert (HN6a4 : N6 !!! Regidx Ra4 = (pav : SailStdpp.Values.mword 64))
+      by (rewrite /N6; apply upd_eq).
+    assert (Hp178 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x18a) : mword 64) 2
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x18c)) by pcstep.
+    iEval (rewrite Hp178) in "Hpc".
+    (* ---- +0x18c  lhu a5,2(a4) ---- *)
+    assert (Hidxa2 : add_vec (rget N6 Ra4)
+                       (sign_extend' 64 (mword_of_int 2 : mword 12))
+                     = (pa_add pav 2%nat : SailStdpp.Values.mword 64))
+      by (rgall; rewrite HN6a4; apply vdrwd_idx_addr).
+    iApply (wp_vdrwd_lhu_avail γu γd pme pd pav pu
+              (mword_of_int (KernelSyms.virtio_disk_rw + 0x18c) : mword 64) Ra5 Ra4
+              (mword_of_int 2 : mword 12) N6 av np Hidxa2
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc [] Hdinv Hgeom Hpub Havh").
+    { iApply (rwi_18c with "Htext"). }
+    iIntros "Hpub Havh Hcg Hpc".
+    set (N7 := <[Regidx Ra5 := regval_into_reg
+                  (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16))]> N6).
+    change (<[Regidx Ra5 := regval_into_reg
+                  (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16))]> N6) with N7.
+    assert (HN7a5 : N7 !!! Regidx Ra5
+                    = (zero_extend' 64 (wrap16 np : SailStdpp.Values.mword 16)
+                       : SailStdpp.Values.mword 64))
+      by (rewrite /N7; apply upd_eq).
+    assert (HN7a4 : N7 !!! Regidx Ra4 = (pav : SailStdpp.Values.mword 64))
+      by (rewrite /N7 upd_ne; [| reg_neq]; exact HN6a4).
+    assert (Hp17c : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x18c) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x190)) by pcstep.
+    iEval (rewrite Hp17c) in "Hpc".
+    (* ---- +0x190  c.addiw a5,a5,1 ---- *)
+    iApply (wp_caddiw_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x190) : mword 64) Ra5
+              (mword_of_int 1 : mword 6) N7 av false
+              ltac:(vm_compute; discriminate) ltac:(rdok)
+              with "Hcg Hpc []").
+    { iApply (rwi_190 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    set (N8 := <[Regidx Ra5 := regval_into_reg
+                  (sign_extend' 64 (subrange_vec_dec
+                     (add_vec (N7 !!! Regidx Ra5)
+                        (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)))) 31 0))]> N7).
+    change (<[Regidx Ra5 := regval_into_reg
+                  (sign_extend' 64 (subrange_vec_dec
+                     (add_vec (N7 !!! Regidx Ra5)
+                        (sign_extend' 64 (sign_extend' 12 (mword_of_int 1 : mword 6)))) 31 0))]> N7)
+      with N8.
+    assert (HN8sv : trunc16 (N8 !!! Regidx Ra5)
+                    = (wrap16 (S np) : SailStdpp.Values.mword 16)).
+    { rewrite /N8 upd_eq HN7a5. apply vdrwd_publish_val. }
+    assert (HN8a4 : N8 !!! Regidx Ra4 = (pav : SailStdpp.Values.mword 64))
+      by (rewrite /N8 upd_ne; [| reg_neq]; exact HN7a4).
+    assert (Hp17e : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x190) : mword 64) 2
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x192)) by pcstep.
+    iEval (rewrite Hp17e) in "Hpc".
+    (* ---- assemble the pin and the writable footprint ---- *)
+    assert (Hlensl : length (vdrwd_sldata wr bs_buf bs_disk) = 1024%nat).
+    { unfold vdrwd_sldata. destruct (vdrwd_out wr); assumption. }
+    assert (Hbsl : vdrwd_out wr = true -> vdrwd_sldata wr bs_buf bs_disk = bs_buf).
+    { unfold vdrwd_sldata. intro Ho. rewrite Ho. reflexivity. }
+    iDestruct (vdrwd_pin_res kq pd pav pu b np h m2 t wr sector bs_buf
+                 (vdrwd_sldata wr bs_buf bs_disk)
+                 Hh8 Hm8 Ht8 Hlenbuf Hlensl Hbsl Hspd Hspav Hsbuf
+                 with "Hkm Hchain Hbuf") as
+      (pin wrb) "(%Hpinok & %Hwrbdom & %Hwrpin & %Hpinr & Hpin & Kpin & Hwrb & Hib & Hbd & Hrm & Hrt)".
+    (* ---- the claim, recorded in the lock's map before the bump: fresh
+       because every row is below [np], and the fragment goes into the
+       receipt at the publish ---- *)
+    set (V := DClaim b (vdrwd_slot kq b h wr sector (vdrwd_sldata wr bs_buf bs_disk))
+                     pin np).
+    iMod (ghost_map_insert np V (vdrwd_cm_fresh np cm Hcm) with "Hclaim")
+      as "[Hclaim Hcfrag]".
+    (* ---- +0x192  sh a5,2(a4)  -- THE PUBLISH ---- *)
+    assert (Hidxa3 : add_vec (rget N8 Ra4)
+                       (sign_extend' 64 (mword_of_int 2 : mword 12))
+                     = (pa_add pav 2%nat : SailStdpp.Values.mword 64))
+      by (rgall; rewrite HN8a4; apply vdrwd_idx_addr).
+    iApply (wp_vdrwd_sh_publish γu γd pme pd pav pu
+              (mword_of_int (KernelSyms.virtio_disk_rw + 0x192) : mword 64) Ra5 Ra4
+              (mword_of_int 2 : mword 12) N8 av np
+              (vdrwd_slot kq b h wr sector (vdrwd_sldata wr bs_buf bs_disk)) V pin wrb
+              Hidxa3 HN8sv Hpinok eq_refl eq_refl eq_refl Hwrbdom Hwrpin
+              with "Hcg Hpc [] Hdinv Hgeom Hpub Havh Hstg [Hfrag] Hcfrag Hpin Hwrb
+                    [Hdisk Hpend]").
+    { iApply (rwi_192 with "Htext"). }
+    { rewrite (vdrwd_slot_hd kq b h wr sector _ Hh8). iExact "Hfrag". }
+    { iExists bs_disk. iSplitR.
+      - iPureIntro. unfold vs_len, vdrwd_slot. cbn [rw_slot vs_req vr_len].
+        rewrite vdrwd_len1024. exact Hlendisk.
+      - iSplitR.
+        + iPureIntro. unfold vs_is_out, vs_data, vdrwd_slot, vdrwd_sldata, vdrwd_out.
+          cbn [rw_slot vs_req vr_type]. intro Ho. rewrite Ho. reflexivity.
+        + (* NOTHING HAS DRAINED YET: the whole write is still owed, so the
+             torn set is empty ([vs_kept_full]) and the permit is at its
+             ROOT -- which is exactly the index [PermInv.perm_deposit_kq]
+             handed the enqueuer back. *)
+          iSplitR; [iPureIntro; rewrite vs_kept_full; apply vs_torn_empty|].
+          iSplitL "Hdisk".
+          * rewrite (vdrwd_slot_off kq b h wr sector
+                       (vdrwd_sldata wr bs_buf bs_disk)
+                       (bv_unsigned sector) eq_refl) Hoff.
+            iExact "Hdisk".
+          * (* [vs_perm (vdrwd_slot kq …) = kq] by conversion; the entry's
+               INDEX has to be rewritten to the slot's own [vs_wr], and its
+               remaining set is every sector -- nothing has landed. *)
+            rewrite /vs_all.
+            rewrite (vdrwd_slot_wr kq b h wr sector bs_buf bs_disk sec_off Hoff).
+            iExact "Hpend". }
+    iIntros "Hcg Hpc Hpub Hstg Hact Havh Hpb".
+    iEval (rewrite (vdrwd_slot_hd kq b h wr sector _ Hh8)) in "Hact".
+    (* A6.125 step 4: the publisher's kept halves plus the lease's memory half
+       are the pin's half ctx cells; the claim ROW keeps them (the row design) *)
+    iDestruct (keep_map_back with "Kpin Hpb") as "Hhc".
+    assert (Hp182 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x192) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x196)) by pcstep.
+    iEval (rewrite Hp182) in "Hpc".
+    (* ---- +0x196  fence rw,rw ---- *)
+    iApply (wp_fence_gen_s_sconf (mword_of_int (KernelSyms.virtio_disk_rw + 0x196) : mword 64)
+              (mword_of_int 0) (mword_of_int 15) (mword_of_int 15)
+              (Regidx (mword_of_int 0)) (Regidx (mword_of_int 0)) N8 av false
+              with "Hcg Hpc []").
+    { iApply (rwi_196 with "Htext"). }
+    iApply wp_next_off_intro. iIntros "Hcg Hpc". rgall.
+    assert (Hp186 : add_vec_int (mword_of_int (KernelSyms.virtio_disk_rw + 0x196) : mword 64) 4
+                    = mword_of_int (KernelSyms.virtio_disk_rw + 0x19a)) by pcstep.
+    iEval (rewrite Hp186) in "Hpc".
+    (* ---- the rebuilt lock resource ---- *)
+    iApply ("Hcont" $! N8 pin with "[%] [%] Hcg Hpc [-Hact Hrm Hrt] Hact Hrm Hrt").
+    { split.
+      - intros r Hr.
+        rewrite /N8 upd_ne; [| csne]. rewrite /N7 upd_ne; [| csne].
+        rewrite /N6 upd_ne; [| csne]. rewrite /N5 upd_ne; [| csne].
+        rewrite /N4 upd_ne; [| csne]. rewrite /N3 upd_ne; [| csne].
+        rewrite /N2 upd_ne; [| csne]. rewrite /N1 upd_ne; [| csne]. reflexivity.
+      - rewrite /N8 upd_ne; [| reg_neq]. rewrite /N7 upd_ne; [| reg_neq].
+        rewrite /N6 upd_ne; [| reg_neq]. rewrite /N5 upd_ne; [| reg_neq].
+        rewrite /N4 upd_ne; [| reg_neq]. rewrite /N3 upd_ne; [| reg_neq].
+        rewrite /N2 upd_ne; [| reg_neq]. rewrite /N1 upd_ne; [| reg_neq]. reflexivity. }
+    { exact Hpinr. }
+    rewrite /vdrw_body.
+    iSplitR.
+    { iPureIntro. apply (vdrwd_cm_ins np cm V Hcm eq_refl).
+      exact (vdrwd_slot_link kq b h wr sector (vdrwd_sldata wr bs_buf bs_disk) Hh8). }
+    iFrame "Hpub Hlb Hrd Hdfl Hstg Hclaim Huidx Hfb Hring Havh".
+    (* THE ROW: the claim's two driver cells and the pin's kept halves, seated
+       in the payload at the old count (in flight: [b->disk = 1]) *)
+    rewrite (big_sepM_insert _ cm np V (vdrwd_cm_fresh np cm Hcm)).
+    iFrame "Hrows". rewrite /claim_cells /V. cbn [dc_buf dc_slot dc_pin].
+    rewrite (vdrwd_slot_head kq b h wr sector (vdrwd_sldata wr bs_buf bs_disk) Hh8).
+    iFrame "Hib Hhc". iLeft. iExact "Hbd".
+  Qed.
+
+End VdrwdP4.
+
+(* ===================================================================== *)
+(* §7  The P3 -> P4 glue and the P4/P5 SEAM live in ProofVirtioDiskRwDSeam. *)
+(*                                                                       *)
+(* [P3.vdrw_p3_exit] lives inside ProofVirtioDiskRwC's functor, so the    *)
+(* glue re-opens the functor over the same four callee module types.      *)
+(* Everything P4 needs arrives through that seam: the lock resource with   *)
+(* the claim map, the chain, and the three INACTIVE receipts.             *)
+(* ===================================================================== *)

@@ -1,0 +1,388 @@
+(* FsDurBytes.v -- THE THEORY OF [LogDefs.fs_dbytes].
+
+   Design of record: claude-notes/design/fs-state.md sections 1 and 4; this
+   is durable-disk 2c-img, leaf 1.
+
+   [LogDefs.fs_dbytes] flattens a BLOCK view [D : gmap Z (list (bv 8))] into
+   the BYTE map a durable instance's authority is held at: block [b]'s [i]th
+   byte lives at [b * BSIZE + i].  What a durable instance needs is to look
+   INSIDE it: that the byte elements at [fs_dbytes D] ARE the file system's
+   per-block ownership, one [FsStateDefs.blk_owned] per entry of [D].  That
+   is [fs_dbytes_blocks] below, stated Gamma-generically.
+
+   THE ONE PREMISE IS A LENGTH BOUND, and it is what makes the flattening
+   injective: two blocks' byte ranges are disjoint exactly because a block
+   contributes at most [BSIZE] bytes starting at a multiple of [BSIZE]
+   ([dbytes_seq_disj]).  Without it [fs_dbytes] is still defined -- the fold
+   just overwrites -- and says nothing, so no lemma below holds unguarded.
+   [map_fold]'s own insert equation ([map_fold_insert_L]) needs the same
+   fact, since its commutation premise is [map_union_comm]'s.
+
+   THERE IS NO [Gamma_D] RECORD ANY MORE (durable-disk lane CE, S2's arity
+   sweep).  The pre-snapshot design instantiated [FsStateDefs]' view record
+   at a fixed-layer byte-map gname and a two-gname bundle; the snapshot
+   ruling made the durable half of [FsCrash.P_fs] a function of the
+   committed map over its OWN existential names, and nothing read the
+   instance.  What is left is the Gamma-GENERIC flattening theory, section 2.
+
+   SECTION 3 IS THE DURABLE INSTANCE ITSELF, and it is not that record
+   returning: [snap_gamma] is a function of ONE epoch's three existential
+   gnames, which is exactly what the snapshot ruling left.  It lives here,
+   at the bottom of the durable stack, because BOTH files above instantiate
+   the flattening over it and NEITHER needs the other -- [FsDurXfer]
+   allocates a fresh family, [FsDurRead] reads an existing one, and the
+   three lines of the record were the whole of the edge between them.
+
+   THIS IS ALSO THE ONLY PLACE THE RECORD CAN SIT WITHOUT TWO [ghost_map]
+   CLASS PATHS IN SCOPE AT ONCE.  The logged instance's bridge
+   ([FsBytesGamma.fs_gamma_L]) is stated over [fsLogG]'s byte map; put
+   [diskImgG] beside it and [ghost_map_auth_frac (fs_bytes γfs) 1 Lb] resolves
+   through the wrong class and no agreement law applies (the trap
+   [FsDurSnap.fs_bytes_auth]'s section was written to dodge, durable-disk
+   lane H).  Section 2 carries no [ghost_map] class at all, so section 3
+   brings the first and only one. *)
+
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import dfrac.
+From iris.base_logic.lib Require Import iprop ghost_map.
+Require Import BioDefs.        (* [BSIZE] -- the flattening's stride       *)
+Require Import LogDefs.        (* [fs_dbytes] -- the byte flattening       *)
+Require Import DiskImg.        (* [diskImgG] -- section 3's byte class.
+                                  IMPORTED, not merely required: a capacity
+                                  class named through a transitive Require
+                                  is inert (durable-notes.md).  It is already
+                                  in this file's cone via [RiscvPtsto], so
+                                  the Require costs no build edge *)
+(* LAST, so its [byte_range]/[blk_owned] win over the block layer's twins
+   wherever a consumer imports both (durable-notes.md, AND WHERE THAT
+   IMPORT COLLIDES PUT IT EARLY). *)
+Require Export FsStateDefs.
+
+(* the proofmode import re-opens [nat_scope] on top of the scope stack *)
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(*  1.  THE PURE THEORY OF [fs_dbytes]                                    *)
+(* ===================================================================== *)
+
+(* the flattening's stride, as a [Z] literal.  Every arithmetic side
+   condition below is discharged at [1024]; [BSIZE] is a [nat] and
+   [Z.of_nat BSIZE] is opaque to [lia]. *)
+Lemma dbytes_stride : Z.of_nat BSIZE = 1024.
+Proof. reflexivity. Qed.
+
+(* THE GUARD.  Every block of [D] contributes at most a block's worth of
+   bytes -- which is what makes distinct blocks' contributions disjoint. *)
+Definition dbytes_ok (D : gmap Z (list (bv 8))) : Prop :=
+  forall (b : Z) (bs : list (bv 8)), D !! b = Some bs -> (length bs <= BSIZE)%nat.
+
+Lemma dbytes_ok_full (D : gmap Z (list (bv 8))) :
+  (forall b bs, D !! b = Some bs -> length bs = BSIZE) -> dbytes_ok D.
+Proof. intros H b bs Hb. rewrite (H b bs Hb). reflexivity. Qed.
+
+(* the [D !! b = None] premise is REAL, not slack: without it the insert
+   SHADOWS whatever [D] holds at [b], and that entry is unconstrained. *)
+Lemma dbytes_ok_insert (D : gmap Z (list (bv 8))) (b : Z) (bs : list (bv 8)) :
+  D !! b = None -> dbytes_ok (<[b := bs]> D) -> dbytes_ok D.
+Proof.
+  intros Hb Hok c cs Hc.
+  destruct (decide (c = b)) as [-> | Hne].
+  - rewrite Hb in Hc. discriminate.
+  - apply (Hok c cs). rewrite lookup_insert_ne; [exact Hc |].
+    intros ->. exact (Hne eq_refl).
+Qed.
+
+Lemma dbytes_ok_head (D : gmap Z (list (bv 8))) (b : Z) (bs : list (bv 8)) :
+  dbytes_ok (<[b := bs]> D) -> (length bs <= BSIZE)%nat.
+Proof. intros Hok. apply (Hok b bs). apply lookup_insert_eq. Qed.
+
+(* TWO BLOCKS' BYTE RANGES ARE DISJOINT.  The whole content of the length
+   premise: a block starts at a multiple of the stride and is no longer
+   than it, so the ranges of [b1] and [b2 <> b1] cannot meet. *)
+Lemma dbytes_seq_disj (b1 b2 : Z) (bs1 bs2 : list (bv 8)) :
+  b1 <> b2 -> (length bs1 <= BSIZE)%nat -> (length bs2 <= BSIZE)%nat ->
+  (map_seqZ (b1 * Z.of_nat BSIZE) bs1 : gmap Z (bv 8))
+    ##ₘ (map_seqZ (b2 * Z.of_nat BSIZE) bs2 : gmap Z (bv 8)).
+Proof.
+  intros Hne H1 H2.
+  assert (Hl1 : Z.of_nat (length bs1) <= 1024).
+  { rewrite -dbytes_stride. apply Nat2Z.inj_le. exact H1. }
+  assert (Hl2 : Z.of_nat (length bs2) <= 1024).
+  { rewrite -dbytes_stride. apply Nat2Z.inj_le. exact H2. }
+  apply map_seqZ_disjoint. rewrite dbytes_stride. lia.
+Qed.
+
+Lemma fs_dbytes_empty : fs_dbytes ∅ = ∅.
+Proof. reflexivity. Qed.
+
+(* THE INSERT EQUATION.  [map_fold_insert_L]'s commutation premise is
+   restricted to the keys of the map, which is exactly where the length
+   guard lives -- so [map_union_comm] discharges it. *)
+Lemma fs_dbytes_insert (D : gmap Z (list (bv 8))) (b : Z) (bs : list (bv 8)) :
+  dbytes_ok (<[b := bs]> D) -> D !! b = None ->
+  fs_dbytes (<[b := bs]> D)
+  = (map_seqZ (b * Z.of_nat BSIZE) bs : gmap Z (bv 8)) ∪ fs_dbytes D.
+Proof.
+  intros Hok Hb.
+  assert (Hcomm :
+    forall (j1 j2 : Z) (z1 z2 : list (bv 8)) (y : gmap Z (bv 8)),
+      j1 <> j2 ->
+      <[b := bs]> D !! j1 = Some z1 -> <[b := bs]> D !! j2 = Some z2 ->
+      (map_seqZ (j1 * Z.of_nat BSIZE) z1 : gmap Z (bv 8))
+        ∪ ((map_seqZ (j2 * Z.of_nat BSIZE) z2 : gmap Z (bv 8)) ∪ y)
+      = (map_seqZ (j2 * Z.of_nat BSIZE) z2 : gmap Z (bv 8))
+        ∪ ((map_seqZ (j1 * Z.of_nat BSIZE) z1 : gmap Z (bv 8)) ∪ y)).
+  { intros j1 j2 z1 z2 y Hne Hj1 Hj2.
+    rewrite !assoc_L. f_equal. apply map_union_comm.
+    apply dbytes_seq_disj;
+      [exact Hne | exact (Hok j1 z1 Hj1) | exact (Hok j2 z2 Hj2)]. }
+  exact (map_fold_insert_L _ ∅ b bs D Hcomm Hb).
+Qed.
+
+(* ...and the disjointness the insert equation's two summands enjoy *)
+Lemma fs_dbytes_disj_seq (D : gmap Z (list (bv 8))) (b : Z) (bs : list (bv 8)) :
+  dbytes_ok D -> (length bs <= BSIZE)%nat -> D !! b = None ->
+  (map_seqZ (b * Z.of_nat BSIZE) bs : gmap Z (bv 8)) ##ₘ fs_dbytes D.
+Proof.
+  revert b bs.
+  induction D as [| b0 bs0 D Hb0 IH] using map_ind; intros b bs Hok Hlen Hb.
+  - rewrite fs_dbytes_empty. apply map_disjoint_empty_r.
+  - apply lookup_insert_None in Hb as [HbD Hne].
+    assert (HokD : dbytes_ok D) by exact (dbytes_ok_insert D b0 bs0 Hb0 Hok).
+    rewrite (fs_dbytes_insert D b0 bs0 Hok Hb0).
+    apply map_disjoint_union_r. split.
+    + apply dbytes_seq_disj;
+        [ intros ->; exact (Hne eq_refl)
+        | exact Hlen
+        | exact (dbytes_ok_head D b0 bs0 Hok) ].
+    + exact (IH b bs HokD Hlen HbD).
+Qed.
+
+(* THE LOOKUP LAW, both ways: a byte of the flattening is a byte of exactly
+   one block of [D], at its own offset. *)
+Lemma fs_dbytes_lookup_Some (D : gmap Z (list (bv 8))) (a : Z) (v : bv 8) :
+  dbytes_ok D ->
+  fs_dbytes D !! a = Some v
+  <-> exists (b : Z) (bs : list (bv 8)) (k : nat),
+        D !! b = Some bs /\ bs !! k = Some v
+        /\ a = b * Z.of_nat BSIZE + Z.of_nat k.
+Proof.
+  revert a v.
+  induction D as [| b0 bs0 D Hb0 IH] using map_ind; intros a v Hok.
+  - rewrite fs_dbytes_empty lookup_empty. split; [discriminate |].
+    intros (b & bs & k & Hb & _ & _). rewrite lookup_empty in Hb. discriminate.
+  - assert (HokD : dbytes_ok D) by exact (dbytes_ok_insert D b0 bs0 Hb0 Hok).
+    assert (Hlen0 : (length bs0 <= BSIZE)%nat)
+      by exact (dbytes_ok_head D b0 bs0 Hok).
+    rewrite (fs_dbytes_insert D b0 bs0 Hok Hb0).
+    rewrite (lookup_union_Some _ _ _ _
+               (fs_dbytes_disj_seq D b0 bs0 HokD Hlen0 Hb0)).
+    rewrite lookup_map_seqZ_Some.
+    split.
+    + intros [[Hge Hk] | Hin].
+      * exists b0, bs0, (Z.to_nat (a - b0 * Z.of_nat BSIZE)).
+        split; [apply lookup_insert_eq |].
+        split; [exact Hk |].
+        rewrite Z2Nat.id; lia.
+      * apply (proj1 (IH a v HokD)) in Hin as (b & bs & k & Hb & Hk & ->).
+        exists b, bs, k. split; [| split; [exact Hk | reflexivity]].
+        rewrite lookup_insert_ne; [exact Hb |].
+        intros ->. rewrite Hb0 in Hb. discriminate.
+    + intros (b & bs & k & Hb & Hk & ->).
+      apply lookup_insert_Some in Hb as [[Heq Hbs] | [Hne Hb]].
+      * left. rewrite -Heq Hbs. split; [lia |].
+        assert (Hz : b0 * Z.of_nat BSIZE + Z.of_nat k - b0 * Z.of_nat BSIZE
+                     = Z.of_nat k) by lia.
+        rewrite Hz Nat2Z.id. exact Hk.
+      * right. apply (proj2 (IH _ v HokD)). by exists b, bs, k.
+Qed.
+
+Lemma fs_dbytes_lookup (D : gmap Z (list (bv 8))) (b : Z) (bs : list (bv 8))
+    (k : nat) (v : bv 8) :
+  dbytes_ok D -> D !! b = Some bs -> bs !! k = Some v ->
+  fs_dbytes D !! (b * Z.of_nat BSIZE + Z.of_nat k) = Some v.
+Proof.
+  intros Hok Hb Hk. apply (proj2 (fs_dbytes_lookup_Some D _ v Hok)).
+  by exists b, bs, k.
+Qed.
+
+(* ===================================================================== *)
+(*  1b. THE FLATTENING AS A BIG-OP, Gamma-GENERICALLY                     *)
+(*                                                                        *)
+(*  The relation “the byte elements of [fs_dbytes D] ARE one [blk_owned]   *)
+(*  per block of [D]” is about [map_seqZ] and the stride, and about        *)
+(*  nothing else -- in particular it is not about WHICH points-to [fsΦ]    *)
+(*  is.  So it is stated over an arbitrary view record, and section 2's    *)
+(*  landed durable readings are its instances (by [reflexivity] on the     *)
+(*  [fsΦ] field).  This is what lets durable-disk 4's SNAPSHOT allocator   *)
+(*  build [FsState.fs_state] over a PERSISTENT byte points-to             *)
+(*  ([a -> v at dq = DfracDiscarded]) from the very same theorem the       *)
+(*  exclusive durable instance uses.                                       *)
+(* ===================================================================== *)
+
+(* ===================================================================== *)
+(*  2.  THE FLATTENING, Gamma-GENERICALLY                                 *)
+(* ===================================================================== *)
+
+Section DbytesGen.
+  Context {Σ : gFunctors}.
+  Implicit Types Γ : fs_view_names Σ.
+
+  (* ONE BLOCK'S ELEMENTS ARE ITS [blk_owned], at any view *)
+  Lemma blk_owned_seqZ Γ (b : Z) (bs : list (bv 8)) :
+    length bs = BSIZE ->
+    blk_owned Γ b bs
+    ⊣⊢ ([∗ map] a ↦ v ∈ (map_seqZ (b * Z.of_nat BSIZE) bs : gmap Z (bv 8)),
+          fsΦ Γ (DfracOwn 1) a v).
+  Proof using .
+    intros Hlen.
+    rewrite big_sepM_map_seqZ_gen.
+    rewrite /blk_owned /byte_range /byte_range_q.
+    rewrite (big_sepL_proper
+               (fun (k : nat) (v : bv 8) =>
+                  (fsΦ Γ (DfracOwn 1) (b * BSIZE_z + 0 + Z.of_nat k) v)%I)
+               (fun (k : nat) (v : bv 8) =>
+                  (fsΦ Γ (DfracOwn 1) (b * Z.of_nat BSIZE + Z.of_nat k) v)%I)
+               bs);
+      last first.
+    { intros k v _.
+      assert (Hz : b * BSIZE_z + 0 + Z.of_nat k
+                   = b * Z.of_nat BSIZE + Z.of_nat k).
+      { rewrite dbytes_stride. change BSIZE_z with 1024. lia. }
+      rewrite Hz //. }
+    iSplit.
+    - iIntros "[_ H]". iExact "H".
+    - iIntros "H". iSplitR; [iPureIntro; exact Hlen | iExact "H"].
+  Qed.
+
+  (* THE TIE, Gamma-generically: the view's byte points-to at [fs_dbytes D]
+     ARE one [blk_owned] per block of [D].  It is the only thing in the tree
+     that ever looks inside [fs_dbytes]. *)
+  Theorem fs_dbytes_blocks Γ (D : gmap Z (list (bv 8))) :
+    (forall b bs, D !! b = Some bs -> length bs = BSIZE) ->
+    ([∗ map] a ↦ v ∈ fs_dbytes D, fsΦ Γ (DfracOwn 1) a v)
+    ⊣⊢ ([∗ map] b ↦ bs ∈ D, blk_owned Γ b bs).
+  Proof using .
+    induction D as [| b bs D Hb IH] using map_ind; intros Hlen.
+    - rewrite fs_dbytes_empty big_sepM_empty big_sepM_empty //.
+    - assert (Hok : dbytes_ok (<[b := bs]> D))
+        by exact (dbytes_ok_full _ Hlen).
+      assert (HokD : dbytes_ok D) by exact (dbytes_ok_insert D b bs Hb Hok).
+      assert (Hlb : length bs = BSIZE)
+        by exact (Hlen b bs (lookup_insert_eq _ _ _)).
+      assert (HlenD : forall c cs, D !! c = Some cs -> length cs = BSIZE).
+      { intros c cs Hc. apply (Hlen c cs).
+        rewrite lookup_insert_ne; [exact Hc |].
+        intros ->. rewrite Hb in Hc. discriminate. }
+      rewrite (fs_dbytes_insert D b bs Hok Hb).
+      rewrite big_sepM_union;
+        [| exact (fs_dbytes_disj_seq D b bs HokD
+                    ltac:(rewrite Hlb; reflexivity) Hb)].
+      rewrite -(blk_owned_seqZ Γ b bs Hlb).
+      rewrite (IH HlenD).
+      rewrite big_sepM_insert; [reflexivity | exact Hb].
+  Qed.
+
+  (* ------------------------------------------------------------------ *)
+  (*  THE SAME OVER A HOME SET (durable-disk BT-0, the boot-side           *)
+  (*  transport's one new bridge).                                        *)
+  (*                                                                      *)
+  (*  THE ERA'S BYTE HALF IS NOT A BLOCK MAP.  [FsBoot.fs_boot_ghosts]     *)
+  (*  hands the era [[∗ set] b ∈ home, fsblock (fs_bytes γfs) b (Dv b)] -- *)
+  (*  a big-op over a SET at a TOTAL block view -- while everything on the *)
+  (*  durable side is indexed by the [gmap] [LogDefs.fs_restrict Pb home]. *)
+  (*  The two are THE SAME RESOURCE and the proof says why in one line:    *)
+  (*  the restriction's domain IS [home] ([fs_restrict_dom]) and its value *)
+  (*  at [b] IS [Pb b] ([fs_restrict_lookup_Some]), so once the body no    *)
+  (*  longer reads the map's value the block-map big-op collapses onto the *)
+  (*  set's by [big_sepM_dom].  Nothing is carved and no disjointness is   *)
+  (*  stated: the flattening's injectivity is already [fs_dbytes_blocks]'. *)
+  (*                                                                      *)
+  (*  THE LENGTH PREMISE IS VERBATIM [fs_boot_ghosts]' THIRD HYPOTHESIS,   *)
+  (*  which is where the non-vacuity comes from -- the era cannot be       *)
+  (*  allocated without it. *)
+  Theorem fs_dbytes_set_blocks Γ (Pb : Z -> list (bv 8)) (home : gset Z) :
+    (forall b, b ∈ home -> length (Pb b) = BSIZE) ->
+    ([∗ map] a ↦ v ∈ fs_dbytes (fs_restrict Pb home), fsΦ Γ (DfracOwn 1) a v)
+    ⊣⊢ ([∗ set] b ∈ home, blk_owned Γ b (Pb b)).
+  Proof using .
+    intros Hlen.
+    assert (Hml : forall b bs,
+               fs_restrict Pb home !! b = Some bs -> length bs = BSIZE).
+    { intros b bs Hb.
+      apply fs_restrict_lookup_Some in Hb as [Hin ->]. exact (Hlen b Hin). }
+    rewrite (fs_dbytes_blocks Γ (fs_restrict Pb home) Hml).
+    rewrite (big_sepM_proper
+               (fun (b : Z) (bs : list (bv 8)) => blk_owned Γ b bs)%I
+               (fun (b : Z) (_ : list (bv 8)) => blk_owned Γ b (Pb b))%I);
+      last first.
+    { intros b bs Hb.
+      apply fs_restrict_lookup_Some in Hb as [_ ->]. reflexivity. }
+    rewrite (big_sepM_dom (fun b : Z => blk_owned Γ b (Pb b))).
+    rewrite fs_restrict_dom //.
+  Qed.
+
+  (* NON-VACUITY: the flattening actually COVERS every home block, so a
+     non-empty [home] gives a non-empty byte map on the left and the
+     equation above is not two [emp]s.  (One byte of one block suffices;
+     [BSIZE] is [1024], so block [b]'s first byte is at [b * 1024].) *)
+  Lemma fs_dbytes_set_blocks_cover (Pb : Z -> list (bv 8)) (home : gset Z)
+      (b : Z) (k : nat) (v : bv 8) :
+    (forall c, c ∈ home -> length (Pb c) = BSIZE) ->
+    b ∈ home -> Pb b !! k = Some v ->
+    fs_dbytes (fs_restrict Pb home) !! (b * Z.of_nat BSIZE + Z.of_nat k)
+    = Some v.
+  Proof using .
+    intros Hlen Hb Hk.
+    apply (fs_dbytes_lookup _ b (Pb b) k v).
+    - apply dbytes_ok_full. intros c cs Hc.
+      apply fs_restrict_lookup_Some in Hc as [Hin ->]. exact (Hlen c Hin).
+    - by apply fs_restrict_lookup_Some.
+    - exact Hk.
+  Qed.
+
+End DbytesGen.
+
+(* ===================================================================== *)
+(*  3.  THE DURABLE INSTANCE'S VIEW RECORD                                *)
+(*                                                                       *)
+(*  [FsStateDefs.fs_view_names]' [fsΦ] is an abstract byte-address-keyed  *)
+(*  points-to, and the file system is instantiated twice over it.  This   *)
+(*  is the DURABLE instance: the full element of one epoch's own byte     *)
+(*  map, together with the two properties of it a consumer cannot prove   *)
+(*  of an abstract predicate ([GTimeless], [phi_excl]).                   *)
+(*                                                                       *)
+(*  There is no [phi_frac] witness and none is wanted: the durable        *)
+(*  instances stay at [DfracOwn 1] and never split.  That is the whole    *)
+(*  difference from the logged instance's bridge, [FsBytesGamma], where   *)
+(*  the read-locker's quarter comes from.                                 *)
+(* ===================================================================== *)
+
+Section SnapGamma.
+  (* [diskImgG] is the tree's UNIQUE [ghost_mapG Σ Z (bv 8)]; a durable
+     family's byte map is a gname at that same class. *)
+  Context `{!diskImgG Σ}.
+
+  (* the FULL element, exactly as the era's [FsBytesGamma.fs_gamma_L] is *)
+  Definition snap_gamma (g gl gt : gname) : fs_view_names Σ :=
+    MkFsView (fun (dq : dfrac) (a : Z) (v : bv 8) => (a ↪[g]{dq} v)%I) gl gt.
+
+  Global Instance snap_gamma_gtimeless g gl gt :
+    GTimeless (snap_gamma g gl gt).
+  Proof using . intros dq a v. rewrite /snap_gamma /=. apply _. Qed.
+
+  (* two owners of one byte is [False].  [FsStateDefs.phi_excl]'s consumers
+     -- [FsStateBitmap.free_pool_used], hence xv6's "freeing free block"
+     panic arm, and [FsStateDefs.blk_owned_ne] -- therefore read on the
+     durable side exactly as they do at the era's view. *)
+  Lemma snap_gamma_excl g gl gt : phi_excl (snap_gamma g gl gt).
+  Proof using .
+    intros a v w dq1 dq2. rewrite /snap_gamma /=.
+    iIntros "[H1 H2]".
+    iDestruct (ghost_map_elem_valid_2 with "H1 H2") as %[Hv _].
+    done.
+  Qed.
+
+End SnapGamma.

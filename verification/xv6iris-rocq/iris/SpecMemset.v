@@ -1,0 +1,114 @@
+(* SpecMemset.v -- the general whole-function spec of the kernel's
+   [memset]: fill an ARBITRARY array of [len] bytes at base [p] with the low
+   byte of [cval].  This is memset's actual contract; the page-level spec
+   (SpecMemsetPage) and walk's page-zeroing step are both instances at
+   len = 4096.  Stated over the per-byte buffer (not [page_own]), so it is
+   independent of the kalloc page abstraction.
+
+   Requires only the definitional layer -- never a whole-function proof file --
+   so every function proof can be checked in parallel. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes RiscvLang RiscvPtsto.
+Require Import RegFile WpNext.
+Require Import InstrBytes.
+Require Import RiscvExtras.
+Require Import KernelText.
+Require Import CalleeSaved.
+Require Import IntrDefs.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.   (* CurCtx / own_context / ctx_pointsto *)
+Import Defs.
+
+
+(* memset(p, cval, len): fills [len] bytes at base [p] with [cval]'s low byte.
+   [len] need only fit in 32 bits (the C source truncates the count to
+   [unsigned int] via a slli/srli round-trip); len = 0 is allowed (the source's
+   [n == 0] test skips the loop) and so is an array that wraps the 64-bit
+   address space -- the caller's buffer is indexed by [pa_add], which wraps
+   exactly as the hardware's pointer increment does.  memset saves ra/s0 in a
+   2-slot frame, so it needs 2 of the [n] available stack slots and returns
+   them (avail [n] preserved). *)
+(* CONVERTED TO THE CONTEXT STYLE (tso-port leg M; the tree's first).
+   Three deltas from the pre-conversion statement, nothing else:
+   the ambient [`{XI : CurCtx}] binder (the thread token itself rides
+   INSIDE [sie_cap_gpr] since the M2 fold -- nothing extra in spec text);
+   the byte window at [↦c[ktb]] -- the context-indexed points-to
+   at the ambient [cur_ctx] (TsoCtx.v's notation).  At the
+   [wp_next], [CID] rebinds -- memset can be preempted and resume on any
+   hart -- and [cur_ctx] does NOT: the window in the continuation names
+   the same ξ.  At SC that is cosmetic; at cutover it is the theorem. *)
+(* §0.26′ / A6.85: THE PRIMITIVE FORM -- the buffer goes in VISIBILITY-FREE
+   (fraction + timestamp element, no claim about its contents) and comes
+   back REGISTERED at the ambient context, filled.  memset never reads
+   what it overwrites, so this is the contract the code actually has; the
+   [↦c]-in form below is its corollary, and no existing client moves.
+   THE CONSUMER IS kfree: a page whose lock another CPU just released has
+   no value well-known to the freer (tso-port.md §0.26′). *)
+Definition wp_memset_free_sconf_body `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (kt ktb : ktier) `{!KtierLe ktb kt} (m0 : regfile) (n : nat) (len : nat) (cval : mword 64) (b : bool) (pcur : mword 64) :=
+  let a0_idx : mword 5 := mword_of_int 10 in
+  let a1_idx : mword 5 := mword_of_int 11 in
+  let a2_idx : mword 5 := mword_of_int 12 in
+  let pcE := mword_of_int KernelSyms.memset in
+  let ra0 := m0 !!! Regidx (mword_of_int 1 : mword 5) in
+  let p := m0 !!! Regidx a0_idx in
+  let ret_tgt := ret_pc ra0 in
+  let cbyte := nth_byte (autocast (T := mword) (subrange_vec_dec cval (Z.sub (Z.mul 1 8) 1) 0) : mword 8) 0 in
+  (2 <= n)%nat ->
+  (Z.of_nat len < 2 ^ 32)%Z ->
+  m0 !!! Regidx a1_idx = cval ->
+  m0 !!! Regidx a2_idx = (mword_of_int (Z.of_nat len) : mword 64) ->
+  sie_cap_gpr kt m0 n b pcur -∗
+  kernel_text -∗ pc_is pcE -∗
+  ([∗ list] j ∈ seq 0 len,
+     TsoCtx.mem_free (KTR := ktb) (pa_add p j) (DfracOwn 1)) -∗
+  wp_next b pcur (fun (CID : CpuId) =>
+    ∀ mfin,
+    sie_cap_gpr kt mfin n b pcur -∗
+    pc_is ret_tgt -∗
+    ([∗ list] j ∈ seq 0 len, (pa_add p j) ↦c[ktb] cbyte) -∗
+    ⌜ callee_saved m0 mfin ⌝ -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Definition wp_memset_sconf_body `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (kt ktb : ktier) `{!KtierLe ktb kt} (m0 : regfile) (n : nat) (len : nat) (cval : mword 64) (olds : nat -> bv 8) (b : bool) (pcur : mword 64) :=
+  let a0_idx : mword 5 := mword_of_int 10 in
+  let a1_idx : mword 5 := mword_of_int 11 in
+  let a2_idx : mword 5 := mword_of_int 12 in
+  let pcE := mword_of_int KernelSyms.memset in
+  let ra0 := m0 !!! Regidx (mword_of_int 1 : mword 5) in
+  let p := m0 !!! Regidx a0_idx in
+  let ret_tgt := ret_pc ra0 in
+  let cbyte := nth_byte (autocast (T := mword) (subrange_vec_dec cval (Z.sub (Z.mul 1 8) 1) 0) : mword 8) 0 in
+  (2 <= n)%nat ->
+  (Z.of_nat len < 2 ^ 32)%Z ->
+  m0 !!! Regidx a1_idx = cval ->
+  m0 !!! Regidx a2_idx = (mword_of_int (Z.of_nat len) : mword 64) ->
+  sie_cap_gpr kt m0 n b pcur -∗
+  kernel_text -∗ pc_is pcE -∗
+  ([∗ list] j ∈ seq 0 len, (pa_add p j) ↦c[ktb] olds j) -∗
+  wp_next b pcur (fun (CID : CpuId) =>
+    ∀ mfin,
+    sie_cap_gpr kt mfin n b pcur -∗
+    pc_is ret_tgt -∗
+    ([∗ list] j ∈ seq 0 len, (pa_add p j) ↦c[ktb] cbyte) -∗
+    ⌜ callee_saved m0 mfin ⌝ -∗
+    mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type MEMSET.
+  Parameter wp_memset_free_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt ktb : ktier) `{!KtierLe ktb kt} (m0 : regfile) (n : nat) (len : nat) (cval : mword 64) (b : bool) (pcur : mword 64),
+      wp_memset_free_sconf_body kt ktb m0 n len cval b pcur.
+  Parameter wp_memset_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx} (kt ktb : ktier) `{!KtierLe ktb kt} (m0 : regfile) (n : nat) (len : nat) (cval : mword 64) (olds : nat -> bv 8) (b : bool) (pcur : mword 64),
+      wp_memset_sconf_body kt ktb m0 n len cval olds b pcur.
+End MEMSET.

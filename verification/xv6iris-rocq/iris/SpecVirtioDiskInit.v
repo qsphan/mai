@@ -1,0 +1,271 @@
+(* SpecVirtioDiskInit.v -- the public interface of VirtioDiskInit, stated
+   independently of its proof.  Requires only the definitional layer -- never a
+   whole-function proof file -- so every function proof can be checked in
+   parallel.
+
+   [virtio_disk_init] (kernel/virtio_disk.c) brings the virtio-mmio block
+   device up.
+
+   What it does, in order:
+     initlock(&disk.vdisk_lock, "virtio_disk")
+     read + check MAGIC / VERSION / DEVICE_ID / VENDOR_ID
+     STATUS <- 0                        (reset)
+     STATUS <- ACKNOWLEDGE, then | DRIVER
+     read DEVICE_FEATURES, mask, write DRIVER_FEATURES
+     STATUS <- | FEATURES_OK, re-read STATUS and check the bit stuck
+     QUEUE_SEL <- 0; check QUEUE_READY is clear; check QUEUE_NUM_MAX >= NUM
+     kalloc() x3 for the descriptor table, available ring and used ring,
+       memset each to zero
+     QUEUE_NUM <- 8; the three ring addresses as low/high halves
+     QUEUE_READY <- 1; disk.free[0..7] <- 1; STATUS <- | DRIVER_OK
+
+   EVERY panic path is refuted rather than assumed, so this spec needs no
+   panic credential at all (all six are refuted):
+     - the four identification reads are constants of the model
+       ([virtio_ident_reads], [virtio_queue_num_max_read]);
+     - FEATURES_OK sticks because the write took ([virtio_status_readback]);
+     - QUEUE_READY reads clear because the reset cleared it
+       ([virtio_reset_not_ready]);
+     - QUEUE_NUM_MAX = 1024, so neither the "no queue 0" nor the "max queue too
+       short" test fires;
+     - kalloc cannot return null, because the caller supplies three pages.
+
+   STATED OVER THE TIME-0 DEVICE INVARIANT.  Device init does NOT run before the
+   device invariant exists: the disk thread must REFUTE [DevStepDiskWild] at
+   every step, and only [virtio_proto] can do that, so [virtio_frag] can never
+   sit raw in a CPU's precondition while the system runs.  The contract
+   therefore takes [WpUart.disk_inv] and borrows the fragment around each MMIO
+   access.  Two things make that work:
+
+     - THE CONFIG TRACKER.  [virtio_proto]'s not-live arm holds HALF of the
+       config cell at [v_cfg v] (VirtioProto.v); the caller holds the other
+       half, [disk_cfg_is γv (DfracOwn (1/2)) c0], and hence knows
+       deterministically which configuration the function has programmed so far
+       even though the state itself lives under an invariant.  The device never
+       writes [v_cfg] ([virtio_complete_cfg]), so the pair is stable across
+       device steps.  [⌜virtio_live c0 = false⌝] is what says the invariant is
+       in its not-live arm at entry -- which the reset (STATUS <- 0) would
+       re-establish anyway, but which the FIRST reads need before the reset.
+
+     - THE LIVE FLIP.  [virtio_live] needs QUEUE_READY and DRIVER_OK, so the
+       arm flips at the LAST MMIO write of the function (STATUS |= DRIVER_OK).
+       That write is therefore where the DMA lease is paid in -- inside this
+       function rather than at the caller ([VirtioProto.virtio_proto_intro] is
+       the transition) -- and the retired config halves are consumed by the
+       freeze that mints the persistent [disk_cfg].
+
+   THE POSTCONDITION consequently hands back no device fragment at all.  What
+   it hands back instead is what a driver needs and can only get here: the
+   publisher token [disk_pub γv 0] -- which is ALSO the witness that the queue
+   is live, since [virtio_proto]'s not-live arm holds the [dn_np] ghost_var_frac at
+   the FULL fraction and every [virtio_proto_*_acc] refutes that arm from the
+   caller's half -- and the frozen [disk_cfg γv (virtio_init_cfg pd pav pu)]
+   that [DiskInv.disk_geom] is built from.
+
+   Two page conjuncts shrank, because the lease is paid from them: the used
+   page goes to the device whole, and so do the two bytes of the available
+   ring's index field, AND its eight ring cells (finding 5 -- the device
+   invariant owns them now).  What comes back of the available page is
+   [seq 20 4076],
+   i.e. from the ring entries on -- the two flags bytes below the index are
+   forfeited too rather than handed back in two pieces, since no consumer has
+   ever wanted them.  The descriptor page comes back whole (it is driver-owned
+   throughout: it becomes [DiskInv.free_slot_res]).
+   See claude-notes/projects/virtio-disk.md.
+
+   PROVEN against this statement in ProofVirtioDiskInit.v /
+   LinkVirtioDiskInit.v (a functor over [INITLOCK], [KALLOC] and [MEMSET]),
+   over the invariant-opening ACCESSOR-form virtio MMIO leaves of
+   WpVirtioDev.v. *)
+From Stdlib Require Import Eqdep_dec ZArith Lia List.
+From stdpp Require Import gmap list list_monad bitvector.definitions bitvector.tactics.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import excl.
+From iris.base_logic.lib Require Import ghost_var gen_heap invariants.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvModelBytes.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RiscvExtras.
+Require Import CalleeSaved.
+Require Import KernelText KernelDataInv.
+Require Import WpLock.
+Require Import KallocInv.
+Require Import CpuOwn.
+Require Import KvmSpec.
+Require Import VirtioModel.
+Require Import DiskPtsto.
+Require Import VirtioProto.
+Require Import DiskAvail.
+Require Import WpUart.
+Require Import IntrDefs.
+Require Import RegFile HartTp.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+
+
+(* the [struct disk] fields this function touches (kernel/virtio_disk.c):
+     +0x000 desc      the descriptor table page
+     +0x008 avail     the available ring page
+     +0x010 used      the used ring page
+     +0x018 free[8]   one byte per descriptor, all set to 1 here
+     +0x128 vdisk_lock *)
+Definition disk_base : mword 64 := mword_of_int KernelSyms.disk.
+Definition disk_desc : mword 64 := disk_base.
+Definition disk_avail : mword 64 :=
+  add_vec disk_base (sign_extend' 64 (mword_of_int 8 : mword 12)).
+Definition disk_used : mword 64 :=
+  add_vec disk_base (sign_extend' 64 (mword_of_int 16 : mword 12)).
+Definition disk_free : mword 64 :=
+  add_vec disk_base (sign_extend' 64 (mword_of_int 24 : mword 12)).
+Definition disk_lock : mword 64 :=
+  add_vec disk_base (sign_extend' 64 (mword_of_int 0x128 : mword 12)).
+
+(* [virtio_disk_init]'s own frame is 32 bytes (4 slots) and its deepest callee
+   is [kalloc], which needs 14 -- stated as a CONSTANT, per the spec-design
+   rule that a stack bound is never coupled to the arguments. *)
+Notation K_virtio_disk_init := (18%nat) (only parsing).
+(* THE POSTCONDITION, as one named predicate rather than a twenty-wand chain
+   spelled inline at the end of the body.  This is a performance-critical
+   abstraction, not tidiness: the whole-function proof carries the continuation
+   as a spatial hypothesis across all ~140 instruction steps, and every
+   proofmode operation that splits or frames the context re-traverses its type
+   -- which, written out, is twenty wands over three [seq 0 4096] big-ops.
+   Sealed here it is one constant application, and the proof unfolds it exactly
+   once, at the return.  Measured on the first thirty instructions: 24 s with
+   the chain inline against 11.5 s with the continuation out of the way.
+   [Typeclasses Opaque] (never [Opaque]) so instance search never walks in
+   while [rewrite /vdi_post] at the return still does. *)
+Definition vdi_post
+    `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γv : disk_names) (γa : gname) (γk : gname * gname)
+    (m : regfile) (K : nat)
+    (eb : bool) (pp : mword 64) (on : option nat)
+    (ret_tgt c_cpu : mword 64) (lks : gset string) : iProp Σ :=
+  ( ∀ (mr : regfile) (pd pav pu : mword 64),
+    sie_cap_gpr KT1 mr K false pp -∗
+    cpu_own 0%nat eb pp false lks -∗
+    pc_is ret_tgt -∗
+    ⌜ callee_saved m mr ⌝ -∗
+    ⌜ page_valid pd ⌝ -∗ ⌜ page_valid pav ⌝ -∗ ⌜ page_valid pu ⌝ -∗
+    kalloc_env_at γa γk (avail_sub on 3) -∗
+    (* The device is LIVE and its queue is the three pages just allocated: the
+       DMA lease has been paid into [disk_inv]'s [virtio_proto] at the final
+       STATUS write, and what comes out is the publisher token at 0 -- nothing
+       has been published, and holding it is ALSO the proof that the protocol
+       is in its live arm (the not-live arm owns the [dn_np] ghost_var_frac whole) --
+       together with the frozen configuration [DiskInv.disk_geom] is built on. *)
+    disk_pub γv 0%nat -∗
+    (* ...and the READ WATERMARK's other half, at 0: the handler presents it
+       to reclaim used records in order, which is what keeps the unread ones a
+       contiguous run (tools/vtest/README.md finding 5). *)
+    disk_read_at γv 0%nat -∗
+    (* ...and the STAGED HEAD at [None]: no publish is half-done (finding 5) *)
+    disk_stage γv None -∗
+    disk_cfg γv (virtio_init_cfg pd pav pu) -∗
+    (* the queue pages, zeroed, minus what went to the device: the used page
+       whole, and the available page's flags+index words and eight ring cells
+       (the lease pins the index at 0, which is what makes the published count
+       start at 0, and owns the cells outright).  What comes back of the
+       available page is what lies past the ring. *)
+    ([∗ list] j ∈ seq 0 4096, (pa_add pd j) ↦ₘ byte_zero) -∗
+    ([∗ list] j ∈ seq 20 4076, (pa_add pav j) ↦ₘ byte_zero) -∗
+    disk_desc ↦₈ pd -∗
+    disk_avail ↦₈ pav -∗
+    disk_used ↦₈ pu -∗
+    ([∗ list] j ∈ seq 0 8, (pa_add disk_free j) ↦ₘ (Z_to_bv 8 1)) -∗
+    disk_lock ↦₄ (mword_of_int 0 : mword 32) -∗
+    (* the name field is written once and then DISCARDED: what comes back is
+       the persistent [lock_name], ready to be sealed into [is_lock]. *)
+    lock_name disk_lock "virtio_disk"%string -∗
+    (* the cpu word at zero WITH its floor: what initlock hands back and
+       what [newlock_at] takes (A6.89) *)
+    WpLock.lk_cpu_ready disk_lock -∗
+    (* A6.124: the vdisk_lock payload's half of the avail-index word, with
+       its floors -- the boot creator's arm (DiskAvail.v) *)
+    avail_half pav 0%nat -∗
+    (* A6.126 §6: the reader's floors -- the two floor stamps of the used
+       index word with the init hart's floors at them (its own byte writes,
+       DiskAvail.used_split_init) and the reader floor at 0
+       (VirtioProto.virtio_proto_intro) -- what [DiskBoot.disk_res_boot]
+       seats in the vdisk_lock's payload.  The reclaimed count at 0 is
+       [disk_read_at γv 0] above. *)
+    (∃ t0 t1 : nat,
+       disk_fl γv t0 t1 ∗ disk_flr γv 0%nat ∗
+       lk_floor cur_ctx t0 ∗ lk_floor cur_ctx t1) -∗
+    (* A6.126 §6 on the pop model (decision 4): the holder's half ctx cells
+       of the eight ring cells; the lease holds the sealed halves *)
+    ring_hcells cur_ctx pav -∗
+    mWP (Loop : expr riscv_lang))%I.
+Global Typeclasses Opaque vdi_post.
+
+(* BOOT-ONLY: virtio_disk_init runs strictly before interrupts are ever
+   enabled (main()'s boot sequence, on hart 0, always before scheduler()'s
+   [intr_on()]) -- see claude-notes/projects/explicit-cpuid-porting-guide.md,
+   "A function that READS tp mid-body must be stated at b = false" for the
+   general shape this follows (worked example: SpecCpuid.v).  So the
+   contract is stated at the literal index [false] rather than a generic
+   [b], with no [wp_next] wrapper at all (it would collapse via
+   [wp_next_off] anyway, since the hart cannot move); [vdi_post] above drops
+   its own [b] parameter for the same reason. *)
+Definition wp_virtio_disk_init_sconf_body
+    `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γv : disk_names) (γa : gname) (γk : gname * gname)
+    (m : regfile) (K : nat)
+    (eb : bool) (pp : mword 64) (on : option nat)
+    (c0 : virtio_cfg) (vlock : bv 32) (vname vcpu : bv 64)
+    (pd0 pav0 pu0 : mword 64) (free0 : nat -> bv 8) (lks : gset string) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.virtio_disk_init in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5) : mword 64) in
+  let c_name := lock_name_field disk_lock in
+  let c_cpu := add_vec disk_lock (sign_extend' 64 (mword_of_int 0x10 : mword 12)) in
+  (K_virtio_disk_init <= K)%nat ->
+  (* three pages must be allocatable; this is the ONLY hypothesis any of the
+     six panic paths needs *)
+  (exists nb, on = Some nb /\ (3 <= nb)%nat) ->
+  (* the kvm/kalloc convention: tp holds this hart's id, so kalloc's
+     push_off/pop_off address this cpu's cells *)
+  m !!! Regidx (mword_of_int 4 : mword 5) = cid_word ->
+  (* the protocol is in its not-live arm at entry -- which is what the
+     caller's config half [c0] identifies with the invariant's *)
+  virtio_live c0 = false ->
+  (* virtio_disk_init's cone reaches kalloc (three page allocations) --
+     "kmem" (13) -- and initlock/memset, which need no premise; "kmem" is
+     the whole cone.  Mirrors SpecBfree.v's. *)
+  locks_below lks "kmem" ->
+  sie_cap_gpr KT1 m K false pp -∗
+  cpu_own 0%nat eb pp false lks -∗
+  (* [kernel_data] supplies the "virtio_disk" string literal the auipc/addi
+     pair points at -- the name handed to initlock. *)
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  kalloc_env_at γa γk on -∗
+  (* the disk fabric, borrowed from the invariant around each MMIO access,
+     plus the caller's half of the config tracker: the pair is what keeps the
+     configuration this function programs deterministic while the state lives
+     under [disk_inv]. *)
+  disk_inv γv -∗
+  disk_cfg_is γv (DfracOwn (1/2)) c0 -∗
+  disk_lock ↦₄ vlock -∗
+  c_name ↦₈ vname -∗
+  c_cpu ↦₈ vcpu -∗
+  disk_desc ↦₈ pd0 -∗
+  disk_avail ↦₈ pav0 -∗
+  disk_used ↦₈ pu0 -∗
+  ([∗ list] j ∈ seq 0 8, (pa_add disk_free j) ↦ₘ free0 j) -∗
+  vdi_post γv γa γk m K eb pp on ret_tgt c_cpu lks -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type VIRTIODISKINIT.
+  Parameter wp_virtio_disk_init_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γv : disk_names) (γa : gname) (γk : gname * gname) (m : regfile) (K : nat)
+      (eb : bool) (pp : mword 64) (on : option nat)
+      (c0 : virtio_cfg) (vlock : bv 32) (vname vcpu : bv 64)
+      (pd0 pav0 pu0 : mword 64) (free0 : nat -> bv 8) (lks : gset string),
+      wp_virtio_disk_init_sconf_body γv γa γk m K eb pp on c0 vlock vname vcpu
+                                     pd0 pav0 pu0 free0 lks.
+End VIRTIODISKINIT.

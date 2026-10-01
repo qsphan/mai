@@ -1,0 +1,187 @@
+(* SpecSysWait.v -- the public interface of sys_wait(), stated independently
+   of its proof.
+
+     uint64 sys_wait(void) {
+       uint64 p;
+       argaddr(0, &p);
+       return wait(p);
+     }
+
+   @ KernelSyms.sys_wait = 0x80002a26, thirteen instructions / 34 bytes: a
+   32-byte ra/s0 frame whose slot 3 is the [uint64 p] local at s0-24 =
+   sp+8 -- a WHOLE slot, unlike sys_kill's [int pid], which is the upper
+   half of one.
+
+     +0x00  1101        c.addi     sp,sp,-32
+     +0x02  ec06        c.sdsp     ra,24(sp)
+     +0x04  e822        c.sdsp     s0,16(sp)
+     +0x06  1000        c.addi4spn s0,sp,32
+     +0x08  fe840593    addi       a1,s0,-24      a1 := &p
+     +0x0c  4501        c.li       a0,0
+     +0x0e  efdff0ef    jal        ra,argaddr
+     +0x12  fe843503    ld         a0,-24(s0)     a0 := p
+     +0x16  83dff0ef    jal        ra,kwait
+     +0x1a  60e2        c.ldsp     ra,24(sp)
+     +0x1c  6442        c.ldsp     s0,16(sp)
+     +0x1e  6105        c.addi16sp sp,32
+     +0x20  8082        c.ret
+
+   THE CONTRACT IS THE UNION OF ITS TWO CALLEES', and kwait's dominates it:
+   everything kwait asks for (wait_lock, the scheduler chain, the
+   running-thread bundle, the kalloc environment, [eb = true]) is here
+   verbatim, because sys_wait adds no resource of its own.  The destination
+   cell is carved out of sys_wait's own frame, so it does not appear.
+
+   THE ARGUMENT COMES OUT OF [proc_priv], NOT OUT OF A SEPARATE TRAPFRAME
+   FRACTION.  argaddr's own contract takes the trapframe as a bare fraction
+   (SpecArgraw.v) and sys_kill's contract therefore passes one; but kwait
+   needs the whole private block, so here the fraction is SPLIT OUT of it
+   ([ProcInv.proc_priv_tf]) for the duration of the call and put back.  The
+   argument is then named the way sys_sbrk names its two: as a fact about
+   the block's own trapframe record, [pv_tf V !! tf_arg_idx 0 = Some v0].
+
+   WHAT IT SAYS ABOUT THE RESULT is kwait's verbatim: a sign-extended [int]
+   which, on the reaping arm, NAMES the generation whose escrow comes back
+   with it ([UserChildren.wait_ans]).  [v0] DOES appear in the
+   postcondition, as the base of the write window below; copyout's failure
+   arm returns -1 just as a missing child does, and both land on the
+   answer's first arm, which claims only that nothing moved.
+
+   THE PRIVATE BLOCK GOES IN AND COMES BACK AT AN EXTENDED DESCRIPTOR
+   ([uptd_ext_sz]), which is kwait's copyout, unchanged: argaddr touches no
+   user page.
+
+   WHAT STAYS EXISTENTIAL IS A LENGTH, NOT AN IMAGE, again kwait's
+   verbatim: the post carries [umem_wr (us_M U) v0 d (nth_byte xw)] for
+   some [d <= 4] and the four-byte status word [xw] the escrow is keyed at,
+   based at [v0] -- the syscall's own argument 0, the address argaddr
+   fetched and kwait's [addr].  [v0 = 0], the no-zombie-child arm, and
+   copyout's own failure prefix all move nothing ([d = 0], and [umem_wr M
+   v0 0 bs = M] on the nose).  A caller reads its own untouched bytes back
+   with [UserPtTree.umem_wr_lookup_out]. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import RiscvModelBytes.   (* [nth_byte] -- the status word kwait places *)
+Require Import CalleeSaved KernelText KernelDataInv.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import ProcGeom CpuOwn.
+Require Import KvmSpec.
+Require Import UserPtTree.
+Require Import ProcPtOwn.
+Require Import FdSlots.
+Require Import FileInvDefs.
+Require Import ProcInv.
+Require Import SchedCtx.
+Require Import WaitInv.
+Require Import PidLock.   (* kwait -> freeproc takes <pid_lock> *)
+Require Import SpecProcinit.   (* [wait_lock_addr] *)
+Require Import SpecKwait.      (* [K_kwait] -- the budget this one is built on *)
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import CtxIdDefs.
+Local Open Scope Z_scope.
+Import Defs.
+
+(* 4 slots for sys_wait's own frame, and below it the deeper of its two
+   callees: kwait's 60 (argaddr's is 18). *)
+Notation sys_wait_stack := ((4 + K_kwait)%nat) (only parsing).
+Definition wp_sys_wait_sconf_body `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa γp γf γw : gname)  (γs : list gname) (j : nat) (γl : gname)
+    (m : regfile) (av : nat) (eb : bool) (b : bool) (lks : gset string)
+    (pid : mword 32) (U : ustate) (v0 : mword 64) (cs : gset gname)
+    (* <init>'s pid, as a number -- kwait's parameter, relayed
+       (lane TRAP-ROWS-3/4, T4(b)) *)
+    :=
+  let pcE : mword 64 := mword_of_int KernelSyms.sys_wait in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  (* the syscall argument, out of the trapframe page [proc_priv] carries *)
+  pv_tf (us_V U) !! tf_arg_idx 0 = Some v0 ->
+  (sys_wait_stack <= av)%nat ->
+  (* the PARKING premise, inherited from kwait: everything that sleeps has it *)
+  eb = true ->
+  sie_cap_gpr KT1 m av b pj -∗
+  cpu_own 0%nat eb pj b lks -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  procs_inv γs -∗
+  is_lock γw wait_lock_addr "wait_lock"%string (wait_res_at) -∗
+  kalloc_env γa None -∗
+  (* <pid_lock>, for kwait's freeproc (upstream ded23f2) *)
+  is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+  proc_priv γf pj pid U -∗
+  (* ...AND THE CALLER'S OWN CHILDREN ROW, relayed to kwait, which is
+     what moves it ([SpecKwait]).  sys_wait does nothing with it -- the
+     mold is sys_exit's relay of the same row to kexit. *)
+  ch_frag (pv_chg (us_V U)) pj cs -∗
+  (* ...and who <init> is, as a number -- kwait's premise, relayed
+     ([SpecKwait]; lane TRAP-ROWS-3/4, T4(b)) *)
+  (* AT THE LITERAL 1 (lane TRAP-ROWS-4, B1b): <init>'s pid is <nextpid>'s
+     carved value.  The relay that supplies it is
+     [WaitInv.init_ident_pid_is], off the syscall layer's own
+     [SpecSyscall.sysc_init_id] row. *)
+  SlotGen.init_pid_is (mword_of_int 1 : mword 32) -∗
+  wp_next b pj (fun (CID : CpuId) =>
+  (* kwait's window, verbatim: the only write is copyout's four-byte
+     [xstate] at [v0], the syscall's own argument 0, and only when
+     [v0 <> 0].  See SpecKwait.v's header. *)
+    ∀ (mf : regfile) (P' : uptd) (rv : mword 32) (d : nat) (xw : mword 32)
+      (cs' : gset gname) (k' : nat),
+      ⌜ callee_saved m mf /\
+        mf !!! Regidx (mword_of_int 10 : mword 5) = sign_extend' 64 rv ⌝ -∗
+      ⌜ uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P' ⌝ -∗
+      ⌜ (d <= 4)%nat ⌝ -∗
+      (* ...AND A NULL DESTINATION IS NOT A DESTINATION: kwait's own
+         [addr != 0] test, relayed.  [v0] is the syscall's argument 0, so a
+         caller passing a null status pointer keeps every byte it held. *)
+      ⌜ v0 = (zero_reg : mword 64) -> d = 0%nat ⌝ -∗
+      (* ...AND A REAP AT A REAL POINTER PLACED THE WHOLE WORD, kwait's own
+         guard relayed ([SpecKwait]): copyout answers 0 or -1, a partial
+         write is the -1 arm's, and kwait's [blt a0,x0] turns that into the
+         -1 return.  This is what lets a parent read the four bytes of the
+         status out of its own buffer. *)
+      ⌜ v0 <> (zero_reg : mword 64) ->
+        rv <> (mword_of_int (-1) : mword 32) -> d = 4%nat ⌝ -∗
+      (* ...AND WHAT THE CALL ANSWERED, kwait's verbatim
+         ([UserChildren.wait_ans]): -1 with nothing moved, or the reaped
+         child's pid with its escrow -- at the status word this call
+         copied out -- the pid uniqueness over the caller's children, and
+         the reading at what the reap left it. *)
+      wait_ans rv (xstate_val xw) cs cs' (pv_gen (us_V U))
+        (bool_decide (v0 = (zero_reg : mword 64))) pid -∗
+      sie_cap_gpr KT1 mf av b pj -∗
+      cpu_own 0%nat eb pj b lks -∗
+      pc_is ret_tgt -∗
+      (* ...AT A LATER EVENT COUNT (permit sweep): the reap's freeproc takes
+         the caller's counter, kwait's own row relayed *)
+      ⌜ (pv_ev (us_V U) <= k')%nat ⌝ -∗
+      proc_priv γf pj pid
+        (upd_usM (us_upt (upd_usV U (upd_ev (us_V U) k')) P')
+           (umem_wr (us_M U) v0 d (fun i => nth_byte xw i))) -∗
+      (* the row, back at what the reap left it -- kwait's, verbatim *)
+      ch_frag (pv_chg (us_V U)) pj cs' -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type SYSWAIT.
+  Parameter wp_sys_wait_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, !fileG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa γp γf γw : gname) (γs : list gname) (j : nat) (γl : gname)
+      (m : regfile) (av : nat) (eb : bool) (b : bool) (lks : gset string)
+      (pid : mword 32) (U : ustate) (v0 : mword 64) (cs : gset gname),
+      wp_sys_wait_sconf_body γa γp γf γw γs j γl m av eb b lks pid U v0 cs.
+End SYSWAIT.

@@ -1,0 +1,676 @@
+(* SpecItrunc.v -- the public interface of itrunc, stated independently of
+   its proof.  Requires only the definitional layer -- never a whole-function
+   proof file -- so every function proof can be checked in parallel.
+
+     void itrunc(struct inode *ip) {
+       int i, j;
+       struct buf *bp;
+       uint *a;
+
+       for (i = 0; i < NDIRECT; i++) {
+         if (ip->addrs[i]) {
+           bfree(ip->dev, ip->addrs[i]);
+           ip->addrs[i] = 0;
+         }
+       }
+
+       if (ip->addrs[NDIRECT]) {
+         bp = bread(ip->dev, ip->addrs[NDIRECT]);
+         a = (uint * )bp->data;
+         for (j = 0; j < NINDIRECT; j++) {
+           if (a[j])
+             bfree(ip->dev, a[j]);
+         }
+         brelse(bp);
+         bfree(ip->dev, ip->addrs[NDIRECT]);
+         ip->addrs[NDIRECT] = 0;
+       }
+
+       ip->size = 0;
+       iupdate(ip);
+     }
+
+   148 bytes, 53 instructions.  Two loops -- twelve direct entries, then the
+   256 entries of the indirect block, read through a bread/brelse pair --
+   followed by the indirect block's own free, [ip->size = 0] and the flush.
+   Note the compiler saves s4 CONDITIONALLY: [sd s4,0(sp)] sits at +0x50,
+   inside the indirect arm, and is restored at +0x90, so the direct-only
+   path never touches it.
+
+   THE CONTRACT.  itrunc empties the inode: [inode_map] comes back at
+   [InodeInv.bm_empty], every block the map named goes back to the free pool
+   (into [BitmapInv.bitmap_inv], via bfree), the size is zeroed and the
+   whole thing is flushed by the tail call to iupdate.  The postcondition is
+   stated at the CLOSED value [bm_empty] rather than at "some map whose
+   slots are all zero" so that iput -- the only caller -- needs no reasoning
+   to see the inode names nothing.
+
+   THE BUDGET IS THE INTERESTING PART, and it is why the log ledger had to
+   change first.  itrunc calls bfree up to NDIRECT + NINDIRECT + 1 = 269
+   times and then iupdate once.  Charging a unit per log_write -- the old
+   always-consume accounting -- would demand 270 against a MAXOPBLOCKS of
+   10, which no caller could supply.  But [FSSIZE = 2000 < BPB = 8192] means
+   there is exactly ONE bitmap block, so all 269 frees hit it and the log
+   ABSORBS every one after the first: the true cost is 2, one bitmap block
+   and one inode block.  The credited arms of log_write and bfree
+   ([LogInv.log_opS], [SpecBfree.wp_bfree_gen]) are what let that be stated.
+
+   [bm_paid] below is the shape the loops carry.  It says "the bitmap
+   block's log slot is paid for, and u units remain for everything else",
+   as a disjunction over whether the payment has happened yet -- and it is
+   IDEMPOTENT under bfree: the unpaid arm spends its spare unit and becomes
+   paid, the paid arm presents its credit and absorbs.  So itrunc's loop
+   invariant is literally [bm_paid γ bmapstart 1] -- one unit held back for
+   iupdate -- unchanged across all 269 calls, with no data-dependent case
+   split on which free happened to be the first.
+
+   SPEND-AT-MOST-TWO, AT-LEAST-ONE.  The exit is [∃ u', u <= u' <= S u], the
+   same shape bmap uses: iupdate always runs, so one unit is certainly
+   spent; the bitmap unit is spent only if the inode named any block at all.
+
+   itrunc SLEEPS (bread, and bfree's own bread), so it threads the full
+   running-process bundle exactly as SpecBfree.v / SpecIupdate.v do.  It
+   enters and returns at noff 0.
+
+   NOT ITS BUSINESS: ip->lock.  The C comment says "Caller must hold
+   ip->lock", and the caller does -- iput takes the sleeplock before
+   calling.  itrunc itself performs no locking, so the contract simply takes
+   the inode's resources directly, exactly as iupdate's does. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list functions bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.algebra Require Import auth gmap frac.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap ghost_map.
+From iris.program_logic Require Import language weakestpre lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import KernelDataInv.
+Require Import SpecPanic.
+Require Import FdSlots.
+Require Import ProcGeom.
+Require Export SwtchCtx.
+Require Import CpuOwn.
+Require Import SchedCtx.
+Require Import ProcDefs.  (* [proc_priv_bare] *)
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import FsBlocks LogInv.
+Require Import BitmapInv.
+Require Import DinodeEnc.
+Require Import InodeInv.
+Require Import InodeRegion.
+Require Import AppCfg.       (* [appcfg]: the era's application record, bound beside [icfg] (app-instances.md round A) *)
+Require Import IcacheInv.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+(* The [set_solver] override.  EXPORT, not Import: this import is         *)
+(* deliberately "dead" -- the file compiles without it, just far slower --  *)
+(* and the nightly dead-import sweep skips [Require Export] lines.         *)
+(* It has to be HERE rather than inherited: [Require Export] only          *)
+(* propagates through an unbroken chain of Exports, and this tree's        *)
+(* intermediate files use [Require Import], so nothing downstream inherits *)
+(* it.  See FastSetSolver.v.                                              *)
+Require Export FastSetSolver.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Import Defs.
+Require Import TsoCtx.
+
+Local Open Scope Z_scope.
+
+(* itrunc's own frame is 48 bytes (6 slots) -- [addi sp,sp,-48] at +0x00,
+   ra/s0/s1/s2/s3 pushed, and s4 conditionally at +0x50.  Its deepest
+   callee is bfree (66); bread wants 62, brelse 26 and iupdate 66. *)
+Notation K_itrunc := (72%nat) (only parsing).
+(* THE TRUNCATED RECORD: the same inode with its size zeroed and its addrs
+   emptied.  [type], [major], [minor] and [nlink] are untouched -- itrunc
+   frees blocks, it does not delete the inode; zeroing the type is iput's
+   job, one level up.  The addrs field is set to [bm_cells bm_empty] rather
+   than left alone because iupdate's premise ties it to the map, and the map
+   itrunc hands back is [bm_empty]. *)
+Definition di_trunc (d : dinode) : dinode :=
+  MkDinode (di_type d) (di_major d) (di_minor d) (di_nlink d)
+           (bv_0 32) (bm_cells bm_empty).
+
+Lemma di_trunc_addrs (d : dinode) : di_addrs (di_trunc d) = bm_cells bm_empty.
+Proof. reflexivity. Qed.
+
+Lemma di_trunc_wf (d : dinode) : dinode_wf (di_trunc d).
+Proof.
+  rewrite /dinode_wf /di_trunc /bm_cells /bm_empty. cbn [di_addrs bm_dir bm_ind].
+  rewrite length_app length_replicate /=. reflexivity.
+Qed.
+
+Section ItruncSpec.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, ICFG : icfg, APP : appcfg Σ, FSC : fscfg}.
+
+  (* "THE BITMAP BLOCK'S LOG SLOT IS PAID FOR, and u units remain for
+     everything else."
+
+     The left disjunct is the paid state: the op holds a credit for
+     [bmapstart] and [S u] units.  The right is the unpaid state: no credit,
+     but one extra unit in reserve to buy one.
+
+     IDEMPOTENT UNDER bfree, which is the whole point.  From the unpaid
+     state bfree's uncredited arm spends the spare unit, records the bitmap
+     block in the op's set, and lands in the paid state; from the paid state
+     bfree's credited arm presents the credit, log_write absorbs, and the
+     unit comes back -- paid again.  So a loop that frees an unknown number
+     of blocks carries this ONE assertion and never case-splits on how many
+     it has freed so far. *)
+  Definition bm_paid (u : nat) : iProp Σ :=
+    ((∃ Sb : gset Z, ⌜fsc_bmapstart ∈ Sb⌝ ∗ log_opS icfg_log (S u) Sb)
+     ∨ (∃ Sb : gset Z, log_opS icfg_log (S (S u)) Sb))%I.
+
+  (* entering the loops: two units and no credit yet *)
+  Lemma bm_paid_intro u :
+    log_opb icfg_log (S (S u)) -∗ bm_paid u.
+  Proof using .
+    iIntros "H". rewrite /log_opb. iDestruct "H" as (Sb) "H".
+    iRight. iExists Sb. iFrame.
+  Qed.
+
+  (* ------------------------------------------------------------------ *)
+  (*  THE SET-INDEXED TWIN (fs-sysfile GR-2a's 4a design)                 *)
+  (*                                                                      *)
+  (*  [bm_paid] above is set-form but with the set EXISTENTIAL on both     *)
+  (*  disjuncts, so the caller's [Sb] is forgotten at [bm_paid_intro] and  *)
+  (*  is not recoverable at [bm_paid_elim].  That is exactly the shape     *)
+  (*  GR-2a finding 1 rules out for a gen contract: [log_opS] is an        *)
+  (*  exclusive ghost_map element with no auth-monotone shadow, so a set   *)
+  (*  handed back at an unrelated existential relates to nothing.          *)
+  (*                                                                      *)
+  (*  Indexing by the ENTRY set stops the forgetting.  [Sb] is CONSTANT    *)
+  (*  across both of itrunc's loops -- it is what the caller had on the    *)
+  (*  way in, never the running set, which stays the existential [Sb'] --  *)
+  (*  so the retrofit is one extra parameter on the two loop states,       *)
+  (*  THREADED rather than proven.                                        *)
+  (*                                                                      *)
+  (*  THE [crb] GUARD ON THE UNPAID DISJUNCT IS LOAD-BEARING.  A caller    *)
+  (*  that enters ALREADY PAID ([crb = true]) never had the spare unit at  *)
+  (*  all, and the paid disjunct is absorbing -- [bm_paidS_use] returns to *)
+  (*  it from both arms -- so at [crb = true] the level is pinned to       *)
+  (*  [S u] all the way to the tail.  Without the guard the elim below     *)
+  (*  could only offer the loose [n <= S (S u)], and create's FAIL arm,    *)
+  (*  which needs [iunlockput] to spend EXACTLY ZERO while actually        *)
+  (*  freeing ([CreateBudget.ip_spend crb cru true = 0] at [crb = cru =    *)
+  (*  true]), would not close.                                            *)
+  (*  AND THE BIRTH EPOCH IS THREADED THROUGH IT (fs-log.md §G.20).  [e0]   *)
+  (*  is CONSTANT across both loops for exactly the reason [Sb] is: it is   *)
+  (*  what the caller had on the way in, and nothing an open operation can  *)
+  (*  do moves it.  Without it the tail flush could not present a GROUP     *)
+  (*  credit at all -- a credit is a claim at a NAMED epoch, and every      *)
+  (*  bfree in the loops would otherwise close the existential (§G.20's     *)
+  (*  blocker).  Threaded, not proven: one more parameter on the two loop   *)
+  (*  states.                                                              *)
+  Definition bm_paidS (crb : bool)
+      (u : nat) (Sb : gset Z) (e0 : nat) : iProp Σ :=
+    ((∃ Sb' : gset Z, ⌜Sb ⊆ Sb'⌝ ∗ ⌜fsc_bmapstart ∈ Sb'⌝ ∗ log_opSe icfg_log (S u) Sb' e0)
+     ∨ (⌜crb = false⌝ ∗
+        ∃ Sb' : gset Z, ⌜Sb ⊆ Sb'⌝ ∗ log_opSe icfg_log (S (S u)) Sb' e0))%I.
+
+  (* the level itrunc is HANDED, as a function of the bitmap credit: paid
+     up front costs one unit less, because the bitmap block's slot is
+     already bought. *)
+  Definition it_entry (crb : bool) (u : nat) : nat :=
+    if crb then S u else S (S u).
+
+  (* iupdate's own spend -- definitionally [CreateBudget.iu_spend], spelled
+     here so this file need not import the ledger. *)
+  Definition it_iu (cru : bool) : nat := if cru then 0%nat else 1%nat.
+
+  (* THE BITMAP UNIT, AS A REPORT (fs-log.md §G.22, G-4c).  [w] is "the
+     bitmap block was logged BY THIS CALL", i.e. the unit was actually
+     spent -- and spending it is the same event as putting [bmapstart] in
+     the op's set, which is why the post can promise the membership beside
+     the figure.  At [crb = true] no call ever spends it (the paid disjunct
+     pins the level at [S u]), so the report is [false] there and the
+     caller's own credit is what carries the membership. *)
+  Definition it_bm (w : bool) : nat := if w then 1%nat else 0%nat.
+
+  (* what itrunc spends AT MOST: the bitmap unit (unless already paid) plus
+     the tail flush (unless already credited).  Definitionally
+     [CreateBudget.ip_spend crb cru true]. *)
+  Definition it_spend (crb cru : bool) : nat :=
+    ((if crb then 0%nat else 1%nat) + it_iu cru)%nat.
+
+  (* entering the loops CREDITED: the paid disjunct at the caller's own set,
+     so no unit is spent on the bitmap at all.  At [crb = false] this is
+     [bm_paid_intro] with the set remembered. *)
+  Lemma bm_paidS_intro crb u Sb e0 :
+    (crb = true -> fsc_bmapstart ∈ Sb) ->
+    log_opSe icfg_log (it_entry crb u) Sb e0 -∗ bm_paidS crb u Sb e0.
+  Proof using .
+    intros Hcrb. iIntros "H". rewrite /bm_paidS /it_entry.
+    destruct crb.
+    - iLeft. iExists Sb. iSplitR; [iPureIntro; set_solver|].
+      iSplitR; [iPureIntro; exact (Hcrb eq_refl)|]. iFrame "H".
+    - iRight. iSplitR; [done|]. iExists Sb.
+      iSplitR; [iPureIntro; set_solver|]. iFrame "H".
+  Qed.
+
+  (* leaving them: at least the [S u] units iupdate still needs, and never
+     more than what came in.  The [crb] guard is what makes the upper bound
+     tight on the credited arm.
+
+     AND THE REPORT COMES OUT WITH THE LEVEL (G-4c).  The paid disjunct
+     already holds [bmapstart ∈ Sb']; discarding it here was what made the
+     walkers' [walk_spend w <= 1] unstatable, because a caller that may
+     have paid could then learn neither "it paid" nor "it did not".  [w] is
+     [negb crb && paid]: at [crb = true] the entry level IS [S u], nothing
+     was spent, and the caller carries the membership itself. *)
+  Lemma bm_paidS_elim crb u Sb e0 :
+    bm_paidS crb u Sb e0 -∗
+      ∃ (w : bool) (n : nat) (Sb' : gset Z),
+        ⌜Sb ⊆ Sb'⌝ ∗ ⌜w = true -> fsc_bmapstart ∈ Sb'⌝ ∗
+        ⌜crb = true -> w = false⌝ ∗
+        ⌜(it_entry crb u - it_bm w <= n <= it_entry crb u)%nat
+         /\ (S u <= n)%nat⌝ ∗
+        log_opSe icfg_log n Sb' e0.
+  Proof using .
+    rewrite /bm_paidS /it_entry /it_bm. iIntros "[H|[%Hc H]]".
+    - iDestruct "H" as (Sb') "(%Hsub & %Hin & H)".
+      iExists (negb crb), (S u), Sb'. iSplitR; [iPureIntro; exact Hsub|].
+      iSplitR; [iPureIntro; intros _; exact Hin|].
+      iSplitR; [iPureIntro; intros ->; reflexivity|].
+      iSplitR; [iPureIntro; destruct crb; simpl; lia|]. iFrame "H".
+    - subst crb. iDestruct "H" as (Sb') "(%Hsub & H)".
+      iExists false, (S (S u)), Sb'. iSplitR; [iPureIntro; exact Hsub|].
+      iSplitR; [iPureIntro; discriminate|].
+      iSplitR; [iPureIntro; discriminate|].
+      iSplitR; [iPureIntro; simpl; lia|]. iFrame "H".
+  Qed.
+
+  (* leaving them: at least the [S u] units iupdate still needs *)
+  Lemma bm_paid_elim u :
+    bm_paid u -∗ ∃ n : nat, ⌜(S u <= n <= S (S u))%nat⌝ ∗ log_opb icfg_log n.
+  Proof using .
+    iIntros "[H|H]".
+    - iDestruct "H" as (Sb) "(_ & H)". iExists (S u).
+      iSplitR; [iPureIntro; lia|]. iApply (log_opS_opb with "H").
+    - iDestruct "H" as (Sb) "H". iExists (S (S u)).
+      iSplitR; [iPureIntro; lia|]. iApply (log_opS_opb with "H").
+  Qed.
+
+End ItruncSpec.
+
+Definition wp_itrunc_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, ICFG : icfg, APP : appcfg Σ, FSC : fscfg} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γs : list gname) (j : nat) (γl : gname)          (* the running process *)
+  (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+    (ip : mword 64) (inum : mword 32)
+    (dn dn0 : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8))
+    (u : nat)
+    (pidv : mword 32) (dq dqd dqn dqb dqs : dfrac)
+    (m : regfile) (K : nat) (eb : bool)
+    (b : bool) (lks : gset string) (Upr : ustate) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.itrunc in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (K_itrunc <= K)%nat ->
+  log_geom_ok fsc_cov fsc_logst ->
+  (* ONE BITMAP BLOCK -- the fact that makes the budget work at all *)
+  0 < fsc_size <= BPB ->
+  0 <= fsc_bmapstart ->
+  fsc_bmapstart ∈ fsc_cov ->
+  ~ (fsc_bmapstart ∈ log_region_set fsc_logst) ->
+  (* the inode's own block, for the closing iupdate *)
+  0 <= icfg_ist ->
+  IBLOCK inum icfg_ist ∈ fsc_cov ->
+  ~ (IBLOCK inum icfg_ist ∈ log_region_set fsc_logst) ->
+  (* the inum is one the inode REGION covers -- iupdate's premise, which
+     replaced the block-half premise and its [diblk_wf ds] (design §11.3) *)
+  bv_unsigned inum < 16 * Z.of_nat icfg_nib ->
+  (* THE INODE IS ALLOCATED (fs-icache §16.4).  itrunc's closing iupdate
+     flushes [di_trunc dn], which keeps [dn]'s type, and the region's arm
+     only lets an allocated record's fragment stay OUT of the invariant --
+     a type-0 flush is iput's free path instead.  iput, the only caller,
+     has it from the locked inode's [InodeLock.inode_ok]. *)
+  bv_unsigned (di_type dn) <> 0 ->
+  (* TYPE STABILITY (fs-icache.md §19.6 Part 1, fs-sysfile S5d): itrunc's
+     flush is [di_trunc dn], which keeps the type, and
+     [InodeRegion.ireg_write_au] now forbids a RETYPE of the region's
+     record -- so itrunc owes the agreement between the stale [dn0] and
+     [dn].  iput, its only caller, passes the two as the same record. *)
+  di_type_stable dn dn0 ->
+  (* NLINK STABILITY (fs-icache.md §20.6, fs-sysfile S5f): the link
+     ledger's twin of the premise above, travelling for the same reason --
+     the record the REGION holds at the iupdate below is the stale [dn0].
+     [InodeRegion.di_nlink_stable_refl] discharges it at any caller that
+     holds the two as ONE record with a nonzero type. *)
+  di_nlink_stable dn dn0 ->
+  (* the map is well-formed: this is what says every block it names is a
+     covered home block, and -- via injectivity -- that the 269 frees are
+     269 DISTINCT blocks, so the free pool really does grow by
+     [bm_blocks bm] *)
+  blkmap_wf fsc_cov fsc_logst bm ->
+  (* EVERY BLOCK THE INODE NAMES IS IN RANGE FOR THE BITMAP.  bfree needs
+     [0 <= b < size] of every block it frees.  That used to be taken slot
+     by slot, as an owed hypothesis the model could not supply; it is not
+     owed any more.  [blkmap_wf] ALREADY says every block the inode names
+     is in [fsc_cov], so all that is missing is ONE PURE GEOMETRY FACT relating
+     [fsc_cov] to the file system's size -- of exactly the same character as
+     [log_geom_ok], and supplied from the same place.  The per-slot fact is
+     then [IcacheInv.blkmap_slot_inrange], a two-line corollary, and no
+     invariant moves (claude-notes/design/fs-icache.md §6(i);
+     [IcacheInv.cov_below_of_image] discharges it from the boot image).
+
+     Note there is deliberately NO [bm_blocks bm ⊆ used] premise: itrunc
+     holds the byte run of every block it frees (via [inode_blocks] and
+     [ind_res]), and bfree derives the bit-is-set fact from that run itself
+     ([FsStateBitmap.free_pool_used]).  Demanding it here would have made
+     the contract uncallable by iput, which has no source for it. *)
+  cov_below fsc_cov fsc_size ->
+  (* EVERY DATA BLOCK IS A BLOCK'S WORTH OF BYTES.  bfree demands it of the
+     block it frees, and [inode_blocks] does not carry it: the bundle names
+     contents but says nothing about their length.  Like the range premise
+     above this is a genuine FS fact the model does not yet hold anywhere,
+     and it is recorded as owed in fs-inode.md alongside it. *)
+  (forall i : nat, (i < MAXFILE)%nat -> length (data i) = BSIZE) ->
+  (* the record's addrs field names the cells the map owns -- iupdate's tie,
+     restated here because itrunc rewrites both together *)
+  di_addrs dn = bm_cells bm ->
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  (* a0 = ip *)
+  m !!! Regidx (mword_of_int 10 : mword 5) = ip ->
+  (* itrunc's cone: bfree ("log", 3), bread/brelse ("bcache", 4) on the
+     indirect arm, and its closing iupdate ("log", 3) -- "log" is the
+     lowest, so one premise there covers the whole cone. *)
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m K b pj -∗
+  cpu_own 0 eb pj b lks -∗
+  (* THE TRAP-CSR COMPLEMENT, NOT THE BARE PAIR.  itrunc itself never
+     acquires or releases anything -- it is a pure PASS-THROUGH to its
+     sleeping callees (bfree, bread, iupdate), each of whose OWN acquire
+     mints [arm_pay 0 eb _] and whose OWN release spends it again before
+     returning.  So the complement itrunc receives at entry is a PURE
+     PASS-THROUGH: at [eb = true] it is [emp], so no existing caller gains
+     an obligation; at [eb = false] it is the honest pair, held by the
+     caller because the TRAP handed it over, and itrunc threads it straight
+     through to each callee and back, unused, all the way to its own exit.
+     See claude-notes/completed/sched-hart-generic.md and
+     claude-notes/completed/eb-generic-sweep.md. *)
+  trap_csrs_ext KT1 eb -∗
+  cpu_claim_ext eb pj -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  panic_env -∗
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  (* ip->dev and ip->inum: read, never written *)
+  i_dev ip ↦₄{dqd} icfg_dev -∗
+  i_inum ip ↦₄{dqn} inum -∗
+  (* the five scalars (ip->size is written), the thirteen addrs cells and
+     the indirect block's own resource *)
+  inode_meta ip dn -∗
+  inode_map fsc_fs ip bm -∗
+  (* THE DATA BLOCKS, which is what actually gets freed *)
+  inode_blocks fsc_fs bm data -∗
+  (* the two superblock fields, read and handed straight back *)
+  sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+  sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+  (* the bitmap, with its free pool *)
+  bitmap_inv fsc_fs fsc_bmapstart fsc_cov fsc_logst fsc_size -∗
+  (* THE INODE REGION, and this inum's (stale) on-disk record: iupdate's
+     resources, threaded through (design §11.3/§12) *)
+  ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  dinode_at fsc_ireg inum dn0 -∗
+  (* the caller's own pid cell *)
+  proc_priv_bare pj pidv Upr -∗
+  (* the running-thread bundle *)
+  procs_inv γs -∗
+  (* the disk fabric *)
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  (* THREE slot units, not two.  The indirect arm's bread holds ONE across
+     the whole 256-entry loop -- the buffer stays checked out while the
+     entries are freed -- and each nested bfree still wants the two its own
+     bread/log_write pair needs.  brelse gives the held one back at +0x7c.
+     The direct loop never has a bread outstanding, so two would do there;
+     the arm is what forces three. *)
+  bslots 3 -∗
+  (* THE RESERVATION: two units.  One buys the bitmap block's log slot --
+     ONCE, however many blocks are freed -- and one is iupdate's. *)
+  log_op icfg_log (S (S u)) -∗
+  (* THE CROSSING IS THE LITERAL [true], NOT [b].  This function can SLEEP
+     (its bread / ilock / bwrite does), and a park moves the hart with
+     interrupts off, so the crossing has nothing to do with SIE -- the
+     porting guide's "a PARKING function's [wp_next] index is [true]
+     UNCONDITIONALLY".  Spelled [b] the two coincide at the only instance
+     the [eb = true] premise admits, which is why this went unnoticed; once
+     [eb = false] is reachable the [b] form would promise the caller it
+     comes back on the hart it called from, which a park makes false. *)
+  wp_next true pj (fun (CID : CpuId) =>
+  ∀ mf : regfile,
+      ⌜callee_saved m mf⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      trap_csrs_ext KT1 eb -∗
+      cpu_claim_ext eb pj -∗
+      pc_is ret_tgt -∗
+      proc_priv_bare pj pidv Upr -∗
+      i_dev ip ↦₄{dqd} icfg_dev -∗
+      i_inum ip ↦₄{dqn} inum -∗
+      sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+      sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+      (* THE INODE IS EMPTY: no block, size zero *)
+      inode_meta ip (di_trunc dn) -∗
+      inode_map fsc_fs ip bm_empty -∗
+      inode_blocks fsc_fs bm_empty (fun _ => replicate BSIZE (bv_0 8)) -∗
+      (* ...and every block it named is back in the pool *)
+      (* the flush landed: this inum's on-disk record is the truncated
+         inode *)
+      dinode_at fsc_ireg inum (di_trunc dn) -∗
+      bslots 3 -∗
+      (* SPEND AT MOST TWO, AT LEAST ONE: iupdate always runs; the bitmap
+         unit is spent only if the inode named a block at all *)
+      (∃ u' : nat, ⌜(u <= u' <= S u)%nat⌝ ∗ log_op icfg_log u') -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* ===================================================================== *)
+(*  THE CREDITED SET-FORM CONTRACT (fs-sysfile GR-2b, retrofit 4a)        *)
+(*                                                                        *)
+(*  Verbatim [wp_itrunc_sconf_body] except for the ledger.  Three things   *)
+(*  move, and every one of them is forced by [CreateBudget.ip_spend]:      *)
+(*                                                                        *)
+(*  (1) [crb] -- "this op has already logged the bitmap block".  It enters *)
+(*      [bm_paidS] at the PAID disjunct with [Sb' := Sb], so the bitmap    *)
+(*      unit is never spent and the entry level is [S u] rather than       *)
+(*      [S (S u)].                                                        *)
+(*  (2) [cru] -- "this op has already logged THIS inode's block".  It goes *)
+(*      straight to the tail flush, which is [SpecIupdate]'s landed        *)
+(*      credited walk.                                                    *)
+(*  (3) the post EXPOSES [IBLOCK inum inodestart ∈ Sb'], DETERMINATELY --  *)
+(*      itrunc's tail iupdate logs it unconditionally.  That membership is *)
+(*      what lets iput's OWN [ip->type = 0] flush, which runs immediately  *)
+(*      after itrunc returns, absorb for free; it is the second [iu_spend] *)
+(*      term of [ip_spend], and without it 4b cannot hit [iput_units].     *)
+(*      Stated as a membership rather than as a [⊆], following             *)
+(*      [SpecIalloc.wp_ialloc_gen]'s determinate-union growth.             *)
+(*                                                                        *)
+(*  At [crb := false, cru := false] this is the counted contract:          *)
+(*  [it_entry false u = S (S u)] is its precondition's level, and the      *)
+(*  bounds collapse to [u <= u' <= S u] -- which is what makes             *)
+(*  [wp_itrunc_sconf] a witness-derivation (GR-2a finding 1) and leaves    *)
+(*  every counted caller unmoved.                                         *)
+(* ===================================================================== *)
+Definition wp_itrunc_gen_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, ICFG : icfg, APP : appcfg Σ, FSC : fscfg} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γs : list gname) (j : nat) (γl : gname)          (* the running process *)
+  (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+    (ip : mword 64) (inum : mword 32)
+    (dn dn0 : dinode) (bm : blkmap)
+    (data : nat -> list (bv 8))
+    (u : nat) (Sb : gset Z) (crb cru : bool) (e0 : nat)
+    (pidv : mword 32) (dq dqd dqn dqb dqs : dfrac)
+    (m : regfile) (K : nat) (eb : bool)
+    (b : bool) (lks : gset string) (Upr : ustate) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.itrunc in
+  let pj := proc_addr j in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (K_itrunc <= K)%nat ->
+  (* THE BITMAP CREDIT'S HONESTY PREMISE.  Same device
+     [SpecBmap]/[SpecLogWrite]/[SpecIupdate] all carry: the claim is only
+     usable when the block really is in the op's set.  It stays PURE
+     because the bitmap block is one this op logs itself -- the credit is
+     handed straight to [bm_paidS_intro]'s paid disjunct, never to a group
+     claimant. *)
+  (crb = true -> fsc_bmapstart ∈ Sb) ->
+  log_geom_ok fsc_cov fsc_logst ->
+  0 < fsc_size <= BPB ->
+  0 <= fsc_bmapstart ->
+  fsc_bmapstart ∈ fsc_cov ->
+  ~ (fsc_bmapstart ∈ log_region_set fsc_logst) ->
+  0 <= icfg_ist ->
+  IBLOCK inum icfg_ist ∈ fsc_cov ->
+  ~ (IBLOCK inum icfg_ist ∈ log_region_set fsc_logst) ->
+  bv_unsigned inum < 16 * Z.of_nat icfg_nib ->
+  bv_unsigned (di_type dn) <> 0 ->
+  di_type_stable dn dn0 ->
+  di_nlink_stable dn dn0 ->
+  blkmap_wf fsc_cov fsc_logst bm ->
+  cov_below fsc_cov fsc_size ->
+  (forall i : nat, (i < MAXFILE)%nat -> length (data i) = BSIZE) ->
+  di_addrs dn = bm_cells bm ->
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  m !!! Regidx (mword_of_int 10 : mword 5) = ip ->
+  (* itrunc's cone: bfree ("log", 3), bread/brelse ("bcache", 4) on the
+     indirect arm, and its closing iupdate ("log", 3) -- "log" is the
+     lowest, so one premise there covers the whole cone. *)
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m K b pj -∗
+  cpu_own 0 eb pj b lks -∗
+  trap_csrs_ext KT1 eb -∗
+  cpu_claim_ext eb pj -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  panic_env -∗
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  i_dev ip ↦₄{dqd} icfg_dev -∗
+  i_inum ip ↦₄{dqn} inum -∗
+  inode_meta ip dn -∗
+  inode_map fsc_fs ip bm -∗
+  inode_blocks fsc_fs bm data -∗
+  sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+  sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+  bitmap_inv fsc_fs fsc_bmapstart fsc_cov fsc_logst fsc_size -∗
+  ireg_inv fsc_ireg fsc_fs icfg_ist icfg_nib -∗
+  dinode_at fsc_ireg inum dn0 -∗
+  proc_priv_bare pj pidv Upr -∗
+  procs_inv γs -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  bslots 3 -∗
+  (* THE TAIL FLUSH'S CREDIT, AS A RESOURCE AT A NAMED EPOCH (fs-log.md
+     §G.20).  [cru] says "this inode's block is already in lh.block[]", and
+     the claim goes straight through both loops to the closing iupdate.  It
+     is a [log_credit] rather than the pure [IBLOCK … ∈ Sb] because THIS is
+     the unit a [crz] caller has to buy with a GROUP witness: outside the log
+     spinlock a group claim cannot be turned into a set membership (§G.19),
+     so a pure premise here is a premise no [crz] caller could ever satisfy.
+     [LogInv.log_credit_own] converts for every caller that does hold the
+     own-set fact, so the counted and create paths are unchanged. *)
+  log_credit icfg_log cru Sb e0 (IBLOCK inum icfg_ist) -∗
+  (* THE RESERVATION, SET FORM AND EPOCH-NAMED: [it_entry crb u] units at the
+     caller's own set, at the birth epoch the credit above is ordered
+     against.  Credited, that is ONE unit less than the counted contract asks
+     for -- which is the whole point.  The POST closes the epoch again
+     ([log_opS]): nothing downstream of the flush compares epochs, and the
+     asymmetry is deliberate (§G.20). *)
+  log_opSe icfg_log (it_entry crb u) Sb e0 -∗
+  wp_next true pj (fun (CID : CpuId) =>
+  ∀ mf : regfile,
+      ⌜callee_saved m mf⌝ -∗
+      sie_cap_gpr KT1 mf K b pj -∗
+      cpu_own 0 eb pj b lks -∗
+      trap_csrs_ext KT1 eb -∗
+      cpu_claim_ext eb pj -∗
+      pc_is ret_tgt -∗
+      proc_priv_bare pj pidv Upr -∗
+      i_dev ip ↦₄{dqd} icfg_dev -∗
+      i_inum ip ↦₄{dqn} inum -∗
+      sb_bmapstart ↦₄{dqb} (mword_of_int fsc_bmapstart : mword 32) -∗
+      sb_inodestart ↦₄{dqs} (mword_of_int icfg_ist : mword 32) -∗
+      inode_meta ip (di_trunc dn) -∗
+      inode_map fsc_fs ip bm_empty -∗
+      inode_blocks fsc_fs bm_empty (fun _ => replicate BSIZE (bv_0 8)) -∗
+      dinode_at fsc_ireg inum (di_trunc dn) -∗
+      bslots 3 -∗
+      (* THE LEDGER, SET FORM.  The set only GROWS, it provably contains
+         this inode's block, and the counter is bracketed by the two
+         [CreateBudget] figures: at most [it_bm w + it_iu cru] is gone, and
+         the tail flush's own [it_iu cru] is gone for certain.
+         [it_bm w + it_iu cru <= it_spend crb cru] always, so this is the
+         landed bound and a REPORT: [w] says whether the bitmap unit was
+         spent, and spending it is the same event as logging [bmapstart].
+         That coupling is what a WALKER's per-level [iput] needs -- without
+         it a walk of L levels can only bound its spend by L (fs-log.md
+         §G.22). *)
+      (∃ (w : bool) (u' : nat) (Sb' : gset Z),
+         ⌜Sb ⊆ Sb'⌝ ∗
+         ⌜IBLOCK inum icfg_ist ∈ Sb'⌝ ∗
+         ⌜w = true -> fsc_bmapstart ∈ Sb'⌝ ∗
+         (* A CREDITED CALLER IS NEVER CHARGED ITS OWN CREDIT BACK
+            (fs-log.md §G.25): at [crb = true] the paid disjunct pins the
+            level, so the report is [false] -- which is what lets a walk's
+            next level be FREE rather than merely bounded. *)
+         ⌜crb = true -> w = false⌝ ∗
+         ⌜(it_entry crb u - (it_bm w + it_iu cru) <= u')%nat
+          /\ (u' + it_iu cru <= it_entry crb u)%nat⌝ ∗
+         log_opS icfg_log u' Sb') -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type ITRUNC.
+  Parameter wp_itrunc_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, ICFG : icfg, APP : appcfg Σ, FSC : fscfg} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γs : list gname) (j : nat) (γl : gname)
+      (pd pav pu : mword 64)
+      (ip : mword 64) (inum : mword 32)
+      (dn dn0 : dinode) (bm : blkmap)
+      (data : nat -> list (bv 8))
+      (u : nat)
+      (pidv : mword 32) (dq dqd dqn dqb dqs : dfrac)
+      (m : regfile) (K : nat) (eb : bool)
+      (b : bool) (lks : gset string) (Upr : ustate),
+      wp_itrunc_sconf_body γs j γl pd pav pu
+
+                           ip inum dn dn0 bm data u
+                           pidv dq dqd dqn dqb dqs m K eb b lks Upr.
+  (* the credited set-form contract; [wp_itrunc_sconf] is this at
+     [crb := cru := false], derived at the [log_op] existential's own
+     witness. *)
+  Parameter wp_itrunc_gen :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ, ICFG : icfg, APP : appcfg Σ, FSC : fscfg} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γs : list gname) (j : nat) (γl : gname)
+      (pd pav pu : mword 64)
+      (ip : mword 64) (inum : mword 32)
+      (dn dn0 : dinode) (bm : blkmap)
+      (data : nat -> list (bv 8))
+      (u : nat) (Sb : gset Z) (crb cru : bool) (e0 : nat)
+      (pidv : mword 32) (dq dqd dqn dqb dqs : dfrac)
+      (m : regfile) (K : nat) (eb : bool)
+      (b : bool) (lks : gset string) (Upr : ustate),
+      wp_itrunc_gen_body γs j γl pd pav pu
+
+                         ip inum dn dn0 bm data u Sb crb cru e0
+                         pidv dq dqd dqn dqb dqs m K eb b lks Upr.
+End ITRUNC.

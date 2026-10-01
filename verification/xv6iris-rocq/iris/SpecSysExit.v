@@ -1,0 +1,222 @@
+(* SpecSysExit.v -- the public interface of sys_exit(), stated independently
+   of its proof.
+
+     uint64 sys_exit(void) {
+       int n;
+       argint(0, &n);
+       kexit(n);
+       return 0;  // not reached
+     }
+
+   @ KernelSyms.sys_exit = 0x800028d6, eighteen instructions / 36 bytes: a
+   32-byte ra/s0 frame whose slot 3 holds [int n] at s0-20 = sp+12 -- the
+   UPPER half of one slot, sys_kill's [int pid] shape -- then argint(0,&n),
+   [lw a0,-20(s0)] and a call to kexit.  gcc does not know kexit is
+   noreturn, so it still emits the dead [li a0,0] / epilogue / ret tail:
+
+     +0x00  1101        c.addi     sp,sp,-32
+     +0x02  ec06        c.sdsp     ra,24(sp)
+     +0x04  e822        c.sdsp     s0,16(sp)
+     +0x06  1000        c.addi4spn s0,sp,32
+     +0x08  fec40593    addi       a1,s0,-20      a1 := &n
+     +0x0c  4501        c.li       a0,0
+     +0x0e  f2fff0ef    jal        ra,argint
+     +0x12  fec42503    lw         a0,-20(s0)     a0 := n
+     +0x16  f30ff0ef    jal        ra,kexit
+     +0x1a  4501        c.li       a0,0            DEAD: kexit never returns
+     +0x1c  60e2        c.ldsp     ra,24(sp)
+     +0x1e  6442        c.ldsp     s0,16(sp)
+     +0x20  6105        c.addi16sp sp,32
+     +0x22  8082        c.ret
+
+   IT DIVERGES.  Like SpecKexit.v, the postcondition is [mWP Loop], full
+   stop: nothing after the [jal kexit] is reachable, and the contract says
+   so structurally (no continuation) rather than by convention.  The dead
+   tail gcc emitted at +0x1a..+0x22 is decoded by nobody's proof -- kexit's
+   own contract discharges the whole rest of the function by never handing
+   control back.
+
+   THE CONTRACT IS THE UNION OF ITS TWO CALLEES', and kexit dominates it.
+   The [status] argument does not even need naming: kexit's own contract
+   takes no [status] parameter, because nothing downstream of [p->xstate]
+   is observable from inside its diverging body (see SpecKexit.v -- the
+   ZOMBIE park's [proc_dormant] carries no promise about it either).  So
+   the only thing sys_exit's proof needs from argint is that it MAY be
+   called, i.e. that argument 0 exists in the trapframe -- and, exactly as
+   in SpecSysWait.v, that is a fact about [proc_priv]'s own trapframe
+   record ([pv_tf V !! tf_arg_idx 0 = Some v0]).  The trapframe fraction
+   argint wants is borrowed OUT of [proc_priv] ([ProcInv.proc_priv_tf]) for
+   the duration of the call and put back before kexit -- which wants the
+   whole block -- is entered. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import KernelText KernelDataInv.
+Require Import IntrDefs.
+Require Import WpLock.
+Require Import ProcGeom CpuOwn.
+Require Import FdSlots FileInv.
+Require Import WpMmodeLeafBase.
+Require Import ChildTok.  (* [my_pay]: the exit deposit's own naming *)
+Require Import ProcInv.
+Require Import SchedCtx.
+Require Import KallocInv.
+Require Import IrefSlots.
+Require Import SpecFileclose.
+Require Import WaitInv.
+Require Import WpUart.
+Require Import DiskInv.
+Require Import Xv6Cameras.
+Require Import BioInv.
+Require Import FsBlocks LogInv.
+Require Import FsCrash.
+Require Import SpecPanic.
+Require Import SpecProcinit.   (* [wait_lock_addr] *)
+Require Import SpecKexit.      (* [K_kexit] -- the budget this one is built on *)
+Require Import FsReady.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import FsCfg.   (* [fscfg]: the fs configuration is AMBIENT *)
+Local Open Scope Z_scope.
+Require Import TsoCtx.
+Import Defs.
+
+(* 4 slots for sys_exit's own frame, and below it kexit's 74 -- argint's 18
+   (4 + 18 = 22) is smaller and subsumed. *)
+Notation K_sys_exit := ((4 + K_kexit)%nat) (only parsing).
+Definition wp_sys_exit_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+      !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γft γf γw : gname)                               (* ftable lock, ftable, wait *)
+     (γs : list gname) (j : nat) (γl : gname)
+  (* disk fabric + lock  *)
+    (pd pav pu : mword 64)
+    (ip : mword 64) (dqi : dfrac)                     (* the initproc cell   *)
+               (* kmem.lock, kalloc   *)
+    (on : option nat) (fn : fclose_names)
+    (m : regfile) (av : nat) (eb : bool) (b : bool)
+    (pid : mword 32) (U : ustate) (sts : list fdstate)
+    (v0 : mword 64) (lks : gset string) (cs : gset gname)
+    (* the exit deposit's own payload -- see the premise at the foot of the
+       list *)
+    (Q : Z -> iProp Σ) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.sys_exit in
+  let pj := proc_addr j in
+  fn = MkFCloseNames γs j γl pd pav pu
+         pid (DfracOwn (1/4)) ->
+  (j < NPROC)%nat ->
+  γs !! j = Some γl ->
+  (* the syscall argument, out of the trapframe page [proc_priv] carries *)
+  pv_tf (us_V U) !! tf_arg_idx 0 = Some v0 ->
+  (K_sys_exit <= av)%nat ->
+  (* the covered range's block-number bounds, and the log's own storage *)
+  log_geom_ok fsc_cov fsc_logst ->
+  (* the PARKING premise, inherited from kexit: everything that sleeps or
+     parks needs it *)
+  eb = true ->
+  (* THE FRESHNESS PREMISE, INHERITED FROM KEXIT.  sys_exit acquires no lock
+     of its own -- it is a pure pass-through to kexit, whose own lowest rank
+     is "ftable" (1), via the fileclose loop -- so this is exactly kexit's
+     own premise, unconsumed. *)
+  locks_below lks "log" ->
+  sie_cap_gpr KT1 m av b pj -∗
+  (* THE DYING THREAD'S STACK CLOSER, in transit.  sys_exit is one layer of
+     the diverging chain [usertrap -> syscall -> sys_exit -> kexit]: it takes
+     the closer anchored at ITS entry sp, wraps its own (dead) 4-slot frame
+     around it, and hands the result to kexit, whose ZOMBIE park is where the
+     page finally reaches the slot ([ProcDefs.kstack_closer],
+     [ProcDefs.kstack_closer_frame]).  UNPAID HERE and honestly so: nothing
+     applies this contract yet -- syscall's dispatch does not reach sys_exit
+     (ProofSyscall.v's header lists what blocks it) -- and the payer, when it
+     comes, is usertrap's entry, where sp IS the page top
+     ([ProcDefs.kstack_closer_top]). *)
+  kstack_closer pj (m !!! Regidx csp_rs1) (trap_res b + av)%nat -∗
+  (* entered with no lock held *)
+  cpu_own 0%nat eb pj b lks -∗
+  (* [kernel_data] is argint/argraw's own premise (the jump table it reads
+     lives there); kexit needs none of it *)
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  (* the proc table, and the scheduler chain the park hands itself to *)
+  procs_inv γs -∗
+  panic_env -∗
+  (* the running-thread bundle -- consumed: this thread parks forever *)
+  (* wait_lock, and what it protects *)
+  is_lock γw wait_lock_addr "wait_lock"%string (wait_res_at) -∗
+  (* the open-file table: every non-null descriptor is fileclose'd *)
+  is_ftable γft γf -∗
+  (* ...and closing one can free a pipe's page *)
+  is_lock fsc_kalloc (mword_of_int KernelSyms.kmem) "kmem"%string
+    (λ ξ : CtxId, kmem_res (XIk := ξ) fsc_kpages (mword_of_int (KernelSyms.kmem + 24))) -∗
+  kalloc_avail fsc_kpages on -∗
+  (* the file system, for [begin_op(); iput(p->cwd); end_op();] inside kexit *)
+  bio_ctx fsc_bio (fs_view fsc_fs fsc_disk icfg_dev fsc_cov) -∗
+  log_ctx icfg_log fsc_bio fsc_fs fsc_cov fsc_logst icfg_dev -∗
+  fs_crash_seam fsc_cov fsc_logst -∗
+  gen_cert -∗
+  dev_inv fsc_uart fsc_disk -∗
+  disk_geom fsc_disk pd pav pu -∗
+  is_lock fsc_dlock d_lock "virtio_disk"%string (disk_res_at fsc_disk pd pav pu) -∗
+  bslots 3 -∗
+  (* the inode cache and the two regions iput's truncate arm frees into,
+     kexit's verbatim *)
+  FsReady.fs_ready -∗
+  (* the initproc pointer, at any fraction *)
+  (mword_of_int KernelSyms.initproc : mword 64) ↦₈□ ip -∗
+  (* ...and who <init> is, for kexit's reparent -- see [SpecKexit] *)
+  WaitInv.init_ident ip -∗
+  (* the process itself: its private block (trapframe included) and its
+     fd-slot allowance *)
+  fd_slots FDSPARE -∗
+  (* ... and its iref allowance, which kexit rejoins with the cwd unit iput
+     hands back to build the ZOMBIE block *)
+  iref_slots IREFSPARE -∗
+  proc_priv γf pj pid U -∗
+  (* THE fd-STATE FRAGMENT BUNDLE, and it does not come back: sys_exit runs
+     kexit, which closes every descriptor (a retype, so it needs both halves)
+     and then parks the process as a ZOMBIE.  The bundle dies with the
+     incarnation whose name it is keyed on (FdSlots.v). *)
+  fd_frags (pv_fdg (us_V U)) sts -∗
+  (* ...AND THE BYTE-QUEUE CLOSE PAYMENTS, one per row of the table, relayed
+     to kexit verbatim ([SpecKexit], design/pipe.md "The byte queue") *)
+  fileclose_cpays sts -∗
+  (* ...AND THE SLOT'S CHILDREN ROW, relayed to kexit, which parks it in the
+     ZOMBIE block ([SpecKexit]).  It rides the trap residue beside the
+     fragment bundle ([UsertrapRes.ut_own]) and, like it, does not come back
+     to the caller: there is no caller to come back to. *)
+  ch_frag (pv_chg (us_V U)) pj cs -∗
+  (* ...AND THE EXIT DEPOSIT, relayed to kexit verbatim: the process's own
+     knowledge of the payload its exit owes and that payload PAID at the
+     status its trapframe carries ([ProcGeom.exit_xs], the very word
+     [argint(0,&n)] reads out one instruction below).  sys_exit does
+     nothing with it -- kexit is what parks it as the ZOMBIE escrow
+     ([SpecKexit]) -- so it is stated here exactly as kexit states it. *)
+  my_pay (pv_gen (us_V U)) Q -∗
+  Q (exit_xs (pv_tf (us_V U))) -∗
+  (* NO continuation: sys_exit does not return.  See the header. *)
+  mWP (Loop : expr riscv_lang).
+
+Module Type SYSEXIT.
+  Parameter wp_sys_exit_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γft γf γw : gname)
+      (γs : list gname) (j : nat) (γl : gname)
+      (pd pav pu : mword 64)
+      (ip : mword 64) (dqi : dfrac)
+        (on : option nat) (fn : fclose_names)
+      (m : regfile) (av : nat) (eb : bool) (b : bool)
+      (pid : mword 32) (U : ustate) (sts : list fdstate)
+    (v0 : mword 64) (lks : gset string) (cs : gset gname) (Q : Z -> iProp Σ),
+      wp_sys_exit_sconf_body γft γf γw γs j γl pd pav pu
+ ip dqi
+
+                             on fn m av eb b pid U sts v0 lks cs Q.
+End SYSEXIT.

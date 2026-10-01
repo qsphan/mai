@@ -1,0 +1,209 @@
+(* ===================================================================== *)
+(* UexecRound.v -- THE TRAP ROUND, as a relation on the user-visible      *)
+(* state.                                                                 *)
+(*                                                                        *)
+(* One round of the kernel's trap loop takes the process from the state   *)
+(* it trapped in to the state the sret resumes it at.  [uround_ok] is     *)
+(* WHAT THAT ROUND MAY HAVE DONE, keyed -- like the dispatch itself --    *)
+(* on whether the cause is an ecall:                                      *)
+(*                                                                        *)
+(*   ecall     -- either the entry was [exec] (which never returns to     *)
+(*                this process's WP at all: the new program's slot is     *)
+(*                MINTED, so this row says nothing), or the entry WAS NOT *)
+(*                [exit] and the round bumped the trapframe (a0 := some   *)
+(*                return value, epc += 4) and moved the user              *)
+(*                image/permission map by exactly what                    *)
+(*                [UsysMemOk.usys_mem_ok] allows for the entry's number.  *)
+(*                                                                        *)
+(*                THE [exit] CONJUNCT IS NOT A NICETY (milestone J, K1).  *)
+(*                [UexecRet.uexec_ret]'s ecall arm hands back [emp] at    *)
+(*                [exit] -- a process that exits returns no successor --  *)
+(*                while [usys_mem_ok USYS_exit ...] is SATISFIABLE (exit  *)
+(*                falls into the quiet "nothing moved" row).  Without     *)
+(*                this conjunct the loop reaching a resume would have no  *)
+(*                way to refute the arm where the process handed back     *)
+(*                nothing.  It is FREE on the producing side: the         *)
+(*                dispatcher's returning post now says [sysc_num <> 2]    *)
+(*                ([SpecSyscall]), which all twenty-one returning arms    *)
+(*                read off their own table index and which the exit arm   *)
+(*                owes nothing for, since exit takes the DIVERGENT        *)
+(*                conjunct of [ProofSyscall.sysc_exit_ty].                *)
+(*   anything  -- an interrupt, a page fault, an unexpected scause: the   *)
+(*   else        resume state is the trapped state, on the nose.          *)
+(*                                                                        *)
+(* WHY THE BUMP IS STATED ON THE RESUME PROJECTIONS and not as            *)
+(* [tf' = bump_tf tf r]: the list the sret actually resumes from is       *)
+(* [prepare_return_tf] of the bumped one, which differs in the four       *)
+(* KERNEL words.  [tf_resume_gpr0] / [tf_resume_pc] do not read those, so *)
+(* the projection form is both what is provable and what the slot's key   *)
+(* needs.  [TfUser.tf_ueq] is the corresponding equivalence, and          *)
+(* [uround_ok_ueq_l] / [uround_ok_ueq_r] are its congruences here -- so a *)
+(* kernel proof may state the round at whichever of the two lists it      *)
+(* happens to hold.                                                       *)
+(*                                                                        *)
+(* PURE.  See claude-notes/completed/user-wp-slot.md SS4a (J1a).          *)
+(* ===================================================================== *)
+From Stdlib Require Import ZArith Bool Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvExtras.
+Require Import ProcGeom.     (* [tf_epc_idx] *)
+Require Import TfUser.       (* [tf_ueq] *)
+Require Import UserPerm.     (* [uperm] *)
+Require Import UsysMemOk.    (* [usys_num] / [usys_mem_ok] / [uecall_scause] *)
+Require Import UexecSlot.    (* [tf_w] / [tf_resume_pc] / [tf_ueq_resume_pc] *)
+Require Import UexecRet.     (* [tf_resume_gpr0] / [tf_ueq_resume_gpr0] *)
+Local Open Scope Z_scope.
+
+(* ===================================================================== *)
+(* SS1 The two shapes a round can leave the trapframe in.                  *)
+(* ===================================================================== *)
+
+(* TRANSPARENT: the resume state IS the trapped state. *)
+Definition uround_id_ok (tf tf' : list (mword 64)) : Prop :=
+  tf_resume_gpr0 tf' = tf_resume_gpr0 tf /\ tf_resume_pc tf' = tf_resume_pc tf.
+
+(* BUMPED: a0 := the return value, pc past the ecall.  The right-hand sides
+   are [UexecRet.tf_resume_gpr_bump] / [tf_resume_pc_bump]'s verbatim -- those
+   two lemmas are the one-step dischargers. *)
+Definition uround_bump_ok (tf tf' : list (mword 64)) (r : mword 64) : Prop :=
+  tf_resume_gpr0 tf' = <[Regidx (mword_of_int 10) := r]> (tf_resume_gpr0 tf)
+  /\ tf_resume_pc tf' = ret_pc (add_vec_int (tf_w tf tf_epc_idx) 4).
+
+(* ===================================================================== *)
+(* SS2 THE ROUND.                                                          *)
+(* ===================================================================== *)
+(* [cw] / [cw'] are the cwd's inum before and after ([UexecSlot.uvis_cwd]).
+   The exec disjunct pins it too -- exec INHERITS the caller's directory
+   ([KexecDefs.kexec_ok]'s row), and the failed-exec arm of
+   [UexecApply.uexec_ret_round_slot] resumes at the caller's key, so it
+   has to know the field did not move.  The returning disjunct carries
+   [UsysMemOk.usys_cwd_ok] beside the memory row: chdir may move it, nothing
+   else does. *)
+(* [lz] / [lz'] are the LAZY BIT before and after ([UexecSlot.uvis_lazy],
+   off [ProcDefs.pv_lazy]), and they ride beside the break for its reason:
+   the bit is measured against the break, and the memory row is where the
+   entry says what it did to both.  The exec disjunct says nothing about it
+   (exec's successful record is a different program's; the FAILED arm's row
+   is the table's own equation); the transparent arm KEEPS it -- vmfault
+   writes no field of the block. *)
+(* [secc] / [secc'] are the MASK before and after ([UexecSlot.uvis_secc], off
+   [ProcDefs.pv_secc]; upstream a083670).  The number every disjunct reads is
+   the EFFECTIVE one ([UsysMemOk.usys_eff]) -- a blocked call is the
+   unknown-number call.  exec keeps the mask ([KexecDefs.kexec_ok]), the
+   returning disjunct carries [UsysMemOk.usys_secc_ok] (sys_seccomp's AND),
+   and the transparent arm keeps it. *)
+Definition uround_ok (sc : mword 64)
+    (tf : list (mword 64)) (M : gmap Z (bv 8)) (pi : gmap (mword 27) uperm)
+    (szv : Z) (cw : Z) (lz : bool) (secc : mword 64)
+    (tf' : list (mword 64)) (M' : gmap Z (bv 8)) (pi' : gmap (mword 27) uperm)
+    (szv' : Z) (cw' : Z) (lz' : bool) (secc' : mword 64) : Prop :=
+  if decide (sc = uecall_scause) then
+    (usys_eff secc tf = USYS_exec /\ cw' = cw /\ secc' = secc)
+    \/ (usys_eff secc tf <> USYS_exit
+        /\ exists r : mword 64,
+             uround_bump_ok tf tf' r
+             /\ usys_mem_ok (usys_eff secc tf) tf r M pi szv lz M' pi' szv' lz'
+             /\ usys_cwd_ok (usys_eff secc tf) r cw cw'
+             /\ usys_secc_ok (usys_eff secc tf) tf secc secc' r)
+  else uround_id_ok tf tf' /\ M' = M /\ pi' = pi /\ szv' = szv /\ cw' = cw
+       /\ lz' = lz /\ secc' = secc.
+
+(* ===================================================================== *)
+(* SS3 The readers -- unpack the [decide].                                 *)
+(* ===================================================================== *)
+Lemma uround_ok_ecall (tf : list (mword 64)) (M M' : gmap Z (bv 8))
+    (pi pi' : gmap (mword 27) uperm) (szv szv' : Z) (cw cw' : Z)
+    (lz lz' : bool) (secc secc' : mword 64) (tf' : list (mword 64)) :
+  uround_ok uecall_scause tf M pi szv cw lz secc tf' M' pi' szv' cw' lz' secc' ->
+  (usys_eff secc tf = USYS_exec /\ cw' = cw /\ secc' = secc)
+  \/ (usys_eff secc tf <> USYS_exit
+      /\ exists r : mword 64,
+           uround_bump_ok tf tf' r
+           /\ usys_mem_ok (usys_eff secc tf) tf r M pi szv lz M' pi' szv' lz'
+           /\ usys_cwd_ok (usys_eff secc tf) r cw cw'
+           /\ usys_secc_ok (usys_eff secc tf) tf secc secc' r).
+Proof.
+  unfold uround_ok.
+  destruct (decide (uecall_scause = uecall_scause)) as [_ | Hne];
+    [ intros H; exact H | contradiction (Hne eq_refl) ].
+Qed.
+
+Lemma uround_ok_transparent (sc : mword 64) (tf : list (mword 64))
+    (M M' : gmap Z (bv 8)) (pi pi' : gmap (mword 27) uperm) (szv szv' : Z)
+    (cw cw' : Z) (lz lz' : bool) (secc secc' : mword 64) (tf' : list (mword 64)) :
+  sc <> uecall_scause ->
+  uround_ok sc tf M pi szv cw lz secc tf' M' pi' szv' cw' lz' secc' ->
+  uround_id_ok tf tf' /\ M' = M /\ pi' = pi /\ szv' = szv /\ cw' = cw
+  /\ lz' = lz /\ secc' = secc.
+Proof.
+  intros Hne. unfold uround_ok.
+  destruct (decide (sc = uecall_scause)) as [Heq | _];
+    [ contradiction (Hne Heq) | intros H; exact H ].
+Qed.
+
+(* ===================================================================== *)
+(* SS4 THE CONGRUENCES.  Every reader of [tf] in the relation -- the       *)
+(* number (word 21), [usys_mem_ok]'s window bases (words 14/15,            *)
+(* [UsysMemOk.usys_mem_ok_ueq]), the epc word (3) and the restored file    *)
+(* (words 5..35) -- is inside [tf_ueq]'s reach, and so is every reader of  *)
+(* [tf'].                                                                  *)
+(* ===================================================================== *)
+Lemma uround_ok_ueq_l (sc : mword 64) (tf tfa : list (mword 64))
+    (M M' : gmap Z (bv 8)) (pi pi' : gmap (mword 27) uperm) (szv szv' : Z)
+    (cw cw' : Z) (lz lz' : bool) (secc secc' : mword 64) (tf' : list (mword 64)) :
+  tf_ueq tf tfa ->
+  uround_ok sc tf M pi szv cw lz secc tf' M' pi' szv' cw' lz' secc'
+  -> uround_ok sc tfa M pi szv cw lz secc tf' M' pi' szv' cw' lz' secc'.
+Proof.
+  intros Hu H.
+  pose proof (tf_ueq_num tf tfa Hu) as Hn0.
+  assert (Hn : usys_eff secc tf = usys_eff secc tfa)
+    by (unfold usys_eff; rewrite Hn0; reflexivity).
+  pose proof (proj2 Hu (tf_arg_idx 0) ltac:(unfold tf_arg_idx; lia)) as Ha0.
+  pose proof (tf_ueq_resume_gpr0 tf tfa Hu) as Hg.
+  pose proof (tf_ueq_resume_pc tf tfa Hu) as Hp.
+  pose proof (tf_ueq_epc tf tfa Hu) as He.
+  unfold uround_ok in H |- *.
+  destruct (decide (sc = uecall_scause)).
+  - destruct H as [[Hx Hcw] | [Hnx [r [[Hb1 Hb2] [Hm [Hc Hs]]]]]].
+    + left. split; [ rewrite <- Hn; exact Hx | exact Hcw ].
+    + right. split; [ rewrite <- Hn; exact Hnx | ]. exists r. split; [ split | split_and! ].
+      * rewrite <- Hg. exact Hb1.
+      * unfold tf_w in Hb2 |- *. rewrite <- He. exact Hb2.
+      * rewrite <- Hn.
+        exact (usys_mem_ok_ueq (usys_eff secc tf) tf tfa r M M' pi pi' szv szv'
+                 lz lz' Hu Hm).
+      * rewrite <- Hn. exact Hc.
+      * rewrite <- Hn. exact (usys_secc_ok_arg_cong _ tf tfa _ _ _ Ha0 Hs).
+  - destruct H as [[Hi1 Hi2] Hrest].
+    split; [ split | exact Hrest ].
+    + rewrite <- Hg. exact Hi1.
+    + rewrite <- Hp. exact Hi2.
+Qed.
+
+Lemma uround_ok_ueq_r (sc : mword 64) (tf : list (mword 64))
+    (M M' : gmap Z (bv 8)) (pi pi' : gmap (mword 27) uperm) (szv szv' : Z)
+    (cw cw' : Z) (lz lz' : bool) (secc secc' : mword 64) (tf' tfa' : list (mword 64)) :
+  tf_ueq tf' tfa' ->
+  uround_ok sc tf M pi szv cw lz secc tf' M' pi' szv' cw' lz' secc'
+  -> uround_ok sc tf M pi szv cw lz secc tfa' M' pi' szv' cw' lz' secc'.
+Proof.
+  intros Hu H.
+  pose proof (tf_ueq_resume_gpr0 tf' tfa' Hu) as Hg.
+  pose proof (tf_ueq_resume_pc tf' tfa' Hu) as Hp.
+  unfold uround_ok in H |- *.
+  destruct (decide (sc = uecall_scause)).
+  - destruct H as [Hx | [Hnx [r [[Hb1 Hb2] Hm]]]].
+    + left. exact Hx.
+    + right. split; [ exact Hnx | ]. exists r. split; [ split | exact Hm ].
+      * rewrite <- Hg. exact Hb1.
+      * rewrite <- Hp. exact Hb2.
+  - destruct H as [[Hi1 Hi2] Hrest].
+    split; [ split | exact Hrest ].
+    + rewrite <- Hg. exact Hi1.
+    + rewrite <- Hp. exact Hi2.
+Qed.

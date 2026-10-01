@@ -1,0 +1,410 @@
+(* SpecSysPipe.v -- the public interface of sys_pipe(), stated independently
+   of its proof.  Requires only the definitional layer -- never a
+   whole-function proof file -- so every function proof can be checked in
+   parallel.
+
+     uint64 sys_pipe(void) {
+       uint64 fdarray;                  // user pointer to two ints
+       struct file *rf, *wf;
+       int fd0, fd1;
+       struct proc *p = myproc();
+       argaddr(0, &fdarray);
+       if (pipealloc(&rf, &wf) < 0) return -1;
+       fd0 = -1;
+       if ((fd0 = fdalloc(rf)) < 0 || (fd1 = fdalloc(wf)) < 0) {
+         if (fd0 >= 0) p->ofile[fd0] = 0;
+         fileclose(rf); fileclose(wf); return -1;
+       }
+       if (copyout(p->pagetable, fdarray,     (char * )&fd0, sizeof(fd0)) < 0 ||
+           copyout(p->pagetable, fdarray + 4, (char * )&fd1, sizeof(fd1)) < 0) {
+         p->ofile[fd0] = 0; p->ofile[fd1] = 0;
+         fileclose(rf); fileclose(wf); return -1;
+       }
+       return 0;
+     }
+
+   @ KernelSyms.sys_pipe = 0x80005338, 71 instructions (offsets 0x00 .. 0xe0;
+   see CodeSysPipe.v for the listing).  A 64-byte frame: [fdarray] at
+   s0-40, [rf] at s0-48, [wf] at s0-56, and the two [int]s sharing the
+   bottom slot -- [fd1] in its LOW word (s0-64), [fd0] in its HIGH word
+   (s0-60).
+
+   WHY THIS ONE IS THE INTERESTING SYSCALL.  sys_pipe is the first proof in
+   which every layer of the file/proc model is exercised at once and has to
+   BALANCE:
+
+     - it CREATES two file references (pipealloc) and INSTALLS them in
+       descriptors (fdalloc), where sys_close only destroyed one;
+     - it copies kernel data OUT to user memory, so it crosses the
+       [proc_pt] altitude ([ProcInv.proc_priv_copy]) and the process's page
+       table may GROW under it -- hence the [uptd_ext] descriptor in the
+       continuation, exactly as for fetchaddr;
+     - and it has FOUR exits over three error tails, each of which has to
+       hand back the same resources.
+
+   THE CONSERVATION LAW IS THE SPEC.  Two [fd_slot]s go in -- the
+   per-syscall allowance of FdSlots.v, which is what the "+4" in
+   [FDSLOTS] is for -- and two come back on EVERY exit.  Tracing them is
+   the whole resource argument:
+
+     | exit                  | where the two units end up                  |
+     |-----------------------|---------------------------------------------|
+     | pipealloc failed      | both returned by pipealloc itself           |
+     | fdalloc(rf) failed    | the two fileclose calls return them         |
+     | fdalloc(wf) failed    | fdalloc(rf)'s unit pays to re-null ofile    |
+     |                       | [fd0]; the two fileclose calls return two   |
+     | copyout failed        | the two fdalloc units pay to re-null both   |
+     |                       | descriptors; the two fileclose return two   |
+     | success               | one per fdalloc, straight through           |
+
+   If any one of those legs leaked, the [+4] allowance would drain and a
+   whole-kernel proof could only run sys_pipe finitely often.  That is why
+   [SpecFilealloc]'s failure arm and [SpecPipealloc]'s had to start
+   returning their units before this spec could be written.
+
+   DETERMINISM, AND ITS LIMIT.  Which descriptors get used is NOT a choice:
+   they are the two least free ones, [SpecFdalloc.fd_frees]'s first two
+   entries.  Which EXIT is taken, however, genuinely is not a function of
+   anything the caller holds -- pipealloc can fail because another core just
+   took the last ftable slot or the last page, and copyout can fail on a user
+   address this altitude says nothing about -- so the postcondition is an
+   honest disjunction there.
+
+   WHAT THIS CONTRACT DOES NOT SAY, and why:
+
+   * NOT WHICH BYTES LAND AT [fdarray].  The postcondition names the WINDOW
+     precisely ([UserPtTree.umem_wr] at [v], length [d <= 8]) but leaves the
+     bytes [bs] existential, so no resource here reads as "fdarray[0] =
+     fd0" -- even though [SpecCopyout.wp_copyout_sconf_mem]'s own contract
+     could support pinning [bs] to the little-endian encoding of [fd0] /
+     [fd1].  That is a strictly stronger statement than any other syscall
+     in this tree carries and is left to whoever wants it
+     (SpecFilestat.v's note, on the same choice).
+   * NOTHING ABOUT THE DESCRIPTORS' CONTENTS.  The two [file_ref]s land
+     inside [proc_priv], and [ProcInv.ofile_slot] quantifies the [fcontent]
+     existentially -- so the post can say descriptor [fd0] names ftable slot
+     [k0], but not that [k0]'s type is FD_PIPE and its pipe is the same one
+     [fd1] names.  Recovering that needs a PERSISTENT content witness on the
+     ftable authority (an [agree] component in [FileInv.fileUR]), which is a
+     change to the algebra and to all three of its proved ghost steps.
+     Flagged, not built.
+
+   Design: claude-notes/design/pipe.md, claude-notes/design/file-table.md,
+   claude-notes/design/proc-struct.md. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText KernelDataInv.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import LockRank.
+Require Import ProcGeom CpuOwn.
+Require Import KvmSpec.
+Require Import UserPtTree.
+Require Import ProcPtOwn.
+Require Import FdSlots FileInv ProcInv.
+Require Import SpecPanic.
+Require Import SpecFdalloc.
+Require Import IrefSlots.
+Require Import SpecFileclose.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Import Defs.
+Require Import CtxIdDefs.
+Local Open Scope Z_scope.
+
+
+(* sys_pipe's own frame is 8 slots (c.addi16sp sp,-64); below it pipealloc
+   wants 94 ([SpecPipealloc]'s literal), so 102.  pipealloc sets the bound,
+   and what makes pipealloc the deepest is the fileclose on its own error
+   path -- copyout wants 52, argaddr 18, fdalloc 14, myproc 10. *)
+Notation sys_pipe_stack := (102%nat) (only parsing).
+Require Import PipeQueue.   (* the pipe's byte-queue ghost: names, links, payments *)
+Require Import RiscvModelBytes.  (* [nth_byte] -- pipe reports its
+                                    descriptors by writing them *)
+Section SpecSysPipe.
+  Context `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ}.
+  (* [GenId], for [ProcInv.proc_priv]'s own index: the private block now
+     carries [FirstTok.first_tok], whose boot arm names [gen_cert].  The
+     definitions below mention the block, so the section has to bind it. *)
+  Context `{GEN : GenId}.
+
+  (* sys_pipe's result, keyed by the returned a0, over the process state [W]
+     the syscall ends with -- i.e. the incoming [V] with copyout's page-table
+     growth already folded in (the continuation below does that with
+     [upd_upt], so this predicate is purely about the DESCRIPTORS).
+
+     Both arms hand back the two fd units: see the table in the header. *)
+  (* THE BUNDLE MOVED INSIDE THE DISJUNCTION.  The failure arms hand [sts]
+     back on the nose -- each of them nulls whatever it had installed, and
+     writing 0 back over a slot that was already 0 is the identity, so no
+     descriptor's state moved.  The success arm replaces TWO rows, and
+     names WHICH END IS WHICH: [FdOpen true false FdPipe] reads and
+     [FdOpen false true FdPipe] writes, per [FdSlots]'s note that on a pipe
+     the mode flags ARE the identity of the end.
+
+     THIS IS SHARPER THAN THE SYSCALL TABLE'S PIPE ROW.
+     [UsysMemOk.usys_fd_ok] has to bind the two descriptor NUMBERS
+     existentially, because at that vocabulary they are reported by being
+     WRITTEN into user memory and the fd table cannot see the bytes.  Here
+     they are named: they are the two least-free descriptors, which is a
+     fact about the array this post already carries ([fd_frees … = fd0 ::
+     fd1 :: l]).  When the two tables are read together, this is the row
+     that lets the existential be discharged. *)
+  (* [d]/[bs] are the WINDOW pipe wrote -- carried here so the success arm
+     can say the two descriptors it allocated ARE the two words it put in
+     the caller's buffer.  Without that a caller learns two numbers it
+     cannot act on. *)
+  Definition sys_pipe_post `{XI : CurCtx} (γf : gname) (p : mword 64) (pid : mword 32)
+      (UW : ustate) (sts : list fdstate) (d : nat) (bs : nat -> bv 8)
+      (r : mword 64) : iProp Σ :=
+    ((* FAILURE.  Whichever tail ran, the descriptor array is EXACTLY as it
+        came in: the two arms that had already installed a descriptor null
+        it again, and writing 0 back over a slot that was 0 is the identity
+        ([ProcInv.upd_ofile_id], since [fd_frees] only ever names free
+        slots). *)
+     (⌜r = (mword_of_int (-1) : mword 64)⌝ ∗ proc_priv γf p pid UW ∗
+        fd_frags (pv_fdg (us_V UW)) sts)
+     ∨
+     (* SUCCESS.  The two least free descriptors now hold the read and the
+        write end, in that order. *)
+     (* ...AND THE TWO DESCRIPTORS NAME ONE PIPE, whose byte-queue fragment
+        comes out beside them at its birth state (design/pipe.md, "The byte
+        queue"): exact and exclusive, the application's to keep. *)
+     (∃ (fd0 fd1 : nat) (l : list nat) (k0 k1 : nat) (γp : pipe_names),
+       (* THE TWO ARE DISTINCT, and the post says so: a caller reading the
+          row needs it to know the two inserts commute, and pipe's own proof
+          has the fact already (the second descriptor is still free after
+          the first is installed). *)
+       ⌜r = (zero_reg : mword 64) /\ fd_frees (pv_ofile (us_V UW)) = fd0 :: fd1 :: l
+        /\ fd0 <> fd1
+        (* ...AND BOTH SLOTS WERE CLOSED, both read against the INCOMING
+           table -- see [SpecSysOpen]'s note on the same conjunct.  Two
+           fdalloc calls, two scans; the proof already names both facts
+           (they are what make its two re-nulls the identity on the failure
+           arms), so exposing them costs nothing. *)
+        /\ sts !! fd0 = Some FdClosed /\ sts !! fd1 = Some FdClosed
+        (* ...AND THE TWO DESCRIPTORS ARE THE TWO WORDS IN THE CALLER'S
+           BUFFER.  This is the conjunct that makes the row USABLE by a
+           program: pipe reports its descriptors by WRITING them, so a
+           caller that is handed [fd0]/[fd1] existentially and eight
+           unconstrained bytes has learned nothing it can act on -- it
+           cannot later close what it was given.  The proof has had the
+           fact all along (it copies out exactly these bytes); it simply
+           was not said.  Stated against [UW]'s image, which IS the written
+           one, and at the buffer argument 0 names. *)
+        (* ...AND THE BYTES PIPE WROTE ARE THE TWO DESCRIPTORS.  Stated on
+           the WRITTEN FUNCTION rather than on lookups, because the no-wrap
+           side condition a lookup needs is the CALLER's fact (it comes
+           from owning the run), not something the kernel establishes. *)
+        /\ d = 8%nat
+        /\ (forall i : nat, (i < 8)%nat ->
+              bs i = if (i <? 4)%nat
+                     then nth_byte (trunc32 (mword_of_int (Z.of_nat fd0)
+                                             : mword 64)) i
+                     else nth_byte (trunc32 (mword_of_int (Z.of_nat fd1)
+                                             : mword 64)) (i - 4)%nat)⌝ ∗
+       proc_priv γf p pid
+         (upd_usV UW (upd_ofile (upd_ofile (us_V UW) fd0 (fnode k0)) fd1 (fnode k1))) ∗
+       (* written in the order the two settles run: fd0's read end first,
+          then fd1's write end.  [fd0 <> fd1] (they are distinct entries of
+          [fd_frees]), so the two inserts commute and the order is a
+          presentation choice, not a constraint. *)
+       fd_frags (pv_fdg (us_V UW))
+         (<[fd1 := FdOpen false true (FdPipe γp)]>
+            (<[fd0 := FdOpen true false (FdPipe γp)]> sts)) ∗
+       pipe_qfrag (pn_queue γp) pst0))
+    ∗ fd_slot ∗ fd_slot.
+
+  (* THE LANDED SHAPE, DERIVED -- [SpecSysOpen.sys_open_post_any]'s twin,
+     and for the same reason: the dispatch arm does not name its table yet.
+     One named weakening beats a scatter of [iExists], and it is the line to
+     delete when the arm bundle is indexed. *)
+  Lemma sys_pipe_post_any `{XI : CurCtx} (γf : gname) (p : mword 64)
+      (pid : mword 32) (UW : ustate) (sts : list fdstate)
+      (d : nat) (bs : nat -> bv 8) (r : mword 64) :
+    sys_pipe_post γf p pid UW sts d bs r ⊢
+    ((⌜r = (mword_of_int (-1) : mword 64)⌝ ∗ proc_priv γf p pid UW
+      ∨ ∃ (fd0 fd1 : nat) (l : list nat) (k0 k1 : nat) (γp : pipe_names),
+          ⌜r = (zero_reg : mword 64) /\
+           fd_frees (pv_ofile (us_V UW)) = fd0 :: fd1 :: l /\ fd0 <> fd1⌝ ∗
+          proc_priv γf p pid
+            (upd_usV UW (upd_ofile (upd_ofile (us_V UW) fd0 (fnode k0)) fd1 (fnode k1))) ∗
+          pipe_qfrag (pn_queue γp) pst0)
+     ∗ fd_frags_any (pv_fdg (us_V UW)) ∗ fd_slot ∗ fd_slot).
+  Proof using .
+    rewrite /sys_pipe_post /fd_frags_any.
+    iIntros "[[(%Hr & Hp & Hb) | (%fd0 & %fd1 & %l & %k0 & %k1 & %γp & %Hpu & Hp & Hb & Hq)]
+              [Hu0 Hu1]]".
+    (* split the big disjunct off FIRST: [iFrame "Hu0 Hu1"] walks past it and
+       past [fd_frags_any] once per name (claude-notes/optimization.md, "the
+       cheapest fix is usually to split the big conjunct off first"). *)
+    - iSplitR "Hu0 Hu1 Hb".
+      { iLeft. by iFrame "Hp". }
+      iSplitL "Hb"; [by iExists sts|].
+      iSplitL "Hu0"; [iExact "Hu0"|]. iExact "Hu1".
+    - iSplitR "Hu0 Hu1 Hb"; last first.
+      { iSplitL "Hb";
+          [by iExists (<[fd1 := FdOpen false true (FdPipe γp)]>
+                         (<[fd0 := FdOpen true false (FdPipe γp)]> sts))|].
+        iSplitL "Hu0"; [iExact "Hu0"|]. iExact "Hu1". }
+      iRight. iExists fd0, fd1, l, k0, k1, γp. iFrame "Hp Hq". iPureIntro.
+      destruct Hpu as (H1 & H2 & H3 & _ & _). exact (conj H1 (conj H2 H3)).
+  Qed.
+
+End SpecSysPipe.
+
+Definition wp_sys_pipe_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+      !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname)  (γfl γf : gname)
+    (fn : fclose_names) (on : option nat)
+    (m : regfile) (av : nat) (eb : bool) (p : mword 64)
+    (v : mword 64) (pid : mword 32) (U : ustate) (sts : list fdstate)
+    (b : bool) (lks : gset string) :=
+  (* [pipeG] is not a separate binder: [fileG] subsumes it (FileInv.v), and
+     naming both would put TWO instance paths to [inG Σ fracR] in scope --
+     they print identically and do not unify, so a [pipe_ref] built through
+     one does not close a goal stated through the other.  Nothing about pipes
+     appears below in any case: the two references sys_pipe creates end up
+     inside [proc_priv]'s existentials, as each file's payload. *)
+  let pcE : mword 64 := mword_of_int KernelSyms.sys_pipe in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* sys_pipe reads syscall argument 0 -- the user address of the two-int
+     array -- out of the trapframe page [proc_priv] carries.  Nothing is
+     assumed about it: argaddr does not check, and copyout is the check. *)
+  pv_tf (us_V U) !! tf_arg_idx 0 = Some v ->
+  (sys_pipe_stack <= av)%nat ->
+  (* sys_pipe acquires no lock of its own -- it is a pure pass-through to its
+     three fileclose calls (inside [sp_close2]), whose own lowest rank is
+     "ftable" (1).  One premise covers the whole cone. *)
+  locks_below lks "log" ->
+  (* ---- THE TWO TIES THE PID QUARTER FORCES.  Same story as
+     [SpecSysClose.v]'s, and see durable-notes.md's "A CONTRACT CAN ASK FOR
+     MORE OF A CELL THAN EXISTS".
+
+     This contract used to take the pid quarter inside [fileclose_fs_env],
+     BESIDE [proc_priv] -- three quarters of [p->pid] at once, when
+     [ProcInv.proc_priv_core] owns one half and [SchedCtx.proc_pub], inside
+     [p->lock]'s payload, owns the other.  A thread not holding [p->lock] can
+     have one half and no more, and sys_pipe cannot be holding it (its own
+     [cpu_own 0] says no lock is held, and everything below it sleeps).  So
+     the premise set was unpayable, and nothing saw it: 3/4 <= 1, so the pair
+     is a consistent proposition and no proof can refute it -- what refutes it
+     is where the complementary half lives, which this function's proof never
+     mentions.
+
+     So the environment below is the NOPID bundle, and the quarter is lent out
+     of this function's OWN [proc_priv] for the duration of each fileclose
+     call ([ProcInv.proc_priv_pid] + [SpecFileclose.fileclose_fs_env_split_pid]
+     -- kexit's descriptor loop already works exactly this way).  The two
+     equations identify the lent quarter with the one [fn] describes;
+     [SpecSyscall]'s dispatch discharges [fcn_pid] from its own premise and
+     [fcn_dq] by [reflexivity]. *)
+  fcn_pid fn = pid ->
+  fcn_dq fn = DfracOwn (1/4) ->
+  sie_cap_gpr KT1 m av b p -∗
+  (* [n = 0]: copyout's chain reaches vmfault, whose kalloc runs with
+     interrupts un-pushed (SpecCopyout.v) -- and sys_pipe holds no lock
+     across any of its calls anyway. *)
+  cpu_own 0%nat eb p b lks -∗
+  (* THE TRAP-CSR COMPLEMENT, THREADED.  [emp] at [eb = true], so no existing
+     call site changes; at [eb = false] the real pair, which can only have
+     come from the TRAP.  sys_pipe acquires no lock of its own, so it mints
+     nothing: it is a pure PASS-THROUGH to pipealloc and to its own three
+     fileclose calls, both of whose crossings are the literal [true].  It has
+     to be threaded rather than framed -- a hart-indexed resource held across
+     a [true] crossing could not be transported back.  See
+     claude-notes/completed/eb-generic-sweep.md. *)
+  trap_csrs_ext KT1 eb -∗
+  cpu_claim_ext eb p -∗
+  kernel_text -∗ kernel_data -∗ pc_is pcE -∗
+  panic_env -∗
+  is_ftable γfl γf -∗
+  (* the kmem lock, the sealed page count and panic's contract: pipealloc
+     needs the allocator and copyout needs it again for vmfault, and every
+     acquire on the way has its own panic arm *)
+  kalloc_env γa None -∗
+  proc_priv γf p pid U -∗
+  (* the descriptor-state fragments -- spent on the two new descriptors, at
+     the table the post states its rows against *)
+  fd_frags (pv_fdg (us_V U)) sts -∗
+  (* the syscall's own allowance -- two references may be live in locals
+     before they reach descriptors.  Both come back. *)
+  fd_slot -∗ fd_slot -∗
+  (* FILECLOSE'S LOAN, ONE UNIT IN AND STRAIGHT BACK OUT.  sys_pipe reaches
+     fileclose on three error paths and through pipealloc, and every one of
+     them borrows an iref unit across the call and repays it -- see the note
+     on [SpecFileclose]'s [iref_slot] row.  One unit serves them all, and
+     sys_pipe is net zero. *)
+  iref_slot -∗
+  (* THE CLOSING ENVIRONMENT.  sys_pipe closes files it took back out of the
+     fd table, and [ProcInv.ofile_slot] quantifies their contents -- so, like
+     sys_close, it carries both of fileclose's bundles and hands over
+     whichever the type selects ([SpecFileclose.fileclose_env_frame]).  That
+     it only ever closes pipes is true and unusable: the knowledge of what a
+     descriptor names is going to be per-[ofile] ghost state, not something
+     recoverable from the file table. *)
+  fileclose_pipe_env fn on 0%nat -∗
+  fileclose_fs_env_nopid fn 0%nat eb p -∗
+  (* THE CROSSING IS THE LITERAL [true], NOT [b].  sys_pipe calls pipealloc
+     and fileclose, and both cross at [true] -- fileclose's FS arm parks -- so
+     sys_pipe can return on another hart.  The cost is the CALLER's: it must
+     supply its continuation hart-generically. *)
+  wp_next true p (fun (CID : CpuId) =>
+  (* THE IMAGE MOVES, AND THE MOVE IS A WINDOW AT [v].  sys_pipe's only
+     writes to user memory are its two copyouts, of [fd0] at [v] and [fd1]
+     at [v+4], and the two runs are ADJACENT ([UserPtTree.umem_wr_app]), so
+     the pair composes into ONE window: the entry image with the run
+     [v .. v+d) overwritten and nothing else touched.
+
+     WHAT STAYS EXISTENTIAL IS A LENGTH AND THE BYTES, NOT AN IMAGE: a
+     prefix length [d <= 8] (either copyout can fault part-way) and the
+     BYTES [bs].  On the two early failure arms (pipealloc / fdalloc)
+     neither copyout ran, so [d] is instantiated to [0]; if the first
+     copyout fails, [d] is its own prefix (<= 4); if only the second does,
+     [d] is [4] plus its prefix.  A caller reads its own untouched bytes
+     back with [UserPtTree.umem_wr_lookup_out]. *)
+    ∀ (mf : regfile) (P' : uptd) (d : nat) (bs : nat -> bv 8) (k' : nat),
+      ⌜callee_saved m mf⌝ -∗
+      ⌜uptd_ext_sz (pv_sz (us_V U)) (pv_upt (us_V U)) P'⌝ -∗
+      ⌜(d <= 8)%nat⌝ -∗
+      (* THE EVENT COUNTER (permit sweep L1b): sys_pipe lends the block's counter to copyout and fileclose, which may step it,
+         so the block comes back at a count at least the one it left at *)
+      ⌜(pv_ev (us_V U) <= k')%nat⌝ -∗
+      sie_cap_gpr KT1 mf av b p -∗
+      cpu_own 0%nat eb p b lks -∗
+      trap_csrs_ext KT1 eb -∗
+      cpu_claim_ext eb p -∗
+      pc_is ret_tgt -∗
+      sys_pipe_post γf p pid (upd_usM (us_upt (upd_usV U (upd_ev (us_V U) k')) P') (umem_wr (us_M U) v d bs)) sts
+        d bs (mf !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      iref_slot -∗
+      (* the environment back; the page count has moved if either close was
+         the pipe's last end *)
+      (∃ on', fileclose_pipe_env fn on' 0%nat) -∗
+      fileclose_fs_env_nopid fn 0%nat eb p -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type SYSPIPE.
+  Parameter wp_sys_pipe_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fdslotG Σ, !fileG Σ,
+             !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γfl γf : gname)
+      (fn : fclose_names) (on : option nat)
+      (m : regfile) (av : nat) (eb : bool) (p : mword 64)
+      (v : mword 64) (pid : mword 32) (U : ustate) (sts : list fdstate)
+    (b : bool) (lks : gset string),
+      wp_sys_pipe_sconf_body γa γfl γf fn on m av eb p v pid U sts b lks.
+End SYSPIPE.

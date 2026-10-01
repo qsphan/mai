@@ -1,0 +1,774 @@
+(* ===================================================================== *)
+(* UexecSG.v -- THE PER-SYSCALL DEPOSIT CLASS: what a process hands the   *)
+(* kernel at its ecall, and what comes back under the arm's [∀ r].        *)
+(*                                                                        *)
+(* Design of record: claude-notes/projects/app-echo.md, “THE ARM,         *)
+(* concretely”.  [UexecRet.uexec_ret_F]'s returning-syscall arm is        *)
+(*                                                                        *)
+(*    ∃ f, sbundle_at X n f W                                             *)
+(*         ∗ (∀ r … fdv' cw' cs', <the six pure rows>                    *)
+(*                   -∗ spost_at X n f W r M' fdv' cw' cs'               *)
+(*                   -∗ X (bump W r …))                                   *)
+(*                                                                        *)
+(* -- a DEPOSIT: the process's one-shot AU bundle for syscall [n] goes    *)
+(* down, the syscall's armed post comes back.  Both families are fields   *)
+(* of this class, at the RECURSIVE OCCURRENCE [X], for the reason the     *)
+(* exec payload was: the concrete bundles live above the whole file-system*)
+(* tower ([SpecSysOpen.open_in], [SpecSysExec.sys_exec_au_pre], …) and  *)
+(* threading them as arguments would drag that tower's binders through    *)
+(* every U-mode form below.  The one instance is [UexecExecInst.v].       *)
+(*                                                                        *)
+(* THE FAMILY [f] IS SCOPED OVER BOTH LEGS, and that is the whole point   *)
+(* of the deposit shape: a bundle is built at the CALLER'S OWN receipt,   *)
+(* refund and cursor families, and the armed post is only worth anything  *)
+(* to that caller if it comes back AT THE SAME ONES.  Two independent     *)
+(* existentials -- one inside the bundle, one inside the post -- would    *)
+(* hand a program a post about families it never chose.  So the [∃] sits  *)
+(* on the ARM, outside both, and the two class fields are INDEXED by it:  *)
+(* an existential over a current value, with the deposit and the post     *)
+(* both read at it ([∃ f, sbundle_at .. f ∗ spost_at .. f]).              *)
+(*                                                                        *)
+(* [sfam] IS ONE TYPE, NOT A [Z]-INDEXED FAMILY, and the reason is        *)
+(* mechanical rather than aesthetic.  With [sfam : Z -> Type] the         *)
+(* deposit's index has type [sfam n], so (a) [Proper]/[respectful] cannot *)
+(* be stated past the [n] binder -- the arrow is dependent -- and the     *)
+(* fixpoint's [solve_contractive] has nothing to apply; (b) the instance's *)
+(* [sfam] would be a [match] on [n] and every reader would coerce its [f] *)
+(* through an [eq_rect]; and (c) every contract that carries the deposit  *)
+(* ([SpecUsertrap], [SpecUservec], [SpecSyscall]) would have to carry a   *)
+(* TOTAL function [∀ n, sfam n] rather than one value, because its rows   *)
+(* are quantified over the number.  A single type whose instance is a     *)
+(* RECORD with one field per contracted syscall says the same thing with  *)
+(* no dependency at all: [sbundle_at X n f W] reads only the field [n]    *)
+(* names, and the fields no number reads are inert.                       *)
+(*                                                                        *)
+(* WHY THE FAMILIES TAKE [X].  exec's bundle contains a SLOT WAND -- the  *)
+(* caller's WP for the program exec loads ([SpecKexec.exec_slot_pre]    *)
+(* concludes at [S W']) -- so the family has to be applied to the         *)
+(* fixpoint variable, and at the fixpoint it concludes at [uslot] itself. *)
+(* Non-expansiveness in [X] is a field because that is what the           *)
+(* fixpoint's contractivity needs of the family.                          *)
+(*                                                                        *)
+(* THE SUPPLY LAW, IN TWO HALVES, AND WHY IT IS TWO.  A process that      *)
+(* answers for no abstract state pays every bundle out of [ssupply] -- an *)
+(* OPAQUE persistent proposition here, instantiated at “the application's *)
+(* predicate holds of every view” ([AppInv.app_pred app_run]), which is   *)
+(* what makes a view-moving commit's [AppInv.app_step] free.  It is       *)
+(* opaque because naming the predicate needs [AppCfg.appcfg], and the     *)
+(* return former's cone deliberately has no file-system class in it.      *)
+(*                                                                        *)
+(*   [sbundle_of_supply_ne]  at every number whose bundle does NOT        *)
+(*        mention the slot -- which is every number but exec, exec being  *)
+(*        the one syscall that REPLACES the program -- the supply alone   *)
+(*        pays.  This is the half the engine's ecall leaves use, and it   *)
+(*        is why they cost nothing: [n <> USYS_exec] is a premise every   *)
+(*        one of them already carries.                                    *)
+(*   [sbundle_of_supply]     at every number, given a generic slot family *)
+(*        to answer exec's wand with.  This is the half the GENERIC       *)
+(*        inhabitants use ([UexecRet.uexec_wp_uslot],                     *)
+(*        [UexecCond.cond_entry_slot]), where the family is the Löb       *)
+(*        hypothesis.  AT A CONSTANT PAYLOAD [fun _ => R]: the generic    *)
+(*        slot HOLDS [R] and pays it at exit and at the kill status, and  *)
+(*        exec relays it to the next image's slot (GENERIC-PAY).          *)
+(*                                                                        *)
+(* BOTH LAWS ARE BUPD-SHAPED, and that is not a convenience.  A bundle    *)
+(* can contain a resource that is FREE but not derivable from [emp]:      *)
+(* write's console arm used to carry the trace seed [uart_sent γu []]     *)
+(* []], a mono-list lower bound at the empty list, which is the algebra's *)
+(* unit and is therefore mintable by ANYONE -- under a basic update.      *)
+(* Putting that update in the LAW rather than in some particular supplier *)
+(* is what makes it available to a program whose supplier is [emp]        *)
+(* (echo, pre-taint, which also writes to the console), and it covers any *)
+(* future piece that needs a ghost allocation.  The MODALITY IS THE       *)
+(* LAW'S, NOT THE ARM'S: [UexecRet.uexec_dep_F] still demands a plain     *)
+(* [sbundle], and every leaf mints under the update inside its own WP     *)
+(* step, where a WP absorbs it.                                          *)
+(*                                                                        *)
+(* WHERE [ssupply] COMES FROM, AND WHY NO KERNEL CONTRACT NAMES IT.       *)
+(* At the kernel's instance it is [AppInv.app_sup] -- the application's    *)
+(* claim held of EVERY view, which is what makes a view-moving commit's    *)
+(* step free.  It is a U-TIER credential: the party that holds one is a    *)
+(* process running the generic slot, and the party that founds one is the  *)
+(* GENERIC application, inside its own discharge of the system theorem's   *)
+(* [Hinit_boot] ([SystemAdequacy.init_boot_of_sup]).  A CONSTRAINING       *)
+(* application cannot found it -- echo's claim is [taint ∨ pins], true of  *)
+(* every view only after the taint is minted -- and does not have to: its  *)
+(* first process gets a PINNED exec bundle, fork copies the parent's slot, *)
+(* and the supply a tainted generic slot needs arrives through the exec    *)
+(* bundle the tainted process deposits.  So the kernel neither mints a     *)
+(* slot nor carries a supply, and its contracts name neither.              *)
+(*                                                                        *)
+(* [ssupply] IS NOT IN [uvb], AND MUST NOT BE.  A bundle conjunct would   *)
+(* make the KERNEL owe it to resume ANY process, and an application whose *)
+(* predicate is not trivially true cannot pay that: echo's is             *)
+(* [taint ∨ pins], provable at every view only AFTER the taint is minted, *)
+(* so a pre-taint trap round would be unsatisfiable -- the GAP-premise    *)
+(* trap (durable-notes) in the trap loop.  The supply is a PREMISE of the *)
+(* generic inhabitant and of each verified program's entry constructor,   *)
+(* and it reaches that program's own ecall leaves inside [UkRun.urun].    *)
+(*                                                                        *)
+(* WHICH NUMBERS GO THROUGH THE LAW: the criterion, and the piece-shape    *)
+(* constraint it exposes.                                                 *)
+(*                                                                        *)
+(* [UkRun.udep]'s law is KEY-FREE (it must be: [urun] is re-established    *)
+(* after every instruction and every key component moves under the        *)
+(* program's own execution -- see that file's header).  So a number goes   *)
+(* through the law iff ITS BUNDLE IS PAYABLE AT EVERY KEY FROM THE         *)
+(* SUPPLIER ALONE.  It is not enough that some arm's CONTENT is key-free:  *)
+(* [SpecSysWrite.sys_write_in] is KEYED on the descriptor view, so at a    *)
+(* key whose fd is an inode the bundle is the write chain with real        *)
+(* [AppInv.app_step]s, and a constraining application cannot admit 16      *)
+(* key-free -- its write deposit takes the EXPLICIT route, the one exec's  *)
+(* leaf already uses.  For the GENERIC slot ([Dsup := ssupply]) the        *)
+(* criterion must hold at EVERY syscall with a contract, or the generic    *)
+(* slot cannot be built at all.                                            *)
+(*                                                                        *)
+(* HENCE A CONSTRAINT ON PIECE SHAPE: A PIECE MAY NOT ASK THE CLIENT TO    *)
+(* RETURN A KERNEL-OWNED GHOST MOVED.  A client that answers at an         *)
+(* arbitrary key holds no kernel row, so it cannot move one.  The three    *)
+(* pieces that lend the offset shadow -- [FsAbsReadFire.aread_commit_at]   *)
+(* and the write chain's two arms ([FsAbsWriteFire.awrite_full_at],        *)
+(* [awrite_part_at]) -- take [OffGv.off_gv γo (1/2) off] and hand it back  *)
+(* at [off], UNMOVED; the client merely OBSERVES the offset (and, for      *)
+(* read, the count [d]).  The ADVANCE is the kernel fire lemma's           *)
+(* ([arf_read_fire], [wrf_awrite_fire], [wrf_apart_fire]), paid out of the *)
+(* descriptor row's [OffGv.off_user_inv], which [FdSlots.foff_row] carries *)
+(* down from sys_read's / sys_write's own bundle.  The same rule is why    *)
+(* [SpecFilewrite.filewrite_in]'s console arm carries no [fwn_wp] equation:*)
+(* a pure fact about a KERNEL ghost record is not something a process can  *)
+(* state, so it rides FILEWRITE's / SYSWRITE's Coq premise list instead.   *)
+(*                                                                        *)
+(* Every other piece is already clean: the observation commits             *)
+(* ([aopen_commit_at], [dlookup_commit_at], [dmiss_commit_at]) hand the    *)
+(* lent half straight back; the mutating commits ([atrunc], [acre],        *)
+(* [aarm], [aunarm], [adots], [uent], [utgt], [ltgt], [lent]) lend the     *)
+(* pre-map and take the POST-map back as a WITNESSED OBSERVATION           *)
+(* ([⌜abs_view I' = delta …⌝]), which asks the client for no move; and the *)
+(* walk hop ([FsAbs.ax_hop]) returns the era lend unchanged.               *)
+(* ===================================================================== *)
+
+(* WHY THE LAW IS PER-NUMBER AND NOT [∀ n].  [UkRun.udep]'s law is guarded  *)
+(* on [psok n], and [psok]'s discharge travels BESIDE the supplier rather   *)
+(* than being folded into the law.  Folding it in would make the law        *)
+(* [∀ n], and then a program whose supplier is weak -- echo pre-taint, at   *)
+(* [Dsup := emp] -- could not instantiate it at ANY number and every call   *)
+(* it makes would be forced onto the explicit route.  Per-number is what    *)
+(* lets such a program admit a SMALL OR EMPTY set and still build a         *)
+(* [urun].  So the gate slots and [UexecCond.cond_entry_slot] take          *)
+(* [⌜forall k, k <> USYS_exec -> psok k⌝] alongside [□ Dsup], and the mint  *)
+(* sites -- which see the instance -- discharge both.                       *)
+(* ===================================================================== *)
+
+(* [sbundle_at_mono] is what an injection between two U-mode slot         *)
+(* fixpoints needs when it carries a deposit from one to the other: the   *)
+(* bundles are covariant in the SLOT family, because the only place it    *)
+(* occurs is exec's wand CONCLUSION.  (Not to be confused with [sfam],    *)
+(* the DEPOSIT's families, which the mover fixes.)                        *)
+(* ===================================================================== *)
+From Stdlib Require Import ZArith Bool Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.base_logic.lib Require Import invariants.
+From iris.program_logic Require Import language lifting.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import Riscv.rv64d_types Riscv.rv64d.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import ProcGeom.     (* [tf_arg_idx] -- the argument words the key
+                                congruence is stated at *)
+Require Import FdSlots.
+Require Import UsysMemOk.    (* [USYS_exec] -- the one number whose bundle
+                                carries a slot wand *)
+Require Import ChildTok.     (* [my_pay]: the credential the generic family
+                                takes, and the class's own index *)
+Require Import UexecSlot.    (* [uvis] and its projections: the key *)
+Local Open Scope Z_scope.
+Import Defs.
+
+(* THE KEY ROWS THE BUNDLES READ.  A bundle for syscall [n] reads the
+   process's IMAGE (the path string, the write buffer), its ARGUMENT WORDS
+   0/1/2 (the path pointer, the mode, the count), its DESCRIPTOR VIEW (which
+   fd the call names) and its WORKING DIRECTORY (where a relative walk
+   starts) -- and nothing else off the key.  The congruence below is what
+   the trap route needs: the key the loop traps at differs from the one the
+   dispatcher sees by the epc bump alone, which moves none of these
+   ([UexecApply.uvis_run_arg0] / [_arg1] / [_arg2] and the three
+   projections). *)
+Definition skey_eq (W W' : uvis) : Prop :=
+  uvis_M W = uvis_M W'
+  /\ uvis_tf W !!! tf_arg_idx 0 = uvis_tf W' !!! tf_arg_idx 0
+  /\ uvis_tf W !!! tf_arg_idx 1 = uvis_tf W' !!! tf_arg_idx 1
+  /\ uvis_tf W !!! tf_arg_idx 2 = uvis_tf W' !!! tf_arg_idx 2
+  /\ uvis_fd W = uvis_fd W'
+  /\ uvis_cwd W = uvis_cwd W'
+  (* ...and the two WAIT-EXIT readings.  A bundle for wait(2) is about the
+     set of live children, and a bundle indexed by an escrow is about the
+     depositing generation, so both belong to the data a bundle may read
+     off the key.  Neither moves under the epc bump, so every prover of
+     this congruence still discharges it componentwise. *)
+  /\ uvis_gen W = uvis_gen W'
+  /\ uvis_ch W = uvis_ch W'
+  (* ...AND THE PID.  getpid(2)'s answer is a reading of the key
+     ([UexecSlot.uvis_pid]), so a bundle for it is about the pid and the
+     pid belongs to the data a bundle may read.  It does not move under the
+     epc bump either, so every prover of this congruence still discharges
+     it componentwise. *)
+  /\ uvis_pid W = uvis_pid W'
+  (* ...AND THE PERMISSION MAP AND THE SIZE (app-echo.md, lane
+     CONS-SWALLOW, W4).  read(2)'s receipt says WHY a byte it popped never
+     reached the caller's buffer, and the only reason is that the
+     destination page is not one the kernel can copy to -- a statement
+     about the process's page table, which the key carries as its
+     PROJECTION ([UexecSlot.uvis_perm], beside the size the lazy region is
+     measured by).  So a post row reads them and this congruence has to fix
+     them.  The two are the components a syscall can MOVE (sbrk does, and
+     [UsysMemOk.usys_sbrk_perm] is the row that says how), which is why
+     they were not here before: every prover of this congruence re-keys
+     WITHIN one side of a call, where both are the entry projection
+     ([ProofUserretClosed]'s [Hpi0] / [Hsz0] are exactly these two facts,
+     asserted before either use). *)
+  /\ uvis_perm W = uvis_perm W'
+  /\ uvis_sz W = uvis_sz W'
+  (* ...AND THE LAZY BIT, for the permission map's reason exactly (lane
+     LAZY-FLAG).  read(2)'s receipt row ([UexecExecInst]'s row 5) reads the
+     bit beside the map and the size -- the bit is what turns a W page of
+     the map into a page copyout could write -- so this congruence has to
+     fix it too.  It is a stored field ([ProcDefs.pv_lazy]) that only a
+     syscall writes, so every prover of this congruence, which re-keys
+     WITHIN one side of a call, discharges it componentwise. *)
+  /\ uvis_lazy W = uvis_lazy W'
+  (* ...AND THE MASK (upstream a083670), for the lazy bit's reason: a
+     bundle is keyed on the EFFECTIVE number ([UexecSlot.uvis_num]), which
+     reads the mask, and only a syscall writes it ([ProcDefs.pv_secc]). *)
+  /\ uvis_secc W = uvis_secc W'.
+
+Lemma skey_eq_refl (W : uvis) : skey_eq W W.
+Proof. rewrite /skey_eq. split_and!; reflexivity. Qed.
+
+Lemma skey_eq_sym (W W' : uvis) : skey_eq W W' -> skey_eq W' W.
+Proof.
+  rewrite /skey_eq.
+  intros (HM & H0 & H1 & H2 & Hfd & Hcw & Hg & Hch & Hpid & Hpi & Hsz & Hlz & Hsc).
+  split_and!; symmetry;
+    [ exact HM | exact H0 | exact H1 | exact H2 | exact Hfd | exact Hcw
+    | exact Hg | exact Hch | exact Hpid | exact Hpi | exact Hsz | exact Hlz
+    | exact Hsc ].
+Qed.
+
+(* THE CLASS IS INDEXED BY [ChildTok.ctokG], and by nothing else new.  The
+   index is a NAMED implicit ([{sg_ctok : ctokG Σ}]) and not a generalizable
+   binder: inside a [Context] a backtick-generalizable class argument is
+   GENERALIZED INTO A FRESH VARIABLE rather than resolved, and a file whose
+   [ctokG] comes off [Xv6G]'s field would then hold two of them -- one in
+   the class's index and one in every [my_pay] it writes -- which print
+   identically and do not match.  Named and non-generalizable, the index is
+   filled by instance resolution at every binding site.  The
+   generic-family law below hands a slot the ONE credential a slot needs of
+   the kernel -- the process's own knowledge of what its exit owes
+   ([ChildTok.my_pay] at the key's generation, trivial for a generic
+   process) -- because exit's deposit is a PAYMENT ([UexecRet.
+   uexec_pay_dep]) and a family that is safe at every key has to be able
+   to make it.  Every file that binds this class already has a [ctokG] in
+   scope (its own, or [Xv6G]'s field), so the index costs no binder. *)
+Class uexecSG (Σ : gFunctors) {sg_ctok : ctokG Σ} := {
+  (* THE PROCESS'S CHOICE OF FAMILIES: its receipt, refund and cursor
+     families for every syscall at once, as one value (the header says why
+     it is not indexed by the number).  The arm binds it existentially and
+     both legs read it. *)
+  sfam : Type;
+  (* ...and a point of it, for the arms that carry no deposit: the four
+     non-ecall causes and exit.  A consumer that must NAME a family
+     where the process deposited none takes this one; nothing reads it. *)
+  sfam_pt : sfam;
+
+  (* THE FORK PAYLOAD, and it is a field of the FAMILIES rather than a
+     parameter of the fork rows for one mechanical reason: the trap route
+     splits a process's return into its DEPOSIT and its ARM
+     ([UexecRet.uexec_ret_F_split]) and carries them past each other
+     through the whole kernel excursion, so a payload chosen by the fork
+     deposit and read back by the fork arm must travel with something the
+     route already carries -- and [f] is exactly that thing.  The
+     alternative, an [∃ Q] inside [uexec_ret_F]'s fork branch, does not
+     split: the two halves would bind two unrelated payloads and the
+     parent's token would be about neither.  So the payload joins the
+     receipt families in the one value the process chooses at its trap.
+
+     WHAT IT MEANS: [sfork_pay f xs] is what the process's CHILD's exit at
+     status [xs] owes back ([ChildTok]'s [Q]).  The child's slot is
+     deposited under [my_pay] of it and the parent's arm gets
+     [child_tok] at it. *)
+  sfork_pay : sfam -> Z -> iProp Σ;
+  (* ...and the guarantee that the process may CHOOSE it: a family whose
+     payload is [Q] and whose bundles nothing reads.  A fork trap reads no
+     other field of [f], so this point is all a fork leaf needs -- it is
+     [sfam_pt] with the one field that fork does read. *)
+  (* ...AND WHAT THE PARENT LENDS THE CHILD, on [sfork_pay]'s footing and
+     for [sfork_pay]'s own reason.  [sfork_lend f] is the resource the
+     forking process hands its child to run WITH -- not what the child's
+     exit owes back ([sfork_pay]), and not an address-space view
+     ([UkFork.Forkable] re-mints those at the child's fresh ghost names):
+     a PROTOCOL TOKEN at a FIXED name, such as init's half of the console
+     position pair it lends the shell.
+     IT IS A FIELD OF THE FAMILIES FOR EXACTLY [sfork_pay]'s MECHANICAL
+     REASON, and it is the reason that matters most here: the lend is
+     handed over by fork's DEPOSIT (the child's leg spends it) and handed
+     BACK by fork's ARM (the failing leg refunds it, because the kernel
+     created no child and nothing consumed it), and the trap route splits
+     those two apart and carries them past each other through the whole
+     kernel excursion.  Only [f] travels with both, so only [f] can make
+     the resource that went down and the resource that comes back the SAME
+     resource.  A process that lends nothing forks at [emp]. *)
+  sfork_lend : sfam -> iProp Σ;
+  (* ...and the guarantee that the process may CHOOSE both: a family whose
+     payload is [Q], whose lend is [Rc], and whose bundles nothing reads.
+     A fork trap reads no other field of [f], so this point is all a fork
+     leaf needs -- it is [sfam_pt] with the two fields that fork does
+     read. *)
+  sfam_pay : (Z -> iProp Σ) -> iProp Σ -> sfam;
+  sfork_pay_pay : forall (Q : Z -> iProp Σ) (Rc : iProp Σ),
+    sfork_pay (sfam_pay Q Rc) = Q;
+  sfork_lend_pay : forall (Q : Z -> iProp Σ) (Rc : iProp Σ),
+    sfork_lend (sfam_pay Q Rc) = Rc;
+  (* ...AND THE POINT'S PAYLOAD IS THE TRIVIAL ONE.  The point is what a
+     party that deposits nothing names ([sfam_pt]), and a process forked by
+     one owes its parent nothing -- which is what lets the GENERIC family
+     answer fork's child slot at the credential it is indexed by
+     ([UexecRet.uexec_dep_F_of_supply]). *)
+  sfork_pay_pt : sfork_pay sfam_pt = (fun _ => True)%I;
+  (* ...AND THE POINT LENDS NOTHING, [sfork_pay_pt]'s twin and for its
+     reason: a generic process hands its child no protocol token, so the
+     generic family's fork deposit costs it [emp] and its failing arm
+     refunds [emp]. *)
+  sfork_lend_pt : sfork_lend sfam_pt = emp%I;
+
+  (* THE PROCESS'S OWN PAYLOAD, on [sfork_pay]'s footing and for its
+     reason.  What a process's exit owes its parent is chosen by the
+     DEPOSIT ([UexecRet.uexec_pay_dep], which pays it) and read back by the
+     ARM ([uexec_pay_arm], which takes it at every resume), and the two are
+     split at the trap and carried past each other through the whole kernel
+     excursion -- so the payload must travel with something the route
+     already carries, and [f] is exactly that thing.  An [∃ Q] on each side
+     does not split: the two halves would bind two unrelated payloads, and
+     what came back would be "some payload of my generation", which a
+     process can match to its own only through [ChildTok.gen_agree]'s
+     later.
+
+     WHAT IT MEANS: [sexit_pay f xs] is what THIS process's exit at status
+     [xs] owes ([ChildTok]'s [Q] at its own generation).  [sfork_pay f] is
+     the same thing one generation down. *)
+  sexit_pay : sfam -> Z -> iProp Σ;
+  (* ...and the guarantee that the process may CHOOSE it without giving up
+     the families its bundles are at: [sfam_at Q f] is [f] re-keyed at the
+     payload [Q], every other field passing through.  A leaf holds its
+     bundles at whatever [f] its supplier minted and its payload at
+     [UkRun.ukn_pay] of its own record, and this is what puts the two in
+     one value. *)
+  sfam_at : (Z -> iProp Σ) -> sfam -> sfam;
+  sexit_pay_at : forall (Q : Z -> iProp Σ) (f : sfam),
+    sexit_pay (sfam_at Q f) = Q;
+  sfork_pay_at : forall (Q : Z -> iProp Σ) (f : sfam),
+    sfork_pay (sfam_at Q f) = sfork_pay f;
+  (* ...and so does the LEND, for [sfork_pay_at]'s reason: re-keying a
+     family at this process's own exit payload moves no other field, so a
+     leaf that takes its supplier's [f] and puts its own [UkRun.ukn_pay]
+     in it still forks lending what it chose. *)
+  sfork_lend_at : forall (Q : Z -> iProp Σ) (f : sfam),
+    sfork_lend (sfam_at Q f) = sfork_lend f;
+  (* ...AND THE POINT'S PAYLOAD IS THE TRIVIAL ONE, [sfork_pay_pt]'s twin:
+     the point is what a party that deposits nothing names, and a GENERIC
+     process owes its parent nothing -- which is what lets the generic
+     family pay the deposit's payment row out of the one credential it is
+     indexed by ([UexecRet.uexec_dep_F_of_supply]). *)
+  sexit_pay_pt : sexit_pay sfam_pt = (fun _ => True)%I;
+
+  (* what the process deposits at an ecall of number [n] from key [W], at
+     ITS OWN families [f] -- [emp] at every number without a contract *)
+  sbundle_at : (uvis -d> iPropO Σ) -> Z -> sfam -> uvis -> iProp Σ;
+  (* ...and what the kernel hands back under the arm's [∀ r], AT THE SAME
+     [f]: the syscall's armed post -- the unfired pieces as
+     [PieceFam.pf_at], the receipts, the cursors.  [emp] at every number
+     without a contract, and at exec, whose bundle is CONSUMED and whose
+     process never resumes on success.
+
+     READ AT THE RESUME KEY'S THREE MOVING COMPONENTS, not at the trap key
+     alone.  A RECEIPT is what the process can NAME of what its call did,
+     and for the calls whose whole effect is on the resume key there is
+     nothing to name at the trap key: the descriptor open() returned is a
+     row of [fdv'], the directory chdir() installed is [cw'], and the
+     bytes read() delivered are entries of the resume IMAGE [M'].  So the
+     post takes the returned a0 [r], the resume image [M'], the descriptor
+     view [fdv'] and the working directory [cw'] the arm resumes at, all
+     four bound by the SAME [∀] of the arm
+     ([UexecRet.uexec_ret_cont_F]) that binds the four pure rows.  The
+     remaining resume components -- the permission map and the break --
+     no contract's receipt reads, so they stay out. *)
+  spost_at : (uvis -d> iPropO Σ) -> Z -> sfam -> uvis -> mword 64 ->
+             gmap Z (bv 8) -> list fdstate -> Z -> gset gname -> iProp Σ;
+
+  sbundle_at_ne : forall k,
+    Proper (dist k ==> eq ==> eq ==> eq ==> dist k) sbundle_at;
+  spost_at_ne : forall k,
+    Proper (dist k ==> eq ==> eq ==> eq ==> eq ==> eq ==> eq ==> eq ==> eq ==> dist k)
+      spost_at;
+
+  sbundle_at_cong : forall (X : uvis -d> iPropO Σ) (n : Z) (f : sfam)
+      (W W' : uvis),
+    skey_eq W W' -> sbundle_at X n f W ⊣⊢ sbundle_at X n f W';
+  spost_at_cong : forall (X : uvis -d> iPropO Σ) (n : Z) (f : sfam)
+      (W W' : uvis) (r : mword 64) (M' : gmap Z (bv 8))
+      (fdv' : list fdstate) (cw' : Z) (cs' : gset gname),
+    skey_eq W W' ->
+    spost_at X n f W r M' fdv' cw' cs' ⊣⊢ spost_at X n f W' r M' fdv' cw' cs';
+
+  (* ...and the two bundle rows pass through the payload re-keying: a
+     family re-keyed at a payload deposits and pays back exactly what it
+     did before, which is what lets a leaf take its supplier's [f] and put
+     its own payload in it ([sfam_at]).
+     AT EVERY NUMBER BUT read AND exec (app-echo.md, "SH-LINE RULING",
+     R1, and the EXEC-PAY landing).  read's deposit is a WAND FROM THE
+     FAMILY'S OWN EXIT PAYLOAD ([UexecExecInst.xv6_sbundle] at 5), and
+     exec's carries that payload twice over -- the pay fact the kernel
+     relays to the new image's slot and the [Q (-1)] its two wands take
+     ([SpecKexec.exec_slot_pre]) -- so re-keying is an identity on every
+     OTHER number and the side conditions say exactly that.  Neither leaf
+     re-keys: each takes its deposit already minted at its own payload
+     ([sbundle_of_supply_ne] names it, so does [UkRun.udep]'s law, and
+     [UexecExecInst.sbundle_pay_exec_intro] is exec's introduction).
+     [spost_at_at] needs no such condition: no post reads the payload. *)
+  sbundle_at_at : forall (X : uvis -d> iPropO Σ) (n : Z) (Q : Z -> iProp Σ)
+      (f : sfam) (W : uvis),
+    n <> USYS_read -> n <> USYS_exec ->
+    sbundle_at X n (sfam_at Q f) W = sbundle_at X n f W;
+  (* [spost_at_at] stops at the four arguments the re-keying touches and
+     leaves the answer's five off: the post stands under the arm's own
+     binders ([r], [M'], [fdv'], [cw'], [cs']), so a fully applied left-hand
+     side is not a subterm any leaf can rewrite there, and the partial
+     application -- closed under those binders -- is. *)
+  spost_at_at : forall (X : uvis -d> iPropO Σ) (n : Z) (Q : Z -> iProp Σ)
+      (f : sfam) (W : uvis),
+    spost_at X n (sfam_at Q f) W = spost_at X n f W;
+
+  (* the bundles are covariant in the slot family: the only place it occurs
+     is exec's wand CONCLUSION *)
+  sbundle_at_mono : forall (X Y : uvis -d> iPropO Σ) (n : Z) (f : sfam)
+      (W : uvis),
+    ⊢ □ (∀ W' : uvis, X W' -∗ Y W') -∗ sbundle_at X n f W -∗ sbundle_at Y n f W;
+
+  (* THE SUPPLY: opaque here, persistent by its use ([□ ssupply] in both
+     laws), instantiated at "the application's predicate holds of every
+     view" *)
+  ssupply : iProp Σ;
+
+  (* the half every ecall leaf uses: no slot wand, hence no slot family.
+     AT SOME [f], which is all a program that discards its post wants --
+     the generic one does, and a program that does not takes the EXPLICIT
+     route with its own families.  BUPD-SHAPED (the header): a bundle may
+     hold a resource that is free but not derivable from [emp]. *)
+  (* ...AND IT NAMES THE PAYLOAD (app-echo.md, "SH-LINE RULING", R1).
+     read's bundle is a wand from the family's own exit payload, so a leaf
+     can no longer mint at SOME family and re-key afterwards; the mint
+     takes the payload the leaf has to pay the trap's payment row at, and
+     the law holds at every [Q] because the console arm the read branch
+     concludes at is payable out of the persistent credential at any [P]
+     ([FsAbsInvFire.fsabs_fileread_in]). *)
+  sbundle_of_supply_ne : forall (X : uvis -d> iPropO Σ) (n : Z) (W : uvis)
+      (Q : Z -> iProp Σ),
+    n <> USYS_exec ->
+    ⊢ □ ssupply ==∗ ∃ f : sfam, ⌜sexit_pay f = Q⌝ ∗ sbundle_at X n f W;
+  (* ...and the half the generic inhabitants use *)
+  (* AT A CONSTANT PAYLOAD [fun _ => R] (GENERIC-PAY).  The generic slot is
+     a slot at every key, so it may trap at exit at every key, and exit's
+     deposit is a PAYMENT -- which is why this law is indexed by the pay
+     fact.  The payload is CONSTANT because the one resource the slot
+     holds has to answer exit's additive [Q xs ∧ Q (-1)] from a single
+     copy: at a constant predicate both conjuncts are the same [R].  The
+     credential the law takes is therefore the R-carrying one -- a slot at
+     any key GIVEN the payload back -- because that is the shape exec's
+     wands are answered at: the kernel relays the payload to the new image
+     ([SpecKexec.exec_slot_pre], the EXEC-PAY row) and the new image's
+     generic slot is minted from it.  [R := True] is the trivial instance
+     and every existing caller takes it. *)
+  (* ...AND THE CARRIER IS PERSISTENT (lane SELF-KILL, P6b).  Nothing
+     travels the trap route any more -- the payload at the kill status is
+     the KILLER's price, paid into <p->lock>'s killed row -- so a single
+     LINEAR [R] can no longer serve both legs of a return (the arm builds
+     the successor's slot; the deposit at the exit ecall spends it), nor
+     both of exec's [∗]-separated slot wands.  The generic family is
+     reachable ONLY tainted ([UexecExecMint.uslot_mint_pay] takes
+     [RiscvPtsto.app_taint], which is Persistent), so what it runs on
+     is the payload PERSISTENTLY, and every leg helps itself.
+     THE ANTECEDENT IS DROPPED HERE AND NOWHERE ELSE: the callers state the
+     carrier as [□ (app_taint -∗ R)], but this class carries only
+     [ctokG] and cannot name the taint, so the field takes the cashed form
+     [□ R] and its one caller ([UexecRet.uexec_dep_F_of_supply]) cashes the
+     wand against the [app_taint] it already holds. *)
+  sbundle_of_supply : forall (X : uvis -d> iPropO Σ) (n : Z) (W : uvis)
+      (R : iProp Σ),
+    ⊢ my_pay (uvis_gen W) (fun _ => R)%I -∗ □ ssupply -∗ □ R -∗
+      □ (∀ W' : uvis, my_pay (uvis_gen W') (fun _ => R)%I -∗ □ R -∗ X W') ==∗
+      ∃ f : sfam, ⌜sexit_pay f = (fun _ => R)%I⌝ ∗ sbundle_at X n f W;
+
+  (* ===================================================================
+     WHAT A FAILED exec GIVES BACK (app-echo.md, lane KILL-PAY, K4(a),
+     ruling R-A).
+
+     exec's deposit is a [PieceFam.pfam], and a [pfam] is an AU BESIDE ITS
+     REFUND: [PieceFam.pf_at_refund] says a piece that never fired hands
+     back what was put into it.  An exec that FAILS is exactly such a
+     piece -- and with the -1 payload no longer riding [UkRun.urun]'s row
+     (that row is a wand from the kill credential now), the resource a
+     process spent into the exec deposit is the ONLY thing it has left to
+     pay its own [exit(1)] with when the exec comes back.  So the refund
+     is the process's, not the kernel's frame: the earlier design's "a
+     program cannot retry exec" is withdrawn.
+
+     WHERE IT TRAVELS: the arm's post, at exec, which was [emp] and is now
+     a wand from "the answer was -1".  Nothing between the dispatcher and
+     the ecall leaf had to move -- [spost_at] is already relayed at every
+     number ([SpecSyscall.sysc_sys_out], [UexecRet.uexec_ret_cont_gen]) --
+     which is why the refund reaches the leaf without a new row anywhere.
+     [sexec_refund] NAMES it, because [spost_at]'s type cannot: a caller
+     that wants to state what it gets back has to name the family's own
+     refund, and the family is what carries it. *)
+  sexec_refund : sfam -> iProp Σ;
+  spost_at_exec : forall (X : uvis -d> iPropO Σ) (f : sfam) (W : uvis)
+      (r : mword 64) (M' : gmap Z (bv 8)) (fdv' : list fdstate) (cw' : Z)
+      (cs' : gset gname),
+    spost_at X USYS_exec f W r M' fdv' cw' cs'
+      = (⌜r = (mword_of_int (-1) : mword 64)⌝ -∗ sexec_refund f)%I;
+  (* the refund passes through the payload re-keying, like every other
+     field but the payload itself ([sfam_at]) *)
+  sexec_refund_at : forall (Q : Z -> iProp Σ) (f : sfam),
+    sexec_refund (sfam_at Q f) = sexec_refund f;
+
+  (* ===================================================================
+     A DESCRIPTOR ROW'S REGISTRATION -- what a run carries per table row
+     so that its exit can pay (design/app-pipe.md SS2, lane PIPE-REG).
+
+     kexit closes every descriptor the dying process holds, so exit(2)'s
+     bundle row is [SpecFileclose.fileclose_cpays] of the KEY'S WHOLE
+     TABLE: a [∗ list] of independent payments, [emp] at every row but a
+     pipe end and [PipeQueue.pipe_cpay] there.  The fact that decides it
+     is a fact about the TABLE, so it rides in [UkRun.urun] and is
+     re-established at every trap ([UkRun.urun_nopipe]).
+
+     WHY IT IS A FIELD OF THIS CLASS AND NOT A DEFINITION IN [UkRun]
+     (this lane's finding).  The row IS [PipeReg.pipe_row_reg], which
+     names the pipe's queue camera -- and [UkRun] binds no pipe ghost
+     class, by design ("this file binds no whole-system bundle").  Giving
+     it one adds an implicit [pipeG] argument to [urun] itself and hence
+     a [Context] line to each of the seventy-odd U-tier files that state
+     a run.  Every one of those files already binds THIS class, so
+     routing the row through it costs no site anything: [urun_nopipe] is
+     stated at [srow_reg] and the one instance ([UexecExecInst.
+     uexecSG_xv6]) answers it with [PipeReg.pipe_row_reg].
+
+     THE TWO LAWS ARE WHAT THE ENGINE'S STEPS RUN ON, and nothing else is
+     assumed of the row: it is persistent (so a dup'd row, a forked
+     child's copy of the table and two rows on one pipe all cost
+     nothing), and a row that is not a pipe registers itself (so a
+     program that never calls pipe(2) pays nothing whatever).  The
+     pipe-specific intros -- the taint's and lane PIPE-PROTO's invariant
+     handle -- are NOT laws here: they name pipe ghosts, so they live at
+     the instance, where a file that needs them already has them. *)
+  srow_reg : fdstate -> iProp Σ;
+  srow_reg_persistent : forall st : fdstate, Persistent (srow_reg st);
+  srow_reg_nopipe : forall st : fdstate, fdst_nopipe st -> ⊢ srow_reg st;
+}.
+
+Global Existing Instance sbundle_at_ne.
+Global Existing Instance spost_at_ne.
+Global Existing Instance srow_reg_persistent.
+
+(* stdpp's [f_equiv] enumerates the application arities it can peel and stops
+   at FIVE; [spost_at] takes NINE, so a [solve_contractive] over it fails with
+   a bare "No applicable tactic".  These are stdpp's own fallback pattern at
+   six through nine, and Iris's tactic with it in the [first]; the U-mode
+   slot fixpoint [UexecRet.uslot_F] is the user. *)
+Ltac f_equiv_wide :=
+  match goal with
+  | |- ?R (?f _ _ _ _ _ _ _ _ _) _ =>
+      simple apply (_ : Proper (_ ==> _ ==> _ ==> _ ==> _ ==> _ ==> _ ==> _ ==> _ ==> R) f)
+  | |- ?R (?f _ _ _ _ _ _ _ _) _ =>
+      simple apply (_ : Proper (_ ==> _ ==> _ ==> _ ==> _ ==> _ ==> _ ==> _ ==> R) f)
+  | |- ?R (?f _ _ _ _ _ _ _) _ =>
+      simple apply (_ : Proper (_ ==> _ ==> _ ==> _ ==> _ ==> _ ==> _ ==> R) f)
+  | |- ?R (?f _ _ _ _ _ _) _ =>
+      simple apply (_ : Proper (_ ==> _ ==> _ ==> _ ==> _ ==> _ ==> R) f)
+  end;
+  try reflexivity.
+
+(* [f_contractive] only at a [▷]: tried FIRST at every node, as Iris's own
+   [solve_contractive] does, its failing instance search was ~75 % of the
+   walk (UexecRet's [uslot_F] 15 s -> 3 s, ParkCap's token 7 s -> 2 s).  It
+   stays the last resort for any other contractive head. *)
+Ltac solve_contractive_wide :=
+  solve_proper_core ltac:(fun _ =>
+    lazymatch goal with
+    | |- dist _ (bi_later _) _ => f_contractive
+    | _ => first [f_equiv | f_equiv_wide | f_contractive]
+    end).
+
+(* ===================================================================== *)
+(* THE FAMILY-FREE READER, derived: “a bundle for [n] at this key, at     *)
+(* SOME families”.  It is what a program that does not read its post      *)
+(* deals in -- the two supply laws produce it, [UkRun.udep]'s law is      *)
+(* stated at it, and every ecall leaf destructs it to fill the arm's [∃]. *)
+(* A program that DOES read its post never goes through this: it deposits *)
+(* [sbundle_at] at its own [f] and takes [spost_at] back at that [f].     *)
+(* ===================================================================== *)
+Section SBundle.
+  Context {Σ : gFunctors}.
+  (* [ChildTok.ctokG] BEFORE the class, which is indexed by it: see the
+     class's own note. *)
+  Context `{!ctokG Σ}.
+  Context {SG : uexecSG Σ}.
+
+  Definition sbundle (X : uvis -d> iPropO Σ) (n : Z) (W : uvis) : iProp Σ :=
+    (∃ f : sfam, sbundle_at X n f W)%I.
+
+  (* ...AND THE SAME THING AT A NAMED PAYLOAD (app-echo.md, "SH-LINE
+     RULING", R1).  read's deposit is a wand from the depositing process's
+     own exit payload, so what a leaf needs of its mint is not "a bundle at
+     some family" but "a bundle at a family whose payload is MINE" -- the
+     payload it is about to pay the trap's payment row at.  Every supplier
+     of a deposit produces this form; [sbundle] is what is left once the
+     family is forgotten. *)
+  Definition sbundle_pay (X : uvis -d> iPropO Σ) (n : Z) (Q : Z -> iProp Σ)
+      (W : uvis) : iProp Σ :=
+    (∃ f : sfam, ⌜sexit_pay f = Q⌝ ∗ sbundle_at X n f W)%I.
+
+  Lemma sbundle_of_pay (X : uvis -d> iPropO Σ) (n : Z) (Q : Z -> iProp Σ)
+      (W : uvis) :
+    sbundle_pay X n Q W -∗ sbundle X n W.
+  Proof using . iIntros "H". iDestruct "H" as (f) "[_ Hb]". iExists f. iExact "Hb". Qed.
+
+  (* ...AND THE exec DEPOSIT WITH ITS REFUND'S ONE CONSEQUENCE (app-echo.md,
+     lane KILL-PAY, K4(a), ruling R-A).  A FAILED exec hands the family's
+     refund back to the process ([spost_at_exec]), and the family is
+     EXISTENTIAL here -- a supplier deposits at SOME [f] -- so the leaf
+     cannot name [sexec_refund f] in its continuation.  What it can state
+     is the consequence it wants: whatever the refund is, it pays this
+     record's own exit at the kill status.  Persistent, so a [□]-boxed
+     supply carries it for free; at a trivial payload it is [_ -∗ True],
+     and at a pinned supply that spent a lease into the deposit it is the
+     projection that gets the lease back. *)
+  Definition sbundle_pay_ref (X : uvis -d> iPropO Σ) (Q : Z -> iProp Σ)
+      (W : uvis) : iProp Σ :=
+    (∃ f : sfam, ⌜sexit_pay f = Q⌝ ∗ □ (sexec_refund f -∗ Q (-1))
+                 ∗ sbundle_at X USYS_exec f W)%I.
+
+  Lemma sbundle_pay_of_ref (X : uvis -d> iPropO Σ) (Q : Z -> iProp Σ)
+      (W : uvis) :
+    sbundle_pay_ref X Q W -∗ sbundle_pay X USYS_exec Q W.
+  Proof using .
+    iIntros "H". iDestruct "H" as (f) "(%Hp & _ & Hb)".
+    iExists f. iSplitR; [ done | iExact "Hb" ].
+  Qed.
+
+  (* ...and the other direction AT EVERY NUMBER BUT read AND exec, the two
+     branches whose bundles read the payload: a bundle at some family is
+     re-keyed to the caller's payload for free everywhere else. *)
+  Lemma sbundle_pay_of_sbundle (X : uvis -d> iPropO Σ) (n : Z)
+      (Q : Z -> iProp Σ) (W : uvis) :
+    n <> USYS_read -> n <> USYS_exec ->
+    sbundle X n W -∗ sbundle_pay X n Q W.
+  Proof using .
+    intros Hne Hnx. iIntros "H". iDestruct "H" as (f) "Hb".
+    iExists (sfam_at Q f). rewrite (sbundle_at_at X n Q f W Hne Hnx).
+    iSplitR; [ iPureIntro; apply sexit_pay_at | iExact "Hb" ].
+  Qed.
+
+  Global Instance sbundle_ne (k : nat) :
+    Proper (dist k ==> eq ==> eq ==> dist k) sbundle.
+  Proof using .
+    intros X Y HXY n ? <- W ? <-. rewrite /sbundle.
+    apply bi.exist_ne; intros f. exact (sbundle_at_ne k X Y HXY n n eq_refl
+                                          f f eq_refl W W eq_refl).
+  Qed.
+
+  Lemma sbundle_cong (X : uvis -d> iPropO Σ) (n : Z) (W W' : uvis) :
+    skey_eq W W' -> sbundle X n W ⊣⊢ sbundle X n W'.
+  Proof using .
+    intros Hk. rewrite /sbundle. apply bi.exist_proper; intros f.
+    exact (sbundle_at_cong X n f W W' Hk).
+  Qed.
+
+  Lemma sbundle_mono (X Y : uvis -d> iPropO Σ) (n : Z) (W : uvis) :
+    ⊢ □ (∀ W' : uvis, X W' -∗ Y W') -∗ sbundle X n W -∗ sbundle Y n W.
+  Proof using .
+    iIntros "#Hup Hb". rewrite /sbundle. iDestruct "Hb" as (f) "Hb".
+    iExists f. iApply (sbundle_at_mono X Y n f W with "Hup Hb").
+  Qed.
+End SBundle.
+
+(* ===================================================================== *)
+(* THE PROGRAM'S OWN DEPOSIT DATA, as a second ambient class.             *)
+(*                                                                        *)
+(* [UkRun.urun] carries [□ Dsup] and the pure minting law over its OWN    *)
+(* bound key ([M], [pm], [sz], [fdv], [cw]); what stays free for a        *)
+(* program to choose is which syscall NUMBERS it undertakes to pay for.   *)
+(* A class rather than an index of [urun] so that no program lemma        *)
+(* statement names it: the section binder generalises every lemma in a    *)
+(* program file for free, which is what keeps the ~570 [urun] sites in    *)
+(* UkSh / UkCat / UkInit / UkEcho / UkSync from moving.                   *)
+(*                                                                        *)
+(* Instances: the GENERIC slot takes [Dsup := ssupply] and                *)
+(* [psok := fun _ => True]; a verified program takes its own supplier and *)
+(* the numbers it calls, and discharges the law in its kernel-side        *)
+(* constructor file, above the file-system tower.                         *)
+(* ===================================================================== *)
+Class uprogSG (Σ : gFunctors) := {
+  (* the program's deposit SUPPLIER, used as [□ Dsup] *)
+  Dsup : iProp Σ;
+  (* ...and the syscall numbers it undertakes to pay a bundle for *)
+  psok : Z -> Prop;
+}.
+
+(* ===================================================================== *)
+(* THE FREE NUMBERS (lane SUPPLY-SPLIT).  The literal predicate lives      *)
+(* HERE, beside the class, because both ends need it and they are on       *)
+(* opposite sides of the file-system tower: the PROGRAM tier (UkRun and    *)
+(* every [Uk*.v]) says "my numbers are free" without naming an instance,   *)
+(* and the INSTANCE ([UexecExecInst.xv6_free]) is this same predicate, so  *)
+(* the two meet by [eq_refl] rather than by a bridge lemma.                *)
+(*                                                                        *)
+(* WHICH NUMBERS ARE MISSING, and why (the classification's CLAIM/TAINT    *)
+(* column -- [UexecExecInst.xv6_sbundle] is the evidence, one branch per   *)
+(* number):                                                               *)
+(*   7  exec  -- the minting law never admits it at all (its bundle reads  *)
+(*               the key); the deposit goes the EXPLICIT route             *)
+(*               ([UkRun.uxsup]).                                          *)
+(*   5  read  -- the CONSOLE arm spends the supply; a LEASE holder pays it *)
+(*               at its own claim ([UkRun.udepwf_std]).                    *)
+(*   15 open  -- create / trunc / child are write-kind commits; a PINNED   *)
+(*               open pays them ([UkRun.udepwf_at]).                       *)
+(*   16 write -- the INODE arm is the write chain.  The console arm is     *)
+(*               free, but this law is KEY-FREE, so admitting 16 would     *)
+(*               mean paying it at a key whose fd IS an inode; 16's        *)
+(*               honest supplier is LEDGER-FIXED, not key-free.            *)
+(*   17/18/19/20 mknod / unlink / link / mkdir -- write-kind commits.      *)
+(*                                                                        *)
+(* Every other number's bundle is [emp], and 9 (chdir) -- a walk premise   *)
+(* and a READ-kind commit -- is a closed fact                              *)
+(* ([FsAbsInvFire.fsabs_chdir_pre] takes no supply), so chdir is FREE.     *)
+(* ===================================================================== *)
+(*   6  kill  -- the branch is the KILL CREDENTIAL (lane KILL-PAY, K3(a)):
+                 sys_kill hands it to kkill out of the trapping process's
+                 deposit.  No verified program calls kill(2), so excluding
+                 it here costs nothing; the GENERIC slot pays it out of the
+                 application's supply. *)
+(*   21 close -- the PIPE arm is a close link over the byte queue (design/
+                 pipe.md), payable at a pipe key only by a holder of the
+                 fragment or the taint; a program pays its close deposits
+                 explicitly, at the state its handle names. *)
+Definition free_num (n : Z) : Prop :=
+  n <> USYS_exec /\ n <> 5 /\ n <> 6 /\ n <> 15 /\ n <> 16 /\ n <> 17 /\
+  n <> 18 /\ n <> 19 /\ n <> 20 /\ n <> 21 /\ n <> USYS_exit.
+
+Global Instance free_num_dec (n : Z) : Decision (free_num n).
+Proof. rewrite /free_num. apply _. Defined.
+
+(* ...and what a call site at a LITERAL number discharges it with *)
+Ltac free_lit :=
+  unfold free_num; repeat split;
+  (discriminate || (vm_compute; discriminate)).

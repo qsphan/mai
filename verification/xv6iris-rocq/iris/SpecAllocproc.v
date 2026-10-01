@@ -1,0 +1,648 @@
+(* SpecAllocproc.v -- the public interface of allocproc() (kernel/proc.c),
+   stated independently of its proof.
+
+     static struct proc *allocproc(void) {
+       struct proc *p;
+       for (p = proc; p < &proc[NPROC]; p++) {
+         acquire(&p->lock);
+         if (p->state == UNUSED) goto found;
+         else release(&p->lock);
+       }
+       return 0;
+     found:
+       allocpid(p);           // static, inlined: the pid scan under pid_lock
+       p->state = USED;
+       if ((p->trapframe = kalloc()) == 0) { ... return 0; }
+       p->pagetable = proc_pagetable(p);
+       if (p->pagetable == 0) { ... return 0; }
+       memset(&p->context, 0, sizeof(p->context));
+       p->context.ra = (uint64)forkret;
+       p->context.sp = p->kstack + PGSIZE;
+       return p;
+     }
+
+   @ KernelSyms.allocproc = 0x80001b28, fifty-five instructions: a 32-byte
+   ra/s0/s1/s2 frame, the scan loop (+0x1c .. +0x30), the allocation body
+   (+0x38 .. +0x76), one shared epilogue at +0x78, and the two [freeproc]
+   failure tails at +0x86 / +0x96.
+
+   THE HEADLINE.  This is the function that turns a [ProcInv.proc_dormant]
+   back into a [ProcInv.proc_priv] -- the one producer of the private block
+   every syscall consumes -- and it is where the page table's CONSTRUCTION
+   side (proc_pagetable, completed/proc-pagetable.md) meets its OWNERSHIP
+   side (ProcPtOwn, projects/proc-pagetable-ownership.md), at
+   [ProcPtOwn.proc_pt_intro_ppt].
+
+   ON SUCCESS IT RETURNS WITH THE LOCK HELD.  allocproc never releases the
+   slot it took: its caller (fork / userinit) keeps writing the child under
+   [p->lock] and releases it itself.  So the post hands back
+   [SchedCtx.proc_held j gl USED ch] -- the lock token and every cell the
+   invariant holds unconditionally -- together with the detached private
+   block, and [cpu_own] comes out at [S lvl] with the matching
+   [arm_pay].  On the empty-table path (a0 = 0) every lock the scan
+   touched has been released and [cpu_own] is back at [lvl].
+
+   TWO CONTRACTS, ONE PROOF.  [ALLOCPROC_GEN] below states what allocproc
+   does at ANY page budget: there both failure tails are live code, they run
+   freeproc for real, and the third arm of [allocproc_post] is what they
+   return.  [ALLOCPROC] is the COUNTED specialisation -- with more than
+   [K_allocproc] free pages neither the trapframe [kalloc] nor
+   proc_pagetable can run dry, so that third arm is REFUTABLE from the
+   caller's own premise and a counted caller never sees a resealed budget.
+   The refutation is thirty lines (ProofAllocproc's [AllocprocSeal]); the
+   instruction-level proof is elaborated once, for both.
+
+   WHAT THE POST SAYS ABOUT THE PROCESS.  Its user address space is EMPTY
+   ([pv_upt V = upt_desc root tfp], whose [ud_um] is the empty map): the
+   table maps TRAMPOLINE and TRAPFRAME and nothing else.  Every descriptor is
+   null and [cwd] is 0, straight out of the dormant block, so the caller owes
+   no file reference.  [p->sz] and [p->name] are whatever the block already
+   held -- allocproc writes neither, and freeproc's zeroing of them has no
+   consumer (design/proc-struct.md).  The pid is existential: the inlined
+   allocpid scan (ProofAllocproc.v's [wp_ap_pidsec]) promises nothing about
+   the value it picks, only that the lock is taken and released.
+
+   THE SAVED CONTEXT comes back as raw cells, not as a
+   [SchedCtx.proc_ctx]: turning "ra = forkret, sp = kstack + PGSIZE" into a
+   member of the scheduler's swtch chain is a Löb argument about forkret,
+   which belongs to the caller that parks the process, not here.  The twelve
+   callee-saved slots are existential -- memset zeroed them, but nothing
+   consumes that, and a resumed context may not read them. *)
+From Stdlib Require Import ZArith Lia List.
+From stdpp Require Import gmap list bitvector.definitions.
+From iris.proofmode Require Import proofmode.
+From iris.program_logic Require Import language lifting.
+From iris.base_logic.lib Require Import ghost_var invariants gen_heap.
+Require Import SailStdpp.ConcurrencyInterface SailStdpp.ConcurrencyInterfaceBuiltins SailStdpp.ConcurrencyInterfaceTypes SailStdpp.Operators_mwords.
+Require Import SailStdpp.Base SailStdpp.TypeCasts SailStdpp.Values SailStdpp.MachineWord.
+Require Import RiscvLang RiscvPtsto.
+Require Import InstrBytes.
+Require Import RegFile.
+Require Import RiscvExtras.
+Require Import CalleeSaved KernelText.
+Require Import IntrDefs.
+Require Import WpNext.
+Require Import WpLock.
+Require Import ProcGeom CpuOwn.
+Require Import KallocInv.
+(* the proc table's two regimes -- the counted premise that refutes the
+   empty-table arm, and the marker the found slot is minted with *)
+Require Import ProcPtOwn.
+Require Import SlotGen.   (* [act_lend]: the permit sweep, L1a *)
+Require Import SwtchCtx.
+Require Import FdSlots.
+Require Import FileInvDefs.
+Require Import ProcInv.
+Require Import SchedCtx.
+Require Import ChildTok.  (* [gen_own] -- the incarnation this function mints *)
+Require Import KvmSpec.
+Require Import PidLock.
+Require Import PidEv.   (* [PAlloc]: the ledger event the led twins' receipt names *)
+Require Import LockRank.
+From Kernel Require KernelSyms.
+Require Import Riscv.rv64d_types Riscv.rv64d Riscv.riscv_extras.
+Require Import ProcAvail.
+Require Import Xv6G.   (* the ghost-state bundle; see its header *)
+Require Import TsoCtx.
+Local Open Scope Z_scope.
+
+
+(* The pages allocproc consumes: the trapframe page, plus the three
+   proc_pagetable builds (root + the l1/l0 pair the TRAMPOLINE walk needs;
+   TRAPFRAME shares both).  The premise is STRICT -- [K_allocproc < nb] for a
+   4-page consumption -- by the kalloc chain's counted-arm convention: a
+   [Some 0] remainder would leave the last mappages' [avail_zero] arm
+   unrefutable. *)
+Notation K_allocproc := (7%nat) (only parsing).
+(* the value [p->context.ra] is left holding *)
+Definition forkret_pc : mword 64 := mword_of_int KernelSyms.forkret.
+
+(* The postcondition, as a function of the RETURNED POINTER.  Factoring it
+   out of the continuation is what lets the proof's shared epilogue (both
+   exits join at +0x78) be one lemma: the epilogue moves [s1] into a0, so it
+   knows the returned value and nothing else about which arm produced it.
+
+   THE EXIT SIE INDEX IS PER-ARM, WHICH IS WHY [sie_cap_gpr] LIVES IN HERE
+   RATHER THAN IN THE CONTINUATION.  allocproc RETURNS HOLDING p->lock on the
+   found arm and never releases it, so [acquire]'s unbalanced exit index
+   ([false] whatever the entry [b]) propagates all the way out to the caller
+   -- while the null arm, which releases everything, exits at [b].  A single
+   [sie_cap_gpr mr K b pme] in the shared continuation is not merely
+   unreachable at [b = true], it is REFUTABLE: [sie_arm true pme] owns
+   [cpu_hart 0 true pme] and the found arm owns [cpu_hart (S lvl) eb pme],
+   which [CpuOwn.cpu_own_arm_excl] contradicts.  So the "found a free slot"
+   execution -- an ordinary one -- would have had no derivation at [b = true].
+   Nothing in the premises forces [b = false], and nothing about this fails to
+   compile: the contract typechecks and only the proof discovers it.
+
+   Stating the whole contract at [b = false] would also have closed the hole,
+   but dishonestly: [userinit] is the only caller today and does run at boot
+   with interrupts off, yet [fork] -- which is what allocproc exists for --
+   calls it from a syscall with interrupts on.  The per-arm index says what is
+   actually true, and it is what fork will need, since fork must [release] the
+   proc it gets back and [release] demands [sie_cap_gpr … false …]. *)
+Definition allocproc_post
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γk : gname * gname) (γf : gname) (γs : list gname) (lvl : nat) (eb : bool)
+    (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+    (b : bool) (lks : gset string)
+    (mr : regfile) (K : nat)
+    (* THE PAYLOAD THE CREATOR CHOOSES, AND ITS PAYMENT RULE (lane
+       SELF-KILL, §4b'; coordinator's ruling (A)).  allocproc mints the
+       incarnation AT these now rather than at the trivial payload for a
+       fork row to re-choose: [SchedCtx]'s killed row is per-incarnation
+       and allocproc is what stores the pid it is keyed at, so allocproc
+       has to close that row -- and the row names the generation
+       persistently, which is only possible once the generation has been
+       SPLIT, which freezes the payload.  See [ChildTok.gen_alloc]. *)
+    (Q : Z -> iProp Σ)
+    (rv : mword 64) : iProp Σ :=
+  ( (* --- no free slot: a0 = 0, every lock released, budget untouched.
+
+        AND THE ARM REPORTS WHY, exactly as the third one does and exactly
+        as [KallocInv]'s [kalloc_post] does for a null page: the scan
+        passed all [NPROC] slots, so the caller's PROC count -- if it has
+        one -- must be 0.  A caller in the counted regime ([userinit],
+        holding [procs_avail (Some (S k))]) refutes the whole arm from
+        that, which is the only way a function that does not check
+        allocproc's result can be proved at all; an uncounted one (kfork,
+        [procs_avail None]) reads it as no information and handles the
+        arm.  See [ProcAvail.v]'s header. --- *)
+    (⌜ rv = (zero_reg : mword 64) ⌝ ∗
+     ⌜ avail_zero op ⌝ ∗
+     sie_cap_gpr KT1 mr K b pme ∗
+     cpu_own lvl eb pme b lks ∗
+     kalloc_env_at γa γk on ∗
+     (* THE LEDGER COMES BACK UNMOVED, INDEX AND ALL: this arm never
+        reached the inlined allocpid -- the C scans for a free slot FIRST
+        and calls allocpid only at [found] -- so <nextpid> was not touched
+        and the boot-era token (lane TRAP-ROWS-4, B1b) is still in it. *)
+     procs_avail_at op tk)
+  ∨ (* --- found: a0 = &proc[j], j's lock HELD, the private block built --- *)
+    (∃ (j : nat) (γl : gname) (ch : mword 64) (pid : mword 32)
+       (U : ustate) (root tfp : mword 44) (ks : mword 64)
+       (rest : list (mword 64)) (nc : nat),
+       ⌜ rv = proc_addr j /\
+         (j < NPROC)%nat /\ γs !! j = Some γl /\
+         (* THE PID IS IN [1, PIDMAX] (kernel/param.h).  <allocpid> takes it
+            from the bounded counter <pid_lock> protects
+            ([PidLock.nextpid_res_at]) and its retry loop keeps the bound;
+            the interval, and not just [0 < pid], because it is free at the
+            source and it is what a caller of fork tells the user.  This is
+            the fact the trap loop's fork row runs on: a pid in [1, PIDMAX]
+            is never 0, so the parent of a fork always resumes on its own
+            arm ([UexecRet.uexec_fork_parent_F]'s guard). *)
+         (1 <= bv_unsigned pid <= PIDMAX)%Z /\
+         (* ...AND WHICH SIDE OF <INIT> IT IS ON (lane TRAP-ROWS-4, B1b).
+            The two cases are the ledger's own two regimes and no caller
+            gains a premise it does not already hold:
+              [tk = true]  -- the BOOT-ERA token is in the ledger, so
+                 <pid_lock>'s payload still carries "the counter is 1 and
+                 no slot holds pid 1" and the first candidate is taken
+                 with no retry.  This is userinit's call, and it is what
+                 pins <init>'s pid to the LITERAL 1.
+              [tk = false] -- the ledger is (or has been) sealed, so it
+                 carries <init>'s permanent registration
+                 ([SlotGen.init_reg]) and the scan's own "this key is
+                 free" refutes the candidate 1.  This is kfork's call, and
+                 it is what a forked child spends on wait's reaping arm
+                 ([UexecRet.uexec_fork_child_F]'s [pidc <> 1]). *)
+         (if pav_boot op tk then bv_unsigned pid = 1 else bv_unsigned pid <> 1) /\
+         pv_upt (us_V U) = upt_desc root tfp /\
+         pv_ofile (us_V U) = replicate NOFILE (zero_reg : mword 64) /\
+         pv_cwd (us_V U) = (zero_reg : mword 64) /\
+         length rest = 12%nat /\ (nc <= K_allocproc)%nat ⌝ ∗
+       proc_held cpu_id j γl USED ch ∗
+       (* proc j's HART TAG, whole.  A not-RUNNING proc keeps both halves in
+          its lock ([SchedCtx.proc_slots]'s [not_running] arm), which is the
+          arm allocproc emptied; the caller gets them back here and can
+          rebuild [proc_lock_res] at USED / RUNNABLE. *)
+       hart_at_any (proc_addr j) ∗
+       (* THE DEFICIT BLOCK, not [proc_priv]: allocproc has not set
+          [p->cwd] -- the arm's own [pv_cwd V = 0] says so -- and
+          [ProcInv.cwd_ref] has no null arm, so there is no [proc_priv] at
+          this [V] to hand back.  The caller closes the construction window
+          when it installs a working directory ([proc_priv_split_cwd]);
+          kfork does it at its [sd a0,336(s4)]. *)
+       proc_priv_nocwd γf (proc_addr j) pid U ∗
+       (* THE SLOT'S NEW INCARNATION, MINTED HERE.  allocproc is the one
+          place a process comes into existence, so it is where the
+          generation is minted: a name nothing has ever held, carrying
+          THIS slot's address and the pid <allocpid> just chose, at the
+          TRIVIAL payload -- a process nobody forked owes its parent
+          nothing, and a fork REPLACES the payload before splitting
+          ([ChildTok.gen_set]).  WHOLE, because the caller is the party
+          that chooses: kfork sets the payload and splits the three
+          pieces, and a failure tail simply drops it -- the name dies with
+          the incarnation that never started, exactly as [pv_fdg] does.
+          The block records the name ([ProcDefs.pv_gen]), which is what
+          makes [UexecSlot.uvis_gen] a reading of the block. *)
+       (* ...AND THE TWO GHOSTS MINTED WITH IT (lane SELF-KILL, P6): the
+          incarnation's exclusive SPENT MARKER, which rides the process's
+          private block until its exit trades it for the death payment, and
+          the kill flag's ONE-SHOT at PENDING, which is what <p->lock>'s
+          killed row's zero arm is founded on.  Both are handed out at
+          their GENERATION-indexed forms ([ChildTok.taken_at] /
+          [kill_pend]) so no caller binds a ghost name, and both are
+          bundled into this row so that every pass-through site keeps its
+          arity. *)
+       gen_new (pv_gen (us_V U)) (proc_addr j) pid Q ∗
+       (* ...AND THE TWO EXCLUSIVE GHOSTS THAT SAY THIS INCARNATION IS THE
+          SLOT'S CURRENT ONE, BOTH WHOLE ([SlotGen]).  The generation's
+          came out of the dormant block and was re-keyed here; the pid's
+          was INSERTED here, into the register <pid_lock> carries, at the
+          very store that put the pid in the cell -- the scan is what
+          proved the key free.  WHOLE for [gen_own]'s reason: the caller is
+          the party that splits, keeping a QUARTER of each for the child's
+          block ([ProcInv.proc_priv_core]) and depositing the other three
+          quarters under <wait_lock> ([WaitInv.gen_halves]); a failure tail
+          hands both wholes straight to freeproc, which is what deregisters
+          the pid. *)
+       slot_gen (proc_addr j) (DfracOwn 1) (pv_gen (us_V U)) ∗
+       pid_reg_rest pid (pv_gen (us_V U)) ∗
+       (* THE DESCRIPTOR-STATE FRAGMENTS, minted here with the block: this
+          is the one function that chooses a process's [pv_fdg]
+          ([ProcInv.proc_dormant_unused]), so it is the one place the
+          bundle can come from.  It travels beside the block exactly as the
+          three allowances below do, to the caller's park and from there
+          into [UsertrapRes.ut_own], where every fd operation spends it.
+          A FAILURE TAIL simply drops it -- the name dies with the
+          incarnation that never started. *)
+       fd_frags (pv_fdg (us_V U)) fdt0 ∗
+       (* THE SLOT'S CHILDREN ROW, out of the dormant block with the three
+          allowances and NOT minted here -- the one piece of the block
+          allocproc cannot make.  The authority is <wait_lock>'s
+          ([WaitInv.children_own_at]) and allocproc does not hold that
+          lock, so this is the row BOOT put in the slot
+          ([WaitInv.children_res_alloc]), at the name the block records
+          ([ProcDefs.pv_chg]).  EMPTY, because a process that has not run
+          has no children.  It travels beside [fd_frags] to the caller's
+          park and from there into [UsertrapRes.ut_own], where fork spends
+          it; a FAILURE TAIL hands it straight back to freeproc. *)
+       ch_frag (pv_chg (us_V U)) (proc_addr j) ∅ ∗
+       (* ...AND THE SLOT'S HALF OF [p->xstate], out of the dormant block
+          with the row and for its reason: the block a running process
+          holds carries it ([ProcInv.proc_priv_core]), because the ZOMBIE
+          park keys its escrow at what the cell reads.  It joins the block
+          at the same store the working directory, the token and the pair
+          do ([ProcInv.proc_priv_split_cwd] is six-way). *)
+       (∃ xsv : mword 32, p_xstate (proc_addr j) ↦₄{DfracOwn (1/2)} xsv) ∗
+       (* THE SLOT IS NOW ALLOCATED.  Persistent, minted here out of
+          [procs_avail]'s authority, and what the caller hands to
+          [SchedCtx.proc_slots_park] when it releases the slot at USED or
+          RUNNABLE -- a slot that has left UNUSED carries this on every arm
+          of its lock invariant ([ProcAvail.v]). *)
+       pslot_used_at (proc_addr j) ∗
+       fd_slots FDSPARE ∗
+       (* THE CWD'S UNIT AND THE IREF ALLOWANCE, out of the dormant block
+          allocproc took the slot from.  The [1] is what kfork spends on
+          [idup] -- allocproc is the function that took the slot out of
+          [procs_inv], so it is where the unit has to come from. *)
+       iref_slots (1 + IREFSPARE) ∗
+       (* ...AND THE BIO ALLOWANCE, out of the same dormant block and on the
+          same footing: allocproc never spends these, it only carries them
+          across.  They are the process's from here -- the caller hands them
+          to [SpecForkretPark]'s park, which is what puts them in the child's
+          residue for the first syscall it makes.  A FAILURE TAIL gives them
+          straight back instead ([SpecFreeproc.fp_rest] carries the row), so
+          no path through allocproc can drop a slot's three. *)
+       bslots 3 ∗
+       is_kstack (proc_addr j) ks ∗
+       (* THE SLOT'S KERNEL STACK, out of the dormant block with everything
+          else the slot owned.  SEALED ([ProcDefs.kstack_free]) rather than
+          carved: the caller that wants the words spells [kstack_free_at]
+          against the [is_kstack] one line up.  It is what a failure tail
+          hands freeproc ([SpecFreeproc.fp_rest]) and, once kfork builds a
+          paid park, what [SpecForkretParkPaid.forkret_park_pkg] is anchored
+          on. *)
+       kstack_free (proc_addr j) ∗
+       ctx_cells (p_context (proc_addr j))
+         (forkret_pc :: add_vec ks (mword_of_int 4096) :: rest) ∗
+       (* [trap_res b + K], NOT [K]: allocproc RETURNS HOLDING p->lock, so
+          this arm inherits [acquire]'s unbalanced exit index verbatim -- the
+          caller's trap reserve has moved into the usable count for the
+          interrupts-off critical section it is still inside, and it stays
+          there until the caller's own [release] gives it back.  The null arms
+          below released everything, so they exit at [K] with arm [b] and the
+          reserve back inside [sie_cap]'s [trap_res b] summand. *)
+       sie_cap_gpr KT1 mr (trap_res b + K)%nat false pme ∗
+       (* the found slot's OWN lock is now held, on top of whatever the
+          caller already held: this is the one arm allocproc returns
+          without releasing everything it took. *)
+       cpu_own (S lvl) eb pme false ({["proc"]} ∪ lks) ∗
+       arm_pay KT1 lvl eb pme ∗
+       kalloc_env_at γa γk (avail_sub on nc) ∗
+       (* one slot fewer, by the same [avail_dec] the page count uses, and
+          WITH THE BOOT TOKEN SPENT (lane TRAP-ROWS-4, B1b): the inlined
+          allocpid shot it at its store to <nextpid>.  An uncounted caller
+          loses nothing -- [ProcAvail.pav_spent None] is persistent and it
+          holds [ProcAvail.procs_avail None] anyway -- and userinit closes
+          the counted one at its seal
+          ([ProcAvail.procs_avail_seal_spent]). *)
+       pav_spent (avail_dec op))
+  ∨ (* --- a FAILURE TAIL ran: the slot was taken and then given back.  a0
+        is 0 and every lock is released, exactly as in the first arm, but
+        two things differ and both matter.
+
+        The COUNT IS GONE.  The tails call freeproc, whose callees (kfree,
+        proc_freepagetable) are stated only at [kalloc_env _ None], so the
+        environment has been resealed and no caller can ever count again.
+        That is why this cannot be folded into the first arm.
+
+        And the arm records WHY it was reached: the allocator ran dry after
+        [n <= K_allocproc] pages.  A COUNTED caller refutes the whole arm
+        from its own [K_allocproc < nb]; an uncounted one (kfork) handles
+        it.  Carrying the witness is what lets ONE proof serve both. --- *)
+    (⌜ rv = (zero_reg : mword 64) ⌝ ∗
+     ⌜ exists n : nat, (n <= K_allocproc)%nat /\ avail_zero (avail_sub on n) ⌝ ∗
+     sie_cap_gpr KT1 mr K b pme ∗
+     cpu_own lvl eb pme b lks ∗
+     kalloc_env_at γa γk None ∗
+     (* the failure tails run AFTER the inlined allocpid, so the boot token
+        is spent here too *)
+     pav_spent op))%I.
+
+(* THE LED TWIN OF [allocproc_post] (NI-LEDGER-REST W2, design
+   ni-pid-ledger.md D4, ruling R4): a COPY, comments stripped (read them on
+   the original above), whose FOUND arm also carries the pid ledger's
+   RECEIPT of the allocation the inlined allocpid made -- [PAlloc pme pid]
+   appended right after some history [h] ([SlotGen.pid_receipt]), the actor
+   being the hart's proc word [pme].  The two null arms are unchanged: they
+   never reached a registration.  [allocproc_post_led_post] drops the
+   receipt. *)
+Definition allocproc_post_led
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γk : gname * gname) (γf : gname) (γs : list gname) (lvl : nat) (eb : bool)
+    (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+    (b : bool) (lks : gset string)
+    (mr : regfile) (K : nat)
+    (Q : Z -> iProp Σ)
+    (rv : mword 64) : iProp Σ :=
+  ( 
+    (⌜ rv = (zero_reg : mword 64) ⌝ ∗
+     ⌜ avail_zero op ⌝ ∗
+     sie_cap_gpr KT1 mr K b pme ∗
+     cpu_own lvl eb pme b lks ∗
+     kalloc_env_at γa γk on ∗
+     procs_avail_at op tk)
+  ∨ 
+    (∃ (j : nat) (γl : gname) (ch : mword 64) (pid : mword 32)
+       (U : ustate) (root tfp : mword 44) (ks : mword 64)
+       (rest : list (mword 64)) (nc : nat),
+       (∃ h, pid_receipt h (PAlloc pme pid)) ∗
+       ⌜ rv = proc_addr j /\
+         (j < NPROC)%nat /\ γs !! j = Some γl /\
+         (1 <= bv_unsigned pid <= PIDMAX)%Z /\
+         (if pav_boot op tk then bv_unsigned pid = 1 else bv_unsigned pid <> 1) /\
+         pv_upt (us_V U) = upt_desc root tfp /\
+         pv_ofile (us_V U) = replicate NOFILE (zero_reg : mword 64) /\
+         pv_cwd (us_V U) = (zero_reg : mword 64) /\
+         length rest = 12%nat /\ (nc <= K_allocproc)%nat ⌝ ∗
+       proc_held cpu_id j γl USED ch ∗
+       hart_at_any (proc_addr j) ∗
+       proc_priv_nocwd γf (proc_addr j) pid U ∗
+       gen_new (pv_gen (us_V U)) (proc_addr j) pid Q ∗
+       slot_gen (proc_addr j) (DfracOwn 1) (pv_gen (us_V U)) ∗
+       pid_reg_rest pid (pv_gen (us_V U)) ∗
+       fd_frags (pv_fdg (us_V U)) fdt0 ∗
+       ch_frag (pv_chg (us_V U)) (proc_addr j) ∅ ∗
+       (∃ xsv : mword 32, p_xstate (proc_addr j) ↦₄{DfracOwn (1/2)} xsv) ∗
+       pslot_used_at (proc_addr j) ∗
+       fd_slots FDSPARE ∗
+       iref_slots (1 + IREFSPARE) ∗
+       bslots 3 ∗
+       is_kstack (proc_addr j) ks ∗
+       kstack_free (proc_addr j) ∗
+       ctx_cells (p_context (proc_addr j))
+         (forkret_pc :: add_vec ks (mword_of_int 4096) :: rest) ∗
+       sie_cap_gpr KT1 mr (trap_res b + K)%nat false pme ∗
+       cpu_own (S lvl) eb pme false ({["proc"]} ∪ lks) ∗
+       arm_pay KT1 lvl eb pme ∗
+       kalloc_env_at γa γk (avail_sub on nc) ∗
+       pav_spent (avail_dec op))
+  ∨ 
+    (⌜ rv = (zero_reg : mword 64) ⌝ ∗
+     ⌜ exists n : nat, (n <= K_allocproc)%nat /\ avail_zero (avail_sub on n) ⌝ ∗
+     sie_cap_gpr KT1 mr K b pme ∗
+     cpu_own lvl eb pme b lks ∗
+     kalloc_env_at γa γk None ∗
+     pav_spent op))%I.
+
+Lemma allocproc_post_led_post
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γk : gname * gname) (γf : gname) (γs : list gname) (lvl : nat) (eb : bool)
+    (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+    (b : bool) (lks : gset string)
+    (mr : regfile) (K : nat)
+    (Q : Z -> iProp Σ)
+    (rv : mword 64) :
+  allocproc_post_led γa γk γf γs lvl eb pme on op tk b lks mr K Q rv ⊢
+  allocproc_post γa γk γf γs lvl eb pme on op tk b lks mr K Q rv.
+Proof.
+  rewrite /allocproc_post_led /allocproc_post.
+  iIntros "[Hnull | [Hfound | Hdead]]".
+  - iLeft. iExact "Hnull".
+  - iRight. iLeft.
+    iDestruct "Hfound" as (j γl ch pid U root tfp ks rest nc) "[_ Hfound]".
+    iExists j, γl, ch, pid, U, root, tfp, ks, rest, nc. iExact "Hfound".
+  - iRight. iRight. iExact "Hdead".
+Qed.
+
+Definition wp_allocproc_sconf_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γk : gname * gname) (γp : gname) (γf : gname) 
+    (γs : list gname) (m : regfile) (lvl K : nat) (eb : bool)
+    (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+    (b : bool) (lks : gset string) (Q : Z -> iProp Σ) (k : nat) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.allocproc in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (* 4 slots for this frame, 44 for freeproc's -- the deepest callee now
+     that the error tails are live code (proc_pagetable needs 40) *)
+  (48 <= K)%nat ->
+  (* the proc lock is HELD across kalloc / proc_pagetable, so their own
+     push_off sees [S lvl] and needs one more slot of headroom than usual *)
+  (Z.of_nat lvl + 2 < 2 ^ 31)%Z ->
+  (exists nb, on = Some nb /\ (K_allocproc < nb)%nat) ->
+  (* allocproc's own acquire needs every lock this hart already holds to
+     rank below "proc" (11) -- the ONLY lock allocproc itself acquires.
+     The nested calls it makes while p->lock is held (the inlined allocpid's
+     "nextpid" (10), kalloc's "kmem" (11)) both rank ABOVE "proc", so
+     [locks_below_mono] plus [locks_below_union_singleton] derive their
+     order premises from this single bound; see ProofAllocproc.v. *)
+  locks_below lks "proc" ->
+  (* ...AND HOW A KILLER PAYS FOR THE INCARNATION ABOUT TO BE MINTED (lane
+     SELF-KILL, §4b'; the owner's ruling of 2026-09-13).  [kill(2)] costs
+     the TARGET's exit payload at -1, and a killer holds none of the
+     target's resources -- so the killed row publishes this wand
+     ([SchedCtx.kill_paid]'s live arm) and a TAINTED process cashes it with
+     [RiscvPtsto.app_taint], which is the application's taint on the
+     fixed record and the only thing left that names a kill.  The CREATOR
+     is the only party that can found it: <init>'s payload is
+     [fun _ => True] and the wand is trivial; a forked child's is the
+     forking process's choice, whose payload admits the taint on its taint
+     arm. *)
+  □ (app_taint -∗ Q (-1)) -∗
+  sie_cap_gpr KT1 m K b pme -∗
+  cpu_own lvl eb pme b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  procs_inv γs -∗
+  is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+  kalloc_env_at γa γk on -∗
+  (* the proc table's regime, threaded exactly as [kalloc_env] is, and at
+     its boot-era index (lane TRAP-ROWS-4, B1b) *)
+  procs_avail_at op tk -∗
+  act_lend pme k -∗
+  wp_next b pme (fun (CID : CpuId) =>
+    ∀ (mr : regfile),
+      ⌜ callee_saved m mr ⌝ -∗
+      pc_is ret_tgt -∗
+      (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend pme k') -∗
+      allocproc_post γa γk γf γs lvl eb pme on op tk b lks mr K Q
+        (mr !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* THE LED TWIN of [wp_allocproc_sconf_body] (NI-LEDGER-REST W2): verbatim, comments
+   stripped, at [allocproc_post_led]. *)
+Definition wp_allocproc_sconf_led_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γk : gname * gname) (γp : gname) (γf : gname) 
+    (γs : list gname) (m : regfile) (lvl K : nat) (eb : bool)
+    (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+    (b : bool) (lks : gset string) (Q : Z -> iProp Σ) (k : nat) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.allocproc in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (48 <= K)%nat ->
+  (Z.of_nat lvl + 2 < 2 ^ 31)%Z ->
+  (exists nb, on = Some nb /\ (K_allocproc < nb)%nat) ->
+  locks_below lks "proc" ->
+  □ (app_taint -∗ Q (-1)) -∗
+  sie_cap_gpr KT1 m K b pme -∗
+  cpu_own lvl eb pme b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  procs_inv γs -∗
+  is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+  kalloc_env_at γa γk on -∗
+  procs_avail_at op tk -∗
+  act_lend pme k -∗
+  wp_next b pme (fun (CID : CpuId) =>
+    ∀ (mr : regfile),
+      ⌜ callee_saved m mr ⌝ -∗
+      pc_is ret_tgt -∗
+      (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend pme k') -∗
+      allocproc_post_led γa γk γf γs lvl eb pme on op tk b lks mr K Q
+        (mr !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* THE GENERAL CONTRACT.  Identical to the one below except that it drops the
+   counted premise: everything allocproc actually does is here, and the third
+   arm of [allocproc_post] is what makes an uncounted run STATABLE.  kfork
+   calls allocproc with no page budget, and there the two freeproc tails are
+   LIVE code. *)
+Definition wp_allocproc_core_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γk : gname * gname) (γp : gname) (γf : gname) 
+    (γs : list gname) (m : regfile) (lvl K : nat) (eb : bool)
+    (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+    (b : bool) (lks : gset string) (Q : Z -> iProp Σ) (k : nat) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.allocproc in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (48 <= K)%nat ->
+  (Z.of_nat lvl + 2 < 2 ^ 31)%Z ->
+  (* same order premise as the counted contract above -- "proc" is the
+     lowest (only) rank this function itself acquires. *)
+  locks_below lks "proc" ->
+  (* ...AND HOW A KILLER PAYS FOR THE INCARNATION ABOUT TO BE MINTED (lane
+     SELF-KILL, §4b'; the owner's ruling of 2026-09-13).  [kill(2)] costs
+     the TARGET's exit payload at -1, and a killer holds none of the
+     target's resources -- so the killed row publishes this wand
+     ([SchedCtx.kill_paid]'s live arm) and a TAINTED process cashes it with
+     [RiscvPtsto.app_taint], which is the application's taint on the
+     fixed record and the only thing left that names a kill.  The CREATOR
+     is the only party that can found it: <init>'s payload is
+     [fun _ => True] and the wand is trivial; a forked child's is the
+     forking process's choice, whose payload admits the taint on its taint
+     arm. *)
+  □ (app_taint -∗ Q (-1)) -∗
+  sie_cap_gpr KT1 m K b pme -∗
+  cpu_own lvl eb pme b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  procs_inv γs -∗
+  is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+  kalloc_env_at γa γk on -∗
+  (* the proc table's regime, threaded exactly as [kalloc_env] is, and at
+     its boot-era index (lane TRAP-ROWS-4, B1b) *)
+  procs_avail_at op tk -∗
+  act_lend pme k -∗
+  wp_next b pme (fun (CID : CpuId) =>
+    ∀ (mr : regfile),
+      ⌜ callee_saved m mr ⌝ -∗
+      pc_is ret_tgt -∗
+      (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend pme k') -∗
+      allocproc_post γa γk γf γs lvl eb pme on op tk b lks mr K Q
+        (mr !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+(* THE LED TWIN of [wp_allocproc_core_body] (NI-LEDGER-REST W2): verbatim, comments
+   stripped, at [allocproc_post_led]. *)
+Definition wp_allocproc_core_led_body
+    `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+    (γa : gname) (γk : gname * gname) (γp : gname) (γf : gname) 
+    (γs : list gname) (m : regfile) (lvl K : nat) (eb : bool)
+    (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+    (b : bool) (lks : gset string) (Q : Z -> iProp Σ) (k : nat) :=
+  let pcE : mword 64 := mword_of_int KernelSyms.allocproc in
+  let ret_tgt := ret_pc (m !!! Regidx (mword_of_int 1 : mword 5)) in
+  (48 <= K)%nat ->
+  (Z.of_nat lvl + 2 < 2 ^ 31)%Z ->
+  locks_below lks "proc" ->
+  □ (app_taint -∗ Q (-1)) -∗
+  sie_cap_gpr KT1 m K b pme -∗
+  cpu_own lvl eb pme b lks -∗
+  kernel_text -∗ pc_is pcE -∗
+  procs_inv γs -∗
+  is_lock γp alp_pid_lock "nextpid"%string nextpid_res_at -∗
+  kalloc_env_at γa γk on -∗
+  procs_avail_at op tk -∗
+  act_lend pme k -∗
+  wp_next b pme (fun (CID : CpuId) =>
+    ∀ (mr : regfile),
+      ⌜ callee_saved m mr ⌝ -∗
+      pc_is ret_tgt -∗
+      (∃ k' : nat, ⌜(k <= k')%nat⌝ ∗ act_lend pme k') -∗
+      allocproc_post_led γa γk γf γs lvl eb pme on op tk b lks mr K Q
+        (mr !!! Regidx (mword_of_int 10 : mword 5)) -∗
+      mWP (Loop : expr riscv_lang)) -∗
+  mWP (Loop : expr riscv_lang).
+
+Module Type ALLOCPROC_GEN.
+  Parameter wp_allocproc_core :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γk : gname * gname) (γp : gname) (γf : gname) (γs : list gname) (m : regfile) (lvl K : nat) (eb : bool)
+      (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+      (b : bool) (lks : gset string) (Q : Z -> iProp Σ) (k : nat),
+      wp_allocproc_core_body γa γk γp γf γs m lvl K eb pme on op tk b lks Q k.
+  Parameter wp_allocproc_core_led :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γk : gname * gname) (γp : gname) (γf : gname) (γs : list gname) (m : regfile) (lvl K : nat) (eb : bool)
+      (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+      (b : bool) (lks : gset string) (Q : Z -> iProp Σ) (k : nat),
+      wp_allocproc_core_led_body γa γk γp γf γs m lvl K eb pme on op tk b lks Q k.
+End ALLOCPROC_GEN.
+
+Module Type ALLOCPROC.
+  Parameter wp_allocproc_sconf :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γk : gname * gname) (γp : gname) (γf : gname) (γs : list gname) (m : regfile) (lvl K : nat) (eb : bool)
+      (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+      (b : bool) (lks : gset string) (Q : Z -> iProp Σ) (k : nat),
+      wp_allocproc_sconf_body γa γk γp γf γs m lvl K eb pme on op tk b lks Q k.
+  Parameter wp_allocproc_sconf_led :
+    forall `{!riscvGS Σ, !xv6G Σ, !bioslotG Σ, !fileG Σ, !fdslotG Σ, !irefslotG Σ, !pavG Σ, !wchG Σ} `{GEN : GenId} `{CID : CpuId} `{XI : CurCtx}
+      (γa : gname) (γk : gname * gname) (γp : gname) (γf : gname) (γs : list gname) (m : regfile) (lvl K : nat) (eb : bool)
+      (pme : mword 64) (on : option nat) (op : option nat) (tk : bool)
+      (b : bool) (lks : gset string) (Q : Z -> iProp Σ) (k : nat),
+      wp_allocproc_sconf_led_body γa γk γp γf γs m lvl K eb pme on op tk b lks Q k.
+End ALLOCPROC.
