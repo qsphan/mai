@@ -81,9 +81,25 @@ $$w \leftarrow w - \mathrm{lr} \times \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon}$
 
 $$w \leftarrow w - \mathrm{lr} \times \lambda \times w$$
 
+Read these as two forces computed from the same starting $w_0$ and applied together in one fused update, not as two sequential in-place overwrites. A literal sequential execution would feed the result of the first line into the second line and pick up an extra second-order term ($\mathrm{lr}^2$), which the definition does not include.
+
 Equivalently:
 
 $$w \leftarrow (1 - \mathrm{lr} \times \lambda) w - \mathrm{lr} \times \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon}$$
+
+**Explanation of that equivalence**:
+
+Name the starting value $w_0$ and name the two amounts being subtracted:
+
+$$a = \mathrm{lr} \times \hat{m} / (\sqrt{\hat{v}} + \epsilon), \quad d = \mathrm{lr} \times \lambda \times w_0$$
+
+where $a$ is the Adam amount and $d$ is the decay amount. Applying both to the same $w_0$ gives:
+
+$$w_{\mathrm{new}} = w_0 - a - d$$
+
+Substitute $a$ and $d$ back in:
+
+$$w_{\mathrm{new}} = w_0 - \mathrm{lr} \times \hat{m} / (\sqrt{\hat{v}} + \epsilon) - \mathrm{lr} \times \lambda \times w_0$$
 
 where $\lambda$ is the weight-decay coefficient. So there are two separate forces:
 ```
