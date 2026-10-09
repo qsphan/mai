@@ -239,3 +239,14 @@ Then substraction:
 This works because rule of Pytorch's broadcasting is: *starting from the rightmost dimension, two dimensions are compatible if they are equal or one of them is 1*. So (2,1) and (2,3) match.
 
 Without `keepdim=True`, `m = [5, 7]`, i.e. the shape is `(2,)`. PyTorch aligns dimensions from the right, so `(2,)` is interpreted as `(1, 2)`. So `(1,2)` and `(2,3)` do not match in PyTorch's broadcasting rule.
+
+### PyTorch accumulates gradients by default
+Suppose we need to split a batch of 64 examples into two small batches of 32 examples because the GPU doesn't have enough memory. Suppose:
+ - The first microbatch of 32 examples: grandient +5
+ - The second microbatch of 32 examples: grandient +3
+Our goal is to train on 64 examples with one weight update. If PyTorch automatically overwrote the gradient every time `backward()` ran, the first microbatch's gradient would be lost. By accumulating gradients, PyTorch allows us to calculate the combined gradient and update the weights just once.
+
+Other reasons to accumulate gradient include:
+ - Multiple loss functions: such as calculating a language-modeling loss and an auxiliary loss separately, then combine their gradient contributions.
+ - Multiple backward passes: several backward passes through different parts of a computation before updating the model.
+ - Distributed training: gradients from different devices or workers may need to be combined before an optimizer update.
