@@ -241,6 +241,8 @@ This works because rule of Pytorch's broadcasting is: *starting from the rightmo
 Without `keepdim=True`, `m = [5, 7]`, i.e. the shape is `(2,)`. PyTorch aligns dimensions from the right, so `(2,)` is interpreted as `(1, 2)`. So `(1,2)` and `(2,3)` do not match in PyTorch's broadcasting rule.
 
 ### PyTorch accumulates gradients by default
+PyTorch's `loss.backward()` adds gradients to the existing .grad tensors instead of overwriting them. This is necessary in may cases.
+
 Suppose we need to split a batch of 64 examples into two small batches of 32 examples because the GPU doesn't have enough memory. Suppose:
  - The first microbatch of 32 examples: grandient +5
  - The second microbatch of 32 examples: grandient +3
