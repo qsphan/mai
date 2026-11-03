@@ -1,0 +1,13 @@
+{
+  "bos_token_id": 0,
+  "do_sample": true,
+  "eos_token_id": 1,
+  "max_length": 4096,
+  "num_beams": 1,
+  "pad_token_id": 2,
+  "repetition_penalty": 1.0,
+  "temperature": 1.0,
+  "top_k": 0,
+  "top_p": 1.0,
+  "use_cache": false
+}

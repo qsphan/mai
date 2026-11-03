@@ -1,0 +1,31 @@
+{
+    "producer": {
+        "name": "modelopt",
+        "version": "0.47.0"
+    },
+    "quantization": {
+        "quant_algo": "NVFP4",
+        "kv_cache_quant_algo": null,
+        "exclude_modules": [
+            "lm_head",
+            "model.embed_tokens",
+            "model.norm",
+            "model.layers.0.*",
+            "model.layers.1.*",
+            "model.layers.109.*",
+            "model.layers.110.*",
+            "model.layers.111.*",
+            "model.layers.112.*",
+            "model.layers.113.*",
+            "model.layers.114.*",
+            "model.layers.*.mlp.gate",
+            "model.layers.*.self_attn.a_proj",
+            "model.layers.*.self_attn.b_proj",
+            "model.layers.*.self_attn.*conv1d",
+            "model.layers.*.*layernorm",
+            "model.layers.*.self_attn.*layernorm",
+            "model.layers.*.self_attn.o_norm"
+        ],
+        "group_size": 16
+    }
+}
